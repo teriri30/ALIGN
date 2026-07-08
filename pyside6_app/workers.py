@@ -13,6 +13,44 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal, QObject
 
 
+class MaskDiagnosticExportWorker(QObject):
+    """Build a mask diagnostic ZIP without blocking the GUI thread."""
+
+    progress = Signal(int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, output_path, raw_mask, mask_result, options=None, parent=None):
+        super().__init__(parent)
+        self.output_path = str(output_path)
+        self.raw_mask = raw_mask
+        self.mask_result = dict(mask_result or {})
+        self.options = dict(options or {})
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            if self._cancelled:
+                return
+            self.progress.emit(10, "正在分析掩膜连通区域...")
+            from mask_diagnostics import export_mask_diagnostic_bundle
+            result = export_mask_diagnostic_bundle(
+                self.output_path,
+                self.raw_mask,
+                self.mask_result,
+                **self.options,
+            )
+            if self._cancelled:
+                return
+            self.progress.emit(100, "掩膜诊断包已生成")
+            self.finished.emit(result)
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
 def display_affine(source_affine, full_width, full_height, display_width, display_height):
     """Map display pixel centres to the exact source raster footprint."""
     from affine import Affine
@@ -595,10 +633,16 @@ class PlanWorker(QObject):
 
     def __init__(self, mask_result: dict, geo, state, config: dict, detected_mask=None, parent=None):
         super().__init__(parent)
+        from config import Config
+
         self.mask_result = dict(mask_result or {})
         self.geo = geo
         self.state = state
-        self.config = dict(config or {})
+        # DECISION-013: the executed planner configuration must match the configuration
+        # recorded in path provenance. Per-run values override persisted ones.
+        self.config = Config().section("path_planning")
+        self.config.update(dict(config or {}))
+        self.config.setdefault("headland_damage_weight", 1.0)
         self.detected_mask = detected_mask
         self._cancelled = False
 

@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QProgressBar,
     QTextEdit, QListWidget, QListWidgetItem, QFormLayout, QDoubleSpinBox,
     QSpinBox, QDialogButtonBox, QTabWidget, QWidget, QFileDialog, QCheckBox,
-    QComboBox
+    QComboBox, QMessageBox
 )
 from pyside6_app.styles import COLORS
 from config import save_json_atomic
@@ -52,6 +52,11 @@ class HarvesterParamsDialog(QDialog):
         spin.setButtonSymbols(QDoubleSpinBox.UpDownArrows)
         return spin
 
+    def _speed_spin(self, value):
+        spin = self._spin(value, 0.05, 5.0, 0.05)
+        spin.setSuffix(" m/s")
+        return spin
+
     def _build_ui(self):
         lo = QVBoxLayout(self)
         lo.setSpacing(12)
@@ -63,15 +68,35 @@ class HarvesterParamsDialog(QDialog):
         fm.setSpacing(8)
         fm.setContentsMargins(0, 8, 0, 8)
         self.spin_cutter = self._spin(self._params.get("cutter_width_m", 2.0), 0.5, 6.0, 0.1)
-        fm.addRow(QLabel("割台宽度:"), self.spin_cutter)
+        fm.addRow(QLabel("割台有效割幅:"), self.spin_cutter)
+        offset_value = self._params.get("cutter_forward_offset_m")
+        self.spin_cutter_offset = self._spin(
+            float(offset_value) if offset_value not in (None, "") else 0.0,
+            0.0,
+            10.0,
+            0.05,
+        )
+        self.spin_cutter_offset.setSpecialValueText("未设置")
+        self.spin_cutter_offset.setToolTip(
+            "履带接地区域几何中心到割刀切割线的水平前向距离，必须实测"
+        )
+        fm.addRow(QLabel("割刀前置距离:"), self.spin_cutter_offset)
         self.spin_track = self._spin(self._params.get("track_width_m", 0.35), 0.1, 1.0, 0.05)
         fm.addRow(QLabel("履带宽度:"), self.spin_track)
         self.spin_gauge = self._spin(self._params.get("track_gauge_m", 1.7), 0.5, 3.0, 0.1)
         fm.addRow(QLabel("履带中心距:"), self.spin_gauge)
         self.spin_wheelbase = self._spin(self._params.get("wheelbase_m", 2.5), 1.0, 6.0, 0.1)
         fm.addRow(QLabel("轴距:"), self.spin_wheelbase)
+        self.spin_track_length = self._spin(self._params.get("track_length_m", 1.7), 0.5, 6.0, 0.1)
+        fm.addRow(QLabel("履带接地长度:"), self.spin_track_length)
         self.spin_turn = self._spin(self._params.get("turn_radius_m", 2.0), 0.5, 6.0, 0.1)
         fm.addRow(QLabel("最小转弯半径:"), self.spin_turn)
+        self.spin_work_speed = self._speed_spin(self._params.get("work_speed_mps", 1.2))
+        fm.addRow(QLabel("作业速度:"), self.spin_work_speed)
+        self.spin_turn_speed = self._speed_spin(self._params.get("turn_speed_mps", 0.6))
+        fm.addRow(QLabel("转弯速度:"), self.spin_turn_speed)
+        self.spin_entry_speed = self._speed_spin(self._params.get("entry_speed_mps", 0.8))
+        fm.addRow(QLabel("进出场速度:"), self.spin_entry_speed)
         lo.addLayout(fm)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
@@ -81,12 +106,31 @@ class HarvesterParamsDialog(QDialog):
     def get_params(self):
         return {
             "cutter_width_m": self.spin_cutter.value(),
+            "cutter_forward_offset_m": (
+                self.spin_cutter_offset.value()
+                if self.spin_cutter_offset.value() > 0
+                else None
+            ),
             "track_width_m": self.spin_track.value(),
             "track_gauge_m": self.spin_gauge.value(),
             "wheelbase_m": self.spin_wheelbase.value(),
             "turn_radius_m": self.spin_turn.value(),
-            "track_length_m": self._params.get("track_length_m", 1.5),
+            "track_length_m": self.spin_track_length.value(),
+            "work_speed_mps": self.spin_work_speed.value(),
+            "turn_speed_mps": self.spin_turn_speed.value(),
+            "entry_speed_mps": self.spin_entry_speed.value(),
         }
+    def accept(self):
+        if self.spin_cutter_offset.value() <= 0:
+            QMessageBox.warning(
+                self,
+                "缺少实测参数",
+                "请填写履带接地区域几何中心到割刀切割线的水平前向距离。\n"
+                "系统不会根据轴距或机身尺寸推算该值。",
+            )
+            self.spin_cutter_offset.setFocus()
+            return
+        super().accept()
 
 
 class MachineRecommendationDialog(QDialog):
@@ -112,7 +156,16 @@ class MachineRecommendationDialog(QDialog):
         row = QHBoxLayout()
         btn_apply = QPushButton("应用候选参数")
         btn_close = QPushButton("关闭")
-        btn_apply.setEnabled(bool(self._recommendation.get("params")))
+        btn_apply.setEnabled(
+            bool(self._recommendation.get("params"))
+            and self._recommendation.get("evidence_quality") != "insufficient"
+        )
+        if not btn_apply.isEnabled() and bool(self._recommendation.get("params")):
+            btn_apply.setToolTip("当前影像证据不足，不能形成可应用的候选尺寸")
+        elif btn_apply.isEnabled() and not bool(
+            (self._recommendation.get("params") or {}).get("cutter_forward_offset_m")
+        ):
+            btn_apply.setToolTip("只应用履带、中心距、轴距等候选尺寸；割刀前置距离仍需实测")
         btn_apply.clicked.connect(self.accept)
         btn_close.clicked.connect(self.reject)
         row.addStretch()

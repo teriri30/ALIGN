@@ -60,8 +60,20 @@ class TaskStatus:
     action: Optional[str] = None
 
 
-def _has_harvester_params(params: Any) -> bool:
-    return bool(isinstance(params, dict) and params.get("cutter_width_m"))
+def _has_harvester_base_params(params: Any) -> bool:
+    return bool(
+        isinstance(params, dict)
+        and params.get("cutter_width_m")
+        and params.get("track_width_m")
+        and params.get("track_gauge_m")
+        and params.get("wheelbase_m")
+        and params.get("track_length_m")
+        and params.get("turn_radius_m")
+    )
+
+
+def _has_cutter_forward_offset(params: Any) -> bool:
+    return bool(isinstance(params, dict) and params.get("cutter_forward_offset_m"))
 
 
 def _has_points(value: Any) -> bool:
@@ -86,7 +98,10 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     process_running = bool(getattr(state, "mask_processing_running", False))
     process_done = bool(getattr(state, "mask_processed", False) and getattr(state, "mask_result", None) is not None)
     plan_running = bool(getattr(state, "plan_running", False))
-    params_done = _has_harvester_params(getattr(state, "harvester_params", {}))
+    harvester_params = getattr(state, "harvester_params", {})
+    params_ready = _has_harvester_base_params(harvester_params)
+    cutter_offset_ready = _has_cutter_forward_offset(harvester_params)
+    params_done = bool(params_ready and cutter_offset_ready)
     entry = getattr(state, "entry_point", None)
     exit_point = getattr(state, "exit_point", None)
     unload_points = list(getattr(state, "unload_points", []) or [])
@@ -106,7 +121,12 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     if process_running:
         statuses["process"] = TaskStatus("in_progress", "处理中")
     if process_done:
-        statuses["params"] = TaskStatus("done" if params_done else "available")
+        if params_done:
+            statuses["params"] = TaskStatus("done")
+        elif params_ready:
+            statuses["params"] = TaskStatus("available", "缺割刀前置", action="补填")
+        else:
+            statuses["params"] = TaskStatus("available")
         if entry:
             text = "已确认" if getattr(state, "entry_point_locked", False) else "智能推荐"
             statuses["entry"] = TaskStatus("done", text)
@@ -124,7 +144,7 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
         else:
             statuses["unload"] = TaskStatus("pending", "可选")
 
-    ready_to_plan = process_done and params_done and _has_points(entry) and _has_points(exit_point)
+    ready_to_plan = process_done and params_ready and _has_points(entry) and _has_points(exit_point)
     if ready_to_plan:
         statuses["plan"] = TaskStatus("done" if path_done else "available", action="重算" if path_done else "生成")
     if plan_running:

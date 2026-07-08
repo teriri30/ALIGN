@@ -153,6 +153,7 @@ def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
         "machine_readiness": {
             "eligible_for_machine_export": False,
             "blockers": ["footprint_optimized_work_lines_not_used"],
+            "controlled_trial_blockers": ["footprint_optimized_work_lines_not_used"],
         },
         "ordered_segments": [
             {"segment_index": 0, "type": "work", "points": [(0, 0), (1, 0)]},
@@ -169,9 +170,8 @@ def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
     assert "接近 1" in summary
     assert "倒车 1" in summary
     assert "进出田/卸粮 1" in summary
-    assert "快速预览" in panel._safety.text()
-    assert "中心线" in panel._safety.text()
-    assert "不建议导出" in panel._safety.text()
+    assert panel._safety.text() == "路径状态：不建议导出"
+    assert "足迹优化" in panel._safety.toolTip()
     assert "支撑<=100" in panel._safety.toolTip()
     assert [row._segment_type for row in panel.findChildren(RouteSegmentRow)] == [
         "work", "turn_approach", "turn", "turn_reverse", "exit"
@@ -216,6 +216,7 @@ def test_export_blocks_when_harvester_parameters_changed_after_planning():
     window = MainWindow()
     window.geo = _MetricGeo()
     window.state.harvester_params = window._effective_harvester_params({})
+    window.state.harvester_params["cutter_forward_offset_m"] = 1.2
     planned = dict(window.state.harvester_params)
     planned["track_width_m"] += 0.1
     window._pipeline_result = {
@@ -331,15 +332,24 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
     assert manifest["integrity"]["config_sha256"]
     assert manifest["integrity"]["route_data_sha256"]
 
-    trial_output = tmp_path / "trial.csv"
-    trial_output.write_text("lon,lat\n120,30\n", encoding="utf-8")
+    trial_output = tmp_path / "trial.path"
+    trial_output.write_text("$PATH,0,0,1,30,120,0,0,1*\n", encoding="utf-8")
     path_result["machine_readiness"] = {"controlled_trial_ready": True}
     trial_manifest_path = window._write_export_manifest(
-        str(trial_output), "CSV", path_result, points
+        str(trial_output), "$PATH", path_result, points
     )
     trial_manifest = json.loads(open(trial_manifest_path, "r", encoding="utf-8").read())
     assert trial_manifest["output"]["route_classification"] == "controlled_field_trial"
     assert "LOW_SPEED_MANUAL_SUPERVISION" in trial_manifest["output"]["usage_restriction"]
+    assert trial_manifest["output"]["machine_executable"] is False
+    assert trial_manifest["output"]["candidate_machine_path"] is True
+    assert trial_manifest["output"]["terminal_protocol_validated"] is False
+    assert trial_manifest["output"]["path_protocol"]["coordinate_order"] == [
+        "latitude", "longitude"
+    ]
+    assert trial_manifest["output"]["path_protocol"]["point_index_base"] == 0
+    assert trial_manifest["output"]["internal_path_reference_point"] == "track_contact_center"
+    assert trial_manifest["output"]["footprint_model"] == "planar_rigid_footprint_v2"
 
 
 def test_machine_parameter_output_is_explicitly_unvalidated_heuristic():
@@ -355,5 +365,5 @@ def test_machine_parameter_output_is_explicitly_unvalidated_heuristic():
     })
 
     assert recommendation["validated"] is False
-    assert recommendation["method"] == "path_metric_heuristic_v1"
+    assert recommendation["method"] == "mask_geometry_heuristic_v2"
     assert "没有 DEM" in recommendation["message"]

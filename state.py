@@ -238,13 +238,13 @@ class AppState:
         self._temp_field_data: Optional[dict] = None
 
         self.last_rolling_rate: float = 0.0
-        self.last_harvest_rate: float = 0.0
-        self.last_planned_harvest_rate: float = 0.0
+        self.last_crop_mask_geometric_coverage_pct: float = 0.0
+        self.last_planned_target_geometric_coverage_pct: float = 0.0
         self.last_total_path_m: float = 0.0
         self.last_work_path_m: float = 0.0
         self.last_turn_path_m: float = 0.0
         self.last_entry_exit_path_m: float = 0.0
-        self.last_detected_harvest_rate: float = 0.0
+        self.last_detected_mask_geometric_coverage_pct: float = 0.0
         self.last_field_efficiency: float = 0.0
 
     def _copy_array(self, arr):
@@ -281,8 +281,9 @@ class AppState:
             "path_points", "path_status", "auto_path", "auto_path_planned",
             "auto_path_segments", "auto_path_geo", "auto_path_valid", "auto_path_desc",
             "workflow_step", "simulation_done", "export_done",
-            "last_rolling_rate", "last_harvest_rate", "last_planned_harvest_rate",
-            "last_detected_harvest_rate", "last_field_efficiency",
+            "last_rolling_rate", "last_crop_mask_geometric_coverage_pct",
+            "last_planned_target_geometric_coverage_pct",
+            "last_detected_mask_geometric_coverage_pct", "last_field_efficiency",
             "last_total_path_m", "last_work_path_m", "last_turn_path_m",
             "last_entry_exit_path_m",
         )
@@ -304,8 +305,9 @@ class AppState:
             "path_points", "path_status", "auto_path", "auto_path_planned",
             "auto_path_segments", "auto_path_geo", "auto_path_valid",
             "auto_path_desc", "simulation_done", "export_done",
-            "last_rolling_rate", "last_harvest_rate",
-            "last_planned_harvest_rate", "last_detected_harvest_rate",
+            "last_rolling_rate", "last_crop_mask_geometric_coverage_pct",
+            "last_planned_target_geometric_coverage_pct",
+            "last_detected_mask_geometric_coverage_pct",
             "last_field_efficiency", "last_total_path_m",
             "last_work_path_m", "last_turn_path_m",
             "last_entry_exit_path_m",

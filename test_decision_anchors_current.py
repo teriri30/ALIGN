@@ -58,6 +58,25 @@ DECISION_ANCHORS = {
         "path_planner.py",
         "test_turn_endpoint_current.py",
     ),
+    "DECISION-011": (
+        "docs/DECISIONS.md",
+        "footprint_planner.py",
+        "test_planar_footprint_current.py",
+    ),
+    "DECISION-012": (
+        "docs/DECISIONS.md",
+        "path_pose.py",
+        "path_planner.py",
+        "workflow.py",
+        "test_cross_module_math_current.py",
+    ),
+    "DECISION-013": (
+        "docs/DECISIONS.md",
+        "footprint_planner.py",
+        "path_planner.py",
+        "pyside6_app/workers.py",
+        "test_cross_module_math_current.py",
+    ),
 }
 
 

@@ -10,6 +10,8 @@ def _valid_path_result(mode="footprint_optimized"):
             "field_boundary_present": True,
             "semantic_support_present": True,
             "forbidden_mask_present": True,
+            "footprint_model": "planar_rigid_footprint_v2",
+            "footprint_reference_point": "track_contact_center",
         },
         "layout": {"work_line_mode": mode},
         "turn_assessment": {"hard_reasons": []},
@@ -69,28 +71,40 @@ def test_machine_readiness_accepts_only_complete_verified_evidence():
     assert readiness["blockers"] == []
 
 
-def test_footprint_work_line_mode_uses_generator_without_fallback(monkeypatch):
+def test_footprint_work_line_mode_requires_four_row_band_references(monkeypatch):
     import path_planner
 
-    expected = [[(1.0, 2.0), (3.0, 4.0)]]
-    called = {}
+    called = False
 
-    def fake_generate(mask, angle, **kwargs):
-        called["shape"] = mask.shape
-        called["angle"] = angle
-        return expected, {"generated_pass_count": 1}
+    def fake_generate(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return [[(1.0, 2.0), (3.0, 4.0)]], {"generated_pass_count": 1}
 
     monkeypatch.setattr(path_planner, "generate_work_lines", fake_generate)
+    class State:
+        harvester_params = {
+            "cutter_width_m": 2.0,
+            "cutter_forward_offset_m": 1.2,
+            "track_width_m": 0.4,
+            "track_gauge_m": 1.6,
+            "wheelbase_m": 1.8,
+            "track_length_m": 1.7,
+            "turn_radius_m": 0.9,
+        }
+
     lines, layout = path_planner._prepare_work_line_layout(
         [],
         np.zeros((20, 30), dtype=np.uint8),
         0.25,
+        state=State(),
         config={"work_line_mode": "footprint_optimized"},
     )
 
-    assert lines == expected
+    assert lines == []
     assert layout["work_line_mode"] == "footprint_optimized"
-    assert called == {"shape": (20, 30), "angle": 0.25}
+    assert layout["reason"] == "no_valid_four_row_centerlines"
+    assert called is False
 
 
 def test_forbidden_regions_are_rasterized_in_local_mask_coordinates():

@@ -94,6 +94,35 @@ def test_adjacent_parallel_residual_remains_attached_to_body():
     assert np.count_nonzero(uncertain) == 0
 
 
+def test_attached_oblique_block_residual_does_not_become_work_body():
+    """Attached residuals must still look like row strips before joining body."""
+    import cv2
+    from row_geometry import residual_mask_layers
+
+    raw = np.zeros((160, 220), dtype=np.uint8)
+    rebuilt = np.zeros_like(raw)
+    rebuilt[58:66, 20:180] = 255
+    raw[58:66, 20:180] = 255
+    cv2.fillPoly(
+        raw,
+        [np.asarray([[22, 66], [185, 112], [185, 145], [22, 96]], dtype=np.int32)],
+        255,
+    )
+
+    headland, body_residual, uncertain = residual_mask_layers(
+        raw,
+        rebuilt,
+        main_angle=0.0,
+        meters_per_px=0.1,
+        min_area_ratio=0.001,
+    )
+
+    residual_area = int(np.count_nonzero(raw & cv2.bitwise_not(rebuilt)))
+    assert np.count_nonzero(body_residual) == 0
+    assert np.count_nonzero(headland) == 0
+    assert np.count_nonzero(uncertain) == residual_area
+
+
 def test_terminal_band_gap_uses_stricter_threshold_than_internal_gap():
     """DECISION-009: a detached terminal fragment cannot use the internal gap limit."""
     from row_geometry import close_band_support_gaps

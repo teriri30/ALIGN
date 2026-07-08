@@ -182,16 +182,61 @@
 
 **不变量**：
 
-- `work_line_mode=band_centerline` 保持现有论文流程；`footprint_optimized` 显式启用足迹代价驱动作业线，失败时不得静默回退。
-- 用户界面只提供“快速预览、田间试验、高级校验”三个使用模式；默认田间试验模式，内部配置细节不要求普通用户理解。
+- `work_line_mode=band_centerline` 保持现有论文流程；`footprint_optimized` 也必须保留四行带中心线作为路径参考，足迹模型只用于验证和风险评分，不得把作业线横向推到窄水道。
+- 用户界面不暴露“快速预览、田间试验、高级校验”等内部模式；默认按田间试验要求执行，内部配置细节不要求普通用户理解。
 - 验证等级分为 `research`、`field_trial` 和 `machine_candidate`；结果界面只显示路径状态、作业线模式和关键风险，内部阻断项放入详情提示。
 - 未确认的不确定残差不得自动升级为禁行区；提供禁行区时，履带重叠默认硬门限为 0%。
 - 禁行区必须来自用户确认多边形，并进入项目缓存、路径 provenance、足迹验证和导出 manifest；任何修改必须使旧路径失效。
 - GeoJSON、CSV、KML、JSON 和 `$PATH` 标记为科研/人工复核导出，不得宣称为机器可执行路线。
 - 缺少外部定位精度、车辆参考几何、完整运动学、终端适配、实车跟踪验证或人工签署时，机器执行就绪评估必须失败关闭。
-- 足迹验证必须记录 `simple_track_offset_v1`，不得表述为完整车辆扫掠包络。
+- 足迹验证必须记录 `planar_rigid_footprint_v2` 和参考点 `track_contact_center`。演示与验证共用左右履带、机身和割刀线；履带碾压使用有限接地长度的有向矩形扫掠，作物掩膜几何覆盖使用具有实测前置距离的有效割幅线段扫掠。
+- 二维刚体模型不得表述为真实 CAD、车辆动力学或土壤压实模型；轴距影响机身与割台前后位置，履带接地长度独立决定履带接地矩形，禁止重复计量。
 
-**代码锚点**：`path_planner._prepare_work_line_layout`、`footprint_planner.validate_footprints`、`footprint_planner.rasterize_forbidden_regions`、`machine_route_validator.assess_machine_readiness`、`RouteInfoPanel`。
+**代码锚点**：`path_planner._prepare_work_line_layout`、`harvester_geometry.planar_geometry_m`、`footprint_planner.validate_footprints`、`footprint_planner.rasterize_forbidden_regions`、`machine_route_validator.assess_machine_readiness`、`RouteInfoPanel`。
+
+**测试锚点**：`test_planar_geometry_uses_the_same_configured_dimensions_as_animation`、`test_track_contact_length_changes_terminal_rolling_area`、`test_validation_identifies_rigid_planar_footprint_model`。
+
+## DECISION-012：碾压目标、路径姿态与结果状态必须形成单一数学链
+
+**结论**：预计碾压只定义为两条履带有限矩形沿路径扫掠后与全部已确认作物像素（主体与田头）的交集比例。机身不计入碾压，割刀线只计算主体作物掩膜几何覆盖。验证和演示共用唯一的分段路径姿态采样器；路径排序中的田头农业价值差异由 DECISION-013 的独立代价表达，不得改写物理碾压率。
+
+**不变量**：
+
+- 不得使用机身或割台面积增加或替代履带碾压率。
+- 验证口径中的割刀只建模为横向有效割幅线段。`cutter_forward_offset_m` 必须实测；禁止由轴距、机身长度或固定比例推算割台纵向深度。UI 可绘制 `cutter_visual` 作为显示用割台面板，但不得把它计入覆盖率、碾压率或足迹校验。
+- “作物掩膜几何覆盖率”不得表述为实际收获率。覆盖结果只说明二维割刀扫掠是否掠过对应掩膜。
+- `rolling_crop_pct` 废止；界面、报告和导出只把 `rolling_canopy_pct` 称为预计碾压率。
+- `rolling_canopy_pct` 必须使用 `processed_mask | headland_mask` 的去重并集；主体和田头碾压同时单列，任何权重不得进入该物理比例。
+- 自动规划完成后，演示状态中的覆盖、碾压、效率和各类路径长度必须来自同一次 `validation`，不得读取初始值或历史值。
+- `path_pose` 是位置插值、航向窗口和倒车方向的唯一实现；验证和演示不得各自计算航向。
+- 缺少有效米制尺度或完整农机几何字段时失败关闭，不得使用 `0.01 m/px` 或模块私有默认尺寸。
+- 作业、转弯和进出场速度是明确农机配置；播放倍率仅用于演示控制。
+- 受控试验就绪检查必须核验足迹模型版本与内部路径参考点。
+
+**代码锚点**：`path_pose.py`、`path_planner._rank_path_candidates`、`footprint_planner.validate_footprints`、`workflow.AnimationEngine`、`MainWindow._store_path_result`、`machine_route_validator.assess_machine_readiness`。
+
+**测试锚点**：`test_cross_module_math_current.py`、`test_animation_controls_current.py`。
+
+## DECISION-013：田头降级只能进入独立农业损伤代价
+
+**结论**：主作业区作物、田头作物、未确认无掩膜区和人工禁行区必须保持不同语义。路径候选在硬约束通过后先比较 `agronomic_damage_cost_m2`，再比较不加权的 `rolling_canopy_pct`；农业损伤代价按“主体履带重叠面积 + 田头权重 × 田头履带重叠面积”计算。
+
+**原因**：田头稻桩仍影响再生季产量，不能像确认无作物道路一样按零损失处理；但田头可能因预收、稀疏度和管理方式具有不同边际产量。该差异尚无项目田间标定数据，不能通过修改“预计碾压率”或私设经验常数掩盖。
+
+**不变量**：
+
+- `headland_damage_weight` 必须在 `(0, 1]` 内，默认 `1.0`；低于 `1.0` 只允许依据田间对照产量标定后使用。
+- 调整田头权重不得改变主体、田头、全田作物的真实碾压面积和 `rolling_canopy_pct`。
+- `agronomic_damage_cost_m2` 是路径排序代价，不得在界面、论文、日志或导出中称为碾压率。
+- `headland_mask` 只能使用与主体掩膜同尺度的确认作物证据；重叠像素必须去重，不得重复计量。
+- 无掩膜像素不得自动认定为无作物道路；未确认区域继续接受语义支撑、禁行区和人工复核约束。
+- 实际执行配置与路径 provenance 中记录的配置必须一致，田头权重变化必须使路径阶段指纹变化。
+
+**代码锚点**：`footprint_planner.validate_footprints`、`path_planner._rank_path_candidates`、`pyside6_app.workers.PlanWorker`。
+
+**测试锚点**：`test_cross_module_math_current.py`。
+
+**允许的变更方式**：可使用田头/主体的未碾压与碾压对照小区第二季单位面积产量标定田头权重；修改默认值时必须同时报告样本、估计方法、置信区间以及对候选路径排序的敏感性分析。
 
 ## 修改决策的方式
 

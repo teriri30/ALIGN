@@ -6,6 +6,13 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from harvester_geometry import (
+    FOOTPRINT_MODEL,
+    FOOTPRINT_REFERENCE_POINT,
+    planar_geometry_m,
+    transform_polygon,
+)
+from path_pose import sample_polyline_poses
 from row_geometry import meters_per_pixel, odd_size, rotate_bound, smooth_1d
 
 
@@ -130,7 +137,7 @@ def _choose_layout(
                 objective,
                 kept,
                 {
-                    "predicted_harvest_coverage_pct": coverage * 100.0,
+                    "predicted_geometric_coverage_pct": coverage * 100.0,
                     "predicted_track_core_overlap_pct": core_overlap * 100.0,
                     "predicted_track_canopy_overlap_pct": soft_overlap * 100.0,
                     "pass_count": len(kept),
@@ -278,10 +285,14 @@ def generate_work_lines(
 ) -> Tuple[List[List[Point]], Dict]:
     """Generate coverage passes whose two track footprints avoid crop cores."""
     cfg = config or {}
-    specs = harvester or {}
-    cutter_width_m = float(specs.get("cutter_width_m", 2.15))
-    track_width_m = float(specs.get("track_width_m", 0.4))
-    track_gauge_m = float(specs.get("track_gauge_m", 1.7))
+    specs = dict(harvester or {})
+    required = ("cutter_width_m", "track_width_m", "track_gauge_m")
+    missing = [key for key in required if key not in specs]
+    if missing:
+        raise ValueError("missing work-line geometry parameters: " + ", ".join(missing))
+    cutter_width_m = float(specs["cutter_width_m"])
+    track_width_m = float(specs["track_width_m"])
+    track_gauge_m = float(specs["track_gauge_m"])
     headland_buffer_m = float(cfg.get("headland_buffer_m", 3.0))
 
     def report(value: float, stage: str):
@@ -429,6 +440,124 @@ def _offset_polyline(points: np.ndarray, offset: float) -> np.ndarray:
     return result
 
 
+def _sample_planar_poses(
+    points: np.ndarray,
+    spacing_px: float,
+    *,
+    heading_window_px: float,
+    reversing: bool = False,
+) -> List[Tuple[float, float, float]]:
+    """Use the canonical path-pose sampler shared with animation."""
+    try:
+        return sample_polyline_poses(
+            points,
+            lambda first, second: math.hypot(
+                second[0] - first[0], second[1] - first[1]
+            ),
+            max(0.5, float(spacing_px)),
+            max(1.0, float(heading_window_px)),
+            reversing=reversing,
+        )
+    except ValueError:
+        return []
+
+
+def _rasterize_planar_sweeps(
+    shape: Tuple[int, int],
+    full_path: List[List[Point]],
+    segment_types: Optional[List[str]],
+    geometry: Dict,
+    work_mpp: float,
+    config: Dict,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, int]:
+    track_swept = np.zeros(shape, dtype=np.uint8)
+    cutter_swept = np.zeros(shape, dtype=np.uint8)
+    machine_swept = np.zeros(shape, dtype=np.uint8)
+    dimensions = geometry["dimensions_m"]
+    default_step_m = min(
+        0.10,
+        max(
+            0.025,
+            min(dimensions["track_width_m"], dimensions["track_length_m"]) / 3.0,
+        ),
+    )
+    pose_step_m = float(config.get("footprint_pose_step_m", default_step_m))
+    pose_step_m = max(0.01, min(0.20, pose_step_m))
+    pose_heading_window_m = max(
+        0.01, float(config.get("pose_heading_window_m", 0.30))
+    )
+    spacing_px = pose_step_m / work_mpp
+    heading_window_px = pose_heading_window_m / work_mpp
+    pixels_per_meter = 1.0 / work_mpp
+    pose_count = 0
+
+    for segment_index, segment in enumerate(full_path):
+        if len(segment) < 2:
+            continue
+        segment_type = (
+            segment_types[segment_index]
+            if segment_types and segment_index < len(segment_types)
+            else ("work" if segment_index % 2 == 0 else "turn")
+        )
+        poses = _sample_planar_poses(
+            np.asarray(segment, dtype=np.float64),
+            spacing_px,
+            heading_window_px=heading_window_px,
+            reversing=str(segment_type) == "turn_reverse",
+        )
+        pose_count += len(poses)
+        previous_cutter = None
+        for x, y, heading in poses:
+            center = (x, y)
+            left = transform_polygon(
+                geometry["left_track"], center, heading, pixels_per_meter
+            )
+            right = transform_polygon(
+                geometry["right_track"], center, heading, pixels_per_meter
+            )
+            body = transform_polygon(
+                geometry["body"], center, heading, pixels_per_meter
+            )
+            cutter_line = transform_polygon(
+                geometry["cutter_line"], center, heading, pixels_per_meter
+            )
+            cv2.fillPoly(track_swept, [np.rint(left).astype(np.int32)], 255)
+            cv2.fillPoly(track_swept, [np.rint(right).astype(np.int32)], 255)
+            cv2.fillPoly(machine_swept, [np.rint(body).astype(np.int32)], 255)
+            cutter_pixels = np.rint(cutter_line).astype(np.int32)
+            cv2.line(
+                machine_swept,
+                tuple(cutter_pixels[0]),
+                tuple(cutter_pixels[1]),
+                255,
+                1,
+            )
+            if str(segment_type) == "work":
+                cv2.line(
+                    cutter_swept,
+                    tuple(cutter_pixels[0]),
+                    tuple(cutter_pixels[1]),
+                    255,
+                    1,
+                )
+                if previous_cutter is not None:
+                    swept_quad = np.asarray(
+                        (
+                            previous_cutter[0],
+                            previous_cutter[1],
+                            cutter_pixels[1],
+                            cutter_pixels[0],
+                        ),
+                        dtype=np.int32,
+                    )
+                    cv2.fillPoly(cutter_swept, [swept_quad], 255)
+                previous_cutter = cutter_pixels
+    return (
+        track_swept, cutter_swept, machine_swept,
+        pose_step_m, pose_heading_window_m, pose_count,
+    )
+
+
 def validate_footprints(
     full_path: List[List[Point]],
     processed_mask: np.ndarray,
@@ -444,10 +573,15 @@ def validate_footprints(
     uncertain_mask: Optional[np.ndarray] = None,
     forbidden_mask: Optional[np.ndarray] = None,
 ) -> Dict:
-    """Validate footprints without conflating crop evidence and field support.
+    """Validate one canonical planar rigid footprint against semantic masks.
 
     DECISION-009 keeps crop overlap based on ``processed_mask`` while the
     separate support mask is used only for field-boundary support checks.
+    DECISION-011 requires display and validation to share the same configured
+    track, body and cutter polygons around the track-contact centre.
+    DECISION-013 keeps physical rolling separate from the calibrated agronomic
+    damage cost: body and headland crop pixels are both physical crop evidence,
+    while only the latter may receive an explicit planning weight.
     """
     cfg = config or {}
     if headland_mask is None:
@@ -458,22 +592,20 @@ def validate_footprints(
         uncertain_mask = cfg.get("uncertain_mask")
     if forbidden_mask is None:
         forbidden_mask = cfg.get("forbidden_mask")
-    specs = harvester or {}
-    cutter_width_m = float(specs.get("cutter_width_m", 2.15))
-    track_width_m = float(specs.get("track_width_m", 0.4))
-    track_gauge_m = float(specs.get("track_gauge_m", 1.7))
+    specs = dict(harvester or {})
+    geometry = planar_geometry_m(specs)
 
     raw = (np.asarray(processed_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
     h, w = raw.shape[:2]
     mpp = meters_per_pixel(raw, geo, state)
     max_dim = int(cfg.get("validation_max_dim", 3000))
     scale = min(1.0, float(max_dim) / max(h, w))
-    soft = cv2.resize(
+    body = cv2.resize(
         raw,
         (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
         interpolation=cv2.INTER_AREA,
     )
-    soft = (soft >= 96).astype(np.uint8) * 255
+    body = (body >= 96).astype(np.uint8) * 255
     detected = None
     if detected_mask is not None:
         detected_raw = (
@@ -482,7 +614,7 @@ def validate_footprints(
         if detected_raw.shape[:2] == raw.shape[:2]:
             detected = cv2.resize(
                 detected_raw,
-                (soft.shape[1], soft.shape[0]),
+                (body.shape[1], body.shape[0]),
                 interpolation=cv2.INTER_AREA,
             )
             detected = (detected >= 96).astype(np.uint8) * 255
@@ -494,22 +626,27 @@ def validate_footprints(
         if planned_raw.shape[:2] == raw.shape[:2]:
             planned = cv2.resize(
                 planned_raw,
-                (soft.shape[1], soft.shape[0]),
+                (body.shape[1], body.shape[0]),
                 interpolation=cv2.INTER_AREA,
             )
             planned = (planned >= 96).astype(np.uint8) * 255
-    headland = None
+    headland = np.zeros_like(body)
+    headland_present = headland_mask is not None
     if headland_mask is not None:
         headland_raw = (
             np.asarray(headland_mask, dtype=np.uint8) > 0
         ).astype(np.uint8) * 255
-        if headland_raw.shape[:2] == raw.shape[:2]:
-            headland = cv2.resize(
-                headland_raw,
-                (soft.shape[1], soft.shape[0]),
-                interpolation=cv2.INTER_AREA,
-            )
-            headland = (headland >= 96).astype(np.uint8) * 255
+        if headland_raw.shape[:2] != raw.shape[:2]:
+            raise ValueError("headland mask shape does not match processed mask")
+        headland = cv2.resize(
+            headland_raw,
+            (body.shape[1], body.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+        headland = (headland >= 96).astype(np.uint8) * 255
+        # A pixel cannot be charged as both body and headland crop.
+        headland = cv2.bitwise_and(headland, cv2.bitwise_not(body))
+    canopy = cv2.bitwise_or(body, headland)
     support_source = raw
     semantic_support = None
     if support_mask is not None:
@@ -518,22 +655,22 @@ def validate_footprints(
             support_source = candidate_support
             semantic_support = cv2.resize(
                 candidate_support,
-                (soft.shape[1], soft.shape[0]),
+                (body.shape[1], body.shape[0]),
                 interpolation=cv2.INTER_NEAREST,
             )
-    elif headland is not None:
+    elif headland_present:
         support_source = cv2.bitwise_or(
             raw,
             (np.asarray(headland_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255,
         )
         semantic_support = cv2.resize(
             support_source,
-            (soft.shape[1], soft.shape[0]),
+            (body.shape[1], body.shape[0]),
             interpolation=cv2.INTER_NEAREST,
         )
     field_support = cv2.resize(
         _field_support(support_source, state),
-        (soft.shape[1], soft.shape[0]),
+        (body.shape[1], body.shape[0]),
         interpolation=cv2.INTER_NEAREST,
     )
     uncertain = None
@@ -542,7 +679,7 @@ def validate_footprints(
         if candidate.shape[:2] == raw.shape[:2]:
             uncertain = cv2.resize(
                 candidate,
-                (soft.shape[1], soft.shape[0]),
+                (body.shape[1], body.shape[0]),
                 interpolation=cv2.INTER_NEAREST,
             )
     forbidden = None
@@ -551,14 +688,14 @@ def validate_footprints(
         if candidate.shape[:2] == raw.shape[:2]:
             forbidden = cv2.resize(
                 candidate,
-                (soft.shape[1], soft.shape[0]),
+                (body.shape[1], body.shape[0]),
                 interpolation=cv2.INTER_NEAREST,
             )
     work_mpp = mpp / scale
     erosion_m = float(cfg.get("crop_core_erosion_m", 0.10))
     erosion_px = max(1, int(round(erosion_m / work_mpp)))
     core = cv2.erode(
-        soft,
+        body,
         cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (odd_size(erosion_px * 2 + 1), odd_size(erosion_px * 2 + 1)),
@@ -566,66 +703,45 @@ def validate_footprints(
         iterations=1,
     )
 
-    track_swept = np.zeros_like(soft)
-    cutter_swept = np.zeros_like(soft)
-    track_half_gauge_px = track_gauge_m / work_mpp / 2.0
-    track_thickness = odd_size(track_width_m / work_mpp, minimum=1)
-    cutter_thickness = odd_size(cutter_width_m / work_mpp, minimum=1)
-
-    for segment_index, segment in enumerate(full_path):
-        if len(segment) < 2:
-            continue
-        points = np.asarray(segment, dtype=np.float64) * scale
-        left = _offset_polyline(points, -track_half_gauge_px)
-        right = _offset_polyline(points, track_half_gauge_px)
-        cv2.polylines(
-            track_swept,
-            [np.round(left).astype(np.int32)],
-            False,
-            255,
-            track_thickness,
-            cv2.LINE_AA,
-        )
-        cv2.polylines(
-            track_swept,
-            [np.round(right).astype(np.int32)],
-            False,
-            255,
-            track_thickness,
-            cv2.LINE_AA,
-        )
-        segment_type = (
-            segment_types[segment_index]
-            if segment_types and segment_index < len(segment_types)
-            else ("work" if segment_index % 2 == 0 else "turn")
-        )
-        if segment_type == "work":
-            cv2.polylines(
-                cutter_swept,
-                [np.round(points).astype(np.int32)],
-                False,
-                255,
-                cutter_thickness,
-                cv2.LINE_AA,
-            )
+    scaled_path = [
+        [(float(x) * scale, float(y) * scale) for x, y in segment]
+        for segment in full_path
+    ]
+    (
+        track_swept,
+        cutter_swept,
+        machine_swept,
+        pose_step_m,
+        pose_heading_window_m,
+        pose_count,
+    ) = _rasterize_planar_sweeps(
+        body.shape[:2], scaled_path, segment_types, geometry, work_mpp, cfg
+    )
 
     track_area = max(int(np.count_nonzero(track_swept)), 1)
-    crop_area = max(int(np.count_nonzero(soft)), 1)
+    body_area_raw = int(np.count_nonzero(body))
+    headland_area_raw = int(np.count_nonzero(headland))
+    canopy_area_raw = int(np.count_nonzero(canopy))
+    body_area = max(body_area_raw, 1)
+    headland_area = max(headland_area_raw, 1)
+    canopy_area = max(canopy_area_raw, 1)
     core_area = max(int(np.count_nonzero(core)), 1)
-    track_canopy = int(np.count_nonzero((track_swept > 0) & (soft > 0)))
+    track_body = int(np.count_nonzero((track_swept > 0) & (body > 0)))
+    track_headland = int(np.count_nonzero((track_swept > 0) & (headland > 0)))
+    track_canopy = int(np.count_nonzero((track_swept > 0) & (canopy > 0)))
     track_core = int(np.count_nonzero((track_swept > 0) & (core > 0)))
-    harvested = int(np.count_nonzero((cutter_swept > 0) & (soft > 0)))
+    crop_mask_covered = int(np.count_nonzero((cutter_swept > 0) & (body > 0)))
     detected_crop_area = max(int(np.count_nonzero(detected)), 1) if detected is not None else 1
-    detected_harvested = (
+    detected_mask_covered = (
         int(np.count_nonzero((cutter_swept > 0) & (detected > 0)))
         if detected is not None
         else 0
     )
-    planned_crop_area = max(int(np.count_nonzero(planned)), 1) if planned is not None else crop_area
-    planned_harvested = (
+    planned_crop_area = max(int(np.count_nonzero(planned)), 1) if planned is not None else body_area
+    planned_target_covered = (
         int(np.count_nonzero((cutter_swept > 0) & (planned > 0)))
         if planned is not None
-        else harvested
+        else crop_mask_covered
     )
     outside_field = int(
         np.count_nonzero((track_swept > 0) & (field_support == 0))
@@ -645,23 +761,60 @@ def validate_footprints(
         if forbidden is not None
         else None
     )
-    headland_track = (
-        int(np.count_nonzero((track_swept > 0) & (headland > 0)))
-        if headland is not None
-        else 0
+    headland_weight = float(cfg.get("headland_damage_weight", 1.0))
+    if not np.isfinite(headland_weight) or not 0.0 < headland_weight <= 1.0:
+        raise ValueError("headland_damage_weight must be within (0, 1]")
+    pixel_area_m2 = work_mpp * work_mpp
+    physical_rolling_area_m2 = track_canopy * pixel_area_m2
+    agronomic_damage_cost_m2 = (
+        track_body + headland_weight * track_headland
+    ) * pixel_area_m2
+    machine_area = max(int(np.count_nonzero(machine_swept)), 1)
+    machine_outside_field = int(
+        np.count_nonzero((machine_swept > 0) & (field_support == 0))
+    )
+    machine_forbidden = (
+        int(np.count_nonzero((machine_swept > 0) & (forbidden > 0)))
+        if forbidden is not None
+        else None
     )
 
     return {
-        "footprint_model": "simple_track_offset_v1",
+        "footprint_model": FOOTPRINT_MODEL,
+        "footprint_reference_point": FOOTPRINT_REFERENCE_POINT,
+        "footprint_dimensions_m": dict(geometry["dimensions_m"]),
+        "footprint_pose_step_m": pose_step_m,
+        "footprint_pose_heading_window_m": pose_heading_window_m,
+        "footprint_pose_count": pose_count,
+        "track_swept_area_m2": track_area * pixel_area_m2,
+        "machine_swept_area_m2": machine_area * pixel_area_m2,
+        "body_crop_area_m2": body_area_raw * pixel_area_m2,
+        "headland_crop_area_m2": headland_area_raw * pixel_area_m2,
+        "canopy_crop_area_m2": canopy_area_raw * pixel_area_m2,
+        "track_body_overlap_area_m2": track_body * pixel_area_m2,
+        "track_headland_overlap_area_m2": track_headland * pixel_area_m2,
+        "physical_crop_rolling_area_m2": physical_rolling_area_m2,
+        "headland_damage_weight": headland_weight,
+        "agronomic_damage_cost_m2": agronomic_damage_cost_m2,
+        "agronomic_damage_cost_basis": (
+            "track_body_overlap_area_m2 + headland_damage_weight * "
+            "track_headland_overlap_area_m2"
+        ),
         "track_canopy_overlap_pct": track_canopy / track_area * 100.0,
+        "track_body_overlap_pct": track_body / track_area * 100.0,
         "track_core_overlap_pct": track_core / track_area * 100.0,
-        "rolling_canopy_pct": track_canopy / crop_area * 100.0,
+        "rolling_body_pct": track_body / body_area * 100.0 if body_area_raw else 0.0,
+        "rolling_headland_pct": (
+            track_headland / headland_area * 100.0
+            if headland_present and headland_area_raw
+            else (0.0 if headland_present else None)
+        ),
+        "rolling_canopy_pct": track_canopy / canopy_area * 100.0,
         "rolling_core_pct": track_core / core_area * 100.0,
-        "rolling_crop_pct": track_core / core_area * 100.0,
-        "harvest_coverage_pct": harvested / crop_area * 100.0,
-        "planned_target_coverage_pct": planned_harvested / planned_crop_area * 100.0,
-        "detected_harvest_coverage_pct": (
-            detected_harvested / detected_crop_area * 100.0
+        "crop_mask_geometric_coverage_pct": crop_mask_covered / body_area * 100.0,
+        "planned_target_geometric_coverage_pct": planned_target_covered / planned_crop_area * 100.0,
+        "detected_mask_geometric_coverage_pct": (
+            detected_mask_covered / detected_crop_area * 100.0
             if detected is not None
             else 0.0
         ),
@@ -687,7 +840,14 @@ def validate_footprints(
         "semantic_support_present": semantic_support is not None,
         "uncertain_mask_present": uncertain is not None,
         "forbidden_mask_present": forbidden is not None,
-        "track_headland_overlap_pct": headland_track / track_area * 100.0,
+        "headland_mask_present": headland_present,
+        "track_headland_overlap_pct": track_headland / track_area * 100.0,
+        "machine_outside_field_pct": machine_outside_field / machine_area * 100.0,
+        "machine_forbidden_overlap_pct": (
+            machine_forbidden / machine_area * 100.0
+            if machine_forbidden is not None
+            else None
+        ),
         "footprint_resolution_m": float(work_mpp),
         "crop_core_erosion_m": erosion_m,
     }

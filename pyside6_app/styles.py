@@ -77,6 +77,9 @@ class ThemeManager(QObject):
     def current_theme(self):
         return self._current
 
+    def current_mode(self):
+        return self._mode
+
     def colors(self):
         return THEMES[self._current]
 

@@ -16,7 +16,7 @@ from footprint_planner import generate_work_lines, validate_footprints
 from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
 
 
-PATH_PLANNING_VERSION = "footprint-path-v4"
+PATH_PLANNING_VERSION = "footprint-path-v8"
 
 
 def build_band_mask(shape, bands: List[Dict]) -> np.ndarray:
@@ -275,6 +275,26 @@ def _points_inside_polygon(points, polygon: Optional[np.ndarray], tolerance: flo
 
 def _segment_inside_field_boundary(segment, polygon: Optional[np.ndarray]) -> bool:
     return _points_inside_polygon(segment, polygon)
+
+
+def _non_work_boundary_violations(full_path, segment_types, polygon: Optional[np.ndarray]) -> List[Dict]:
+    if polygon is None:
+        return []
+    violations = []
+    for index, segment in enumerate(full_path or []):
+        segment_type = (
+            segment_types[index]
+            if segment_types and index < len(segment_types)
+            else ("work" if index % 2 == 0 else "turn")
+        )
+        if segment_type == "work":
+            continue
+        if not _segment_inside_field_boundary(segment, polygon):
+            violations.append({
+                "segment_index": int(index),
+                "segment_type": str(segment_type),
+            })
+    return violations
 
 
 def _adjust_turn_to_field_boundary(
@@ -1207,8 +1227,17 @@ def connect_centerlines(bands: List[Dict], main_angle: float,
 def _harvester_specs(state=None) -> Dict[str, float]:
     cfg = Config()
     values = getattr(state, "harvester_params", {}) or {}
+    cutter_forward_offset = values.get(
+        "cutter_forward_offset_m", cfg.CUTTER_FORWARD_OFFSET_M
+    )
+    if cutter_forward_offset is None:
+        raise ValueError(
+            "missing measured cutter_forward_offset_m; "
+            "the system will not infer cutter position"
+        )
     return {
         "cutter_width_m": float(values.get("cutter_width_m", cfg.CUTTER_WIDTH_M)),
+        "cutter_forward_offset_m": float(cutter_forward_offset),
         "track_width_m": float(values.get("track_width_m", cfg.TRACK_WIDTH_M)),
         "track_gauge_m": float(values.get("track_gauge_m", cfg.TRACK_GAUGE_M)),
         "wheelbase_m": float(values.get("wheelbase_m", cfg.WHEELBASE_M)),
@@ -1355,7 +1384,6 @@ def _connect_work_lines(
             return [], [], diagnostics
         return [], []
 
-    specs = _harvester_specs(state)
     cfg = dict(config or {})
     clearance_m = max(
         float(cfg.get("turn_outward_clearance_m", 0.6)),
@@ -1461,6 +1489,8 @@ def _connect_work_lines(
     )
     endpoint_alignment["direction_source"] = alignment_direction_source
 
+    endpoint_alignment["path_reference_shift_applied"] = False
+
     if entry_point and oriented:
         full_path.append([entry_point, oriented[0][0]])
         segment_types.append("entry")
@@ -1528,9 +1558,36 @@ def _connect_work_lines(
                 clearance_m,
                 inner=(selected_strategy == "alpha"),
             )
-            for turn_part, turn_type in turn_parts:
-                full_path.append(turn_part)
-                segment_types.append(turn_type)
+            reverse_leaves_boundary = (
+                field_polygon is not None
+                and any(
+                    not _segment_inside_field_boundary(turn_part, field_polygon)
+                    for turn_part, _turn_type in turn_parts
+                )
+            )
+            if reverse_leaves_boundary:
+                direct = [start, end]
+                if _segment_inside_field_boundary(direct, field_polygon):
+                    full_path.append(direct)
+                    segment_types.append("turn")
+                    boundary_adjustments.append(
+                        "倒车折返会越出框选田块，已退化为边界内端点连接"
+                    )
+                    boundary_hard_reasons.append(
+                        "reverse turn geometry degraded to a straight segment because no "
+                        "kinematically valid reverse manoeuvre fit inside the field boundary"
+                    )
+                else:
+                    boundary_adjustments.append(
+                        "倒车折返仍可能越出框选田块，请调整边界/起终点或手动编辑路线"
+                    )
+                    for turn_part, turn_type in turn_parts:
+                        full_path.append(turn_part)
+                        segment_types.append(turn_type)
+            else:
+                for turn_part, turn_type in turn_parts:
+                    full_path.append(turn_part)
+                    segment_types.append(turn_type)
         else:
             turn, _turn_strategy, boundary_reason = _adjust_turn_to_field_boundary(
                 start,
@@ -1578,6 +1635,15 @@ def _connect_work_lines(
         if math.hypot(exit_point[0] - route_end[0], exit_point[1] - route_end[1]) > 1e-6:
             full_path.append([route_end, exit_point])
             segment_types.append("exit")
+    non_work_boundary_violations = _non_work_boundary_violations(
+        full_path,
+        segment_types,
+        field_polygon,
+    )
+    for violation in non_work_boundary_violations:
+        boundary_hard_reasons.append(
+            f"{violation['segment_type']} segment leaves field boundary"
+        )
     assessment_strategy = (
         requested_strategy
         if not fallback_reasons
@@ -1601,6 +1667,7 @@ def _connect_work_lines(
             "field_boundary_present": field_polygon is not None,
             "turns_adjusted": len(boundary_adjustments),
             "adjustment_reasons": boundary_adjustments,
+            "non_work_violations": non_work_boundary_violations,
         },
         "pass_spacings_m": pass_spacings_m,
         "turn_decisions": turn_decisions,
@@ -1736,7 +1803,7 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         },
     }.get(profile)
     max_core_overlap = float(cfg.get("max_track_core_overlap_pct", 8.0))
-    min_harvest_coverage = float(cfg.get("min_harvest_coverage_pct", 90.0))
+    min_geometric_coverage = float(cfg.get("min_geometric_coverage_pct", 90.0))
     max_outside = float(
         profile_limits["outside_field"] if profile_limits
         else cfg.get("max_track_outside_field_pct", 2.0)
@@ -1758,10 +1825,10 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
             f"履带与稻株核心重叠 {footprint['track_core_overlap_pct']:.1f}% "
             f"> {max_core_overlap:.1f}%"
         )
-    if footprint["planned_target_coverage_pct"] < min_harvest_coverage:
+    if footprint["planned_target_geometric_coverage_pct"] < min_geometric_coverage:
         issues.append(
-            f"规划目标覆盖率 {footprint['planned_target_coverage_pct']:.1f}% "
-            f"< {min_harvest_coverage:.1f}%"
+            f"规划目标几何覆盖率 {footprint['planned_target_geometric_coverage_pct']:.1f}% "
+            f"< {min_geometric_coverage:.1f}%"
         )
     if footprint["track_outside_field_pct"] > max_outside:
         issues.append(
@@ -1994,14 +2061,14 @@ def auto_validate_path(full_path: List[List[Tuple[float, float]]],
     )
     is_valid = (
         metrics["track_core_overlap_pct"] <= 8.0
-        and metrics["harvest_coverage_pct"] >= 90.0
+        and metrics["crop_mask_geometric_coverage_pct"] >= 90.0
         and metrics["track_outside_field_pct"] <= 2.0
     )
     description = (
         f"履带核心重叠={metrics['track_core_overlap_pct']:.1f}%, "
-        f"作物主体预计碾压={metrics['rolling_canopy_pct']:.1f}%, "
+        f"全田作物预计碾压={metrics['rolling_canopy_pct']:.1f}%, "
         f"作物核心碾压={metrics['rolling_core_pct']:.1f}%, "
-        f"割台覆盖={metrics['harvest_coverage_pct']:.1f}%, "
+        f"作物掩膜几何覆盖={metrics['crop_mask_geometric_coverage_pct']:.1f}%, "
         f"越界={metrics['track_outside_field_pct']:.1f}%"
     )
     return is_valid, description
@@ -2207,7 +2274,10 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
 
     Lower score is better. The score intentionally penalizes invalid geometry,
     crop-core rolling, field-boundary excursions and self-crossings far more
-    than a modest length increase.
+    than a modest length increase. DECISION-012 preserves physical canopy
+    rolling as an unweighted measurement. DECISION-013 uses the separately
+    named agronomic damage cost as the first route objective after hard
+    validity constraints; physical rolling remains the next criterion.
     """
     ranked = []
     for candidate in candidates or []:
@@ -2218,6 +2288,19 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
         valid_penalty = 0.0 if validation.get("valid", False) else 10000.0
         hard_penalty = 1500.0 * len(assessment.get("hard_reasons") or [])
         crossing_penalty = 1200.0 * float(assessment.get("turn_self_crossing_count", 0) or 0)
+        rolling_value = validation.get("rolling_canopy_pct")
+        rolling_missing = rolling_value is None
+        rolling_canopy = (
+            101.0 if rolling_missing else float(rolling_value or 0.0)
+        )
+        damage_value = validation.get("agronomic_damage_cost_m2")
+        damage_missing = damage_value is None
+        # Legacy/synthetic candidates may not carry the v8 metric. Falling
+        # back to physical rolling preserves deterministic ordering without
+        # inventing a field-calibration weight.
+        agronomic_damage = (
+            rolling_canopy if damage_missing else float(damage_value or 0.0)
+        )
         core_overlap = float(validation.get("track_core_overlap_pct", 0.0) or 0.0)
         outside = float(validation.get("track_outside_field_pct", 0.0) or 0.0)
         outside_support = float(validation.get("track_outside_support_pct", 0.0) or 0.0)
@@ -2225,14 +2308,21 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
         forbidden_overlap = float(validation.get("track_forbidden_overlap_pct", 0.0) or 0.0)
         profile = str(validation.get("validation_profile", "research"))
         semantic_weight = 1.0 if profile == "research" else 4.0
-        coverage = float(validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct", 0.0)) or 0.0)
+        coverage = float(
+            validation.get(
+                "crop_mask_geometric_coverage_pct",
+                validation.get("planned_target_geometric_coverage_pct", 0.0),
+            ) or 0.0
+        )
         total_length = float(validation.get("total_length_m", 0.0) or 0.0)
         reverse_turns = sum(1 for value in segment_types if str(value).startswith("turn_reverse"))
         unload_visits = sum(1 for value in segment_types if value == "unload")
         score = (
-            valid_penalty
-            + hard_penalty
-            + crossing_penalty
+            valid_penalty * 100000000.0
+            + hard_penalty * 1000000.0
+            + crossing_penalty * 1000000.0
+            + agronomic_damage * 1000000.0
+            + rolling_canopy * 1000.0
             + core_overlap * 80.0
             + outside * 120.0
             + outside_support * 25.0 * semantic_weight
@@ -2247,18 +2337,40 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
             "valid_penalty": valid_penalty,
             "hard_reason_count": len(assessment.get("hard_reasons") or []),
             "turn_self_crossing_count": int(assessment.get("turn_self_crossing_count", 0) or 0),
+            "rolling_canopy_pct": None if rolling_missing else rolling_canopy,
+            "agronomic_damage_cost_m2": (
+                None if damage_missing else agronomic_damage
+            ),
+            "headland_damage_weight": validation.get("headland_damage_weight"),
             "track_core_overlap_pct": core_overlap,
             "track_outside_field_pct": outside,
             "track_outside_support_pct": outside_support,
             "track_uncertain_overlap_pct": uncertain_overlap,
             "track_forbidden_overlap_pct": forbidden_overlap,
-            "harvest_coverage_pct": coverage,
+            "crop_mask_geometric_coverage_pct": coverage,
             "total_length_m": total_length,
             "reverse_turns": reverse_turns,
             "unload_visits": unload_visits,
         }
+        item["candidate_rank_key"] = (
+            0 if validation.get("valid", False) else 1,
+            len(assessment.get("hard_reasons") or []),
+            int(assessment.get("turn_self_crossing_count", 0) or 0),
+            1 if damage_missing else 0,
+            agronomic_damage,
+            1 if rolling_missing else 0,
+            rolling_canopy,
+            forbidden_overlap,
+            outside,
+            outside_support,
+            uncertain_overlap,
+            core_overlap,
+            -coverage,
+            total_length,
+            str(item.get("strategy", "")),
+        )
         ranked.append(item)
-    return sorted(ranked, key=lambda value: (value["candidate_score"], str(value.get("strategy", ""))))
+    return sorted(ranked, key=lambda value: value["candidate_rank_key"])
 
 
 def _build_planning_factor_report(
@@ -2341,15 +2453,27 @@ def _prepare_work_line_layout(
     cfg = dict(config or {})
     mode = str(cfg.get("work_line_mode", "footprint_optimized")).strip().lower()
     if mode == "footprint_optimized":
-        work_lines, layout = generate_work_lines(
-            processed_mask,
-            main_angle,
-            geo=geo,
-            state=state,
-            harvester=_harvester_specs(state),
-            config=cfg,
-            progress_callback=progress_callback,
-        )
+        if not wide_bands:
+            work_lines, layout = [], {
+                "reason": "no_valid_four_row_centerlines",
+                "footprint_optimization_scope": "validation_only",
+            }
+        else:
+            work_lines, layout = prepare_band_centerlines(
+                wide_bands,
+                main_angle,
+                geo=geo,
+                state=state,
+                config=cfg,
+            )
+            layout["footprint_optimization_scope"] = "validation_only"
+        if not work_lines and wide_bands:
+            work_lines = [
+                list(item.get("centerline", []))
+                for item in wide_bands
+                if len(item.get("centerline", [])) >= 2
+            ]
+            layout = {"fallback": "raw_band_centerlines", "footprint_optimization_scope": "validation_only"}
     elif mode == "band_centerline":
         work_lines, layout = prepare_band_centerlines(
             wide_bands,
@@ -2413,7 +2537,7 @@ def plan_path(wide_bands: List[Dict],
 
     log = AppLogger()
     cfg_obj = Config()
-    cfg = dict(cfg_obj._raw.get("path_planning", {}))
+    cfg = cfg_obj.section("path_planning")
     cfg.update(config or {})
     cancel_callback = cfg.get("_cancel_callback")
 
@@ -2592,11 +2716,13 @@ def plan_path(wide_bands: List[Dict],
 
     description = (
         f"履带核心重叠 {validation['track_core_overlap_pct']:.1f}%, "
-        f"作物主体预计碾压 {validation['rolling_canopy_pct']:.1f}%, "
+        f"全田作物预计碾压 {validation['rolling_canopy_pct']:.1f}%, "
+        f"主体碾压 {validation['rolling_body_pct']:.1f}%, "
+        f"田头碾压 {float(validation.get('rolling_headland_pct') or 0.0):.1f}%, "
         f"作物核心碾压 {validation['rolling_core_pct']:.1f}%, "
-        f"规划目标覆盖 {validation['planned_target_coverage_pct']:.1f}%, "
-        f"结构化作物覆盖 {validation['harvest_coverage_pct']:.1f}%, "
-        f"原始识别作物覆盖 {validation['detected_harvest_coverage_pct']:.1f}%, "
+        f"规划目标几何覆盖 {validation['planned_target_geometric_coverage_pct']:.1f}%, "
+        f"作物掩膜几何覆盖 {validation['crop_mask_geometric_coverage_pct']:.1f}%, "
+        f"原始识别掩膜几何覆盖 {validation['detected_mask_geometric_coverage_pct']:.1f}%, "
         f"越界 {validation['track_outside_field_pct']:.1f}%"
     )
     if validation["issues"]:
@@ -2615,6 +2741,8 @@ def plan_path(wide_bands: List[Dict],
     _report(0.94, "坐标转换")
     geo_points = path_to_geo(path_segments, geo, state, segment_types)
     display_path_segments = _path_to_global_coords(path_segments, state)
+    offset_x = float(getattr(state, "mask_offset_x", 0) or 0) if state is not None else 0.0
+    offset_y = float(getattr(state, "mask_offset_y", 0) or 0) if state is not None else 0.0
     segment_lengths_m = [
         sum(
             math.hypot(segment[i][0] - segment[i - 1][0], segment[i][1] - segment[i - 1][1])
@@ -2644,6 +2772,13 @@ def plan_path(wide_bands: List[Dict],
         "description": description,
         "layout": layout,
         "planning_factors": planning_factors,
+        "coordinate_space": {
+            "planner_segments": "local_mask_pixel",
+            "validation_segments": "local_mask_pixel",
+            "display_segments": "global_display_pixel",
+            "geo_points_source": "local_mask_pixel_plus_offset",
+            "mask_offset_xy": [offset_x, offset_y],
+        },
         "path_candidates": [
             {
                 "strategy": item.get("strategy"),

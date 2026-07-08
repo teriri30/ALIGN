@@ -2,7 +2,7 @@
 """
 main_window.py - PySide6 主窗口。
 """
-import os, sys, time, json, math, threading, hashlib, datetime
+import os, sys, time, json, math, threading, hashlib, datetime, shutil, tempfile
 from typing import Optional, List, Tuple
 import numpy as np
 import cv2
@@ -20,7 +20,10 @@ from model import ModelEngine, scan_model_dir
 from pyside6_app.image_view import ImageViewerGroup
 from pyside6_app.panels import TaskPanel, ParamPanel, LogPanel, RouteInfoPanel
 from pyside6_app.top_bar import TopToolbar
-from pyside6_app.workers import PipelineWorker, MaskProcessWorker, PlanWorker, TifLoadWorker, CacheRestoreWorker
+from pyside6_app.workers import (
+    PipelineWorker, MaskProcessWorker, PlanWorker, TifLoadWorker,
+    CacheRestoreWorker, MaskDiagnosticExportWorker,
+)
 from pyside6_app.event_handler import EventBridge
 from pyside6_app.dialogs import (
     HarvesterParamsDialog, ModelManagerDialog, SettingsDialog,
@@ -59,7 +62,6 @@ class MainWindow(QMainWindow):
         # 动画引擎
         self._anim_engine: Optional[AnimationEngine] = None
         self._anim_timer: Optional[QTimer] = None
-        self._anim_trail: List[Tuple[int, int]] = []  # 轨迹尾迹
         self._anim_overlay_items = []
         # 田块边界绘制状态
         self._field_drawing = False
@@ -77,10 +79,10 @@ class MainWindow(QMainWindow):
         # 模型列表
         self._model_list: list = []
         self._build_menu(); self._build_central(); self._build_statusbar()
+        self._ensure_field_trial_planning_mode()
+        self._on_theme_changed(self._theme_mgr.current_theme())
         self.task_panel.set_mask_strength(self._mask_processing_strength)
-        self.task_panel.set_usage_mode(self._usage_mode_from_config())
         self._connect_signals()
-        self.top_toolbar.update_theme_icon(self._theme_mgr.current_theme())
         self._state_timer = QTimer(self)
         self._state_timer.timeout.connect(self._refresh_state); self._state_timer.start(200)
         self._pending_segment_display = False
@@ -106,11 +108,15 @@ class MainWindow(QMainWindow):
         """Return complete harvester geometry, filling missing config/project keys with defaults."""
         params = {
             "cutter_width_m": float(self.cfg.CUTTER_WIDTH_M),
+            "cutter_forward_offset_m": None,
             "track_width_m": float(self.cfg.TRACK_WIDTH_M),
             "track_gauge_m": float(self.cfg.TRACK_GAUGE_M),
             "wheelbase_m": float(self.cfg.WHEELBASE_M),
             "track_length_m": float(self.cfg.TRACK_LENGTH_M),
             "turn_radius_m": float(self.cfg.TURN_RADIUS_M),
+            "work_speed_mps": float(self.cfg.WORK_SPEED_MPS),
+            "turn_speed_mps": float(self.cfg.TURN_SPEED_MPS),
+            "entry_speed_mps": float(self.cfg.ENTRY_SPEED_MPS),
         }
         for source in (self.cfg.section("harvester"), override or {}):
             if not isinstance(source, dict):
@@ -141,6 +147,7 @@ class MainWindow(QMainWindow):
         self.top_toolbar.refresh_theme()
         self.top_toolbar.update_theme_icon(theme)
         self.route_info.refresh_theme()
+        self.log_panel.refresh_theme()
         for v in (self.image_view,):
             v.refresh_theme()
         # 强制重绘。
@@ -163,7 +170,7 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "保存项目", QKeySequence.Save, self._on_save_project)
         self._add_action(fm, "加载模型...", "Ctrl+M", self._on_load_model)
         fm.addSeparator()
-        self._add_action(fm, "导出收获机路径（$PATH）...", None, self._on_export_path_format)
+        self._add_action(fm, "导出收获机候选路径（$PATH）...", None, self._on_export_path_format)
         record_menu = fm.addMenu("查看与记录导出")
         self._add_action(record_menu, "导出 GeoJSON...", "Ctrl+E", self._on_export_geojson)
         self._add_action(record_menu, "导出 CSV (经纬度)...", "Ctrl+Shift+E", self._on_export_csv_geo)
@@ -236,8 +243,9 @@ class MainWindow(QMainWindow):
         tp.run_requested.connect(self._on_run)
         tp.segment_requested.connect(self._on_segment)
         tp.process_requested.connect(self._on_mask_process)
+        tp.export_mask_diagnostics_requested.connect(self._on_export_mask_diagnostics)
         tp.plan_requested.connect(self._on_plan)
-        tp.simulate_requested.connect(self._on_toggle_animation)
+        tp.simulate_requested.connect(self._on_simulate_task_action)
         tp.params_requested.connect(self._on_params_dialog)
         tp.entry_exit_toggle.connect(self._on_toggle_entry_exit)
         tp.export_geojson_requested.connect(self._on_export_geojson)
@@ -247,7 +255,6 @@ class MainWindow(QMainWindow):
         tp.model_changed.connect(self._on_model_combo_changed)
         tp.mask_strength_changed.connect(self._on_mask_strength_changed)
         tp.turn_strategy_changed.connect(self._on_turn_strategy_changed)
-        tp.usage_mode_changed.connect(self._on_usage_mode_changed)
         tp.confirm_no_forbidden_requested.connect(self._on_confirm_no_forbidden)
         tp.draw_forbidden_requested.connect(self._on_toggle_forbidden_drawing)
         tp.route_edit_requested.connect(self._on_route_edit_requested)
@@ -271,6 +278,9 @@ class MainWindow(QMainWindow):
         self.image_view.snapshot_requested.connect(self._on_save_snapshot)
         self.image_view.mask_compare_requested.connect(self._on_toggle_mask_compare)
         self.image_view.measure_tool_changed.connect(self._on_measure_tool_changed)
+        self.image_view.animation_pause_requested.connect(self._on_animation_pause)
+        self.image_view.animation_seek_requested.connect(self._on_animation_seek)
+        self.image_view.animation_speed_requested.connect(self._on_animation_speed)
 
     def _build_statusbar(self):
         self.status_bar = QStatusBar()
@@ -297,10 +307,15 @@ class MainWindow(QMainWindow):
     def _has_background_worker(self):
         return bool(self._worker_thread and self._worker_thread.isRunning())
 
-    def _start_background_worker(self, worker, run_message):
+    def _start_background_worker(self, worker, run_message, *, warn_if_busy=True, busy_message=None):
         """Start one cancellable worker without blocking the Qt UI thread."""
         if self._has_background_worker():
-            QMessageBox.warning(self, "任务正在运行", "当前已有耗时任务正在执行，请等待完成后再操作。")
+            if warn_if_busy:
+                QMessageBox.warning(
+                    self,
+                    "任务正在运行",
+                    busy_message or "当前已有耗时任务正在执行，请等待完成后再操作。",
+                )
             return False
         self._worker_thread = QThread(self)
         self._worker = worker
@@ -407,8 +422,8 @@ class MainWindow(QMainWindow):
              "路径规划缺少起点或终点。",
              "请在“起点/终点”步骤确认系统推荐点，或手动重新布设。卸粮点是可选项。"),
             ("农机参数不完整", ["harvester", "cutter_width", "turn_radius_m", "农机参数", "割台", "履带", "参数不完整"],
-             "农机几何参数不完整，无法判断割台覆盖和履带足迹。",
-             "请打开“农机参数”，检查割台宽度、履带宽度、履带中心距和最小转弯半径。"),
+             "农机几何参数不完整，无法判断作物掩膜几何覆盖和履带足迹。",
+             "请打开“农机参数”，检查有效割幅、割刀前置距离、履带尺寸和最小转弯半径。"),
             ("转弯半径无法满足", ["2r", "turn radius", "min_turn_radius", "转弯半径", "无法相切", "半径", "行距ω小于2r"],
              "当前行距或田头空间无法满足所选调头方式的最小转弯半径。",
              "请尝试切换为“自动推荐/鱼尾折返/紧凑 Alpha”，或调整农机最小转弯半径后重算。"),
@@ -496,7 +511,6 @@ class MainWindow(QMainWindow):
         if validation:
             self._show_validation_report(path_result, validation)
             self._warn_path_validation_issues(path_result)
-        QTimer.singleShot(0, lambda pr=path_result: self._show_machine_recommendation(pr))
         if self._worker_thread:
             self._worker_thread.quit()
 
@@ -510,16 +524,15 @@ class MainWindow(QMainWindow):
         self.log_panel.info(f"主题: {labels.get(mode, mode)}")
 
     def _toggle_theme(self):
-        cur = self._theme_mgr.current_theme()
-        if cur == "dark":
-            self._theme_mgr.set_mode(ThemeMode.LIGHT)
-            self.log_panel.info("主题: 浅色")
-        elif cur == "light":
-            self._theme_mgr.set_mode(ThemeMode.SYSTEM)
-            self.log_panel.info("主题: 跟随系统")
-        else:
-            self._theme_mgr.set_mode(ThemeMode.DARK)
-            self.log_panel.info("主题: 深色")
+        # The toolbar button is a direct dark/light toggle. SYSTEM remains an
+        # explicit menu choice; cycling through it can look like a no-op when
+        # the system theme resolves to the same colour scheme.
+        target = (
+            ThemeMode.LIGHT
+            if self._theme_mgr.current_theme() == "dark"
+            else ThemeMode.DARK
+        )
+        self._set_theme_mode(target)
     def _builtin_model_dir(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(root, "data", "models")
@@ -722,12 +735,22 @@ class MainWindow(QMainWindow):
             self.task_panel.set_task_status("import_img", "done")
             self.task_panel.set_task_action("import_img", "重选")
             self._sync_task_statuses()
-            self._start_cache_restore(path)
+            self._queue_cache_restore_after_current_worker(path)
         finally:
             self.progress_bar.hide()
             self.top_toolbar.set_progress(0)
             if self._worker_thread:
                 self._worker_thread.quit()
+
+    def _queue_cache_restore_after_current_worker(self, path):
+        """Start cache restore after the current load worker has fully released the worker slot."""
+        thread = self._worker_thread
+        if thread and thread.isRunning():
+            thread.finished.connect(
+                lambda p=path: QTimer.singleShot(0, lambda: self._start_cache_restore(p))
+            )
+            return
+        QTimer.singleShot(0, lambda p=path: self._start_cache_restore(p))
 
     def _start_cache_restore(self, path):
         worker = CacheRestoreWorker(
@@ -735,7 +758,11 @@ class MainWindow(QMainWindow):
             expected_source_sha256=str(getattr(self.state, "source_sha256", "") or ""),
         )
         worker.finished.connect(self._on_cache_restore_done)
-        if not self._start_background_worker(worker, "正在后台恢复项目缓存..."):
+        if not self._start_background_worker(
+            worker,
+            "正在后台恢复项目缓存...",
+            warn_if_busy=False,
+        ):
             self._log.info("cache restore skipped: background worker busy")
 
     @Slot(dict)
@@ -774,8 +801,8 @@ class MainWindow(QMainWindow):
                     'model_sha256', 'inference_provenance', 'mask_provenance',
                     'path_provenance', 'inference_runtime', 'path_runtime',
                     'last_total_path_m', 'last_work_path_m', 'last_turn_path_m',
-                    'last_entry_exit_path_m', 'last_harvest_rate',
-                    'last_planned_harvest_rate', 'last_detected_harvest_rate',
+                    'last_entry_exit_path_m', 'last_crop_mask_geometric_coverage_pct',
+                    'last_planned_target_geometric_coverage_pct', 'last_detected_mask_geometric_coverage_pct',
                     'last_rolling_rate', 'last_field_efficiency',
                 )
             }
@@ -1246,6 +1273,11 @@ class MainWindow(QMainWindow):
         """Render task panel from the actual domain state (single source of truth)."""
         statuses = derive_task_statuses(self.state, has_image=self._tif_rgb is not None)
         self.task_panel.apply_task_statuses(statuses)
+        if getattr(self.state, "anim_active", False):
+            self.task_panel.set_task_action(
+                "simulate",
+                "继续" if getattr(self.state, "anim_paused", False) else "暂停",
+            )
 
     def _invalidate_analysis_from(self, stage, reason=""):
         """DECISION-007: invalidate every result derived from changed input.
@@ -1314,6 +1346,8 @@ class MainWindow(QMainWindow):
             self._anim_timer.stop()
         self._anim_timer = None
         self._anim_engine = None
+        self.image_view.set_animation_controls_visible(False)
+        self.lbl_speed.clear()
         self.state.safe_update(**updates)
         self._pipeline_result = None
         self.route_info.clear_info()
@@ -1351,44 +1385,20 @@ class MainWindow(QMainWindow):
         else:
             self.log_panel.info(f"掩膜处理强度: {labels.get(strength_key, strength_key)}")
 
-    def _usage_mode_from_config(self):
-        planning = self.cfg.section("path_planning")
-        mode = str(planning.get("work_line_mode", "footprint_optimized"))
-        profile = str(planning.get("validation_profile", "field_trial"))
-        if mode == "footprint_optimized" and profile == "machine_candidate":
-            return "machine_candidate"
-        if mode == "footprint_optimized" and profile == "field_trial":
-            return "field_trial"
-        return "quick"
-
-    def _on_usage_mode_changed(self, usage_mode):
-        mapping = {
-            "quick": ("band_centerline", "research"),
-            "field_trial": ("footprint_optimized", "field_trial"),
-            "machine_candidate": ("footprint_optimized", "machine_candidate"),
-        }
-        usage_mode = str(usage_mode or "quick")
-        work_line_mode, validation_profile = mapping.get(usage_mode, mapping["quick"])
+    def _ensure_field_trial_planning_mode(self):
         current = self.cfg.section("path_planning")
+        desired = {
+            "work_line_mode": "footprint_optimized",
+            "validation_profile": "field_trial",
+        }
         if (
-            current.get("work_line_mode", "footprint_optimized") == work_line_mode
-            and current.get("validation_profile", "field_trial") == validation_profile
+            current.get("work_line_mode", desired["work_line_mode"]) == desired["work_line_mode"]
+            and current.get("validation_profile", desired["validation_profile"]) == desired["validation_profile"]
         ):
             return
-        snapshot = self.cfg.update_section("path_planning", {
-            "work_line_mode": work_line_mode,
-            "validation_profile": validation_profile,
-        })
+        snapshot = self.cfg.update_section("path_planning", desired)
         cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
         save_json_atomic(cfg_path, snapshot)
-        if getattr(self.state, "auto_path_planned", False):
-            self._invalidate_analysis_from("path", "使用模式已变化，必须重新规划和验证")
-        labels = {
-            "quick": "快速预览",
-            "field_trial": "田间试验（推荐）",
-            "machine_candidate": "高级校验",
-        }
-        self.log_panel.info(f"使用模式：{labels.get(usage_mode, usage_mode)}")
 
     def _on_turn_strategy_changed(self, strategy_key):
         """DECISION-007: a new turn strategy invalidates the planned route."""
@@ -1954,9 +1964,6 @@ class MainWindow(QMainWindow):
         self._pending_segment_display = True
 
     def _planning_preflight(self, mask_result):
-        usage_mode = self._usage_mode_from_config()
-        if usage_mode == "quick":
-            return True
         if not getattr(self.state, "forbidden_regions_confirmed", False):
             answer = QMessageBox.question(
                 self,
@@ -1999,6 +2006,14 @@ class MainWindow(QMainWindow):
             return
         if not hp.get("cutter_width_m"):
             QMessageBox.warning(self, "提示", "请先配置收割机参数")
+            return
+        if not hp.get("cutter_forward_offset_m"):
+            QMessageBox.warning(
+                self,
+                "缺少割刀前置距离",
+                "请在农机参数中实测填写：履带接地区域几何中心到割刀切割线的水平前向距离。\n\n"
+                "该参数影响田头端部的作物掩膜几何覆盖，系统不会使用假定值。",
+            )
             return
         if self._has_background_worker():
             QMessageBox.warning(self, "任务正在运行", "当前已有耗时任务正在执行，请等待完成后再生成路径。")
@@ -2311,12 +2326,16 @@ class MainWindow(QMainWindow):
             current_harvester = self._effective_harvester_params(
                 getattr(self.state, "harvester_params", {}) or {}
             )
-            changed = [
-                key
-                for key, value in planned_harvester.items()
-                if key in current_harvester
-                and abs(float(value) - float(current_harvester[key])) > 1e-9
-            ]
+            changed = []
+            for key, value in planned_harvester.items():
+                if key not in current_harvester:
+                    continue
+                current_value = current_harvester[key]
+                if value is None or current_value is None:
+                    if value is not current_value:
+                        changed.append(key)
+                elif abs(float(value) - float(current_value)) > 1e-9:
+                    changed.append(key)
             if changed:
                 raise ValueError(
                     "当前农机参数与路径规划时不一致，必须重新规划："
@@ -2347,6 +2366,21 @@ class MainWindow(QMainWindow):
                     ):
                         raise ValueError(
                             "路径点超出影像范围，禁止使用仿射外推坐标: "
+                            f"segment={segment_index}, point={point_index}, "
+                            f"pixel=({float(pixel_x):.3f},{float(pixel_y):.3f})"
+                        )
+        field_boundary = getattr(self.state, "field_boundary", None) or []
+        if len(field_boundary) >= 3:
+            polygon = np.asarray(field_boundary, dtype=np.float32)
+            for segment_index, segment in enumerate(full_path):
+                for point_index, (pixel_x, pixel_y) in enumerate(segment):
+                    if cv2.pointPolygonTest(
+                        polygon,
+                        (float(pixel_x), float(pixel_y)),
+                        False,
+                    ) < -1e-6:
+                        raise ValueError(
+                            "route point leaves field boundary; formal export is blocked: "
                             f"segment={segment_index}, point={point_index}, "
                             f"pixel=({float(pixel_x):.3f},{float(pixel_y):.3f})"
                         )
@@ -2486,6 +2520,50 @@ class MainWindow(QMainWindow):
         ])
         readiness = dict(path_result.get("machine_readiness") or {})
         controlled_trial = bool(readiness.get("controlled_trial_ready", False))
+        output_metadata = {
+            "path": os.path.abspath(output_path),
+            "format": str(output_format),
+            "sha256": self._sha256_file(output_path, use_cache=False),
+            "point_count": len(geo_points),
+            "coordinate_crs": "EPSG:4326",
+            "internal_path_reference_point": str(
+                (path_result.get("validation", {}) or {}).get(
+                    "footprint_reference_point", "track_contact_center"
+                )
+            ),
+            "footprint_model": str(
+                (path_result.get("validation", {}) or {}).get(
+                    "footprint_model", "planar_rigid_footprint_v2"
+                )
+            ),
+            "route_classification": (
+                "controlled_field_trial" if controlled_trial
+                else "research_manual_review"
+            ),
+            "machine_executable": False,
+            "usage_restriction": (
+                "CONTROLLED_FIELD_TRIAL_LOW_SPEED_MANUAL_SUPERVISION"
+                if controlled_trial else "RESEARCH_MANUAL_REVIEW_ONLY"
+            ),
+        }
+        if str(output_format).upper() == "$PATH":
+            output_metadata["candidate_machine_path"] = True
+            output_metadata["terminal_protocol_validated"] = False
+            output_metadata["path_protocol"] = {
+                "record_prefix": "$PATH",
+                "coordinate_order": ["latitude", "longitude"],
+                "point_index_base": 0,
+                "record_terminator": "*",
+                "route_id": self.cfg.ROUTE_ID,
+                "status_codes": {
+                    "turn_or_other": 0,
+                    "work": 1,
+                    "entry": 2,
+                    "exit": 3,
+                    "turn_reverse_or_aux": 4,
+                },
+                "final_record": self.cfg.INFM_LINE,
+            }
         manifest = {
             "schema": 2,
             "application_version": APP_VERSION,
@@ -2493,22 +2571,7 @@ class MainWindow(QMainWindow):
             "git_dirty": git_is_dirty(project_root),
             "scientific_code": scientific_code,
             "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-            "output": {
-                "path": os.path.abspath(output_path),
-                "format": str(output_format),
-                "sha256": self._sha256_file(output_path, use_cache=False),
-                "point_count": len(geo_points),
-                "coordinate_crs": "EPSG:4326",
-                "route_classification": (
-                    "controlled_field_trial" if controlled_trial
-                    else "research_manual_review"
-                ),
-                "machine_executable": False,
-                "usage_restriction": (
-                    "CONTROLLED_FIELD_TRIAL_LOW_SPEED_MANUAL_SUPERVISION"
-                    if controlled_trial else "RESEARCH_MANUAL_REVIEW_ONLY"
-                ),
-            },
+            "output": output_metadata,
             "source_image": {
                 "path": os.path.abspath(self._tif_path) if self._tif_path else "",
                 "identity": source_identity(self._tif_path) if self._tif_path else {},
@@ -2631,19 +2694,55 @@ class MainWindow(QMainWindow):
             if len(points) < 2:
                 continue
             segment_type = str(item.get("segment_type") or ("work" if index % 2 == 0 else "turn"))
+            cached_length = item.get("length_m")
+            if cached_length is None:
+                cached_length = self._segment_length(points)
             cached_segments.append({
                 "points": points,
                 "type": segment_type,
                 "segment_index": index,
-                "length": self._segment_length(points),
+                "length": float(cached_length),
             })
         if not cached_segments:
             return {}
+        segment_lengths_m = [float(seg["length"]) for seg in cached_segments]
+        work_length_m = sum(
+            seg["length"] for seg in cached_segments if seg["type"] == "work"
+        )
+        turn_length_m = sum(
+            seg["length"] for seg in cached_segments if seg["type"].startswith("turn")
+        )
+        entry_exit_length_m = sum(
+            seg["length"]
+            for seg in cached_segments
+            if seg["type"] in ("entry", "exit", "unload")
+        )
+        total_length_m = sum(segment_lengths_m)
+        validation = {
+            "valid": bool(saved.get("auto_path_valid", False)),
+            "total_length_m": float(saved.get("last_total_path_m") or total_length_m),
+            "work_length_m": float(saved.get("last_work_path_m") or work_length_m),
+            "turn_length_m": float(saved.get("last_turn_path_m") or turn_length_m),
+            "entry_exit_length_m": float(
+                saved.get("last_entry_exit_path_m") or entry_exit_length_m
+            ),
+        }
+        optional_metrics = {
+            "rolling_canopy_pct": "last_rolling_rate",
+            "crop_mask_geometric_coverage_pct": "last_crop_mask_geometric_coverage_pct",
+            "planned_target_geometric_coverage_pct": "last_planned_target_geometric_coverage_pct",
+            "detected_mask_geometric_coverage_pct": "last_detected_mask_geometric_coverage_pct",
+            "field_efficiency_pct": "last_field_efficiency",
+        }
+        for metric_name, saved_name in optional_metrics.items():
+            if saved_name in saved and saved[saved_name] is not None:
+                validation[metric_name] = float(saved[saved_name])
         path_result = {
             "full_path": [seg["points"] for seg in cached_segments],
             "segment_types": [seg["type"] for seg in cached_segments],
+            "segment_lengths_m": segment_lengths_m,
             "is_valid": bool(saved.get("auto_path_valid", False)),
-            "validation": {"valid": bool(saved.get("auto_path_valid", False))},
+            "validation": validation,
             "description": saved.get("auto_path_desc", ""),
             "geo_points": saved.get("auto_path_geo", []),
             "provenance": saved.get("path_provenance", {}),
@@ -2675,7 +2774,7 @@ class MainWindow(QMainWindow):
 
         geo_points = normalised.get("geo_points", [])
         validation = normalised.get("validation", {}) or {}
-        self.state.safe_update(
+        state_updates = dict(
             auto_path=auto_segments,
             auto_path_segments=auto_segments,
             auto_path_geo=geo_points,
@@ -2687,6 +2786,21 @@ class MainWindow(QMainWindow):
             path_provenance=dict(normalised.get("provenance") or {}),
             path_runtime=dict(normalised.get("runtime") or {}),
         )
+        metric_state_fields = {
+            "last_rolling_rate": "rolling_canopy_pct",
+            "last_crop_mask_geometric_coverage_pct": "crop_mask_geometric_coverage_pct",
+            "last_planned_target_geometric_coverage_pct": "planned_target_geometric_coverage_pct",
+            "last_detected_mask_geometric_coverage_pct": "detected_mask_geometric_coverage_pct",
+            "last_field_efficiency": "field_efficiency_pct",
+            "last_total_path_m": "total_length_m",
+            "last_work_path_m": "work_length_m",
+            "last_turn_path_m": "turn_length_m",
+            "last_entry_exit_path_m": "entry_exit_length_m",
+        }
+        for state_name, metric_name in metric_state_fields.items():
+            if metric_name in validation and validation[metric_name] is not None:
+                state_updates[state_name] = float(validation[metric_name])
+        self.state.safe_update(**state_updates)
 
         result = dict(pipeline_result or self._pipeline_result or {})
         result["path"] = normalised
@@ -2714,7 +2828,10 @@ class MainWindow(QMainWindow):
         label = self._turn_strategy_label(path_result)
         total = validation.get("total_length_m")
         turn = validation.get("turn_length_m")
-        coverage = validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct"))
+        coverage = validation.get(
+            "crop_mask_geometric_coverage_pct",
+            validation.get("planned_target_geometric_coverage_pct"),
+        )
         rolling = validation.get("rolling_canopy_pct")
         parts = [f"[{label}]"]
         if total is not None: parts.append(f"总长 {self._fmt_metric(total)}")
@@ -2741,7 +2858,10 @@ class MainWindow(QMainWindow):
         total = validation.get("total_length_m", path_result.get("total_length_m"))
         work = validation.get("work_length_m", path_result.get("work_length_m"))
         turn = validation.get("turn_length_m", path_result.get("turn_length_m"))
-        coverage = validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct"))
+        coverage = validation.get(
+            "crop_mask_geometric_coverage_pct",
+            validation.get("planned_target_geometric_coverage_pct"),
+        )
         rolling = validation.get("rolling_canopy_pct")
         efficiency = validation.get("field_efficiency_pct", validation.get("field_efficiency"))
         if total is not None:
@@ -2751,7 +2871,7 @@ class MainWindow(QMainWindow):
         if turn is not None:
             parts.append(f"转弯 {self._fmt_metric(turn)}")
         if coverage is not None:
-            parts.append(f"覆盖率 {self._fmt_metric(coverage, '%')}")
+            parts.append(f"作物掩膜覆盖 {self._fmt_metric(coverage, '%')}")
         if rolling is not None:
             parts.append(f"碾压率 {self._fmt_metric(rolling, '%')}")
         if efficiency is not None:
@@ -2834,7 +2954,6 @@ class MainWindow(QMainWindow):
         if validation:
             self._show_validation_report(pr, validation)
             self._warn_path_validation_issues(pr)
-        QTimer.singleShot(0, lambda pr=pr: self._show_machine_recommendation(pr))
 
     @Slot(str)
     def _on_pipeline_error(self, msg):
@@ -2910,7 +3029,12 @@ class MainWindow(QMainWindow):
         oy = int(getattr(self.state, 'mask_offset_y', 0) or 0)
         semantic_layers = {
             key: value
-            for key in ("headland_mask", "uncertain_residual_mask")
+            for key in (
+                "regularized_body_mask", "body_residual_mask",
+                "gap_repair_added_mask", "support_clip_removed_mask",
+                "headland_corridor_mask", "headland_mask",
+                "uncertain_residual_mask",
+            )
             if isinstance((value := (mask_result or {}).get(key)), np.ndarray)
             and value.shape[:2] == processed_mask.shape[:2]
         }
@@ -3259,6 +3383,12 @@ class MainWindow(QMainWindow):
                         cv2.polylines(ov, [pts.astype(np.int32)], False, hl_color, 5)
                 self.image_view.set_image(ov)
 
+    def _on_simulate_task_action(self):
+        if getattr(self.state, "anim_active", False):
+            self._on_animation_pause()
+            return
+        self._on_toggle_animation()
+
     def _on_toggle_animation(self):
         if getattr(self.state, 'anim_active', False):
             self.state.anim_active = False
@@ -3266,8 +3396,12 @@ class MainWindow(QMainWindow):
             if self._anim_timer:
                 self._anim_timer.stop()
                 self._anim_timer = None
+            self.image_view.set_animation_controls_visible(False)
+            self.lbl_speed.clear()
             self.log_panel.info("已结束演示")
             self._show_path((self._pipeline_result or {}).get("path", {}))
+            self._sync_task_statuses()
+            self.top_toolbar.refresh_actions(self.state)
             return
         pr = self._pipeline_result or {}
         path = self._normalise_path_result(pr.get("path", {}))
@@ -3285,7 +3419,12 @@ class MainWindow(QMainWindow):
         self.state.anim_paused = False
         self.state.anim_speed = 1.0
         self.state.anim_frame = 0
-        self._anim_trail = []
+        self.image_view.set_animation_controls_visible(True)
+        self.image_view.set_animation_paused(False)
+        self.image_view.set_animation_speed(1.0)
+        self.image_view.set_animation_progress(0.0)
+        self._sync_task_statuses()
+        self.top_toolbar.refresh_actions(self.state)
         self.log_panel.info("开始演示")
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._anim_frame_tick)
@@ -3331,19 +3470,52 @@ class MainWindow(QMainWindow):
             if self._anim_timer:
                 self._anim_timer.stop()
                 self._anim_timer = None
+            self.image_view.set_animation_progress(1.0)
+            self.image_view.set_animation_controls_visible(False)
+            self.lbl_speed.clear()
             self.log_panel.info("演示完成")
             report = self._anim_engine._gen_report()
             if report:
                 self.log_panel.info(report)
             self._show_path(self._pipeline_result.get("path", {}))
             WorkflowUpdater.advance(self.state, "ANIMATION_DONE")
+            self._sync_task_statuses()
+            self.top_toolbar.refresh_actions(self.state)
             return
         self._render_anim_frame()
-        pct = int(s.anim_frame / max(1, s.anim_total_frames) * 100)
+        ratio = self._anim_engine.progress_ratio()
+        pct = int(round(ratio * 100))
+        self.image_view.set_animation_progress(ratio)
         remaining = self._anim_engine.get_remaining_seconds()
         rem_str = f"{remaining:.0f}s" if remaining > 0 else "..."
-        speed_str = f"{s.anim_speed:.0f}x"
-        self.lbl_speed.setText(f"  进度 {pct}%  速度 {speed_str}  剩余 {rem_str}  ")
+        speed_str = f"{s.anim_speed:g}x"
+        self.lbl_speed.setText(f"  进度 {pct}%  播放 {speed_str}  剩余 {rem_str}  ")
+
+    def _on_animation_pause(self):
+        if not self._anim_engine or not self.state.anim_active:
+            return
+        self._anim_engine.toggle_pause()
+        self.image_view.set_animation_paused(self.state.anim_paused)
+        self._sync_task_statuses()
+        self.lbl_status.setText("演示已暂停" if self.state.anim_paused else "演示中")
+
+    def _on_animation_seek(self, ratio):
+        if not self._anim_engine or not self.state.anim_active:
+            return
+        self._anim_engine.seek_ratio(float(ratio))
+        self._render_anim_frame()
+        actual_ratio = self._anim_engine.progress_ratio()
+        self.image_view.set_animation_progress(actual_ratio)
+        self.lbl_speed.setText(
+            f"  进度 {actual_ratio * 100:.0f}%  播放 {self.state.anim_speed:g}x  "
+        )
+
+    def _on_animation_speed(self, ratio):
+        if not self._anim_engine:
+            return
+        self._anim_engine.set_speed_ratio(float(ratio))
+        self.image_view.set_animation_speed(self.state.anim_speed)
+        self.lbl_status.setText(f"演示播放倍速 {self.state.anim_speed:g}x")
 
     def _clear_anim_overlay(self):
         viewer = self.image_view.viewer
@@ -3368,21 +3540,17 @@ class MainWindow(QMainWindow):
         else:
             point, heading = pos
             px, py = point
-        self._anim_trail.append((int(px), int(py)))
-        if len(self._anim_trail) > 500:
-            self._anim_trail = self._anim_trail[-500:]
-
         viewer = self.image_view.viewer
         self._clear_anim_overlay()
         before = len(viewer._overlay_group)
-        if len(self._anim_trail) > 1:
-            viewer.draw_polyline(self._anim_trail[-100:], color=(255, 200, 0), width=2)
         ix, iy = int(px), int(py)
         self._draw_harvester_pose(ix, iy, heading)
         self._anim_overlay_items = list(viewer._overlay_group[before:])
 
     def _draw_harvester_pose(self, x, y, heading):
-        """Draw the physical harvester model in image coordinates."""
+        """Draw the same canonical planar geometry used by footprint validation."""
+        from harvester_geometry import planar_geometry_px, transform_polygon
+
         viewer = self.image_view.viewer
         params = self._effective_harvester_params(getattr(self.state, 'harvester_params', {}) or {})
         try:
@@ -3390,40 +3558,59 @@ class MainWindow(QMainWindow):
         except Exception:
             ppm = 20.0
         ppm = max(1.0, float(ppm))
-        cut_w = float(params.get('cutter_width_m', 2.0))
-        track_w = float(params.get('track_width_m', 0.35))
-        track_gauge = float(params.get('track_gauge_m', 1.7))
-        wheelbase = float(params.get('wheelbase_m', 2.5))
-        track_len = float(params.get('track_length_m', 1.5))
-        half_body_len = max(8.0, max(wheelbase, track_len) * ppm * 0.5)
-        half_body_w = max(5.0, (track_gauge + track_w) * ppm * 0.5)
-        half_cut_w = max(7.0, cut_w * ppm * 0.5)
-        half_track_w = max(2.0, track_w * ppm * 0.5)
-        half_track_len = max(6.0, track_len * ppm * 0.5)
-        track_spacing = max(4.0, track_gauge * ppm * 0.5)
-        c, s_v = math.cos(heading), math.sin(heading)
-        rot = np.asarray([[c, -s_v], [s_v, c]], dtype=np.float64)
-        center = np.asarray((float(x), float(y)), dtype=np.float64)
+        geometry = planar_geometry_px(params, (float(x), float(y)), heading, ppm)
 
-        def transform(local_points):
-            pts = np.asarray(local_points, dtype=np.float64) @ rot.T + center
-            return [(float(px), float(py)) for px, py in pts]
+        def polygon(name, fill, outline):
+            points = [(float(px), float(py)) for px, py in geometry[name]]
+            return viewer.draw_polygon(points, color=fill, outline=outline, width=1)
 
-        def polygon(local_points, fill, outline):
-            return viewer.draw_polygon(transform(local_points), color=fill, outline=outline, width=1)
-
-        polygon([(-half_body_len, -half_body_w), (half_body_len, -half_body_w), (half_body_len, half_body_w), (-half_body_len, half_body_w)], (30, 150, 205), (190, 225, 240))
-        header_depth = max(5.0, 0.32 * wheelbase * ppm)
-        polygon([(half_body_len, -half_cut_w), (half_body_len + header_depth, -half_cut_w), (half_body_len + header_depth, half_cut_w), (half_body_len, half_cut_w)], (60, 174, 76), (200, 244, 205))
-        for side in (-1.0, 1.0):
-            offset = side * track_spacing
-            polygon([(-half_track_len, offset - half_track_w), (half_track_len, offset - half_track_w), (half_track_len, offset + half_track_w), (-half_track_len, offset + half_track_w)], (32, 36, 34), (115, 125, 120))
-        polygon([(-half_body_len * 0.65, -half_body_w * 0.55), (-half_body_len * 0.05, -half_body_w * 0.55), (-half_body_len * 0.05, half_body_w * 0.55), (-half_body_len * 0.65, half_body_w * 0.55)], (54, 122, 170), (180, 213, 228))
-        cab = np.asarray((half_body_len * 0.18, -half_body_w * 0.25)) @ rot.T + center
-        viewer.draw_circle(float(cab[0]), float(cab[1]), radius=max(3, int(min(half_body_len, half_body_w) * 0.38)), color=(150, 205, 220))
-        tip = center + np.asarray((math.cos(heading), math.sin(heading))) * max(10.0, wheelbase * ppm)
-        viewer.draw_line(float(center[0]), float(center[1]), float(tip[0]), float(tip[1]), color=(255, 255, 100), width=2)
-        viewer.draw_circle(x, y, radius=4, color=(255, 255, 0))
+        polygon("body", (30, 150, 205), (190, 225, 240))
+        polygon("cutter_visual", (178, 132, 48), (244, 210, 110))
+        cutter_line = geometry["cutter_visual_edge"]
+        viewer.draw_line(
+            float(cutter_line[0][0]),
+            float(cutter_line[0][1]),
+            float(cutter_line[1][0]),
+            float(cutter_line[1][1]),
+            color=(255, 225, 120),
+            width=max(2, int(round(ppm * 0.045))),
+        )
+        polygon("left_track", (32, 36, 34), (115, 125, 120))
+        polygon("right_track", (32, 36, 34), (115, 125, 120))
+        dimensions = geometry["dimensions_m"]
+        tank_local = np.asarray([
+            (-dimensions["body_length_m"] * 0.325, -dimensions["body_width_m"] * 0.275),
+            (-dimensions["body_length_m"] * 0.025, -dimensions["body_width_m"] * 0.275),
+            (-dimensions["body_length_m"] * 0.025, dimensions["body_width_m"] * 0.275),
+            (-dimensions["body_length_m"] * 0.325, dimensions["body_width_m"] * 0.275),
+        ])
+        tank = transform_polygon(tank_local, (x, y), heading, ppm)
+        viewer.draw_polygon(
+            [(float(px), float(py)) for px, py in tank],
+            color=(54, 122, 170), outline=(180, 213, 228), width=1,
+        )
+        cab_local = np.asarray([[
+            dimensions["body_length_m"] * 0.18,
+            -dimensions["body_width_m"] * 0.25,
+        ]])
+        cab = transform_polygon(cab_local, (x, y), heading, ppm)[0]
+        cab_radius = max(
+            3,
+            int(min(dimensions["body_length_m"], dimensions["body_width_m"]) * ppm * 0.19),
+        )
+        viewer.draw_circle(
+            float(cab[0]), float(cab[1]),
+            radius=cab_radius,
+            color=(150, 205, 220),
+            scene_scaled=True,
+        )
+        center_radius = max(2, int(round(ppm * 0.08)))
+        viewer.draw_circle(
+            x, y,
+            radius=center_radius,
+            color=(255, 255, 0),
+            scene_scaled=True,
+        )
 
     def _on_export_geojson(self):
         path, _ = QFileDialog.getSaveFileName(self, "导出 GeoJSON", "path_result.geojson", "GeoJSON (*.geojson)")
@@ -3512,32 +3699,141 @@ class MainWindow(QMainWindow):
             self._show_geo_export_error("JSON", e)
 
     def _on_export_path_format(self):
-        if QMessageBox.warning(
-            self,
-            "导出受控田间试验路径",
-            "该路径用于受控田间试验。导入收获机前，请复核影像位置、农机参数、起终点、禁行区和调头方式。\n\n"
-            "首次试跑请低速运行并保持人工看护。是否继续导出？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        ) != QMessageBox.Yes:
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出收获机路径", "mission_field_trial.path",
-            "PATH (*.path);;Text (*.txt)",
-        )
-        if not path:
+        scope = self._prompt_path_export_scope()
+        if not scope:
             return
         try:
-            _path_result, geo_points = self._geo_export_payload()
-            from path_planner import export_path_format
-            export_path_format(geo_points, path)
-            manifest = self._write_export_manifest(path, "$PATH", _path_result, geo_points)
+            if scope == "path":
+                path, _ = QFileDialog.getSaveFileName(
+                    self, "导出收获机候选路径", "mission_field_trial.path",
+                    "PATH (*.path);;Text (*.txt)",
+                )
+                if not path:
+                    return
+                self._export_candidate_path(path)
+                message = (
+                    f"已导出收获机候选路径：{os.path.basename(path)}；"
+                    "必需校验记录已保存"
+                )
+            else:
+                parent = QFileDialog.getExistingDirectory(
+                    self, "选择完整试验资料包的保存位置"
+                )
+                if not parent:
+                    return
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    package_dir, path, _manifest = self._export_complete_trial_package(parent)
+                finally:
+                    QApplication.restoreOverrideCursor()
+                message = f"完整试验资料包已导出：{os.path.basename(package_dir)}"
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(
-                f"已导出收获机路径：{os.path.basename(path)}；试验记录已保存"
-            )
+            self.log_panel.success(message)
+            self.lbl_status.setText("路径导出完成")
         except Exception as e:
+            if QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
             self._show_geo_export_error("$PATH", e)
+
+    def _prompt_path_export_scope(self):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("导出收获机候选路径")
+        box.setText(
+            "该文件面向受控田间试验，尚未验证具体收获机终端协议。\n\n"
+            "导入前请核对终端格式、纬度/经度顺序、坐标基准、车辆参考点、"
+            "影像位置、农机参数、禁行区和调头方式。首次试跑必须低速运行、"
+            "人工看护并具备紧急停机条件。"
+        )
+        path_button = box.addButton("仅导出候选路径", QMessageBox.AcceptRole)
+        package_button = box.addButton("导出完整试验资料包", QMessageBox.ActionRole)
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is path_button:
+            return "path"
+        if clicked is package_button:
+            return "package"
+        return ""
+
+    def _export_candidate_path(self, path, path_result=None, geo_points=None):
+        """DECISION-001: every candidate path remains inseparable from its manifest."""
+        if path_result is None or geo_points is None:
+            path_result, geo_points = self._geo_export_payload()
+        from path_planner import export_path_format
+        export_path_format(geo_points, path)
+        manifest = self._write_export_manifest(
+            path, "$PATH", path_result, geo_points
+        )
+        return path, manifest
+
+    @staticmethod
+    def _unique_package_path(parent):
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join(parent, f"reui_field_trial_{stamp}")
+        candidate = base
+        suffix = 2
+        while os.path.exists(candidate):
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def _export_complete_trial_package(self, parent):
+        """Export review visuals plus the same fail-closed candidate route."""
+        from trial_package import export_visual_artifacts, write_package_index
+
+        parent = os.path.abspath(parent)
+        if not os.path.isdir(parent):
+            raise ValueError("资料包保存位置不存在")
+        path_result, geo_points = self._geo_export_payload()
+        raw_mask = getattr(self.state, "mask_raw", None)
+        mask_result = getattr(self.state, "mask_result", None) or {}
+        processed = mask_result.get("processed_mask") if isinstance(mask_result, dict) else None
+        if not isinstance(self._tif_rgb, np.ndarray):
+            raise ValueError("缺少源影像显示数据，不能生成完整资料包")
+        if not isinstance(raw_mask, np.ndarray) or not isinstance(processed, np.ndarray):
+            raise ValueError("缺少原始或处理后掩膜，不能生成完整资料包")
+
+        final_dir = self._unique_package_path(parent)
+        staging_dir = tempfile.mkdtemp(prefix=".reui_package_build_", dir=parent)
+        moved = False
+        try:
+            export_visual_artifacts(
+                staging_dir,
+                source_image=self._tif_rgb,
+                raw_mask=raw_mask,
+                mask_result=mask_result,
+                path_result=path_result,
+                offset=(
+                    int(getattr(self.state, "mask_offset_x", 0) or 0),
+                    int(getattr(self.state, "mask_offset_y", 0) or 0),
+                ),
+                field_boundary=getattr(self.state, "field_boundary", []) or [],
+                forbidden_regions=getattr(self.state, "forbidden_regions", []) or [],
+                service_points={
+                    "entry": getattr(self.state, "entry_point", None),
+                    "exit": getattr(self.state, "exit_point", None),
+                    "unload": getattr(self.state, "unload_points", []) or [],
+                },
+                geo=self.geo,
+                mask_config=self.cfg.section("mask_processing"),
+            )
+            os.replace(staging_dir, final_dir)
+            moved = True
+            route_path = os.path.join(final_dir, "mission_field_trial.path")
+            route_path, manifest_path = self._export_candidate_path(
+                route_path, path_result, geo_points
+            )
+            write_package_index(final_dir)
+            return final_dir, route_path, manifest_path
+        except Exception:
+            cleanup = final_dir if moved else staging_dir
+            if os.path.isdir(cleanup):
+                common = os.path.commonpath((parent, os.path.abspath(cleanup)))
+                if common == parent and os.path.abspath(cleanup) != parent:
+                    shutil.rmtree(cleanup, ignore_errors=True)
+            raise
 
     def _on_export_img(self):
         path, _ = QFileDialog.getSaveFileName(self, "保存图像", "result.png", "PNG (*.png);;JPEG (*.jpg)")
@@ -3552,39 +3848,167 @@ class MainWindow(QMainWindow):
                 cv2.polylines(overlay, [pts.astype(np.int32)], False, (0, 200, 50), 3)
         cv2.imwrite(path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
         self.log_panel.success(f"已保存图像: {path}")
+
+    def _on_export_mask_diagnostics(self):
+        raw_mask = getattr(self.state, "mask_raw", None)
+        mask_result = getattr(self.state, "mask_result", None) or {}
+        processed = mask_result.get("processed_mask") if isinstance(mask_result, dict) else None
+        if not isinstance(raw_mask, np.ndarray) or not isinstance(processed, np.ndarray):
+            QMessageBox.warning(self, "缺少掩膜", "请先完成 AI 识别和掩膜处理。")
+            return
+        default_name = "mask_diagnostic.zip"
+        if self._tif_path:
+            stem = os.path.splitext(os.path.basename(self._tif_path))[0]
+            default_name = f"{stem}_mask_diagnostic.zip"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出掩膜诊断数据",
+            default_name,
+            "ZIP archive (*.zip)",
+        )
+        if not path:
+            return
+        worker = MaskDiagnosticExportWorker(
+            path,
+            raw_mask,
+            mask_result,
+            options={
+                "offset": (
+                    int(getattr(self.state, "mask_offset_x", 0) or 0),
+                    int(getattr(self.state, "mask_offset_y", 0) or 0),
+                ),
+                "geo": self.geo,
+                "config": self.cfg.section("mask_processing"),
+                "source_image": self._tif_rgb,
+            },
+        )
+        worker.finished.connect(self._on_mask_diagnostic_exported)
+        self._start_background_worker(worker, "正在生成掩膜诊断数据...")
+
+    @Slot(dict)
+    def _on_mask_diagnostic_exported(self, result):
+        self.progress_bar.hide()
+        self.top_toolbar.set_progress(0)
+        self.top_toolbar.set_worker_cancel_visible(False)
+        if hasattr(self, "btn_cancel_task"):
+            self.btn_cancel_task.hide()
+        filename = os.path.basename(str(result.get("path", "mask_diagnostic.zip")))
+        count = int(result.get("review_component_count", 0) or 0)
+        self.log_panel.success(
+            f"掩膜诊断数据已导出：{filename}；需复核区域 {count} 个"
+        )
+        self.lbl_status.setText("掩膜诊断数据已导出")
+        if self._worker_thread:
+            self._worker_thread.quit()
     def _on_params_dialog(self):
         """DECISION-007: changed machine footprint requires replanning."""
-        dlg = HarvesterParamsDialog(self.cfg.section("harvester"), self)
-        if dlg.exec() == QDialog.Accepted:
-            p = dlg.get_params()
-            previous = self._effective_harvester_params(
+        mode = self._prompt_machine_parameter_mode()
+        if mode == "custom":
+            current = self._effective_harvester_params(
                 getattr(self.state, "harvester_params", {}) or {}
             )
-            self._save_system_undo("修改农机参数")
-            self.state.harvester_params = p
-            self.log_panel.success(
-                "农机参数已保存: "
-                f"割台={p['cutter_width_m']:.2f}m, "
-                f"履带={p['track_width_m']:.2f}m, "
-                f"中心距={p['track_gauge_m']:.2f}m, "
-                f"轴距={p['wheelbase_m']:.2f}m, "
-                f"转弯半径={p['turn_radius_m']:.2f}m"
+            dlg = HarvesterParamsDialog(current, self)
+            if dlg.exec() == QDialog.Accepted:
+                self._apply_harvester_params(dlg.get_params(), "用户自定义")
+        elif mode == "recommend":
+            self._show_machine_recommendation(None)
+
+    def _prompt_machine_parameter_mode(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("农机尺寸配置")
+        box.setIcon(QMessageBox.Question)
+        box.setText(
+            "请选择参数来源。智能推荐会根据处理后的宽窄行通道净宽和田头空间"
+            "给出候选尺寸；具体机型仍需人工核对。"
+        )
+        custom_button = box.addButton("自定义输入", QMessageBox.AcceptRole)
+        recommend_button = box.addButton("智能推荐尺寸", QMessageBox.ActionRole)
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(custom_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is custom_button:
+            return "custom"
+        if clicked is recommend_button:
+            return "recommend"
+        return ""
+
+    def _apply_harvester_params(self, values, source, *, require_cutter_offset=True):
+        params = self._effective_harvester_params(values)
+        if require_cutter_offset and not params.get("cutter_forward_offset_m"):
+            QMessageBox.warning(
+                self,
+                "农机参数不完整",
+                "割刀前置距离必须根据实际收获机测量，不能由系统推荐或推算。",
             )
-            config_snapshot = self.cfg.update_section("harvester", p)
-            cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-            save_json_atomic(cfg_path, config_snapshot)
-            if (
-                getattr(self.state, "auto_path_planned", False)
-                and any(
-                    abs(float(previous.get(key, 0.0)) - float(p.get(key, 0.0))) > 1e-9
-                    for key in p
-                )
-            ):
-                self._invalidate_analysis_from(
-                    "path",
-                    "农机物理参数已变化，旧路径足迹验证已经失效",
-                )
-            self._sync_task_statuses()
+            return False
+        previous = self._effective_harvester_params(
+            getattr(self.state, "harvester_params", {}) or {}
+        )
+        current_raw = getattr(self.state, "harvester_params", {}) or {}
+        def differs(key):
+            before = previous.get(key)
+            after = params.get(key)
+            if before is None or after is None:
+                return before is not after
+            return abs(float(before) - float(after)) > 1e-9
+
+        def state_needs_sync():
+            if not isinstance(current_raw, dict):
+                return True
+            for key, after in params.items():
+                before = current_raw.get(key)
+                if before is None or after is None:
+                    if before is not after:
+                        return True
+                else:
+                    try:
+                        if abs(float(before) - float(after)) > 1e-9:
+                            return True
+                    except (TypeError, ValueError):
+                        if before != after:
+                            return True
+            return False
+
+        changed = any(differs(key) for key in params)
+        if not changed:
+            if state_needs_sync():
+                self.state.harvester_params = params
+                self._sync_task_statuses()
+                self.log_panel.info(f"{source}农机参数与当前配置一致，已应用到当前任务")
+                return True
+            self.log_panel.info(f"{source}农机参数与当前配置一致")
+            return False
+        self._save_system_undo("修改农机参数")
+        self.state.harvester_params = params
+        config_snapshot = self.cfg.update_section("harvester", params)
+        cfg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config.json",
+        )
+        save_json_atomic(cfg_path, config_snapshot)
+        if getattr(self.state, "auto_path_planned", False):
+            self._invalidate_analysis_from(
+                "path",
+                "农机物理参数已变化，旧路径足迹验证已经失效",
+            )
+        self._sync_task_statuses()
+        cutter_offset = params.get("cutter_forward_offset_m")
+        cutter_offset_text = (
+            f"{float(cutter_offset):.2f}m" if cutter_offset else "未设置"
+        )
+        self.log_panel.success(
+            f"{source}农机参数已保存: "
+            f"割台={params['cutter_width_m']:.2f}m, "
+            f"割刀前置={cutter_offset_text}, "
+            f"履带={params['track_width_m']:.2f}m, "
+            f"中心距={params['track_gauge_m']:.2f}m, "
+            f"轴距={params['wheelbase_m']:.2f}m, "
+            f"转弯半径={params['turn_radius_m']:.2f}m"
+        )
+        if not cutter_offset:
+            self.log_panel.warn("割刀前置距离未设置；路径规划前仍需按实际收获机测量填写")
+        return True
 
     def _on_settings_dialog(self):
         previous = self.cfg.snapshot()
@@ -3624,146 +4048,21 @@ class MainWindow(QMainWindow):
             "转弯策略": getattr(self.state, 'turn_strategy', 'auto'),
         }, self).exec()
 
-    @staticmethod
-    def _nearest(value, candidates):
-        return min(candidates, key=lambda item: abs(float(item) - float(value)))
-
     def _build_machine_recommendation(self, path_result):
-        path_result = self._normalise_path_result(path_result)
-        validation = path_result.get("validation", {}) or {}
+        from machine_recommendation import recommend_machine_dimensions
+
         mask_result = getattr(self.state, "mask_result", None) or {}
-        diagnostics = mask_result.get("diagnostics", {}) if isinstance(mask_result, dict) else {}
         hp = self._effective_harvester_params(getattr(self.state, "harvester_params", {}) or {})
-
-        bands = list(mask_result.get("all_bands", []) or []) if isinstance(mask_result, dict) else []
-        widths = [float(b.get("width_m", 0.0)) for b in bands if isinstance(b, dict) and b.get("width_m")]
-        median_width = float(np.median(widths)) if widths else 0.0
-        main_angle = float(mask_result.get("main_angle", 0.0) or 0.0) if isinstance(mask_result, dict) else 0.0
-        centroids = []
-        for band in bands:
-            if isinstance(band, dict) and band.get("centroid"):
-                try:
-                    x, y = band["centroid"]
-                    centroids.append(float(x) * math.cos(main_angle + math.pi / 2.0) + float(y) * math.sin(main_angle + math.pi / 2.0))
-                except Exception:
-                    pass
-        spacings = []
-        if len(centroids) >= 2:
-            ordered = np.sort(np.asarray(centroids, dtype=np.float64))
-            mpp = float(diagnostics.get("meters_per_pixel", 0.0) or 0.0)
-            if mpp > 0:
-                spacings = [float(v * mpp) for v in np.diff(ordered) if v > 0]
-        median_spacing = float(np.median(spacings)) if spacings else 0.0
-
-        track_core_risk = float(validation.get("track_core_overlap_pct", 0.0) or 0.0)
-        outside = float(validation.get("track_outside_field_pct", 0.0) or 0.0)
-        coverage = float(validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct", 0.0)) or 0.0)
-        work_len = float(validation.get("work_length_m", path_result.get("work_length_m", 0.0)) or 0.0)
-        turn_len = float(validation.get("turn_length_m", path_result.get("turn_length_m", 0.0)) or 0.0)
-        turn_ratio = turn_len / max(work_len, 1.0)
-        issues = list(validation.get("issues") or [])
-        assessment = path_result.get("turn_assessment", {}) or {}
-        issues.extend(assessment.get("hard_reasons") or [])
-
-        current_track = float(hp.get("track_width_m", 0.45) or 0.45)
-        track_candidates = [0.40, 0.45, 0.50, 0.55]
-        if track_core_risk > 8.0:
-            target_track = 0.45 if current_track >= 0.45 else current_track
-        elif outside < 1.0 and turn_ratio < 0.28 and coverage >= 90.0:
-            target_track = 0.50
-        else:
-            target_track = 0.45
-        target_track = self._nearest(target_track, track_candidates)
-
-        current_gauge = float(hp.get("track_gauge_m", 1.7) or 1.7)
-        target_gauge = current_gauge
-        if track_core_risk > 8.0 and outside <= 2.0:
-            target_gauge += 0.10
-        elif outside > 2.0:
-            target_gauge -= 0.10
-        if median_spacing > 0:
-            target_gauge = min(target_gauge, max(1.4, median_spacing * 2.0))
-        target_gauge = max(1.4, min(2.0, round(target_gauge, 1)))
-
-        compact_turn = bool(issues) or turn_ratio > 0.35 or outside > 2.0
-        target_wheelbase = 1.8 if compact_turn else 1.9
-        target_turn_radius = 0.9 if compact_turn else 1.0
-        target_track_length = max(1.6, min(2.0, target_wheelbase - 0.1))
-
-        params = dict(hp)
-        params.update({
-            "track_width_m": float(target_track),
-            "track_gauge_m": float(target_gauge),
-            "wheelbase_m": float(target_wheelbase),
-            "track_length_m": float(target_track_length),
-            "turn_radius_m": float(target_turn_radius),
-        })
-
-        reasons = []
-        if track_core_risk > 8.0:
-            reasons.append(
-                f"履带与作物核心重叠 {track_core_risk:.1f}%，"
-                "优先控制履带宽度并适当调整中心距。"
-            )
-        if outside > 2.0:
-            reasons.append(f"履带越界率 {outside:.1f}%，建议更紧凑的轴距/转弯半径并避免过大中心距。")
-        if turn_ratio > 0.35:
-            reasons.append(f"转弯距离占作业距离 {turn_ratio * 100:.1f}%，田头调头空间偏紧。")
-        if median_spacing > 0:
-            reasons.append(f"估计行带横向间距约 {median_spacing:.2f} m，履带中心距建议控制在 {target_gauge:.1f} m 左右。")
-        if median_width > 0:
-            reasons.append(f"重建行带中位宽度约 {median_width:.2f} m。")
-        if not reasons:
-            reasons.append("当前路径验证指标较平衡，建议使用通用紧凑型履带收获机参数。")
-
-        message = "\n".join([
-            "启发式候选参数（未经过机型适配或地形安全验证）",
-            f"- 履带宽度：{params['track_width_m'] * 100:.0f} cm",
-            f"- 履带中心距：{params['track_gauge_m']:.1f} m",
-            f"- 轴距：{params['wheelbase_m']:.1f} m",
-            f"- 履带接地长度：{params['track_length_m']:.1f} m",
-            f"- 最小转弯半径：{params['turn_radius_m']:.1f} m",
-            "",
-            "当前参数",
-            f"- 履带宽度：{current_track * 100:.0f} cm，中心距：{current_gauge:.1f} m，轴距：{float(hp.get('wheelbase_m', 0.0)):.1f} m",
-            "",
-            "分析依据",
-            f"- 调头策略：{self._turn_strategy_label(path_result)}",
-            f"- 作业线/正式调头段：{len(path_result.get('tracks', []))} / {len(path_result.get('formal_turns', path_result.get('turns', [])))}",
-            f"- 覆盖率：{coverage:.1f}%，履带核心区重叠：{track_core_risk:.1f}%，履带越界：{outside:.1f}%",
-            *[f"- {reason}" for reason in reasons],
-            "",
-            "说明：当前系统没有 DEM、坡度、土壤承载力、重心或侧翻模型。以下结果仅根据影像行带和路径指标生成，不是地形安全结论，也不能替代具体机型技术参数。割台宽度暂沿用当前配置；应用后必须重新生成路径。",
-        ])
-        return {
-            "title": "基于路径指标的启发式农机参数候选",
-            "message": message,
-            "params": params,
-            "method": "path_metric_heuristic_v1",
-            "validated": False,
-        }
+        return recommend_machine_dimensions(mask_result, hp, path_result or {})
 
     def _show_machine_recommendation(self, path_result):
         recommendation = self._build_machine_recommendation(path_result)
         dlg = MachineRecommendationDialog(recommendation, self)
         if dlg.exec() == QDialog.Accepted:
-            params = self._effective_harvester_params(dlg.get_params())
-            self._save_system_undo("应用农机尺寸建议")
-            self.state.harvester_params = params
-            config_snapshot = self.cfg.update_section("harvester", params)
-            cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-            save_json_atomic(cfg_path, config_snapshot)
-            if getattr(self.state, "auto_path_planned", False):
-                self._invalidate_analysis_from(
-                    "path",
-                    "已应用新的启发式候选参数，必须重新规划和验证",
-                )
-            self._sync_task_statuses()
-            self.log_panel.success(
-                "已应用农机尺寸建议: "
-                f"履带={params['track_width_m']:.2f}m, "
-                f"中心距={params['track_gauge_m']:.2f}m, "
-                f"轴距={params['wheelbase_m']:.2f}m"
+            self._apply_harvester_params(
+                dlg.get_params(),
+                "智能推荐",
+                require_cutter_offset=False,
             )
 
     def _show_validation_report(self, path_result, validation):
@@ -3777,8 +4076,11 @@ class MainWindow(QMainWindow):
             "cutter_width": getattr(self.state, 'harvester_params', {}).get('cutter_width_m', 2.0),
         }
         extra = []
-        if "harvest_coverage_pct" in validation:
-            extra.append(f"覆盖率: {validation['harvest_coverage_pct']:.1f}%")
+        if "crop_mask_geometric_coverage_pct" in validation:
+            extra.append(
+                f"作物掩膜几何覆盖率: "
+                f"{validation['crop_mask_geometric_coverage_pct']:.1f}%"
+            )
         if "rolling_canopy_pct" in validation:
             extra.append(f"预计碾压率: {validation['rolling_canopy_pct']:.1f}%")
         if "track_core_overlap_pct" in validation:
@@ -3915,7 +4217,7 @@ class MainWindow(QMainWindow):
         st.auto_path_geo = geo_points
         st.auto_path_planned = True
         st.auto_path_valid = False
-        st.auto_path_desc = "路线已手动编辑，覆盖率与碾压率需重新规划后评估"
+        st.auto_path_desc = "路线已手动编辑，作物掩膜几何覆盖率与碾压率需重新规划后评估"
         st.path_provenance = {}
         st.path_runtime = {}
         st.last_work_path_m = sum(item.length_m for item in segments if item.segment_type == "work")
@@ -3931,7 +4233,7 @@ class MainWindow(QMainWindow):
             "geo_points": geo_points,
             "validation": {
                 "valid": False,
-                "issues": ["路线已手动编辑，覆盖率与碾压率需重新规划后评估"],
+                "issues": ["路线已手动编辑，作物掩膜几何覆盖率与碾压率需重新规划后评估"],
                 "total_length_m": float(st.last_total_path_m),
                 "work_length_m": float(st.last_work_path_m),
                 "turn_length_m": float(st.last_turn_path_m),
@@ -4092,6 +4394,14 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("就绪")
     def _refresh_state(self):
         self.top_toolbar.refresh_actions(self.state)
+        mask_result = getattr(self.state, "mask_result", None)
+        self.task_panel.set_mask_diagnostic_available(
+            bool(
+                getattr(self.state, "mask_processed", False)
+                and isinstance(mask_result, dict)
+                and isinstance(mask_result.get("processed_mask"), np.ndarray)
+            )
+        )
         self.task_panel.set_forbidden_state(
             len(getattr(self.state, "forbidden_regions", []) or []),
             bool(getattr(self.state, "forbidden_regions_confirmed", False)),

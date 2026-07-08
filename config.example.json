@@ -1,5 +1,5 @@
 {
-  "_schema_version": "1.2",
+  "_schema_version": "1.3",
   "window": {
     "width": 1500,
     "height": 900,
@@ -35,11 +35,15 @@
   },
   "harvester": {
     "cutter_width_m": 2.15,
+    "cutter_forward_offset_m": null,
     "track_width_m": 0.4,
     "track_gauge_m": 1.7,
     "wheelbase_m": 1.9,
     "track_length_m": 1.8,
-    "turn_radius_m": 1.0
+    "turn_radius_m": 1.0,
+    "work_speed_mps": 1.2,
+    "turn_speed_mps": 0.6,
+    "entry_speed_mps": 0.8
   },
   "path_planning": {
     "work_line_mode": "footprint_optimized",
@@ -51,12 +55,15 @@
     "endpoint_shortfall_min_m": 0.5,
     "endpoint_extension_max_m": 4.0,
     "endpoint_outlier_mad_scale": 3.0,
+    "footprint_pose_step_m": 0.08,
+    "pose_heading_window_m": 0.3,
     "max_track_core_overlap_pct": 8.0,
-    "min_harvest_coverage_pct": 90.0,
+    "min_geometric_coverage_pct": 90.0,
     "max_track_outside_field_pct": 2.0,
     "max_track_outside_support_pct": 5.0,
     "max_track_uncertain_overlap_pct": 10.0,
-    "max_track_forbidden_overlap_pct": 0.0
+    "max_track_forbidden_overlap_pct": 0.0,
+    "headland_damage_weight": 1.0
   },
   "mask_processing": {
     "strength": "standard",
@@ -66,8 +73,19 @@
     "band_internal_gap_close_m": 6.0,
     "band_end_gap_close_m": 0.35,
     "band_end_guard_m": 1.0,
+    "headland_corridor_enabled": true,
+    "headland_corridor_close_m": 1.2,
+    "headland_corridor_depth_smooth_m": 0.1,
+    "headland_corridor_terminal_depth_m": 3.0,
+    "headland_corridor_min_span_ratio": 0.45,
+    "headland_corridor_max_body_cut_m": 3.0,
+    "headland_corridor_endpoint_margin_m": 0.3,
+    "headland_corridor_fill_envelope": true,
+    "headland_corridor_min_seed_ratio": 0.12,
     "residual_body_attach_m": 0.12,
-    "residual_body_min_attach_ratio": 0.02
+    "residual_body_min_attach_ratio": 0.02,
+    "residual_body_max_angle_deg": 22.5,
+    "residual_body_min_elongation": 2.2
   },
   "raster_preprocessing": {
     "mode": "percentile_per_band",

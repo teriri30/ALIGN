@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-MASK_REGULARIZATION_VERSION = 4
+MASK_REGULARIZATION_VERSION = 7
 
 
 def odd_size(value: float, minimum: int = 3) -> int:
@@ -23,7 +23,9 @@ def meters_per_pixel(mask: np.ndarray, geo=None, state=None) -> float:
         if 1e-5 <= value <= 5.0:
             return value
         raise ValueError(f"invalid metric scale: {value!r} m/px")
-    return 0.01
+    raise ValueError(
+        "verified metric scale requires ready georeferencing and image state"
+    )
 
 
 def field_polygon_local(
@@ -146,6 +148,18 @@ def _component_main_angle(mask: np.ndarray) -> float:
     return math.atan2(float(vec[1]), float(vec[0])) % math.pi
 
 
+def _component_elongation(mask: np.ndarray) -> float:
+    ys, xs = np.where(mask > 0)
+    if xs.size < 3:
+        return 1.0
+    coords = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
+    coords -= coords.mean(axis=0)
+    cov = np.cov(coords.T)
+    eigvals, _ = np.linalg.eigh(cov)
+    eigvals = np.maximum(np.asarray(eigvals, dtype=np.float64), 1e-9)
+    return float(math.sqrt(float(eigvals.max() / eigvals.min())))
+
+
 def _component_extent_along_angle(mask: np.ndarray, angle: float) -> float:
     ys, xs = np.where(mask > 0)
     if xs.size == 0:
@@ -216,6 +230,10 @@ def residual_mask_layers(
             iterations=1,
         )
     min_attach_ratio = float(cfg.get("residual_body_min_attach_ratio", 0.02))
+    body_angle_threshold = math.radians(
+        float(cfg.get("residual_body_max_angle_deg", 22.5))
+    )
+    min_body_elongation = float(cfg.get("residual_body_min_elongation", 2.2))
     direction = np.asarray(
         (math.cos(float(main_angle)), math.sin(float(main_angle))),
         dtype=np.float64,
@@ -243,6 +261,7 @@ def residual_mask_layers(
         comp_angle = _component_main_angle(component)
         diff = abs(comp_angle - float(main_angle)) % math.pi
         diff = min(diff, math.pi - diff)
+        elongation = _component_elongation(component)
         parallel_extent = _component_extent_along_angle(component, main_angle)
         comp_start, comp_end = _component_projection_interval(component, main_angle)
         projection_offset = float(x * direction[0] + y * direction[1])
@@ -257,6 +276,8 @@ def residual_mask_layers(
         )
         if diff > threshold or not overlaps_body_extent:
             assign_component(headland)
+        elif diff > body_angle_threshold or elongation < min_body_elongation:
+            assign_component(uncertain)
         elif parallel_extent < min_parallel_extent or body_attachment_zone is None:
             assign_component(uncertain)
         else:
@@ -322,6 +343,292 @@ def constrain_generated_body_to_raw_support(
     raw_support = repair_row_gaps(raw, main_angle, meters_per_px, cfg)
     constrained = cv2.bitwise_and(generated, raw_support)
     return constrained
+
+
+def resolve_terminal_headland_overlap(
+    raw_mask: np.ndarray,
+    body_mask: np.ndarray,
+    headland_seed_mask: np.ndarray,
+    main_angle: float,
+    meters_per_px: float,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Give strong terminal headland corridors precedence over rebuilt rows.
+
+    Headland is initially detected from ``raw & ~rebuilt`` and therefore has
+    periodic holes wherever rebuilt longitudinal bands overlap a transverse
+    terminal strip.  Only fill those holes when the seed spans a substantial
+    fraction of the row lattice, lies near a body endpoint, has limited depth,
+    and retains enough original headland evidence.  This avoids turning an
+    internal ditch or a few terminal pixels into a field-wide cut.
+    """
+    cfg = dict(config or {})
+    raw = (np.asarray(raw_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    body = (np.asarray(body_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    seed = (
+        (np.asarray(headland_seed_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    )
+    empty = np.zeros_like(body)
+    diagnostics = {
+        "enabled": bool(cfg.get("headland_corridor_enabled", True)),
+        "candidate_count": 0,
+        "corridor_count": 0,
+        "corridor_px": 0,
+        "removed_body_px": 0,
+        "envelope_added_px": 0,
+        "rejected": {},
+        "candidates": [],
+    }
+    if (
+        not diagnostics["enabled"]
+        or body.shape != raw.shape
+        or seed.shape != raw.shape
+        or cv2.countNonZero(body) == 0
+        or cv2.countNonZero(seed) == 0
+        or not np.isfinite(float(meters_per_px))
+        or float(meters_per_px) <= 0
+    ):
+        return body, seed, empty, diagnostics
+
+    seed_rotated, matrix = rotate_bound(
+        seed, math.degrees(float(main_angle)), cv2.INTER_NEAREST
+    )
+    out_h, out_w = seed_rotated.shape[:2]
+    body_rotated = cv2.warpAffine(
+        body, matrix, (out_w, out_h), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    raw_rotated = cv2.warpAffine(
+        raw, matrix, (out_w, out_h), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    body_ys, body_xs = np.where(body_rotated > 0)
+    if body_xs.size == 0:
+        return body, seed, empty, diagnostics
+
+    close_m = float(cfg.get("headland_corridor_close_m", 1.2))
+    close_px = odd_size(close_m / float(meters_per_px), minimum=3)
+    depth_smooth_m = float(cfg.get("headland_corridor_depth_smooth_m", 0.10))
+    depth_smooth_px = odd_size(
+        depth_smooth_m / float(meters_per_px), minimum=1
+    )
+    close_px = min(close_px, max(3, int(out_h * 0.35) | 1))
+    depth_smooth_px = min(depth_smooth_px, max(1, int(out_w * 0.02) | 1))
+    reconstructed = cv2.morphologyEx(
+        seed_rotated,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (depth_smooth_px, close_px)
+        ),
+    )
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (reconstructed > 0).astype(np.uint8), 8
+    )
+    diagnostics["candidate_count"] = max(0, int(count - 1))
+    body_x_min, body_x_max = int(body_xs.min()), int(body_xs.max())
+    body_y_min, body_y_max = int(body_ys.min()), int(body_ys.max())
+    body_cross_span = max(1, body_y_max - body_y_min + 1)
+    terminal_depth_px = max(1, int(round(
+        float(cfg.get("headland_corridor_terminal_depth_m", 3.0))
+        / float(meters_per_px)
+    )))
+    min_span_ratio = float(cfg.get("headland_corridor_min_span_ratio", 0.45))
+    max_body_cut_px = max(1, int(round(
+        float(cfg.get("headland_corridor_max_body_cut_m", 3.0))
+        / float(meters_per_px)
+    )))
+    endpoint_margin_px = max(0, int(round(
+        float(cfg.get("headland_corridor_endpoint_margin_m", 0.30))
+        / float(meters_per_px)
+    )))
+    min_seed_ratio = float(cfg.get("headland_corridor_min_seed_ratio", 0.12))
+    corridor_rotated = np.zeros_like(seed_rotated)
+
+    def reject(reason: str):
+        rejected = diagnostics["rejected"]
+        rejected[reason] = int(rejected.get(reason, 0)) + 1
+
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        component = labels[y:y + height, x:x + width] == label
+        span_ratio = float(height / body_cross_span)
+        near_start = x <= body_x_min + terminal_depth_px
+        near_end = x + width - 1 >= body_x_max - terminal_depth_px
+        near_terminal = near_start or near_end
+        seed_pixels = int(np.count_nonzero(
+            component & (seed_rotated[y:y + height, x:x + width] > 0)
+        ))
+        seed_ratio = float(seed_pixels / max(area, 1))
+        reason = "accepted"
+        if not near_terminal:
+            reason = "not_terminal"
+        elif span_ratio < min_span_ratio:
+            reason = "insufficient_cross_row_span"
+        elif seed_ratio < min_seed_ratio:
+            reason = "insufficient_seed_support"
+        diagnostics["candidates"].append({
+            "bbox": [x, y, width, height],
+            "depth_m": float(width * meters_per_px),
+            "cross_row_span_ratio": span_ratio,
+            "seed_ratio": seed_ratio,
+            "near_start": bool(near_start),
+            "near_end": bool(near_end),
+            "decision": reason,
+        })
+        if reason != "accepted":
+            reject(reason)
+            continue
+        allowed_columns = np.zeros(width, dtype=bool)
+        global_columns = np.arange(x, x + width)
+        if near_start:
+            allowed_columns |= global_columns <= body_x_min + max_body_cut_px
+        if near_end:
+            allowed_columns |= global_columns >= body_x_max - max_body_cut_px
+        component = component & allowed_columns.reshape(1, -1)
+        if not np.any(component):
+            reject("outside_body_cut_depth")
+            continue
+        envelope_fill = bool(cfg.get("headland_corridor_fill_envelope", True))
+        if envelope_fill:
+            local_ys, local_xs = np.where(component)
+            global_y0 = y + int(local_ys.min())
+            global_y1 = y + int(local_ys.max()) + 1
+            component_x0 = x + int(local_xs.min())
+            component_x1 = x + int(local_xs.max()) + 1
+            rectangles: List[Tuple[int, int, int, int]] = []
+            if near_start:
+                rectangles.append((
+                    max(0, min(component_x0, body_x_min)),
+                    min(
+                        out_w,
+                        max(component_x1 + endpoint_margin_px, body_x_min + 1),
+                        body_x_min + max_body_cut_px + 1,
+                    ),
+                    global_y0,
+                    global_y1,
+                ))
+            if near_end:
+                rectangles.append((
+                    max(
+                        0,
+                        min(component_x0 - endpoint_margin_px, body_x_max),
+                        body_x_max - max_body_cut_px,
+                    ),
+                    min(out_w, max(component_x1, body_x_max + 1)),
+                    global_y0,
+                    global_y1,
+                ))
+            before = int(cv2.countNonZero(corridor_rotated))
+            for rect_x0, rect_x1, rect_y0, rect_y1 in rectangles:
+                if rect_x1 > rect_x0 and rect_y1 > rect_y0:
+                    corridor_rotated[rect_y0:rect_y1, rect_x0:rect_x1] = 255
+            after = int(cv2.countNonZero(corridor_rotated))
+            diagnostics["envelope_added_px"] += int(
+                max(0, after - before - int(np.count_nonzero(component)))
+            )
+        else:
+            target = corridor_rotated[y:y + height, x:x + width]
+            target[component] = 255
+        diagnostics["corridor_count"] += 1
+
+    if cv2.countNonZero(corridor_rotated) == 0:
+        return body, seed, empty, diagnostics
+
+    inverse = cv2.invertAffineTransform(matrix)
+    corridor = cv2.warpAffine(
+        corridor_rotated,
+        inverse,
+        (body.shape[1], body.shape[0]),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    corridor = (corridor > 0).astype(np.uint8) * 255
+    evidence = cv2.bitwise_or(raw, body)
+    corridor = cv2.bitwise_and(corridor, evidence)
+    clean_body = cv2.bitwise_and(body, cv2.bitwise_not(corridor))
+    resolved_headland = cv2.bitwise_or(
+        seed, cv2.bitwise_and(corridor, raw)
+    )
+    diagnostics["corridor_px"] = int(cv2.countNonZero(corridor))
+    diagnostics["removed_body_px"] = int(cv2.countNonZero(
+        cv2.bitwise_and(body, corridor)
+    ))
+    return clean_body, resolved_headland, corridor, diagnostics
+
+
+def clip_bands_to_body(
+    bands: List[Dict[str, Any]],
+    body_mask: np.ndarray,
+) -> Tuple[List[Dict[str, Any]], List[int]]:
+    """Synchronize band contours and centerlines with the resolved body mask."""
+    body = (np.asarray(body_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    height, width = body.shape[:2]
+    kept: List[Dict[str, Any]] = []
+    dropped: List[int] = []
+    for original in bands or []:
+        band = dict(original)
+        contour_value = band.get("contour")
+        contour = np.asarray(
+            contour_value if contour_value is not None else [], dtype=np.int32
+        ).reshape(-1, 2)
+        if contour.shape[0] < 3:
+            dropped.append(int(band.get("id", -1)))
+            continue
+        band_mask = np.zeros_like(body)
+        cv2.fillPoly(band_mask, [contour], 255)
+        clipped = cv2.bitwise_and(band_mask, body)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (clipped > 0).astype(np.uint8), 8
+        )
+        if count <= 1:
+            dropped.append(int(band.get("id", -1)))
+            continue
+        selected_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        selected = (labels == selected_label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(
+            selected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            dropped.append(int(band.get("id", -1)))
+            continue
+        clipped_contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
+
+        points = [tuple(map(float, point)) for point in band.get("centerline", [])]
+        runs: List[List[Tuple[float, float]]] = []
+        current: List[Tuple[float, float]] = []
+        for point in points:
+            px = int(round(point[0]))
+            py = int(round(point[1]))
+            valid = (
+                0 <= px < width and 0 <= py < height and selected[py, px] > 0
+            )
+            if valid:
+                current.append(point)
+            elif current:
+                runs.append(current)
+                current = []
+        if current:
+            runs.append(current)
+        centerline = max(runs, key=len) if runs else []
+        if len(centerline) < 2:
+            dropped.append(int(band.get("id", -1)))
+            continue
+
+        bx, by, bw, bh = cv2.boundingRect(clipped_contour)
+        centroid = np.mean(np.asarray(centerline, dtype=np.float64), axis=0)
+        band["contour"] = clipped_contour
+        band["centerline"] = centerline
+        band["centroid"] = (float(centroid[0]), float(centroid[1]))
+        band["bbox"] = (int(bx), int(by), int(bw), int(bh))
+        band["area"] = float(cv2.contourArea(clipped_contour.astype(np.float32)))
+        kept.append(band)
+    return kept, dropped
 
 
 def residual_headland_mask(
@@ -797,6 +1104,9 @@ def regularize_crop_mask(
             "processed_mask": raw,
             "regularized_body_mask": raw.copy(),
             "body_residual_mask": empty_layer.copy(),
+            "gap_repair_added_mask": empty_layer.copy(),
+            "support_clip_removed_mask": empty_layer.copy(),
+            "headland_corridor_mask": empty_layer.copy(),
             "headland_mask": empty_layer.copy(),
             "uncertain_residual_mask": empty_layer.copy(),
             "neutral_support_mask": empty_layer.copy(),
@@ -1307,9 +1617,42 @@ def regularize_crop_mask(
         angle_thresh_deg=float(cfg.get("headland_angle_thresh_deg", 60.0)),
         min_area_ratio=float(cfg.get("headland_min_area_ratio", 0.001)),
     )
-    visible_body = cv2.bitwise_or(rebuilt, body_residual_mask)
-    visible_body = repair_row_gaps(visible_body, angle, mpp, cfg)
-    visible_body = constrain_generated_body_to_raw_support(visible_body, raw, angle, mpp, cfg)
+    after_residual_merge = cv2.bitwise_or(rebuilt, body_residual_mask)
+    after_gap_repair = repair_row_gaps(after_residual_merge, angle, mpp, cfg)
+    gap_repair_added_mask = cv2.bitwise_and(
+        after_gap_repair, cv2.bitwise_not(after_residual_merge)
+    )
+    visible_body = constrain_generated_body_to_raw_support(
+        after_gap_repair, raw, angle, mpp, cfg
+    )
+    support_clip_removed_mask = cv2.bitwise_and(
+        after_gap_repair, cv2.bitwise_not(visible_body)
+    )
+    visible_body, headland_mask, headland_corridor_mask, headland_corridor_diagnostics = (
+        resolve_terminal_headland_overlap(
+            raw,
+            visible_body,
+            headland_mask,
+            angle,
+            mpp,
+            cfg,
+        )
+    )
+    body_residual_mask = cv2.bitwise_and(
+        body_residual_mask, cv2.bitwise_not(headland_corridor_mask)
+    )
+    gap_repair_added_mask = cv2.bitwise_and(
+        gap_repair_added_mask, cv2.bitwise_not(headland_corridor_mask)
+    )
+    uncertain_residual_mask = cv2.bitwise_and(
+        uncertain_residual_mask, cv2.bitwise_not(headland_corridor_mask)
+    )
+    if headland_corridor_diagnostics.get("corridor_count", 0):
+        bands, corridor_dropped_band_ids = clip_bands_to_body(bands, visible_body)
+    else:
+        corridor_dropped_band_ids = []
+    wide = [item for item in bands if item.get("band_type") == "wide"]
+    narrow = [item for item in bands if item.get("band_type") == "narrow"]
     visible_body_bool = visible_body > 0
     headland_bool = headland_mask > 0
     neutral_support_mask = uncertain_residual_mask
@@ -1334,6 +1677,12 @@ def regularize_crop_mask(
         "iou_to_raw": float(intersection / max(union, 1)),
         "headland_removed_px": int(np.count_nonzero(headland_bool)),
         "uncertain_residual_px": int(np.count_nonzero(uncertain_residual_mask)),
+        "body_residual_px": int(np.count_nonzero(body_residual_mask)),
+        "gap_repair_added_px": int(np.count_nonzero(gap_repair_added_mask)),
+        "support_clip_removed_px": int(np.count_nonzero(support_clip_removed_mask)),
+        "headland_corridor_px": int(np.count_nonzero(headland_corridor_mask)),
+        "headland_corridor": headland_corridor_diagnostics,
+        "headland_corridor_dropped_band_ids": corridor_dropped_band_ids,
         "body_interval": body_diagnostics,
         "candidate_band_count": len(runs),
         "rebuilt_band_count": len(bands),
@@ -1350,6 +1699,9 @@ def regularize_crop_mask(
         "processed_mask": visible_body,
         "regularized_body_mask": rebuilt,
         "body_residual_mask": body_residual_mask,
+        "gap_repair_added_mask": gap_repair_added_mask,
+        "support_clip_removed_mask": support_clip_removed_mask,
+        "headland_corridor_mask": headland_corridor_mask,
         "headland_mask": headland_mask,
         "uncertain_residual_mask": uncertain_residual_mask,
         "neutral_support_mask": neutral_support_mask,

@@ -108,6 +108,7 @@ def test_pyside_harvester_pose_draws_body_header_and_two_tracks(monkeypatch):
     window.geo = FakeGeo()
     window.state.harvester_params = {
         "cutter_width_m": 2.0,
+        "cutter_forward_offset_m": 1.2,
         "track_width_m": 0.35,
         "track_gauge_m": 1.7,
         "wheelbase_m": 2.5,
@@ -119,14 +120,15 @@ def test_pyside_harvester_pose_draws_body_header_and_two_tracks(monkeypatch):
     circles = []
     monkeypatch.setattr(window.image_view.viewer, "draw_polygon", lambda pts, color, outline=None, width=1: polygons.append((pts, color, outline, width)))
     monkeypatch.setattr(window.image_view.viewer, "draw_line", lambda x1, y1, x2, y2, color=(0, 200, 80), width=2, style=None: lines.append((x1, y1, x2, y2, color, width)))
-    monkeypatch.setattr(window.image_view.viewer, "draw_circle", lambda x, y, radius=4, color=(255, 255, 0): circles.append((x, y, radius, color)))
+    monkeypatch.setattr(window.image_view.viewer, "draw_circle", lambda x, y, radius=4, color=(255, 255, 0), **kwargs: circles.append((x, y, radius, color, kwargs)))
 
     window._draw_harvester_pose(50, 40, 0.0)
 
-    assert len(polygons) >= 5  # body + header + 2 tracks + tank
+    assert len(polygons) >= 5  # body + cutter visual + 2 tracks + tank
     colors = [item[1] for item in polygons]
     assert (30, 150, 205) in colors
-    assert (60, 174, 76) in colors
+    assert (178, 132, 48) in colors
     assert colors.count((32, 36, 34)) >= 2
-    assert lines  # direction arrow/axis
+    assert any(item[4] == (255, 225, 120) for item in lines)  # cutter leading edge
     assert circles  # cab/center marker
+    assert any(item[4].get("scene_scaled") for item in circles)

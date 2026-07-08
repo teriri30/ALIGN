@@ -28,6 +28,16 @@ def test_missing_config_uses_native_640_capture_size():
         ({"model": {"tile_overlap": 1.0}}, "tile_overlap"),
         ({"model": {"conf_threshold": -0.1}}, "conf_threshold"),
         ({"harvester": {"track_width_m": 0.8, "track_gauge_m": 0.5}}, "track_width_m"),
+        (
+            {
+                "harvester": {
+                    "cutter_forward_offset_m": 5.0,
+                    "track_length_m": 1.7,
+                    "wheelbase_m": 1.8,
+                }
+            },
+            "cutter_forward_offset_m",
+        ),
         ({"mask_processing": {"strength": "unknown"}}, "strength"),
     ],
 )

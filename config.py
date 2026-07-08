@@ -9,6 +9,19 @@ class ConfigValidationError(ValueError):
     """Configuration is syntactically valid JSON but scientifically unsafe."""
 
 
+DEFAULT_HARVESTER_PARAMS = {
+    "cutter_width_m": 2.15,
+    "track_width_m": 0.40,
+    "track_gauge_m": 1.60,
+    "wheelbase_m": 1.80,
+    "track_length_m": 1.70,
+    "turn_radius_m": 0.90,
+    "work_speed_mps": 1.20,
+    "turn_speed_mps": 0.60,
+    "entry_speed_mps": 0.80,
+}
+
+
 def _validated_number(section: dict, key: str, *, minimum=None, maximum=None, strict_min=False):
     if key not in section:
         return
@@ -27,7 +40,7 @@ def validate_config(raw: dict) -> dict:
     if not isinstance(raw, dict):
         raise ConfigValidationError("configuration root must be an object")
     schema_version = str(raw.get("_schema_version", "1.1"))
-    if schema_version not in {"1.1", "1.2"}:
+    if schema_version not in {"1.1", "1.2", "1.3"}:
         raise ConfigValidationError(f"unsupported _schema_version: {schema_version}")
     for name in ("model", "harvester", "path_planning", "mask_processing", "raster_preprocessing", "geo"):
         if name in raw and not isinstance(raw[name], dict):
@@ -43,9 +56,30 @@ def validate_config(raw: dict) -> dict:
     harvester = raw.get("harvester", {})
     for key in (
         "cutter_width_m", "track_width_m", "track_gauge_m", "wheelbase_m",
-        "track_length_m", "turn_radius_m",
+        "track_length_m", "turn_radius_m", "work_speed_mps",
+        "turn_speed_mps", "entry_speed_mps",
     ):
         _validated_number(harvester, key, minimum=0.0, strict_min=True)
+    if harvester.get("cutter_forward_offset_m") is not None:
+        _validated_number(
+            harvester, "cutter_forward_offset_m", minimum=0.0, strict_min=True
+        )
+        cutter_forward_offset = float(harvester["cutter_forward_offset_m"])
+        track_length = float(
+            harvester.get(
+                "track_length_m", DEFAULT_HARVESTER_PARAMS["track_length_m"]
+            )
+        )
+        wheelbase = float(
+            harvester.get("wheelbase_m", DEFAULT_HARVESTER_PARAMS["wheelbase_m"])
+        )
+        max_forward_offset = max(3.0, track_length + wheelbase)
+        if cutter_forward_offset > max_forward_offset:
+            raise ConfigValidationError(
+                "cutter_forward_offset_m is implausibly far from "
+                f"track_contact_center; must be <= {max_forward_offset:.2f} "
+                "for the configured track_length_m and wheelbase_m"
+            )
     if "track_width_m" in harvester and "track_gauge_m" in harvester:
         if float(harvester["track_width_m"]) >= float(harvester["track_gauge_m"]):
             raise ConfigValidationError("track_width_m must be smaller than track_gauge_m")
@@ -70,27 +104,47 @@ def validate_config(raw: dict) -> dict:
     _validated_number(planning, "endpoint_shortfall_min_m", minimum=0.0)
     _validated_number(planning, "endpoint_extension_max_m", minimum=0.0)
     _validated_number(planning, "endpoint_outlier_mad_scale", minimum=0.0)
+    _validated_number(planning, "footprint_pose_step_m", minimum=0.01, maximum=0.20)
+    _validated_number(planning, "pose_heading_window_m", minimum=0.01, maximum=2.0)
     for key in (
-        "max_track_core_overlap_pct", "min_harvest_coverage_pct",
+        "max_track_core_overlap_pct", "min_geometric_coverage_pct",
         "max_track_outside_field_pct", "max_track_outside_support_pct",
         "max_track_uncertain_overlap_pct", "max_track_forbidden_overlap_pct",
     ):
         _validated_number(planning, key, minimum=0.0, maximum=100.0)
+    _validated_number(
+        planning, "headland_damage_weight",
+        minimum=0.0, maximum=1.0, strict_min=True,
+    )
 
     mask = raw.get("mask_processing", {})
     if "strength" in mask and str(mask["strength"]) not in {
         "light", "standard", "strong", "very_strong",
     }:
         raise ConfigValidationError("strength must be light, standard, strong, or very_strong")
+    if "headland_corridor_enabled" in mask and not isinstance(
+        mask["headland_corridor_enabled"], bool
+    ):
+        raise ConfigValidationError("headland_corridor_enabled must be boolean")
+    if "headland_corridor_fill_envelope" in mask and not isinstance(
+        mask["headland_corridor_fill_envelope"], bool
+    ):
+        raise ConfigValidationError("headland_corridor_fill_envelope must be boolean")
     _validated_number(mask, "max_work_dim", minimum=256)
     _validated_number(mask, "band_width_threshold_m", minimum=0.0, strict_min=True)
     for key in (
         "band_internal_gap_close_m", "band_end_gap_close_m",
         "band_endpoint_gap_close_m", "band_end_guard_m",
-        "residual_body_attach_m",
+        "residual_body_attach_m", "residual_body_max_angle_deg",
+        "residual_body_min_elongation", "headland_corridor_close_m",
+        "headland_corridor_depth_smooth_m",
+        "headland_corridor_terminal_depth_m", "headland_corridor_max_body_cut_m",
+        "headland_corridor_endpoint_margin_m",
     ):
         _validated_number(mask, key, minimum=0.0)
     _validated_number(mask, "residual_body_min_attach_ratio", minimum=0.0, maximum=1.0)
+    _validated_number(mask, "headland_corridor_min_span_ratio", minimum=0.0, maximum=1.0)
+    _validated_number(mask, "headland_corridor_min_seed_ratio", minimum=0.0, maximum=1.0)
 
     raster = raw.get("raster_preprocessing", {})
     if "mode" in raster and str(raster["mode"]) not in {
@@ -316,17 +370,26 @@ class Config:
     def MASK_PROCESSING_STRENGTH(self) -> str: return self._get("mask_processing", "strength", default="standard")
 
     @property
-    def CUTTER_WIDTH_M(self) -> float: return self._get("harvester", "cutter_width_m", default=2.0)
+    def CUTTER_WIDTH_M(self) -> float: return self._get("harvester", "cutter_width_m", default=DEFAULT_HARVESTER_PARAMS["cutter_width_m"])
     @property
-    def TRACK_WIDTH_M(self) -> float: return self._get("harvester", "track_width_m", default=0.35)
+    def CUTTER_FORWARD_OFFSET_M(self) -> Optional[float]: return self._get("harvester", "cutter_forward_offset_m", default=None)
     @property
-    def TRACK_GAUGE_M(self) -> float: return self._get("harvester", "track_gauge_m", default=1.7)
+    def TRACK_WIDTH_M(self) -> float: return self._get("harvester", "track_width_m", default=DEFAULT_HARVESTER_PARAMS["track_width_m"])
     @property
-    def WHEELBASE_M(self) -> float: return self._get("harvester", "wheelbase_m", default=2.5)
+    def TRACK_GAUGE_M(self) -> float: return self._get("harvester", "track_gauge_m", default=DEFAULT_HARVESTER_PARAMS["track_gauge_m"])
     @property
-    def TRACK_LENGTH_M(self) -> float: return self._get("harvester", "track_length_m", default=1.5)
+    def WHEELBASE_M(self) -> float: return self._get("harvester", "wheelbase_m", default=DEFAULT_HARVESTER_PARAMS["wheelbase_m"])
     @property
-    def TURN_RADIUS_M(self) -> float: return self._get("harvester", "turn_radius_m", default=2.0)
+    def TRACK_LENGTH_M(self) -> float: return self._get("harvester", "track_length_m", default=DEFAULT_HARVESTER_PARAMS["track_length_m"])
+    @property
+    def TURN_RADIUS_M(self) -> float: return self._get("harvester", "turn_radius_m", default=DEFAULT_HARVESTER_PARAMS["turn_radius_m"])
+
+    @property
+    def WORK_SPEED_MPS(self) -> float: return self._get("harvester", "work_speed_mps", default=DEFAULT_HARVESTER_PARAMS["work_speed_mps"])
+    @property
+    def TURN_SPEED_MPS(self) -> float: return self._get("harvester", "turn_speed_mps", default=DEFAULT_HARVESTER_PARAMS["turn_speed_mps"])
+    @property
+    def ENTRY_SPEED_MPS(self) -> float: return self._get("harvester", "entry_speed_mps", default=DEFAULT_HARVESTER_PARAMS["entry_speed_mps"])
 
     @property
     def DEFAULT_EPSG(self) -> str: return self._get("geo", "default_epsg", default="32650")

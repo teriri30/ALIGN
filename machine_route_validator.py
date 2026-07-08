@@ -3,6 +3,8 @@
 import math
 from typing import Dict, Optional
 
+from harvester_geometry import FOOTPRINT_MODEL, FOOTPRINT_REFERENCE_POINT
+
 
 MACHINE_READINESS_SCHEMA = "reui.machine-readiness.v1"
 
@@ -39,6 +41,11 @@ def assess_machine_readiness(
         controlled_trial_blockers.append("confirmed_field_boundary_missing")
     if not bool(validation.get("semantic_support_present")):
         controlled_trial_blockers.append("semantic_support_missing")
+    if (
+        validation.get("footprint_model") != FOOTPRINT_MODEL
+        or validation.get("footprint_reference_point") != FOOTPRINT_REFERENCE_POINT
+    ):
+        controlled_trial_blockers.append("footprint_contract_mismatch")
     if not (
         bool(validation.get("forbidden_mask_present"))
         and bool(cfg.get("forbidden_mask_confirmed"))

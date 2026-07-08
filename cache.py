@@ -202,6 +202,8 @@ def _mask_result_summary(mask_result: Optional[Dict[str, Any]]) -> Optional[Dict
     dense_mask_keys = {
         "processed_mask", "raw_mask", "debug_images", "regularized_body_mask",
         "body_residual_mask", "headland_mask", "uncertain_residual_mask",
+        "gap_repair_added_mask", "support_clip_removed_mask",
+        "headland_corridor_mask",
         "neutral_support_mask", "planning_support_mask",
     }
     keep = {
@@ -288,12 +290,14 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "last_work_path_m": float(getattr(state, "last_work_path_m", 0.0) or 0.0),
         "last_turn_path_m": float(getattr(state, "last_turn_path_m", 0.0) or 0.0),
         "last_entry_exit_path_m": float(getattr(state, "last_entry_exit_path_m", 0.0) or 0.0),
-        "last_harvest_rate": float(getattr(state, "last_harvest_rate", 0.0) or 0.0),
-        "last_planned_harvest_rate": float(
-            getattr(state, "last_planned_harvest_rate", 0.0) or 0.0
+        "last_crop_mask_geometric_coverage_pct": float(
+            getattr(state, "last_crop_mask_geometric_coverage_pct", 0.0) or 0.0
         ),
-        "last_detected_harvest_rate": float(
-            getattr(state, "last_detected_harvest_rate", 0.0) or 0.0
+        "last_planned_target_geometric_coverage_pct": float(
+            getattr(state, "last_planned_target_geometric_coverage_pct", 0.0) or 0.0
+        ),
+        "last_detected_mask_geometric_coverage_pct": float(
+            getattr(state, "last_detected_mask_geometric_coverage_pct", 0.0) or 0.0
         ),
         "last_rolling_rate": float(getattr(state, "last_rolling_rate", 0.0) or 0.0),
         "last_field_efficiency": float(

@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsEllipseItem,
     QGraphicsItem,
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame,
+    QSlider, QComboBox, QToolButton, QStyle,
 )
 from pyside6_app.styles import COLORS
 
@@ -474,7 +475,7 @@ class ImageViewer(QGraphicsView):
         self._overlay_group.append(item)
         return item
 
-    def draw_circle(self, x, y, radius=4, color=(255, 255, 0)):
+    def draw_circle(self, x, y, radius=4, color=(255, 255, 0), scene_scaled=False):
         brush = QBrush(QColor(*reversed(color)))
         pen_w = max(1, radius // 3)
         pen = QPen(QColor(*reversed(color)), pen_w)
@@ -483,7 +484,8 @@ class ImageViewer(QGraphicsView):
         e.setPen(pen)
         e.setBrush(brush)
         e.setPos(float(x), float(y))
-        e.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        if not scene_scaled:
+            e.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         e.setZValue(30)
         self._scene.addItem(e)
         self._overlay_group.append(e)
@@ -643,6 +645,9 @@ class ImageViewerGroup(QWidget):
     snapshot_requested = Signal()
     mask_compare_requested = Signal()
     measure_tool_changed = Signal(str)
+    animation_pause_requested = Signal()
+    animation_seek_requested = Signal(float)
+    animation_speed_requested = Signal(float)
 
     """带工具栏的图像查看器：适应 / 缩放 / 旋转刻度尺 / 比例尺 / 坐标显示"""
 
@@ -666,6 +671,44 @@ class ImageViewerGroup(QWidget):
 
         self.viewer = ImageViewer()
         layout.addWidget(self.viewer, 1)
+
+        self.animation_bar = QWidget()
+        self.animation_bar.setObjectName("animationBar")
+        animation_layout = QHBoxLayout(self.animation_bar)
+        animation_layout.setContentsMargins(6, 2, 6, 2)
+        animation_layout.setSpacing(6)
+        self.anim_play_btn = QToolButton()
+        self.anim_play_btn.setFixedSize(74, 26)
+        self.anim_play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+        self.anim_play_btn.setText("暂停")
+        self.anim_play_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.anim_play_btn.setToolTip("暂停演示")
+        self.anim_play_btn.setAccessibleName("暂停或继续演示")
+        self.anim_play_btn.clicked.connect(self.animation_pause_requested.emit)
+        animation_layout.addWidget(self.anim_play_btn)
+        self.anim_slider = QSlider(Qt.Horizontal)
+        self.anim_slider.setRange(0, 1000)
+        self.anim_slider.setSingleStep(1)
+        self.anim_slider.setPageStep(25)
+        self.anim_slider.setToolTip("拖动到指定路径位置")
+        self.anim_slider.sliderMoved.connect(
+            lambda value: self.animation_seek_requested.emit(value / 1000.0)
+        )
+        animation_layout.addWidget(self.anim_slider, 1)
+        self.anim_progress_label = QLabel("0%")
+        self.anim_progress_label.setFixedWidth(44)
+        self.anim_progress_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        animation_layout.addWidget(self.anim_progress_label)
+        self.anim_speed_combo = QComboBox()
+        self.anim_speed_combo.setFixedWidth(72)
+        self.anim_speed_combo.setToolTip("播放倍速，不改变规划路径，也不代表实车速度")
+        for ratio in (0.25, 0.5, 1, 2, 5, 10, 20, 40, 60):
+            self.anim_speed_combo.addItem(f"{ratio:g}x", float(ratio))
+        self.anim_speed_combo.setCurrentIndex(self.anim_speed_combo.findData(1.0))
+        self.anim_speed_combo.currentIndexChanged.connect(self._emit_animation_speed)
+        animation_layout.addWidget(self.anim_speed_combo)
+        layout.addWidget(self.animation_bar)
+        self.animation_bar.hide()
 
         # ── 工具栏 ──
         tbar = QHBoxLayout()
@@ -780,6 +823,36 @@ class ImageViewerGroup(QWidget):
             lambda x, y, b: self.lbl_coord.setText(f"x:{x}  y:{y}"))
         self.viewer.view_scale_changed.connect(
             lambda s: self._scale_bar.update_scale(self._ppm, s))
+        self.refresh_theme()
+
+    def _emit_animation_speed(self, index):
+        value = self.anim_speed_combo.itemData(index)
+        if value is not None:
+            self.animation_speed_requested.emit(float(value))
+
+    def set_animation_controls_visible(self, visible):
+        self.animation_bar.setVisible(bool(visible))
+
+    def set_animation_paused(self, paused):
+        icon = QStyle.SP_MediaPlay if paused else QStyle.SP_MediaPause
+        self.anim_play_btn.setIcon(self.style().standardIcon(icon))
+        self.anim_play_btn.setText("继续" if paused else "暂停")
+        self.anim_play_btn.setToolTip("继续演示" if paused else "暂停演示")
+
+    def set_animation_progress(self, ratio):
+        ratio = max(0.0, min(1.0, float(ratio)))
+        self.anim_slider.blockSignals(True)
+        self.anim_slider.setValue(int(round(ratio * 1000)))
+        self.anim_slider.blockSignals(False)
+        self.anim_progress_label.setText(f"{ratio * 100:.0f}%")
+
+    def set_animation_speed(self, ratio):
+        for index in range(self.anim_speed_combo.count()):
+            if abs(float(self.anim_speed_combo.itemData(index)) - float(ratio)) < 1e-9:
+                self.anim_speed_combo.blockSignals(True)
+                self.anim_speed_combo.setCurrentIndex(index)
+                self.anim_speed_combo.blockSignals(False)
+                break
 
     def _on_ruler_angle(self, angle):
         """刻度尺角度变化 → 同步到视图"""
@@ -827,6 +900,14 @@ class ImageViewerGroup(QWidget):
             self._tb_sep_tools.setStyleSheet(f"background:{COLORS['border']};max-width:1px;")
         if hasattr(self, 'lbl_coord'):
             self.lbl_coord.setStyleSheet(f"color:{COLORS['text_dim']};font-size:11px;")
+        if hasattr(self, 'animation_bar'):
+            self.animation_bar.setStyleSheet(
+                f"QWidget#animationBar{{background:{COLORS['bg_dark']};"
+                f"border-top:1px solid {COLORS['border']};}}"
+            )
+            self.anim_progress_label.setStyleSheet(
+                f"color:{COLORS['text_dim']};font-size:11px;"
+            )
         # 更新 ImageViewer 背景
         if hasattr(self.viewer, '_scene'):
             self.viewer.setBackgroundBrush(QColor(COLORS['bg_dark']))

@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw
 from config import Config, AppLogger
 from state import AppState, AutoPathSegment
 from geo import GeoUtils
+from path_pose import build_polyline_metric, pose_at_distance
 from utils import get_chinese_font
 
 
@@ -84,7 +85,7 @@ class WorkflowUpdater:
 
 
 class AnimationEngine:
-    """动画引擎 — 基于真实物理尺度的平滑农机运动模拟
+    """动画引擎 — 基于真实物理尺度的平滑农机运动模拟（DECISION-012）
 
     核心改进:
     1. setup() 重建路径：转弯处圆弧插值，所有路径点等间距分布
@@ -116,6 +117,7 @@ class AnimationEngine:
         self._point_spacing_m: float = self.PATH_RES_M  # 路径点间距（米）
         self._seg_dists: List[float] = []
         self._cum_dists: List[float] = [0.0]
+        self._pose_segments: List[dict] = []
 
     def _pixel_distance_m(self, p1, p2) -> float:
         """Return a finite distance in metres, falling back to pixel Euclidean distance."""
@@ -169,17 +171,41 @@ class AnimationEngine:
         self._cum_dists = [0.0]
         for distance in self._seg_dists:
             self._cum_dists.append(self._cum_dists[-1] + max(0.0, distance))
+        self._pose_segments = []
+        pose_offset_m = 0.0
+        for segment in path_segments:
+            segment_points = [
+                (float(point.pixel_x), float(point.pixel_y))
+                for point in segment.points
+            ]
+            try:
+                values, lengths, cumulative = build_polyline_metric(
+                    segment_points, self._pixel_distance_m
+                )
+            except ValueError:
+                continue
+            segment_length_m = float(cumulative[-1])
+            self._pose_segments.append({
+                "points": values,
+                "lengths": lengths,
+                "cumulative": cumulative,
+                "start_m": pose_offset_m,
+                "end_m": pose_offset_m + segment_length_m,
+                "segment_type": str(segment.segment_type),
+            })
+            pose_offset_m += segment_length_m
 
         # 计算平均间距供诊断使用
         total_m = sum(self._seg_dists)
         self._point_spacing_m = total_m / len(self._seg_dists) if self._seg_dists else self.PATH_RES_M
 
         # 作业速度（米/秒），如有地理数据则使用真实速度
-        s.anim_speed_mps = self.WORK_SPEED_MPS
+        work_speed_mps = self._base_speed_mps("work")
+        s.anim_speed_mps = work_speed_mps
         s.anim_heading_rad = 0.0
         s.anim_curvature_1pm = 0.0
-        s.anim_track_left_mps = self.WORK_SPEED_MPS
-        s.anim_track_right_mps = self.WORK_SPEED_MPS
+        s.anim_track_left_mps = work_speed_mps
+        s.anim_track_right_mps = work_speed_mps
         s.anim_turn_radius_m = float("inf")
 
         self._last_time = time.time()
@@ -200,7 +226,8 @@ class AnimationEngine:
         s.anim_total_frames, s.anim_frame = len(pts), 0
         s.anim_frac = 0.0
         s.anim_active, s.anim_paused, s.anim_speed = True, False, 1.0
-        s.anim_speed_mps = self.WORK_SPEED_MPS
+        work_speed_mps = self._base_speed_mps("work")
+        s.anim_speed_mps = work_speed_mps
         # 计算段间距离（与 setup() 保持一致）
         self._seg_dists = []
         for i in range(len(pts) - 1):
@@ -212,8 +239,8 @@ class AnimationEngine:
         self._point_spacing_m = self.PATH_RES_M
         s.anim_heading_rad = 0.0
         s.anim_curvature_1pm = 0.0
-        s.anim_track_left_mps = self.WORK_SPEED_MPS
-        s.anim_track_right_mps = self.WORK_SPEED_MPS
+        s.anim_track_left_mps = work_speed_mps
+        s.anim_track_right_mps = work_speed_mps
         s.anim_turn_radius_m = float("inf")
 
     # 以下函数已弃用；setup 使用原始路径点，不做平滑/重采样。
@@ -243,12 +270,7 @@ class AnimationEngine:
         # 当前点的类型决定速度
         cur_idx = min(s.anim_frame, len(s.anim_all_pts) - 1)
         cur_type = s.anim_all_types[cur_idx] if cur_idx < len(s.anim_all_types) else "work"
-        if cur_type.startswith("turn"):
-            speed_mps = self.TURN_SPEED_MPS
-        elif cur_type in ("entry", "exit"):
-            speed_mps = self.ENTRY_SPEED_MPS
-        else:
-            speed_mps = self.WORK_SPEED_MPS
+        speed_mps = self._base_speed_mps(cur_type)
 
         # 应用用户速度倍率
         effective_speed = speed_mps * s.anim_speed
@@ -303,10 +325,47 @@ class AnimationEngine:
         if not self.state.anim_paused:
             self._last_time = time.time()  # 恢复时重置时间
 
+    def progress_ratio(self) -> float:
+        """Return playback progress by path arc length, not point count."""
+        s = self.state
+        if not s.anim_all_pts or not self._cum_dists:
+            return 0.0
+        total_m = float(self._cum_dists[-1])
+        if total_m <= 1e-9:
+            return float(s.anim_frame >= max(0, len(s.anim_all_pts) - 1))
+        idx = max(0, min(int(s.anim_frame), len(self._cum_dists) - 1))
+        current_m = self._cum_dists[idx] + max(0.0, float(s.anim_frac))
+        return max(0.0, min(1.0, current_m / total_m))
+
+    def seek_ratio(self, ratio: float):
+        """Move the visual playback head to an arc-length ratio of the route."""
+        s = self.state
+        if not s.anim_all_pts:
+            return
+        ratio = max(0.0, min(1.0, float(ratio)))
+        total_m = float(self._cum_dists[-1]) if self._cum_dists else 0.0
+        if ratio >= 1.0:
+            s.anim_frame = len(s.anim_all_pts) - 1
+            s.anim_frac = 0.0
+        elif total_m <= 1e-9 or not self._seg_dists:
+            s.anim_frame = min(
+                len(s.anim_all_pts) - 1,
+                int(round(ratio * max(0, len(s.anim_all_pts) - 1))),
+            )
+            s.anim_frac = 0.0
+        else:
+            target_m = ratio * total_m
+            idx = int(np.searchsorted(self._cum_dists, target_m, side="right") - 1)
+            idx = max(0, min(idx, len(self._seg_dists) - 1))
+            s.anim_frame = idx
+            s.anim_frac = max(0.0, target_m - self._cum_dists[idx])
+        self._last_time = time.time()
+        s.need_redraw = True
+
     def speed_up(self):
         maximum = self.max_speed_multiplier()
         levels = [
-            level for level in (1, 2, 5, 10, 20, 30, 40, 60, 80, 100)
+            level for level in (0.25, 0.5, 1, 2, 5, 10, 20, 30, 40, 60, 80, 100)
             if level <= maximum
         ]
         if not levels or levels[-1] < maximum:
@@ -325,7 +384,7 @@ class AnimationEngine:
     def speed_down(self):
         maximum = self.max_speed_multiplier()
         levels = sorted({
-            1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 40.0, 60.0,
+            0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 40.0, 60.0,
             maximum,
         }, reverse=True)
         levels = [level for level in levels if level <= maximum]
@@ -336,8 +395,8 @@ class AnimationEngine:
                 self.state.status_message = f"速度: {lvl}x"
                 self.state.need_redraw = True
                 return
-        self.state.anim_speed = 1.0
-        self.state.status_message = "速度: 1x (最慢)"
+        self.state.anim_speed = 0.25
+        self.state.status_message = "速度: 0.25x (最慢)"
         self.state.need_redraw = True
 
     @staticmethod
@@ -370,13 +429,33 @@ class AnimationEngine:
             if idx < len(s.anim_all_types)
             else "work"
         )
-        if current_type.startswith("turn"):
-            base_speed = self.TURN_SPEED_MPS
-        elif current_type in ("entry", "exit"):
-            base_speed = self.ENTRY_SPEED_MPS
-        else:
-            base_speed = self.WORK_SPEED_MPS
+        base_speed = self._base_speed_mps(current_type)
         return base_speed * s.anim_speed
+
+    def _base_speed_mps(self, segment_type: str) -> float:
+        params = dict(getattr(self.state, "harvester_params", {}) or {})
+        if str(segment_type).startswith("turn"):
+            key, fallback = "turn_speed_mps", self.TURN_SPEED_MPS
+        elif str(segment_type) in ("entry", "exit"):
+            key, fallback = "entry_speed_mps", self.ENTRY_SPEED_MPS
+        else:
+            key, fallback = "work_speed_mps", self.WORK_SPEED_MPS
+        value = float(params.get(key, fallback))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} must be a finite positive value")
+        return value
+
+    def _pose_segment_at(self, absolute_m: float):
+        if not self._pose_segments:
+            return None, 0.0
+        distance = max(0.0, float(absolute_m))
+        for index, segment in enumerate(self._pose_segments):
+            if distance < segment["end_m"] - 1e-9 or index == len(self._pose_segments) - 1:
+                return segment, max(
+                    0.0, min(distance - segment["start_m"], segment["cumulative"][-1])
+                )
+        segment = self._pose_segments[-1]
+        return segment, float(segment["cumulative"][-1])
 
     def get_interpolated_position(self):
         """Return a nonholonomic tracked-vehicle pose on the planned path.
@@ -397,40 +476,39 @@ class AnimationEngine:
         )
         total_m = self._cum_dists[-1] if self._cum_dists else 0.0
         absolute_m = max(0.0, min(absolute_m, total_m))
-        x, y = self._sample_path_at(absolute_m)
-
+        pose_segment, local_m = self._pose_segment_at(absolute_m)
+        if pose_segment is None:
+            return self._sample_path_at(absolute_m), s.anim_heading_rad
         heading_window_m = max(
-            0.12,
-            float(self.cfg.section("animation").get(
-                "heading_window_m", 0.30
+            0.01,
+            float(self.cfg.section("path_planning").get(
+                "pose_heading_window_m", 0.30
             )),
         )
-        before_m = max(0.0, absolute_m - heading_window_m)
-        after_m = min(total_m, absolute_m + heading_window_m)
-        p_before = self._sample_path_at(before_m)
-        p_after = self._sample_path_at(after_m)
-        dx = p_after[0] - p_before[0]
-        dy = p_after[1] - p_before[1]
-        heading = (
-            math.atan2(dy, dx)
-            if abs(dx) > 1e-9 or abs(dy) > 1e-9
-            else s.anim_heading_rad
+        reversing = pose_segment["segment_type"] == "turn_reverse"
+        x, y, heading = pose_at_distance(
+            pose_segment["points"],
+            pose_segment["lengths"],
+            pose_segment["cumulative"],
+            local_m,
+            heading_window_m,
+            reversing=reversing,
         )
-        reversing = (
-            idx < len(s.anim_all_types)
-            and s.anim_all_types[idx] == "turn_reverse"
-        )
-        if reversing:
-            heading = self._wrap_angle(heading + math.pi)
 
         half_window = max(0.08, heading_window_m * 0.5)
-        p0 = self._sample_path_at(max(0.0, absolute_m - heading_window_m))
-        p1 = self._sample_path_at(max(0.0, absolute_m - half_window))
-        p2 = self._sample_path_at(min(total_m, absolute_m + half_window))
-        p3 = self._sample_path_at(min(total_m, absolute_m + heading_window_m))
-        heading_before = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
-        heading_after = math.atan2(p3[1] - p2[1], p3[0] - p2[0])
-        curvature_span = max(1e-6, after_m - before_m)
+        sample_before = max(0.0, local_m - half_window)
+        sample_after = min(float(pose_segment["cumulative"][-1]), local_m + half_window)
+        _, _, heading_before = pose_at_distance(
+            pose_segment["points"], pose_segment["lengths"],
+            pose_segment["cumulative"], sample_before, heading_window_m,
+            reversing=reversing,
+        )
+        _, _, heading_after = pose_at_distance(
+            pose_segment["points"], pose_segment["lengths"],
+            pose_segment["cumulative"], sample_after, heading_window_m,
+            reversing=reversing,
+        )
+        curvature_span = max(1e-6, sample_after - sample_before)
         curvature = self._wrap_angle(
             heading_after - heading_before
         ) / curvature_span
@@ -447,7 +525,7 @@ class AnimationEngine:
             )),
         )
         effective_gauge_m = track_gauge_m * icr_factor
-        center_speed_mps = self._current_speed_mps(idx)
+        center_speed_mps = self._base_speed_mps(pose_segment["segment_type"]) * s.anim_speed
         if reversing:
             center_speed_mps *= -1.0
         left_speed_mps = center_speed_mps * (
@@ -479,21 +557,17 @@ class AnimationEngine:
         remaining_m -= s.anim_frac  # 减去当前段已走过的亚帧余量
         # 当前速度
         cur_type = s.anim_all_types[cur_idx] if cur_idx < len(s.anim_all_types) else "work"
-        if cur_type.startswith("turn"):
-            speed_mps = self.TURN_SPEED_MPS
-        elif cur_type in ("entry", "exit"):
-            speed_mps = self.ENTRY_SPEED_MPS
-        else:
-            speed_mps = self.WORK_SPEED_MPS
+        speed_mps = self._base_speed_mps(cur_type)
         effective_speed = speed_mps * s.anim_speed
         return remaining_m / effective_speed if effective_speed > 0.01 else 0.0
 
     def set_speed_ratio(self, ratio: float):
         """Set the visual playback multiplier."""
         self.state.anim_speed = max(
-            0.0,
+            0.25,
             min(self.max_speed_multiplier(), ratio),
         )
+        self._last_time = time.time()
         self.state.need_redraw = True
 
     def _gen_report(self):
@@ -533,10 +607,10 @@ class AnimationEngine:
             f"---\n"
             f"割台理论扫掠面积: {harvest_area:.1f} m²\n"
             f"田块总面积:   {field_area:.1f} m² ({field_area/666.67:.2f} 亩)\n"
-            f"规划目标覆盖: {s.last_planned_harvest_rate:.1f}%\n"
-            f"结构化作物覆盖: {s.last_harvest_rate:.1f}%\n"
-            f"原始识别作物覆盖: {s.last_detected_harvest_rate:.1f}%\n"
-            f"作物核心碾压: {s.last_rolling_rate:.1f}%\n"
+            f"规划目标几何覆盖: {s.last_planned_target_geometric_coverage_pct:.1f}%\n"
+            f"作物掩膜几何覆盖: {s.last_crop_mask_geometric_coverage_pct:.1f}%\n"
+            f"原始识别掩膜几何覆盖: {s.last_detected_mask_geometric_coverage_pct:.1f}%\n"
+            f"预计碾压率: {s.last_rolling_rate:.1f}%\n"
             f"---\n"
             f"收割机: 割台{cut_w:.1f}m 履带{track_w:.2f}m 中心距{track_gauge:.2f}m"
         )

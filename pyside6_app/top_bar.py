@@ -95,7 +95,7 @@ class TopToolbar(QWidget):
             btn = QToolButton(); btn.setText(text); btn.setFixedSize(32,28)
             btn.setStyleSheet(f"QToolButton{{background:transparent;color:{COLORS['text']};border:none;border-radius:4px;font-size:14px;}}QToolButton:hover{{background:{COLORS['bg_hover']};}}")
             if aid == "THEME":
-                btn.setToolTip("切换主题 (深色→浅色→跟随系统)")
+                btn.setToolTip("切换深色/浅色主题")
                 btn.clicked.connect(self.theme_toggle.emit)
                 self._theme_btn = btn
             else:
@@ -108,8 +108,11 @@ class TopToolbar(QWidget):
         if len(name)>28: name = name[:10]+"..."+name[-7:]
         self.lbl_filename.setText(name)
     def update_theme_icon(self, theme_name):
-        icons = {"dark": "☀", "light": "☾", "system": "◐"}
-        tips = {"dark": "当前: 深色 → 点击切换浅色", "light": "当前: 浅色 → 点击切换跟随系统", "system": "当前: 跟随系统 → 点击切换深色"}
+        icons = {"dark": "☀", "light": "☾"}
+        tips = {
+            "dark": "当前: 深色 → 点击切换浅色",
+            "light": "当前: 浅色 → 点击切换深色",
+        }
         if self._theme_btn:
             self._theme_btn.setText(icons.get(theme_name, "☀"))
             self._theme_btn.setToolTip(tips.get(theme_name, "切换主题"))
