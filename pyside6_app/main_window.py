@@ -809,6 +809,12 @@ class MainWindow(QMainWindow):
             restored_state['harvester_params'] = self._effective_harvester_params(
                 saved.get('harvester_params') or {}
             )
+            if saved.get('auto_path_planned'):
+                restored_state.update(
+                    auto_path_valid=False,
+                    simulation_done=False,
+                    export_done=False,
+                )
             self.state.safe_update(**restored_state)
             self.log_panel.info("已恢复最近项目；任务状态将按实际缓存内容同步")
             for message in payload.get("cache_validation_messages", []) or []:
@@ -2307,6 +2313,10 @@ class MainWindow(QMainWindow):
         if not path_result.get("ordered_segments"):
             raise ValueError("当前没有可导出的路径，请先生成路径")
         validation = path_result.get("validation", {}) or {}
+        if validation.get("validation_source") == "cache_snapshot" or not bool(
+            validation.get("current_validation_complete", True)
+        ):
+            raise ValueError("路径来自缓存快照，尚未使用当前输入重新验证，禁止正式导出")
         path_valid = bool(
             path_result.get("is_valid", validation.get("valid", False))
             and validation.get("valid", path_result.get("is_valid", False))
@@ -2697,7 +2707,7 @@ class MainWindow(QMainWindow):
             segment_type = str(item.get("segment_type") or ("work" if index % 2 == 0 else "turn"))
             cached_length = item.get("length_m")
             if cached_length is None:
-                cached_length = self._segment_length(points)
+                return {}
             cached_segments.append({
                 "points": points,
                 "type": segment_type,
@@ -2719,8 +2729,12 @@ class MainWindow(QMainWindow):
             if seg["type"] in ("entry", "exit", "unload")
         )
         total_length_m = sum(segment_lengths_m)
+        valid_at_save_time = bool(saved.get("auto_path_valid", False))
         validation = {
-            "valid": bool(saved.get("auto_path_valid", False)),
+            "valid": False,
+            "valid_at_save_time": valid_at_save_time,
+            "current_validation_complete": False,
+            "validation_source": "cache_snapshot",
             "total_length_m": float(saved.get("last_total_path_m") or total_length_m),
             "work_length_m": float(saved.get("last_work_path_m") or work_length_m),
             "turn_length_m": float(saved.get("last_turn_path_m") or turn_length_m),
@@ -2742,7 +2756,7 @@ class MainWindow(QMainWindow):
             "full_path": [seg["points"] for seg in cached_segments],
             "segment_types": [seg["type"] for seg in cached_segments],
             "segment_lengths_m": segment_lengths_m,
-            "is_valid": bool(saved.get("auto_path_valid", False)),
+            "is_valid": False,
             "validation": validation,
             "description": saved.get("auto_path_desc", ""),
             "geo_points": saved.get("auto_path_geo", []),

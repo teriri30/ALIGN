@@ -675,6 +675,11 @@ def test_cached_auto_path_rebuilds_pipeline_result_for_restore():
     assert window._pipeline_result["path"]["segment_types"] == ["work", "turn"]
     assert window._pipeline_result["path"]["segment_lengths_m"] == [5.0, 3.0]
     assert window._pipeline_result["path"]["validation"]["total_length_m"] == 8.0
+    assert window._pipeline_result["path"]["is_valid"] is False
+    assert window.state.auto_path_valid is False
+    assert window._pipeline_result["path"]["validation"]["valid_at_save_time"] is True
+    assert window._pipeline_result["path"]["validation"]["current_validation_complete"] is False
+    assert window._pipeline_result["path"]["validation"]["validation_source"] == "cache_snapshot"
 
 
 def test_task_panel_accordion_keeps_only_one_card_expanded():

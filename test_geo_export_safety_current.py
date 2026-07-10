@@ -144,6 +144,29 @@ def test_manual_route_edit_refreshes_path_but_blocks_unvalidated_export(monkeypa
         window._geo_export_payload()
 
 
+def test_geo_export_rejects_cached_validation_snapshot(monkeypatch):
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)
+    window.geo = _GoodGeo()
+    window._pipeline_result = {
+        "path": {
+            "full_path": [[(1.0, 1.0), (10.0, 1.0)]],
+            "segment_types": ["work"],
+            "validation": {
+                "valid": True,
+                "current_validation_complete": False,
+                "validation_source": "cache_snapshot",
+            },
+            "is_valid": True,
+        }
+    }
+    monkeypatch.setattr(window, "_verify_scientific_provenance", lambda _path: None)
+
+    with pytest.raises(ValueError, match="缓存快照"):
+        window._geo_export_payload()
+
+
 def test_geo_export_rejects_segment_crossing_concave_field_even_when_vertices_are_inside(monkeypatch):
     QApplication.instance() or QApplication([])
     window = MainWindow()

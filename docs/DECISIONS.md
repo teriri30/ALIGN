@@ -32,6 +32,7 @@
 - 不按图像尺寸跨源复用缓存。
 - 推理失效必须使掩膜和路径失效；掩膜失效必须使路径失效。
 - 旧模式缓存失败关闭，不猜测兼容。
+- 恢复的路径几何和指标只能作为历史快照展示；在当前输入与当前验证规则下重新执行完整路径验证前，`auto_path_valid` 必须为 `False`，且禁止正式导出。
 
 **代码锚点**：`CacheRestoreWorker`、`cache.load_project_state`、`provenance.verify_stage_record`。
 

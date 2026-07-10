@@ -9,7 +9,7 @@ from typing import Optional, Tuple, Dict, Any
 import numpy as np
 
 CACHE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hillcache")
-PROJECT_STATE_SCHEMA = 5
+PROJECT_STATE_SCHEMA = 6
 _PROJECT_LOCKS = {}
 _PROJECT_LOCKS_GUARD = threading.Lock()
 _PENDING_STATE_SAVES = {}
@@ -279,6 +279,10 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "export_done": bool(getattr(state, "export_done", False)),
         "auto_path_planned": bool(getattr(state, "auto_path_planned", False)),
         "auto_path_valid": bool(getattr(state, "auto_path_valid", False)),
+        "path_validation_snapshot": {
+            "valid_at_save_time": bool(getattr(state, "auto_path_valid", False)),
+            "source": "current_run" if bool(getattr(state, "auto_path_valid", False)) else "unverified",
+        },
         "auto_path_desc": str(getattr(state, "auto_path_desc", "") or ""),
         "path_provenance": _jsonable(getattr(state, "path_provenance", {}) or {}),
         "path_runtime": _jsonable(getattr(state, "path_runtime", {}) or {}),
