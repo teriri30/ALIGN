@@ -41,6 +41,8 @@
 - `track_outside_support_pct`：履带扫掠离开语义支撑区的比例，不能替代田界指标。
 - `track_uncertain_overlap_pct`：履带扫掠经过未确认残差的比例，仅在提供该图层时有效。
 - `track_forbidden_overlap_pct`：履带扫掠进入人工确认禁行区的比例，仅在提供该图层时有效。
+- `machine_outside_field_pct`：二维刚体模型中机身平面包络扫掠越出田块硬边界的比例；它不等同于履带接地越界率，也不等同于真实 CAD 外廓越界率。
+- `machine_forbidden_overlap_pct`：二维刚体模型中机身平面包络扫掠进入人工确认禁行区的比例；它不替代履带禁行区指标。
 - `footprint_model=planar_rigid_footprint_v2`：路径点表示 `track_contact_center`；左右履带由宽度、中心距和接地长度构成有向矩形。割刀由横向有效割幅线段表示，其纵向位置必须来自实测 `cutter_forward_offset_m`。演示和验证必须调用同一几何定义；`cutter_visual` 仅用于 UI 中显示有厚度的割台外观，不参与覆盖率、碾压率或足迹校验。该模型仍不包含土壤压实、打滑、坡度、悬挂、惯性、GNSS 天线偏移或真实 CAD 外廓。
 - `rolling_body_pct`：履带扫掠与 `processed_mask` 主体重叠面积 / 主体作物面积。
 - `rolling_headland_pct`：履带扫掠与 `headland_mask` 重叠面积 / 田头作物面积；缺少田头层时为 `null`。

@@ -12,6 +12,12 @@ def _valid_path_result(mode="footprint_optimized"):
             "forbidden_mask_present": True,
             "footprint_model": "planar_rigid_footprint_v2",
             "footprint_reference_point": "track_contact_center",
+            "machine_outside_field_pct": 0.0,
+            "machine_forbidden_overlap_pct": 0.0,
+            "validation_limits_pct": {
+                "machine_outside_field": 0.0,
+                "machine_forbidden_overlap": 0.0,
+            },
         },
         "layout": {"work_line_mode": mode},
         "turn_assessment": {"hard_reasons": []},
@@ -69,6 +75,39 @@ def test_machine_readiness_accepts_only_complete_verified_evidence():
     assert readiness["eligible_for_machine_export"] is True
     assert readiness["controlled_trial_ready"] is True
     assert readiness["blockers"] == []
+
+
+def test_machine_candidate_rejects_unacceptable_machine_envelope_risks():
+    from machine_route_validator import assess_machine_readiness
+
+    result = _valid_path_result()
+    result["validation"].update({
+        "machine_outside_field_pct": 0.1,
+        "machine_forbidden_overlap_pct": 0.1,
+        "validation_limits_pct": {
+            "machine_outside_field": 0.0,
+            "machine_forbidden_overlap": 0.0,
+        },
+    })
+
+    readiness = assess_machine_readiness(result, {"forbidden_mask_confirmed": True})
+
+    assert readiness["controlled_trial_ready"] is False
+    assert "machine_envelope_leaves_field" in readiness["controlled_trial_blockers"]
+    assert "machine_envelope_enters_forbidden_region" in readiness["controlled_trial_blockers"]
+
+
+def test_machine_candidate_fails_closed_when_machine_envelope_metrics_are_missing():
+    from machine_route_validator import assess_machine_readiness
+
+    result = _valid_path_result()
+    result["validation"].pop("machine_outside_field_pct")
+    result["validation"].pop("machine_forbidden_overlap_pct")
+
+    readiness = assess_machine_readiness(result, {"forbidden_mask_confirmed": True})
+
+    assert readiness["controlled_trial_ready"] is False
+    assert "machine_envelope_validation_missing" in readiness["controlled_trial_blockers"]
 
 
 def test_footprint_work_line_mode_requires_four_row_band_references(monkeypatch):

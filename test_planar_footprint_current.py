@@ -71,6 +71,41 @@ def test_track_contact_length_changes_terminal_rolling_area():
     assert long["track_swept_area_m2"] > short["track_swept_area_m2"]
 
 
+def test_machine_candidate_validation_rejects_machine_envelope_risk(monkeypatch):
+    import path_planner
+
+    footprint = {
+        "track_core_overlap_pct": 0.0,
+        "planned_target_geometric_coverage_pct": 100.0,
+        "track_outside_field_pct": 0.0,
+        "track_outside_support_pct": 0.0,
+        "track_uncertain_overlap_pct": 0.0,
+        "track_forbidden_overlap_pct": 0.0,
+        "machine_outside_field_pct": 0.1,
+        "machine_forbidden_overlap_pct": 0.0,
+    }
+    monkeypatch.setattr(path_planner, "validate_footprints", lambda *_args, **_kwargs: footprint)
+
+    result = path_planner.validate_path(
+        [[(1.0, 1.0), (2.0, 1.0)]],
+        np.ones((20, 20), dtype=np.uint8) * 255,
+        0.0,
+        geo=_Geo(),
+        state=_State(),
+        segment_types=["work"],
+        config={
+            "validation_profile": "machine_candidate",
+            "max_track_core_overlap_pct": 100.0,
+            "min_geometric_coverage_pct": 0.0,
+        },
+    )
+
+    assert result["valid"] is False
+    assert result["machine_outside_field_pct"] == pytest.approx(0.1)
+    assert result["validation_limits_pct"]["machine_outside_field"] == pytest.approx(0.0)
+    assert any("整机平面包络越出田块" in issue for issue in result["issues"])
+
+
 def test_validation_identifies_rigid_planar_footprint_model():
     crop = np.zeros((80, 120), dtype=np.uint8)
     crop[30:50, 10:110] = 255
@@ -99,6 +134,7 @@ class _State:
     mask_offset_x = 0
     mask_offset_y = 0
     field_boundary = []
+    harvester_params = _params()
 
 
 def _metric_context():

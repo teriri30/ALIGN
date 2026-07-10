@@ -59,6 +59,28 @@ def assess_machine_readiness(
         if float(resolution) > resolution_limit:
             controlled_trial_blockers.append("planning_resolution_too_coarse")
 
+    if validation.get("validation_profile") == "machine_candidate":
+        machine_outside = validation.get("machine_outside_field_pct")
+        machine_forbidden = validation.get("machine_forbidden_overlap_pct")
+        limits = dict(validation.get("validation_limits_pct") or {})
+        max_machine_outside = limits.get("machine_outside_field")
+        max_machine_forbidden = limits.get("machine_forbidden_overlap")
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in (
+                machine_outside,
+                machine_forbidden,
+                max_machine_outside,
+                max_machine_forbidden,
+            )
+        ):
+            controlled_trial_blockers.append("machine_envelope_validation_missing")
+        else:
+            if float(machine_outside) > float(max_machine_outside):
+                controlled_trial_blockers.append("machine_envelope_leaves_field")
+            if float(machine_forbidden) > float(max_machine_forbidden):
+                controlled_trial_blockers.append("machine_envelope_enters_forbidden_region")
+
     controlled_trial_blockers = list(dict.fromkeys(controlled_trial_blockers))
     blockers = list(controlled_trial_blockers)
     if validation.get("validation_profile") != "machine_candidate":

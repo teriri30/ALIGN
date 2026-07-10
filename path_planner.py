@@ -1836,6 +1836,8 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
             "outside_support": 2.0,
             "uncertain": 5.0,
             "forbidden": 0.0,
+            "machine_outside_field": 0.0,
+            "machine_forbidden_overlap": 0.0,
         },
     }.get(profile)
     max_core_overlap = float(cfg.get("max_track_core_overlap_pct", 8.0))
@@ -1856,6 +1858,12 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         profile_limits["forbidden"] if profile_limits
         else cfg.get("max_track_forbidden_overlap_pct", 0.0)
     )
+    if profile == "machine_candidate":
+        max_machine_outside = float(profile_limits["machine_outside_field"])
+        max_machine_forbidden = float(profile_limits["machine_forbidden_overlap"])
+    else:
+        max_machine_outside = None
+        max_machine_forbidden = None
     if footprint["track_core_overlap_pct"] > max_core_overlap:
         issues.append(
             f"履带与稻株核心重叠 {footprint['track_core_overlap_pct']:.1f}% "
@@ -1887,6 +1895,24 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         issues.append(
             f"履带进入禁行区 {forbidden_overlap:.1f}% > {max_forbidden:.1f}%"
         )
+    machine_outside = footprint.get("machine_outside_field_pct")
+    if max_machine_outside is not None:
+        if machine_outside is None:
+            issues.append("缺少整机平面包络田块越界校验")
+        elif machine_outside > max_machine_outside:
+            issues.append(
+                f"整机平面包络越出田块 {machine_outside:.1f}% "
+                f"> {max_machine_outside:.1f}%"
+            )
+    machine_forbidden = footprint.get("machine_forbidden_overlap_pct")
+    if max_machine_forbidden is not None:
+        if machine_forbidden is None:
+            issues.append("缺少整机平面包络禁行区校验")
+        elif machine_forbidden > max_machine_forbidden:
+            issues.append(
+                f"整机平面包络进入禁行区 {machine_forbidden:.1f}% "
+                f"> {max_machine_forbidden:.1f}%"
+            )
     if crossing_count > 0:
         issues.append(f"非相邻作业线交叉 {crossing_count} 处")
 
@@ -1904,6 +1930,8 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
             "track_outside_support": max_outside_support,
             "track_uncertain_overlap": max_uncertain,
             "track_forbidden_overlap": max_forbidden,
+            "machine_outside_field": max_machine_outside,
+            "machine_forbidden_overlap": max_machine_forbidden,
         },
         "field_efficiency_pct": (
             work_length_m / total_length_m * 100.0 if total_length_m > 0 else 0.0
