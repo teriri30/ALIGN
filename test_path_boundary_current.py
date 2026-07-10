@@ -163,6 +163,45 @@ def test_entry_exit_and_unload_segments_report_field_boundary_violations():
     assert diagnostics["feasible"] is False
 
 
+def test_segment_boundary_check_rejects_line_crossing_concave_notch():
+    from path_planner import _segment_inside_field_boundary
+
+    field_polygon = np.asarray([
+        (0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (6.0, 10.0),
+        (6.0, 4.0), (4.0, 4.0), (4.0, 10.0), (0.0, 10.0),
+    ], dtype=np.float32)
+
+    assert not _segment_inside_field_boundary([(2.0, 8.0), (8.0, 8.0)], field_polygon)
+
+
+def test_segment_boundary_check_accepts_line_fully_covered_by_concave_field():
+    from path_planner import _segment_inside_field_boundary
+
+    field_polygon = np.asarray([
+        (0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (6.0, 10.0),
+        (6.0, 4.0), (4.0, 4.0), (4.0, 10.0), (0.0, 10.0),
+    ], dtype=np.float32)
+
+    assert _segment_inside_field_boundary([(1.0, 2.0), (9.0, 2.0)], field_polygon)
+
+
+@pytest.mark.parametrize("segment_type", [
+    "entry", "exit", "unload", "turn", "turn_reverse", "turn_aux", "turn_approach",
+])
+def test_all_non_work_segment_types_reject_concave_boundary_crossing(segment_type):
+    from path_planner import _non_work_boundary_violations
+
+    field_polygon = np.asarray([
+        (0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (6.0, 10.0),
+        (6.0, 4.0), (4.0, 4.0), (4.0, 10.0), (0.0, 10.0),
+    ], dtype=np.float32)
+    violations = _non_work_boundary_violations(
+        [[(2.0, 8.0), (8.0, 8.0)]], [segment_type], field_polygon
+    )
+
+    assert violations == [{"segment_index": 0, "segment_type": segment_type}]
+
+
 def test_prepare_band_centerlines_does_not_trim_harvestable_row_ends_by_default():
     from path_planner import _smooth_band_centerline
 

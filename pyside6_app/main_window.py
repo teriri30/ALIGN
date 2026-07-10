@@ -2371,19 +2371,20 @@ class MainWindow(QMainWindow):
                         )
         field_boundary = getattr(self.state, "field_boundary", None) or []
         if len(field_boundary) >= 3:
-            polygon = np.asarray(field_boundary, dtype=np.float32)
+            from path_planner import segment_within_field_boundary
+
+            polygon = np.asarray(field_boundary, dtype=np.float64)
             for segment_index, segment in enumerate(full_path):
-                for point_index, (pixel_x, pixel_y) in enumerate(segment):
-                    if cv2.pointPolygonTest(
-                        polygon,
-                        (float(pixel_x), float(pixel_y)),
-                        False,
-                    ) < -1e-6:
-                        raise ValueError(
-                            "route point leaves field boundary; formal export is blocked: "
-                            f"segment={segment_index}, point={point_index}, "
-                            f"pixel=({float(pixel_x):.3f},{float(pixel_y):.3f})"
-                        )
+                segment_type = (
+                    segment_types[segment_index]
+                    if segment_index < len(segment_types)
+                    else ("work" if segment_index % 2 == 0 else "turn")
+                )
+                if not segment_within_field_boundary(segment, polygon):
+                    raise ValueError(
+                        "route segment leaves field boundary; formal export is blocked: "
+                        f"segment={segment_index}, type={segment_type}"
+                    )
         self._verify_scientific_provenance(path_result)
         expected_count = self._path_result_point_count(path_result)
         from path_planner import global_path_to_geo, validate_geo_points

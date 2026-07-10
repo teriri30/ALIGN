@@ -11,6 +11,7 @@ import math, csv, json, os, tempfile
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 import cv2
+from shapely.geometry import LineString, Point, Polygon
 from config import Config, AppLogger
 from footprint_planner import generate_work_lines, validate_footprints
 from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
@@ -273,8 +274,43 @@ def _points_inside_polygon(points, polygon: Optional[np.ndarray], tolerance: flo
     return True
 
 
+def segment_within_field_boundary(segment, polygon: Optional[np.ndarray]) -> bool:
+    """Return whether an entire polyline is covered by the selected field.
+
+    DECISION-010/011: checking only sampled route vertices is insufficient for
+    concave field boundaries because one edge can cross a notch between two
+    in-boundary endpoints.  This helper deliberately uses ``covers`` so a
+    route exactly on the selected boundary remains valid.
+    """
+    if polygon is None:
+        return True
+    try:
+        boundary_points = [
+            (float(point[0]), float(point[1]))
+            for point in np.asarray(polygon, dtype=np.float64)
+        ]
+        if len(boundary_points) < 3:
+            return False
+        field = Polygon(boundary_points)
+        if field.is_empty or not field.is_valid:
+            return False
+
+        points = []
+        for point in segment or []:
+            current = (float(point[0]), float(point[1]))
+            if not points or current != points[-1]:
+                points.append(current)
+        if not points:
+            return False
+        geometry = Point(points[0]) if len(points) == 1 else LineString(points)
+        return bool(field.covers(geometry))
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
 def _segment_inside_field_boundary(segment, polygon: Optional[np.ndarray]) -> bool:
-    return _points_inside_polygon(segment, polygon)
+    """Backward-compatible private name for complete field-boundary coverage."""
+    return segment_within_field_boundary(segment, polygon)
 
 
 def _non_work_boundary_violations(full_path, segment_types, polygon: Optional[np.ndarray]) -> List[Dict]:

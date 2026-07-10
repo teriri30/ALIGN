@@ -144,6 +144,29 @@ def test_manual_route_edit_refreshes_path_but_blocks_unvalidated_export(monkeypa
         window._geo_export_payload()
 
 
+def test_geo_export_rejects_segment_crossing_concave_field_even_when_vertices_are_inside(monkeypatch):
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tif_rgb = np.zeros((100, 100, 3), dtype=np.uint8)
+    window.geo = _GoodGeo()
+    window.state.field_boundary = [
+        (10.0, 10.0), (90.0, 10.0), (90.0, 90.0), (60.0, 90.0),
+        (60.0, 40.0), (40.0, 40.0), (40.0, 90.0), (10.0, 90.0),
+    ]
+    window._pipeline_result = {
+        "path": {
+            "full_path": [[(20.0, 80.0), (80.0, 80.0)]],
+            "segment_types": ["work"],
+            "validation": {"valid": True},
+            "is_valid": True,
+        }
+    }
+    monkeypatch.setattr(window, "_verify_scientific_provenance", lambda _path: None)
+
+    with pytest.raises(ValueError, match="field boundary"):
+        window._geo_export_payload()
+
+
 def test_geo_export_rejects_valid_flag_when_route_point_leaves_field_boundary(monkeypatch):
     QApplication.instance() or QApplication([])
     window = MainWindow()
