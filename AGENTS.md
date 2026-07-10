@@ -16,4 +16,6 @@ D:\zhl\anaconda\envs\game\python.exe -m compileall -q .
 D:\zhl\anaconda\envs\game\python.exe -m pytest -q
 ```
 
+Git Bash / Hermes 环境使用 `bash scripts/test.sh -q`，脚本会清理继承的 `PYTHONPATH` 并支持用 `REUI_PYTHON` 覆盖解释器路径。
+
 本文件只负责入口。完整规则以 `AI_RULES.md` 和 `docs/DECISIONS.md` 为准。

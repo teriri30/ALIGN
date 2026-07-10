@@ -26,6 +26,13 @@ D:\zhl\anaconda\envs\game\python.exe -m pytest -q
 D:\zhl\anaconda\envs\game\python.exe -m pip check
 ```
 
+在 Git Bash、Hermes 或其他可能注入 Python 环境变量的终端中，使用项目脚本以隔离 `PYTHONPATH`：
+
+```bash
+bash scripts/test.sh -q
+# 或指定解释器：REUI_PYTHON=/d/zhl/anaconda/envs/game/python.exe bash scripts/test.sh -q
+```
+
 导出后可独立验证路径文件和阶段证据；加入 `--verify-sources` 会重新哈希源 GeoTIFF 和模型：
 
 ```powershell
