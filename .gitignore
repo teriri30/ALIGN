@@ -9,9 +9,14 @@ __pycache__/
 config.json
 recent_files.json
 .hillcache/
+.reasonix/
 logs/
 *.log
 *.tmp
+.tmp_*.png
+
+# Generated/decompiled artifacts
+docs/archive/*decompiled*
 
 # Large local assets
 data/models/*.pt
