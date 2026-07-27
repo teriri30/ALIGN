@@ -1,10 +1,4 @@
-numpy==2.2.6
-opencv-python==4.13.0.92
-Pillow==12.1.1
-PySide6==6.11.1
-pyproj==3.7.1
-rasterio==1.4.4
-shapely==2.1.2
-affine==2.4.0
-scipy==1.15.3
+-r requirements-core.txt
 pytest==8.4.2
+pytest-cov==6.2.1
+ruff==0.12.12

@@ -222,24 +222,37 @@ class ImageViewer(QGraphicsView):
         if self._pixmap is None:
             return
         scale = max(abs(self.transform().m11()), 0.001)
-        pad_x = max(self._pixmap.width() * 0.5, self.viewport().width() / scale)
-        pad_y = max(self._pixmap.height() * 0.5, self.viewport().height() / scale)
+        image_h, image_w = self._image_shape or (self._pixmap.height(), self._pixmap.width())
+        pad_x = max(image_w * 0.5, self.viewport().width() / scale)
+        pad_y = max(image_h * 0.5, self.viewport().height() / scale)
         self._scene.setSceneRect(QRectF(
             -pad_x, -pad_y,
-            self._pixmap.width() + pad_x * 2,
-            self._pixmap.height() + pad_y * 2,
+            image_w + pad_x * 2,
+            image_h + pad_y * 2,
         ))
 
-    def set_image(self, img):
+    def set_image(self, img, *, logical_shape=None):
+        """DECISION-004: bound Qt texture memory without changing scene coordinates."""
         if img is None or img.size == 0:
             return
         self.clear_overlays()
-        self._image_shape = img.shape[:2]
+        if logical_shape is None:
+            logical_shape = img.shape[:2]
+        from pyside6_app.workers import bounded_render_preview
+        img = bounded_render_preview(img)
+        logical_h, logical_w = (int(logical_shape[0]), int(logical_shape[1]))
+        if min(logical_h, logical_w) <= 0:
+            raise ValueError("logical image dimensions must be positive")
+        self._image_shape = (logical_h, logical_w)
         pix = self._numpy_to_pixmap(img)
         if pix is None:
             return
         self._pixmap = pix
         self._pixmap_item.setPixmap(pix)
+        self._pixmap_item.setTransform(QTransform().scale(
+            logical_w / float(pix.width()),
+            logical_h / float(pix.height()),
+        ))
         self._update_scene_rect_padding()
 
     def clear_image(self):
@@ -247,6 +260,7 @@ class ImageViewer(QGraphicsView):
         self._pixmap = None
         self._image_shape = None
         self._pixmap_item.setPixmap(QPixmap())
+        self._pixmap_item.setTransform(QTransform())
         self._scene.setSceneRect(QRectF())
 
     def _numpy_to_pixmap(self, img):
@@ -701,7 +715,7 @@ class ImageViewerGroup(QWidget):
         animation_layout.addWidget(self.anim_progress_label)
         self.anim_speed_combo = QComboBox()
         self.anim_speed_combo.setFixedWidth(72)
-        self.anim_speed_combo.setToolTip("播放倍速，不改变规划路径，也不代表实车速度")
+        self.anim_speed_combo.setToolTip("播放倍速仅影响动画播放速度；路径速度采用农机参数中的作业、转弯和进出场速度")
         for ratio in (0.25, 0.5, 1, 2, 5, 10, 20, 40, 60):
             self.anim_speed_combo.addItem(f"{ratio:g}x", float(ratio))
         self.anim_speed_combo.setCurrentIndex(self.anim_speed_combo.findData(1.0))
@@ -879,8 +893,8 @@ class ImageViewerGroup(QWidget):
         self._ppm = ppm
         self._scale_bar.update_scale(ppm, self.viewer.get_view_scale())
 
-    def set_image(self, img):
-        self.viewer.set_image(img)
+    def set_image(self, img, *, logical_shape=None):
+        self.viewer.set_image(img, logical_shape=logical_shape)
         self.viewer.fit_to_view()
 
     def clear_image(self):

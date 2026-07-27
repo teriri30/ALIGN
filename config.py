@@ -1,5 +1,5 @@
 """Configuration management and logging for the PySide6 application."""
-import os, json, logging, datetime, tempfile, glob as _glob, threading
+import os, json, logging, datetime, tempfile, glob as _glob, threading, math
 from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, Optional
@@ -29,6 +29,8 @@ def _validated_number(section: dict, key: str, *, minimum=None, maximum=None, st
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigValidationError(f"{key} must be a number")
     value = float(value)
+    if not math.isfinite(value):
+        raise ConfigValidationError(f"{key} must be finite")
     if minimum is not None and (value < minimum or (strict_min and value == minimum)):
         op = ">" if strict_min else ">="
         raise ConfigValidationError(f"{key} must be {op} {minimum}")
@@ -87,9 +89,11 @@ def validate_config(raw: dict) -> dict:
     planning = raw.get("path_planning", {})
     if "work_line_mode" in planning and str(planning["work_line_mode"]) not in {
         "band_centerline", "footprint_optimized",
+        "band_centerline_with_footprint_validation",
     }:
         raise ConfigValidationError(
-            "work_line_mode must be band_centerline or footprint_optimized"
+            "work_line_mode must be band_centerline or "
+            "band_centerline_with_footprint_validation"
         )
     if "validation_profile" in planning and str(planning["validation_profile"]) not in {
         "research", "field_trial", "machine_candidate",
@@ -116,6 +120,12 @@ def validate_config(raw: dict) -> dict:
         planning, "headland_damage_weight",
         minimum=0.0, maximum=1.0, strict_min=True,
     )
+    if "headland_turn_optimization_enabled" in planning and not isinstance(
+        planning["headland_turn_optimization_enabled"], bool
+    ):
+        raise ConfigValidationError(
+            "headland_turn_optimization_enabled must be boolean"
+        )
 
     mask = raw.get("mask_processing", {})
     if "strength" in mask and str(mask["strength"]) not in {

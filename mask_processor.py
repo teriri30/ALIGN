@@ -8,6 +8,7 @@ import numpy as np
 import cv2
 from config import Config, AppLogger
 from row_geometry import regularize_crop_mask
+from row_orientation import estimate_mask_axis_pca, estimate_row_orientation
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -25,20 +26,7 @@ def detect_main_direction(mask: np.ndarray) -> float:
     文献参考: 此方法等价于最小面积外接矩形（MABR）的长轴方向，
     在田块级别的方向估计中是标准做法。
     """
-    ys, xs = np.where(mask > 0)
-    if len(xs) < 50:
-        return 0.0
-    coords = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
-    mean = coords.mean(axis=0)
-    coords -= mean
-    cov = np.cov(coords.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    # 最大特征值对应的特征向量 = 主方向
-    main_vec = eigvecs[:, np.argmax(eigvals)]
-    angle = math.atan2(main_vec[1], main_vec[0])
-    # 归一化到 [0, π)
-    angle = angle % math.pi
-    return angle
+    return estimate_mask_axis_pca(mask)
 
 
 def detect_main_direction_refined(mask: np.ndarray,
@@ -47,7 +35,7 @@ def detect_main_direction_refined(mask: np.ndarray,
 
     Stage 1: PCA 粗估计田块主方向（field-level orientation）
     Stage 2: 若有源图像，使用 FFT 频谱分析精化种植行方向
-             (参考: _estimate_row_angle in planning.py)
+             (参考: _estimate_row_angle in coverage.py)
 
     Args:
         mask: 二值掩膜
@@ -62,9 +50,7 @@ def detect_main_direction_refined(mask: np.ndarray,
         return coarse_angle
 
     try:
-        # 复用 planning.py 中已验证的 FFT 方向估计
-        from planning import _estimate_row_angle
-        refined_angle = _estimate_row_angle(mask, source_image, None)
+        refined_angle = estimate_row_orientation(mask, source_image)
         # 检查精化角度与粗估计的一致性（容差 15°）
         diff = abs(refined_angle - coarse_angle) % math.pi
         diff = min(diff, math.pi - diff)
@@ -78,7 +64,7 @@ def detect_main_direction_refined(mask: np.ndarray,
                      f"FFT={math.degrees(refined_angle):.1f}°, "
                      f"差异={math.degrees(diff):.1f}° → 采用 FFT")
             return refined_angle
-    except (ImportError, Exception) as e:
+    except Exception as e:
         log = AppLogger()
         log.debug(f"FFT 精化不可用，使用 PCA 粗估计: {e}")
         return coarse_angle

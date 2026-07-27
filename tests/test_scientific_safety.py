@@ -46,7 +46,7 @@ def test_metric_mask_pipeline_failure_is_not_silently_downgraded(monkeypatch):
 
 
 def test_failed_rerun_cannot_mark_old_mask_as_new_success(monkeypatch, tmp_path):
-    import model
+    import inference
     import rasterio
     from state import AppState
 
@@ -62,14 +62,14 @@ def test_failed_rerun_cannot_mark_old_mask_as_new_success(monkeypatch, tmp_path)
         def is_loaded(self):
             return True
 
-    monkeypatch.setattr(model.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(inference.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(rasterio, "open", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("read failed")))
 
     state = AppState()
     state.mask_raw = np.ones((4, 4), dtype=np.uint8)
     state.inference_done = True
     state.field_boundary = [(0, 0), (3, 0), (3, 3), (0, 3)]
-    runner = model.InferenceRunner(state, Engine(), _MetricGeo())
+    runner = inference.InferenceRunner(state, Engine(), _MetricGeo())
 
     runner.start_from_tif(str(tmp_path / "broken.tif"), (4, 4), state.field_boundary, 1)
 
@@ -80,7 +80,7 @@ def test_failed_rerun_cannot_mark_old_mask_as_new_success(monkeypatch, tmp_path)
 
 def test_failed_inference_tile_aborts_instead_of_becoming_background():
     """DECISION-004: a missing tile is a failed inference, not valid background."""
-    from model import TiledInference
+    from inference import TiledInference
 
     class FailingEngine:
         def is_loaded(self):
@@ -170,7 +170,7 @@ def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
     assert "接近 1" in summary
     assert "倒车 1" in summary
     assert "进出田/卸粮 1" in summary
-    assert panel._safety.text() == "路径状态：不建议导出"
+    assert panel._safety.text() == "路径状态：路径校验未通过"
     assert "足迹优化" in panel._safety.toolTip()
     assert "支撑<=100" in panel._safety.toolTip()
     assert [row._segment_type for row in panel.findChildren(RouteSegmentRow)] == [
@@ -186,14 +186,13 @@ def test_invalid_or_manually_edited_path_is_blocked_from_export():
     QApplication.instance() or QApplication([])
     window = MainWindow()
     window.geo = _MetricGeo()
-    window._pipeline_result = {
-        "path": {
-            "full_path": [[(1.0, 1.0), (2.0, 2.0)]],
-            "segment_types": ["work"],
-            "validation": {"valid": False, "issues": ["manual edit"]},
-            "is_valid": False,
-        }
-    }
+    from state import AutoPathSegment
+
+    window.state.auto_path_segments = [
+        AutoPathSegment(points=[(1.0, 1.0), (2.0, 2.0)], segment_type="work")
+    ]
+    window.state.auto_path_valid = False
+    window.state.path_validation = {"valid": False, "issues": ["manual edit"]}
 
     with pytest.raises(ValueError, match="未通过安全验证"):
         window._geo_export_payload()
@@ -219,15 +218,14 @@ def test_export_blocks_when_harvester_parameters_changed_after_planning():
     window.state.harvester_params["cutter_forward_offset_m"] = 1.2
     planned = dict(window.state.harvester_params)
     planned["track_width_m"] += 0.1
-    window._pipeline_result = {
-        "path": {
-            "full_path": [[(1.0, 1.0), (2.0, 2.0)]],
-            "segment_types": ["work"],
-            "validation": {"valid": True, "issues": []},
-            "is_valid": True,
-            "planning_factors": {"harvester": planned},
-        }
-    }
+    from state import AutoPathSegment
+
+    window.state.auto_path_segments = [
+        AutoPathSegment(points=[(1.0, 1.0), (2.0, 2.0)], segment_type="work")
+    ]
+    window.state.auto_path_valid = True
+    window.state.path_validation = {"valid": True, "issues": []}
+    window.state.path_artifact = {"planning_factors": {"harvester": planned}}
 
     with pytest.raises(ValueError, match="农机参数与路径规划时不一致"):
         window._geo_export_payload()
@@ -290,6 +288,41 @@ def test_queued_project_save_serializes_enqueue_time_snapshot(tmp_path, monkeypa
 
     restored = cache.load_project_state(str(source))
     assert restored["field_area_m2"] == 10.0
+
+
+def test_older_queued_project_save_cannot_overwrite_newer_sync_save(tmp_path, monkeypatch):
+    import cache
+    from state import AppState
+
+    class DeferredThread:
+        targets = []
+
+        def __init__(self, target, **_kwargs):
+            self.__class__.targets.append(target)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setattr(cache.threading, "Thread", DeferredThread)
+    cache._PENDING_STATE_SAVES.clear()
+    cache._ACTIVE_STATE_SAVERS.clear()
+    source = tmp_path / "field.tif"
+    source.write_bytes(b"source")
+    state = AppState()
+    state.tif_path = str(source)
+    state.project_generation = 1
+    state.field_area_m2 = 10.0
+
+    cache.request_project_state_save(str(source), state, stage="old")
+    state.project_generation = 2
+    state.field_area_m2 = 99.0
+    cache.save_project_state(str(source), state, stage="new")
+    DeferredThread.targets[-1]()
+
+    restored = cache.load_project_state(str(source))
+    assert restored["project_generation"] == 2
+    assert restored["field_area_m2"] == 99.0
 
 
 def test_route_export_manifest_records_integrity_and_validation(tmp_path):

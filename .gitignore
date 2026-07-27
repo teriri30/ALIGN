@@ -1,4 +1,5 @@
 # Python
+.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -26,8 +27,14 @@ data/tif/
 *.tif
 *.tiff
 
+# Local assistant/runtime workspace
+.hermes/
+
 # IDE / OS
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+experiments/
+.tmp_test_runtime/
+archive/runtime/

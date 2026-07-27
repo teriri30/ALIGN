@@ -7,6 +7,7 @@ import cv2
 from config import Config, AppLogger
 from state import AppState
 from geo import GeoUtils
+from task_lifecycle import TaskToken, make_task_token, result_is_admissible
 # 掩膜处理和路径规划由独立步骤负责，不在推理运行器中调用
 
 
@@ -237,16 +238,61 @@ class TiledInference:
 
 # ─── InferenceRunner ────────────────────────────────────────
 class InferenceRunner:
-    def __init__(self, state: AppState, engine: ModelEngine, geo: GeoUtils):
+    def __init__(
+        self,
+        state: AppState,
+        engine: ModelEngine,
+        geo: GeoUtils,
+        token: Optional[TaskToken] = None,
+    ):
         self.state = state
         self.engine = engine
         self.geo = geo
         self.cfg = Config()
         self.log = AppLogger()
         self._thread: Optional[threading.Thread] = None
+        # Library callers may omit a token; capture identity at construction so
+        # late results still fail closed after a project/model switch.
+        self.token = token or make_task_token(state, "inference")
+        self._cancel_event = threading.Event()
+        self._cache_tif_path = str(getattr(state, "tif_path", "") or "")
+
+    def cancel(self):
+        """Invalidate this runner; in-flight work must not commit its result."""
+        self._cancel_event.set()
+        if self.token is not None:
+            self.token.invalidate()
+
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def _is_active(self) -> bool:
+        if self._cancel_event.is_set():
+            return False
+        # Fail closed: late results without a captured task token are rejected.
+        if self.token is None:
+            return False
+        return result_is_admissible(self.token, self.state)
+
+    def _update(self, **kwargs) -> bool:
+        """Update state only while this task still owns the current project."""
+        if not self._is_active():
+            return False
+        self.state.safe_update(**kwargs)
+        return True
+
+    def _cleanup(self, **kwargs) -> bool:
+        """Clear task flags only when this task still owns the project."""
+        if self.token is None or not self.token.belongs_to(self.state):
+            return False
+        self.state.safe_update(**kwargs)
+        return True
 
     def start(self, full_image: np.ndarray, field_boundary: Optional[List] = None):
+        if not self._is_active():
+            return
         if self.state.inference_running: return
+        self._cache_tif_path = str(getattr(self.state, "tif_path", "") or "")
         self.state.safe_update(
             mask_raw=None,
             inference_original_mask=None,
@@ -267,8 +313,9 @@ class InferenceRunner:
         discard narrow-row evidence and invalidate physical downstream results.
         Oversized crops therefore stream source-resolution tiles.
         """
-        if self.state.inference_running:
+        if not self._is_active() or self.state.inference_running:
             return
+        self._cache_tif_path = str(tif_path or "")
         self.state.safe_update(
             mask_raw=None,
             inference_original_mask=None,
@@ -352,7 +399,7 @@ class InferenceRunner:
                     projected = cv2.resize(tile_mask[:sh, :sw], (dx1 - dx0, dy1 - dy0), interpolation=cv2.INTER_NEAREST)
                     np.maximum(out_mask[dy0:dy1, dx0:dx1], projected, out=out_mask[dy0:dy1, dx0:dx1])
                 processed += 1
-            self.state.safe_update(
+            self._update(
                 inference_progress=0.04 + (processed / max(1, total)) * 0.84,
                 status_message=f"原始影像流式切片推理中... {int(processed / max(1, total) * 100)}%",
             )
@@ -417,7 +464,7 @@ class InferenceRunner:
             from raster_preprocessing import read_rgb_raster
 
             if not field_boundary or len(field_boundary) < 3:
-                self.state.safe_update(status_message="推理失败：请先圈选田块", inference_running=False)
+                self._update(status_message="推理失败：请先圈选田块", inference_running=False)
                 return
 
             display_h, display_w = [max(1, int(v)) for v in display_shape[:2]]
@@ -428,7 +475,7 @@ class InferenceRunner:
             x1_d = min(display_w, int(math.ceil(float(np.max(pts_display[:, 0])))) + 1 + pad_display)
             y1_d = min(display_h, int(math.ceil(float(np.max(pts_display[:, 1])))) + 1 + pad_display)
 
-            self.state.safe_update(inference_progress=0.03, status_message="正在读取原始分辨率田块裁剪...")
+            self._update(inference_progress=0.03, status_message="正在读取原始分辨率田块裁剪...")
             with rasterio.open(tif_path) as src:
                 scale_x = float(src.width) / float(display_w)
                 scale_y = float(src.height) / float(display_h)
@@ -440,7 +487,7 @@ class InferenceRunner:
                 x1_src = min(src.width, int(math.ceil(x1_d * scale_x)))
                 y1_src = min(src.height, int(math.ceil(y1_d * scale_y)))
                 if x1_src <= x0_src or y1_src <= y0_src:
-                    self.state.safe_update(status_message="推理失败：田块范围无效", inference_running=False)
+                    self._update(status_message="推理失败：田块范围无效", inference_running=False)
                     return
                 out_w = max(1, x1_d - x0_d)
                 out_h = max(1, y1_d - y0_d)
@@ -458,7 +505,7 @@ class InferenceRunner:
                         f"原始裁剪区域过大 ({crop_w}x{crop_h}, {crop_pixels / 1_000_000:.1f}MP)，"
                         "改用原始分辨率流式切片推理，避免整体下采样导致掩膜变粗"
                     )
-                    self.state.safe_update(
+                    self._update(
                         status_message=(
                             "圈选区域原始分辨率较大，正在按 640px 原始切片流式推理..."
                         )
@@ -495,7 +542,7 @@ class InferenceRunner:
             )
             if crop_pixels <= max_crop_pixels or max_crop_pixels <= 0:
                 def progress_cb(pct: float):
-                    self.state.safe_update(
+                    self._update(
                         inference_progress=0.04 + pct * 0.84,
                         status_message=f"原始影像切片推理中... {int(pct * 100)}%",
                     )
@@ -511,12 +558,12 @@ class InferenceRunner:
                     batch_size=4,
                 )
             if crop_mask_src is not None:
-                self.state.safe_update(inference_progress=0.92, status_message="正在裁剪田块范围...")
+                self._update(inference_progress=0.92, status_message="正在裁剪田块范围...")
                 clipped = cv2.bitwise_and(crop_mask_src, crop_mask_src, mask=crop_field_mask)
                 if np.count_nonzero(clipped) > 0:
                     crop_mask_src = clipped
             if crop_mask_src is None or np.count_nonzero(crop_mask_src) == 0:
-                self.state.safe_update(status_message="推理失败：掩膜为空", inference_running=False)
+                self._update(status_message="推理失败：掩膜为空", inference_running=False)
                 return
 
             if crop_mask_src.shape[:2] == (out_h, out_w):
@@ -565,9 +612,29 @@ class InferenceRunner:
                 "display_scale_x": float(scale_x),
                 "display_scale_y": float(scale_y),
             }
+            if not self._is_active():
+                return
             from cache import save_mask, save_project_state
-            save_mask(self.state.tif_path, mask, x0_d, y0_d, meta=cache_meta)
-            save_mask(self.state.tif_path, mask, x0_d, y0_d, suffix="_best", meta=cache_meta)
+            cache_tif_path = self._cache_tif_path
+            if not cache_tif_path or save_mask(
+                cache_tif_path,
+                mask,
+                x0_d,
+                y0_d,
+                meta=cache_meta,
+                commit_callback=self._is_active,
+            ) is False:
+                return
+            if not self._is_active() or save_mask(
+                cache_tif_path,
+                mask,
+                x0_d,
+                y0_d,
+                suffix="_best",
+                meta=cache_meta,
+                commit_callback=self._is_active,
+            ) is False:
+                return
             non_zero = np.count_nonzero(mask)
             inference_runtime = {
                 "stage": "inference",
@@ -575,7 +642,7 @@ class InferenceRunner:
                 "source_crop_shape": [int(crop_h), int(crop_w)],
                 "display_mask_shape": [int(out_h), int(out_w)],
             }
-            self.state.safe_update(
+            self._update(
                 mask_raw=mask,
                 inference_original_mask=mask,
                 mask_offset_x=x0_d,
@@ -590,19 +657,26 @@ class InferenceRunner:
                 inference_progress=1.0,
                 status_message=f"AI 识别完成，原始影像推理掩膜已保存（非零像素: {non_zero}）。请执行「掩膜处理」。",
             )
-            save_project_state(self.state.tif_path, self.state, stage="inference")
+            if not self._is_active():
+                return
+            save_project_state(
+                cache_tif_path,
+                self.state,
+                stage="inference",
+                commit_callback=self._is_active,
+            )
             succeeded = True
             self.log.info(f"原始影像推理完成: source_mask={crop_mask_src.shape}, display_mask={mask.shape}, offset=({x0_d},{y0_d})")
         except Exception as e:
             self.log.error(f"原始影像推理异常: {traceback.format_exc()}")
-            self.state.safe_update(status_message=f"推理失败: {e}")
+            self._update(status_message=f"推理失败: {e}")
         finally:
-            self.state.safe_update(
+            self._cleanup(
                 inference_running=False,
                 inference_progress=1.0,
                 inference_done=succeeded,
             )
-            if succeeded:
+            if succeeded and self._is_active():
                 from workflow import WorkflowUpdater
                 WorkflowUpdater.advance(self.state, "INFERENCE_DONE")
 
@@ -611,7 +685,7 @@ class InferenceRunner:
         started_at = time.perf_counter()
         try:
             def progress_cb(pct: float):
-                self.state.safe_update(
+                self._update(
                     inference_progress=0.04 + pct * 0.84,
                     status_message=f"切片推理中... {int(pct * 100)}%",
                 )
@@ -650,7 +724,7 @@ class InferenceRunner:
                     batch_size=4,
                 )
                 if crop_mask is not None:
-                    self.state.safe_update(
+                    self._update(
                         inference_progress=0.92,
                         status_message="正在裁剪田块范围...",
                     )
@@ -669,14 +743,14 @@ class InferenceRunner:
                 mask = np.zeros((H, W), dtype=np.uint8)
 
             if mask is None or np.count_nonzero(mask) == 0:
-                self.state.safe_update(
+                self._update(
                     status_message="推理失败：掩膜为空",
                     inference_running=False,
                 )
                 return
 
             boundary_meta = [[float(px), float(py)] for px, py in (self.state.field_boundary or [])]
-            self.state.safe_update(
+            self._update(
                 inference_progress=0.97,
                 status_message="正在保存项目推理结果...",
             )
@@ -686,7 +760,7 @@ class InferenceRunner:
             if model_path and not model_sha256:
                 model_sha256 = file_sha256(model_path)
             provenance_inputs = {
-                "source_array_sha256": array_sha256(full_image),
+                "source_array_sha256": array_sha256(image),
                 "model_sha256": model_sha256,
                 "field_boundary": boundary_meta,
                 "inference_config": {
@@ -709,13 +783,32 @@ class InferenceRunner:
                 "field_boundary": boundary_meta,
                 "field_area_m2": float(self.state.field_area_m2 or 0.0),
             }
-
+            if not self._is_active():
+                return
             from cache import save_mask, save_project_state
-            save_mask(self.state.tif_path, mask, x0, y0, meta=cache_meta)
-            save_mask(self.state.tif_path, mask, x0, y0, suffix="_best", meta=cache_meta)
+            cache_tif_path = self._cache_tif_path
+            if not cache_tif_path or save_mask(
+                cache_tif_path,
+                mask,
+                x0,
+                y0,
+                meta=cache_meta,
+                commit_callback=self._is_active,
+            ) is False:
+                return
+            if not self._is_active() or save_mask(
+                cache_tif_path,
+                mask,
+                x0,
+                y0,
+                suffix="_best",
+                meta=cache_meta,
+                commit_callback=self._is_active,
+            ) is False:
+                return
 
             non_zero = np.count_nonzero(mask)
-            self.state.safe_update(
+            self._update(
                 mask_raw=mask,
                 inference_original_mask=mask,
                 mask_offset_x=x0,
@@ -733,19 +826,26 @@ class InferenceRunner:
                 inference_progress=1.0,
                 status_message=f"AI 识别完成，原始掩膜已保存（非零像素: {non_zero}）。请执行「掩膜处理」。",
             )
-            save_project_state(self.state.tif_path, self.state, stage="inference")
+            if not self._is_active():
+                return
+            save_project_state(
+                cache_tif_path,
+                self.state,
+                stage="inference",
+                commit_callback=self._is_active,
+            )
             succeeded = True
             self.log.info(f"原始掩膜推理完成: mask shape={mask.shape}, non_zero={non_zero}, offset=({x0},{y0})")
 
         except Exception as e:
             self.log.error(f"推理异常: {traceback.format_exc()}")
-            self.state.safe_update(status_message=f"推理失败: {e}")
+            self._update(status_message=f"推理失败: {e}")
         finally:
-            self.state.safe_update(
+            self._cleanup(
                 inference_running=False,
                 inference_progress=1.0,
                 inference_done=succeeded,
             )
-            if succeeded:
+            if succeeded and self._is_active():
                 from workflow import WorkflowUpdater
                 WorkflowUpdater.advance(self.state, "INFERENCE_DONE")

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 
 def _valid_path_result(mode="footprint_optimized"):
@@ -110,6 +111,19 @@ def test_machine_candidate_fails_closed_when_machine_envelope_metrics_are_missin
     assert "machine_envelope_validation_missing" in readiness["controlled_trial_blockers"]
 
 
+@pytest.mark.parametrize("metric", [float("nan"), float("inf"), "invalid"])
+def test_machine_candidate_readiness_rejects_non_finite_machine_envelope_metric(metric):
+    from machine_route_validator import assess_machine_readiness
+
+    result = _valid_path_result()
+    result["validation"]["machine_outside_field_pct"] = metric
+
+    readiness = assess_machine_readiness(result, {"forbidden_mask_confirmed": True})
+
+    assert readiness["controlled_trial_ready"] is False
+    assert "machine_envelope_validation_missing" in readiness["controlled_trial_blockers"]
+
+
 def test_footprint_work_line_mode_requires_four_row_band_references(monkeypatch):
     import path_planner
 
@@ -141,7 +155,7 @@ def test_footprint_work_line_mode_requires_four_row_band_references(monkeypatch)
     )
 
     assert lines == []
-    assert layout["work_line_mode"] == "footprint_optimized"
+    assert layout["work_line_mode"] == "band_centerline_with_footprint_validation"
     assert layout["reason"] == "no_valid_four_row_centerlines"
     assert called is False
 
@@ -161,7 +175,7 @@ def test_forbidden_regions_are_rasterized_in_local_mask_coordinates():
     assert mask[0, 0] == 0
 
 
-def test_project_cache_keeps_confirmed_forbidden_regions(tmp_path):
+def test_cache_keeps_confirmed_forbidden_regions(tmp_path):
     from cache import _build_project_state_payload
 
     tif_path = tmp_path / "source.tif"

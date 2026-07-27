@@ -149,21 +149,38 @@ def test_geo_export_rejects_cached_validation_snapshot(monkeypatch):
     window = MainWindow()
     window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)
     window.geo = _GoodGeo()
+    window._store_path_result({
+        "full_path": [[(1.0, 1.0), (10.0, 1.0)]],
+        "segment_types": ["work"],
+        "validation": {
+            "valid": True,
+            "current_validation_complete": False,
+            "validation_source": "cache_snapshot",
+        },
+        "is_valid": True,
+    })
+    monkeypatch.setattr(window, "_verify_scientific_provenance", lambda _path: None)
+
+    with pytest.raises(ValueError, match="缓存快照"):
+        window._geo_export_payload()
+
+
+def test_geo_export_ignores_valid_transient_pipeline_path_without_canonical_state():
+    """DECISION-001: formal export never promotes a transient pipeline route."""
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)
+    window.geo = _GoodGeo()
     window._pipeline_result = {
         "path": {
             "full_path": [[(1.0, 1.0), (10.0, 1.0)]],
             "segment_types": ["work"],
-            "validation": {
-                "valid": True,
-                "current_validation_complete": False,
-                "validation_source": "cache_snapshot",
-            },
+            "validation": {"valid": True},
             "is_valid": True,
         }
     }
-    monkeypatch.setattr(window, "_verify_scientific_provenance", lambda _path: None)
 
-    with pytest.raises(ValueError, match="缓存快照"):
+    with pytest.raises(ValueError, match="没有可导出的路径"):
         window._geo_export_payload()
 
 
@@ -176,14 +193,12 @@ def test_geo_export_rejects_segment_crossing_concave_field_even_when_vertices_ar
         (10.0, 10.0), (90.0, 10.0), (90.0, 90.0), (60.0, 90.0),
         (60.0, 40.0), (40.0, 40.0), (40.0, 90.0), (10.0, 90.0),
     ]
-    window._pipeline_result = {
-        "path": {
-            "full_path": [[(20.0, 80.0), (80.0, 80.0)]],
-            "segment_types": ["work"],
-            "validation": {"valid": True},
-            "is_valid": True,
-        }
-    }
+    window._store_path_result({
+        "full_path": [[(20.0, 80.0), (80.0, 80.0)]],
+        "segment_types": ["work"],
+        "validation": {"valid": True},
+        "is_valid": True,
+    })
     monkeypatch.setattr(window, "_verify_scientific_provenance", lambda _path: None)
 
     with pytest.raises(ValueError, match="field boundary"):
@@ -201,14 +216,12 @@ def test_geo_export_rejects_valid_flag_when_route_point_leaves_field_boundary(mo
         (90.0, 90.0),
         (10.0, 90.0),
     ]
-    window._pipeline_result = {
-        "path": {
-            "full_path": [[(20.0, 20.0), (95.0, 20.0)]],
-            "segment_types": ["work"],
-            "validation": {"valid": True},
-            "is_valid": True,
-        }
-    }
+    window._store_path_result({
+        "full_path": [[(20.0, 20.0), (95.0, 20.0)]],
+        "segment_types": ["work"],
+        "validation": {"valid": True},
+        "is_valid": True,
+    })
     monkeypatch.setattr(window, "_verify_scientific_provenance", lambda _path: None)
 
     with pytest.raises(ValueError, match="field boundary"):

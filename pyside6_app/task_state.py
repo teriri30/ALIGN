@@ -102,6 +102,7 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     params_ready = _has_harvester_base_params(harvester_params)
     cutter_offset_ready = _has_cutter_forward_offset(harvester_params)
     params_done = bool(params_ready and cutter_offset_ready)
+    params_confirmed = bool(getattr(state, "harvester_params_confirmed", False))
     entry = getattr(state, "entry_point", None)
     exit_point = getattr(state, "exit_point", None)
     unload_points = list(getattr(state, "unload_points", []) or [])
@@ -121,20 +122,30 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     if process_running:
         statuses["process"] = TaskStatus("in_progress", "处理中")
     if process_done:
-        if params_done:
+        if params_done and params_confirmed:
             statuses["params"] = TaskStatus("done")
+        elif params_done:
+            statuses["params"] = TaskStatus("available", "待确认", action="确认")
         elif params_ready:
             statuses["params"] = TaskStatus("available", "缺割刀前置", action="补填")
         else:
             statuses["params"] = TaskStatus("available")
         if entry:
-            text = "已确认" if getattr(state, "entry_point_locked", False) else "智能推荐"
-            statuses["entry"] = TaskStatus("done", text)
+            locked = bool(getattr(state, "entry_point_locked", False))
+            statuses["entry"] = TaskStatus(
+                "done" if locked else "available",
+                "已确认" if locked else "推荐待确认",
+                action="调整" if locked else "确认",
+            )
         else:
             statuses["entry"] = TaskStatus("available", "待设置")
         if exit_point:
-            text = "已确认" if getattr(state, "exit_point_locked", False) else "智能推荐"
-            statuses["exit"] = TaskStatus("done", text)
+            locked = bool(getattr(state, "exit_point_locked", False))
+            statuses["exit"] = TaskStatus(
+                "done" if locked else "available",
+                "已确认" if locked else "推荐待确认",
+                action="调整" if locked else "确认",
+            )
         else:
             statuses["exit"] = TaskStatus("available", "待设置")
         if unload_points:
@@ -144,7 +155,15 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
         else:
             statuses["unload"] = TaskStatus("pending", "可选")
 
-    ready_to_plan = process_done and params_ready and _has_points(entry) and _has_points(exit_point)
+    ready_to_plan = bool(
+        process_done
+        and params_ready
+        and params_confirmed
+        and _has_points(entry)
+        and _has_points(exit_point)
+        and getattr(state, "entry_point_locked", False)
+        and getattr(state, "exit_point_locked", False)
+    )
     if ready_to_plan:
         statuses["plan"] = TaskStatus("done" if path_done else "available", action="重算" if path_done else "生成")
     if plan_running:

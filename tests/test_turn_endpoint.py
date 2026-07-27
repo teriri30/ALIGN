@@ -64,6 +64,10 @@ def test_single_short_line_uses_separate_headland_approach_before_turn():
     assert approach[-1] == pytest.approx((70.0, 40.0))
     assert diagnostics["endpoint_alignment"]["corrected_endpoint_count"] == 1
     decision = diagnostics["turn_decisions"][0]
+    assert decision["requested_strategy"] == "pear"
+    assert decision["candidate_strategy"] == "pear"
+    assert decision["effective_strategy"] == "pear"
+    assert len(decision["geometry_signature"]) == 64
     assert decision["pass_spacing_m"] == pytest.approx(2.0)
     assert decision["turn_radius_m"] == pytest.approx(2.0)
     assert decision["turn_start"] == pytest.approx([100.0, 20.0])
@@ -179,6 +183,11 @@ def test_boundary_direct_fallback_is_reported_as_kinematic_failure():
     turn = path[segment_types.index("turn")]
     assert len(turn) == 2
     assert diagnostics["feasible"] is False
+    assert diagnostics["kinematically_infeasible"] is True
+    assert diagnostics["display_only_connectors"]
+    connector = diagnostics["display_only_connectors"][0]
+    assert connector["display_only_connector"] is True
+    assert connector["kinematically_infeasible"] is True
     assert any("straight segment" in reason for reason in diagnostics["hard_reasons"])
 
 

@@ -462,6 +462,28 @@ def _sample_planar_poses(
         return []
 
 
+def _accumulate_pose_track_visit(
+    track_visit_count: np.ndarray,
+    left_pixels: np.ndarray,
+    right_pixels: np.ndarray,
+) -> Tuple[int, int]:
+    """Accumulate one pose using only the tracks' clipped local bounding box."""
+    height, width = track_visit_count.shape[:2]
+    points = np.vstack((left_pixels, right_pixels)).astype(np.int32, copy=False)
+    x0 = max(0, int(np.min(points[:, 0])))
+    y0 = max(0, int(np.min(points[:, 1])))
+    x1 = min(width - 1, int(np.max(points[:, 0])))
+    y1 = min(height - 1, int(np.max(points[:, 1])))
+    if x1 < x0 or y1 < y0:
+        return 0, 0
+    local = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
+    offset = np.asarray([x0, y0], dtype=np.int32)
+    cv2.fillPoly(local, [left_pixels - offset], 1)
+    cv2.fillPoly(local, [right_pixels - offset], 1)
+    track_visit_count[y0:y1 + 1, x0:x1 + 1] += local.astype(np.uint32)
+    return local.shape
+
+
 def _rasterize_planar_sweeps(
     shape: Tuple[int, int],
     full_path: List[List[Point]],
@@ -469,10 +491,12 @@ def _rasterize_planar_sweeps(
     geometry: Dict,
     work_mpp: float,
     config: Dict,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, int]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[np.ndarray], float, float, int]:
     track_swept = np.zeros(shape, dtype=np.uint8)
+    track_visit_count = np.zeros(shape, dtype=np.uint32)
     cutter_swept = np.zeros(shape, dtype=np.uint8)
     machine_swept = np.zeros(shape, dtype=np.uint8)
+    segment_track_sweeps = [np.zeros(shape, dtype=np.uint8) for _ in full_path]
     dimensions = geometry["dimensions_m"]
     default_step_m = min(
         0.10,
@@ -507,6 +531,7 @@ def _rasterize_planar_sweeps(
         )
         pose_count += len(poses)
         previous_cutter = None
+        segment_track = segment_track_sweeps[segment_index]
         for x, y, heading in poses:
             center = (x, y)
             left = transform_polygon(
@@ -521,9 +546,18 @@ def _rasterize_planar_sweeps(
             cutter_line = transform_polygon(
                 geometry["cutter_line"], center, heading, pixels_per_meter
             )
-            cv2.fillPoly(track_swept, [np.rint(left).astype(np.int32)], 255)
-            cv2.fillPoly(track_swept, [np.rint(right).astype(np.int32)], 255)
             cv2.fillPoly(machine_swept, [np.rint(body).astype(np.int32)], 255)
+            left_pixels = np.rint(left).astype(np.int32)
+            right_pixels = np.rint(right).astype(np.int32)
+            cv2.fillPoly(segment_track, [left_pixels], 255)
+            cv2.fillPoly(segment_track, [right_pixels], 255)
+            cv2.fillPoly(track_swept, [left_pixels], 255)
+            cv2.fillPoly(track_swept, [right_pixels], 255)
+            _accumulate_pose_track_visit(
+                track_visit_count,
+                left_pixels,
+                right_pixels,
+            )
             cutter_pixels = np.rint(cutter_line).astype(np.int32)
             cv2.line(
                 machine_swept,
@@ -553,7 +587,8 @@ def _rasterize_planar_sweeps(
                     cv2.fillPoly(cutter_swept, [swept_quad], 255)
                 previous_cutter = cutter_pixels
     return (
-        track_swept, cutter_swept, machine_swept,
+        track_swept, track_visit_count, cutter_swept, machine_swept,
+        segment_track_sweeps,
         pose_step_m, pose_heading_window_m, pose_count,
     )
 
@@ -709,8 +744,10 @@ def validate_footprints(
     ]
     (
         track_swept,
+        track_visit_count,
         cutter_swept,
         machine_swept,
+        segment_track_sweeps,
         pose_step_m,
         pose_heading_window_m,
         pose_count,
@@ -719,6 +756,8 @@ def validate_footprints(
     )
 
     track_area = max(int(np.count_nonzero(track_swept)), 1)
+    track_once = int(np.count_nonzero(track_visit_count == 1))
+    track_repeat = int(np.count_nonzero(track_visit_count >= 2))
     body_area_raw = int(np.count_nonzero(body))
     headland_area_raw = int(np.count_nonzero(headland))
     canopy_area_raw = int(np.count_nonzero(canopy))
@@ -765,6 +804,65 @@ def validate_footprints(
     if not np.isfinite(headland_weight) or not 0.0 < headland_weight <= 1.0:
         raise ValueError("headland_damage_weight must be within (0, 1]")
     pixel_area_m2 = work_mpp * work_mpp
+    track_rolling_visit_once_area_m2 = float(np.count_nonzero(track_visit_count == 1) * pixel_area_m2)
+    track_rolling_visit_twice_or_more_area_m2 = float(np.count_nonzero(track_visit_count >= 2) * pixel_area_m2)
+    segment_metrics = []
+    prior_track = np.zeros_like(track_swept)
+    turn_union_exclusive = np.zeros_like(track_swept)
+    turn_union_raw = np.zeros_like(track_swept)
+    for segment_index, segment_sweep in enumerate(segment_track_sweeps):
+        exclusive = cv2.bitwise_and(segment_sweep, cv2.bitwise_not(prior_track))
+        prior_track = cv2.bitwise_or(prior_track, segment_sweep)
+        segment_type = str(segment_types[segment_index]) if segment_types and segment_index < len(segment_types) else ("work" if segment_index % 2 == 0 else "turn")
+        exclusive_bool = exclusive > 0
+        segment_area = max(int(np.count_nonzero(exclusive_bool)), 1)
+        segment_length_m = sum(math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1])) for a, b in zip(full_path[segment_index], full_path[segment_index][1:])) * float(mpp) if segment_index < len(full_path) else 0.0
+        segment_outside = int(np.count_nonzero(exclusive_bool & (field_support == 0)))
+        segment_uncertain = int(np.count_nonzero(exclusive_bool & (uncertain > 0))) if uncertain is not None else None
+        segment_forbidden = int(np.count_nonzero(exclusive_bool & (forbidden > 0))) if forbidden is not None else None
+        segment_record = {
+            "segment_index": int(segment_index),
+            "segment_type": segment_type,
+            "length_m": float(segment_length_m),
+            "track_swept_area_m2": float(np.count_nonzero(exclusive_bool) * pixel_area_m2),
+            "track_body_overlap_area_m2": float(np.count_nonzero(exclusive_bool & (body > 0)) * pixel_area_m2),
+            "track_headland_overlap_area_m2": float(np.count_nonzero(exclusive_bool & (headland > 0)) * pixel_area_m2),
+            "track_uncertain_overlap_area_m2": float(segment_uncertain * pixel_area_m2) if segment_uncertain is not None else None,
+            "track_forbidden_overlap_area_m2": float(segment_forbidden * pixel_area_m2) if segment_forbidden is not None else None,
+            "outside_field_area_m2": float(segment_outside * pixel_area_m2),
+            "outside_field_pct": float(segment_outside / segment_area * 100.0),
+            "turn_cost_m2": float((np.count_nonzero(exclusive_bool & (body > 0)) + float(cfg.get("headland_damage_weight", 1.0)) * np.count_nonzero(exclusive_bool & (headland > 0))) * pixel_area_m2) if segment_type.startswith("turn") else 0.0,
+        }
+        segment_metrics.append(segment_record)
+        segment_record["agronomic_damage_cost_m2"] = float((
+            np.count_nonzero(exclusive_bool & (body > 0))
+            + headland_weight * np.count_nonzero(exclusive_bool & (headland > 0))
+        ) * pixel_area_m2)
+        if segment_type.startswith("turn"):
+            turn_union_exclusive = cv2.bitwise_or(turn_union_exclusive, exclusive)
+            turn_union_raw = cv2.bitwise_or(turn_union_raw, segment_sweep)
+    turn_exclusive_bool = turn_union_exclusive > 0
+    turn_raw_bool = turn_union_raw > 0
+    turn_headland = int(np.count_nonzero(turn_exclusive_bool & (headland > 0)))
+    turn_body = int(np.count_nonzero(turn_exclusive_bool & (body > 0)))
+    turn_uncertain = int(np.count_nonzero(turn_exclusive_bool & (uncertain > 0))) if uncertain is not None else None
+    turn_forbidden = int(np.count_nonzero(turn_exclusive_bool & (forbidden > 0))) if forbidden is not None else None
+    turn_outside = int(np.count_nonzero(turn_exclusive_bool & (field_support == 0)))
+    turn_area = max(int(np.count_nonzero(turn_exclusive_bool)), 1)
+    turn_repeat = int(np.count_nonzero(turn_raw_bool & (track_visit_count >= 2)))
+    turn_metrics = {
+        "turn_segment_metrics": [item for item in segment_metrics if item["segment_type"].startswith("turn")],
+        "headland_turn_track_overlap_area_m2": float(turn_headland * pixel_area_m2),
+        "headland_turn_rolling_pct": float(turn_headland / headland_area_raw * 100.0) if headland_area_raw else None,
+        "turn_body_overlap_area_m2": float(turn_body * pixel_area_m2),
+        "turn_uncertain_overlap_area_m2": float(turn_uncertain * pixel_area_m2) if turn_uncertain is not None else None,
+        "turn_forbidden_overlap_area_m2": float(turn_forbidden * pixel_area_m2) if turn_forbidden is not None else None,
+        "turn_outside_field_area_m2": float(turn_outside * pixel_area_m2),
+        "turn_outside_field_pct": float(turn_outside / turn_area * 100.0),
+        "turn_repeat_twice_or_more_area_m2": float(turn_repeat * pixel_area_m2),
+        "turn_cost_m2": float((turn_body + float(cfg.get("headland_damage_weight", 1.0)) * turn_headland) * pixel_area_m2),
+        "turn_track_swept_area_m2": float(np.count_nonzero(turn_exclusive_bool) * pixel_area_m2),
+    }
     physical_rolling_area_m2 = track_canopy * pixel_area_m2
     agronomic_damage_cost_m2 = (
         track_body + headland_weight * track_headland
@@ -779,13 +877,29 @@ def validate_footprints(
         else None
     )
 
-    return {
+    result = {
         "footprint_model": FOOTPRINT_MODEL,
         "footprint_reference_point": FOOTPRINT_REFERENCE_POINT,
         "footprint_dimensions_m": dict(geometry["dimensions_m"]),
         "footprint_pose_step_m": pose_step_m,
         "footprint_pose_heading_window_m": pose_heading_window_m,
         "footprint_pose_count": pose_count,
+        "segment_metrics": segment_metrics,
+        "turn_segment_metrics": turn_metrics["turn_segment_metrics"],
+        "turn_metrics_attribution_rule": "exclusive_first_segment",
+        "track_rolling_visit_once_area_m2": track_rolling_visit_once_area_m2,
+        "track_rolling_visit_twice_or_more_area_m2": track_rolling_visit_twice_or_more_area_m2,
+        "track_access_count_dtype": str(track_visit_count.dtype),
+        "headland_turn_track_overlap_area_m2": turn_metrics["headland_turn_track_overlap_area_m2"],
+        "headland_turn_rolling_pct": turn_metrics["headland_turn_rolling_pct"],
+        "turn_body_overlap_area_m2": turn_metrics["turn_body_overlap_area_m2"],
+        "turn_uncertain_overlap_area_m2": turn_metrics["turn_uncertain_overlap_area_m2"],
+        "turn_forbidden_overlap_area_m2": turn_metrics["turn_forbidden_overlap_area_m2"],
+        "turn_outside_field_area_m2": turn_metrics["turn_outside_field_area_m2"],
+        "turn_outside_field_pct": turn_metrics["turn_outside_field_pct"],
+        "turn_repeat_twice_or_more_area_m2": turn_metrics["turn_repeat_twice_or_more_area_m2"],
+        "turn_cost_m2": turn_metrics["turn_cost_m2"],
+        "turn_track_swept_area_m2": turn_metrics["turn_track_swept_area_m2"],
         "track_swept_area_m2": track_area * pixel_area_m2,
         "machine_swept_area_m2": machine_area * pixel_area_m2,
         "body_crop_area_m2": body_area_raw * pixel_area_m2,
@@ -850,4 +964,149 @@ def validate_footprints(
         ),
         "footprint_resolution_m": float(work_mpp),
         "crop_core_erosion_m": erosion_m,
+    }
+    # DECISION-015: uint32 access counts support auditable segment attribution.
+    formal = assess_footprint_hard_constraints(
+        result,
+        cfg,
+        require_explicit_valid=False,
+    )
+    result.update({
+        "valid": formal["valid"],
+        "issues": formal["issues"],
+        "validation_profile": formal["validation_profile"],
+        "validation_limits_pct": formal["validation_limits_pct"],
+    })
+    return result
+
+
+def assess_footprint_hard_constraints(
+    footprint: Dict, config: Optional[Dict] = None, *, crossing_count: int = 0,
+    require_optional_layers: bool = False,
+    require_explicit_valid: bool = True,
+) -> Dict:
+    """Apply the formal profile gates used before footprint soft ranking."""
+    cfg = dict(config or {})
+    metrics = dict(footprint or {})
+    profile = str(cfg.get("validation_profile", metrics.get("validation_profile", "field_trial")))
+    profile_limits = {
+        "field_trial": {
+            "outside_field": 1.0, "outside_support": 5.0,
+            "uncertain": 10.0, "forbidden": 0.0,
+        },
+        "machine_candidate": {
+            "outside_field": 0.5, "outside_support": 2.0,
+            "uncertain": 5.0, "forbidden": 0.0,
+            "machine_outside_field": 0.0,
+            "machine_forbidden_overlap": 0.0,
+        },
+    }.get(profile)
+    limits = {
+        "track_core_overlap_pct": cfg.get("max_track_core_overlap_pct", 8.0),
+        "planned_target_geometric_coverage_pct": cfg.get("min_geometric_coverage_pct", 90.0),
+        "track_outside_field_pct": (
+            profile_limits["outside_field"] if profile_limits
+            else cfg.get("max_track_outside_field_pct", 2.0)
+        ),
+        "track_outside_support_pct": (
+            profile_limits["outside_support"] if profile_limits
+            else cfg.get("max_track_outside_support_pct", 100.0)
+        ),
+        "track_uncertain_overlap_pct": (
+            profile_limits["uncertain"] if profile_limits
+            else cfg.get("max_track_uncertain_overlap_pct", 100.0)
+        ),
+        "track_forbidden_overlap_pct": (
+            profile_limits["forbidden"] if profile_limits
+            else cfg.get("max_track_forbidden_overlap_pct", 0.0)
+        ),
+    }
+    required = [
+        "track_core_overlap_pct",
+        "planned_target_geometric_coverage_pct",
+        "track_outside_field_pct",
+    ]
+    optional_layers = (
+        ("planning_support_mask", "track_outside_support_pct"),
+        ("uncertain_mask", "track_uncertain_overlap_pct"),
+        ("forbidden_mask", "track_forbidden_overlap_pct"),
+    )
+    for config_key, metric_key in optional_layers:
+        if require_optional_layers or cfg.get(config_key) is not None:
+            required.append(metric_key)
+    if profile == "machine_candidate":
+        required.extend(("machine_outside_field_pct", "machine_forbidden_overlap_pct"))
+
+    reasons = []
+    issues = [str(issue) for issue in metrics.get("issues") or [] if str(issue)]
+    explicit_valid = metrics.get("valid")
+    if explicit_valid is False:
+        reasons.append("validation_invalid")
+    elif explicit_valid is None and require_explicit_valid:
+        reasons.append("validation_validity_metric_missing")
+        issues.append("required footprint validity evidence missing: valid")
+    elif explicit_valid is not None and explicit_valid is not True:
+        reasons.append("validation_validity_metric_invalid")
+    if issues:
+        reasons.append("validation_issues")
+
+    values = {}
+    for name in required:
+        try:
+            value = float(metrics.get(name))
+        except (TypeError, ValueError):
+            value = float("nan")
+        values[name] = value if np.isfinite(value) else None
+        if values[name] is None:
+            reasons.append(f"validation_metric_missing:{name}")
+            issues.append(f"required footprint metric missing: {name}")
+
+    def add_exceeded(name):
+        value = values.get(name)
+        try:
+            limit = float(limits[name])
+        except (KeyError, TypeError, ValueError):
+            limit = float("nan")
+        if value is not None and np.isfinite(limit) and value > limit:
+            reasons.append(f"validation_gate_exceeded:{name}")
+            issues.append(f"{name}={value:.6g} exceeds limit={limit:.6g}")
+
+    add_exceeded("track_core_overlap_pct")
+    coverage = values.get("planned_target_geometric_coverage_pct")
+    try:
+        minimum_coverage = float(limits["planned_target_geometric_coverage_pct"])
+    except (TypeError, ValueError):
+        minimum_coverage = float("nan")
+    if coverage is not None and np.isfinite(minimum_coverage) and coverage < minimum_coverage:
+        reasons.append("validation_gate_below_minimum:planned_target_geometric_coverage_pct")
+        issues.append(
+            f"planned_target_geometric_coverage_pct={coverage:.6g} "
+        )
+    for name in (
+        "track_outside_field_pct", "track_outside_support_pct",
+        "track_uncertain_overlap_pct", "track_forbidden_overlap_pct",
+    ):
+        add_exceeded(name)
+
+    if profile == "machine_candidate":
+        for name, limit in (("machine_outside_field_pct", 0.0), ("machine_forbidden_overlap_pct", 0.0)):
+            value = values.get(name)
+            if value is not None and value > limit:
+                reasons.append(f"validation_gate_exceeded:{name}")
+                issues.append(f"{name}={value:.6g} exceeds limit={limit:.6g}")
+
+    if int(crossing_count or 0) > 0:
+        reasons.append("non_adjacent_work_line_crossing")
+        issues.append(f"non-adjacent work-line crossings: {int(crossing_count)}")
+    hard_reasons = list(dict.fromkeys(reasons))
+    return {
+        "valid": not hard_reasons,
+        "hard_reasons": hard_reasons,
+        "issues": list(dict.fromkeys(issues)),
+        "validation_profile": profile,
+        "validation_limits_pct": {
+            **limits,
+            "machine_outside_field": 0.0 if profile == "machine_candidate" else None,
+            "machine_forbidden_overlap": 0.0 if profile == "machine_candidate" else None,
+        },
     }

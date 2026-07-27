@@ -13,6 +13,68 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal, QObject
 
 
+QT_RENDER_MAX_DIMENSION = 4096
+
+
+class PaperExperimentWorker(QObject):
+    """Run a frozen paper-experiment matrix outside the UI thread."""
+
+    progress = Signal(int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, runner, plan, token=None, parent=None):
+        super().__init__(parent)
+        self.runner = runner
+        self.plan = dict(plan or {})
+        self.token = token
+        self._cancelled = False
+        self.runner.progress_callback = self._forward_progress
+        self.runner.cancel_callback = lambda: self._cancelled or bool(
+            getattr(self.token, "invalidated", False)
+        )
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _forward_progress(self, value, message):
+        self.progress.emit(int(max(0.0, min(1.0, float(value))) * 100), str(message))
+
+    def run(self):
+        try:
+            if self.runner.cancel_callback():
+                self.finished.emit({
+                    "task_token": self.token,
+                    "status": "cancelled",
+                    "result": None,
+                    "error": "",
+                })
+                return
+            output_dir = self.runner.run(plan=self.plan)
+            if self.runner.cancel_callback():
+                self.finished.emit({
+                    "task_token": self.token,
+                    "status": "cancelled",
+                    "result": None,
+                    "error": "",
+                })
+                return
+            self.progress.emit(100, "论文实验资料包已生成")
+            self.finished.emit({
+                "task_token": self.token,
+                "status": "completed",
+                "result": {"output_dir": str(output_dir)},
+                "error": "",
+            })
+        except Exception as exc:
+            self.finished.emit({
+                "task_token": self.token,
+                "status": "failed",
+                "result": None,
+                "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+            })
+
+
 class MaskDiagnosticExportWorker(QObject):
     """Build a mask diagnostic ZIP without blocking the GUI thread."""
 
@@ -60,6 +122,37 @@ def display_affine(source_affine, full_width, full_height, display_width, displa
     return source_affine * Affine.scale(
         float(full_width) / float(display_width),
         float(full_height) / float(display_height),
+    )
+
+
+def preview_shape(full_height, full_width, max_dimension):
+    """Return an aspect-preserving, bounded preview shape for UI rendering."""
+    full_height, full_width, max_dimension = (
+        int(full_height), int(full_width), int(max_dimension)
+    )
+    if min(full_height, full_width, max_dimension) <= 0:
+        raise ValueError("raster dimensions and maximum preview dimension must be positive")
+    longest = max(full_height, full_width)
+    if longest <= max_dimension:
+        return full_height, full_width
+    scale = float(max_dimension) / float(longest)
+    return (
+        max(1, int(round(full_height * scale))),
+        max(1, int(round(full_width * scale))),
+    )
+
+
+def bounded_render_preview(image, max_dimension=QT_RENDER_MAX_DIMENSION):
+    """DECISION-004: bound Qt texture size without mutating analysis pixels."""
+    array = np.asarray(image)
+    if array.ndim not in (2, 3) or array.size == 0:
+        raise ValueError("preview image must be a non-empty 2D or 3D array")
+    render_h, render_w = preview_shape(array.shape[0], array.shape[1], max_dimension)
+    if (render_h, render_w) == array.shape[:2]:
+        return np.ascontiguousarray(array)
+    import cv2
+    return np.ascontiguousarray(
+        cv2.resize(array, (render_w, render_h), interpolation=cv2.INTER_AREA)
     )
 
 
@@ -188,6 +281,7 @@ class TifLoadWorker(QObject):
                     ],
                     "crs": str(crs) if crs else "",
                     "affine": [float(value) for value in tuple(transform)[:6]],
+                    "overview_factors": list(src.overviews(1)) if src.count else [],
                     "rgb_band_indexes": list(preview_preprocessing.get("source_band_indexes", [])),
                     "rgb_selection_assumed": not all(
                         name in [str(value).lower() for value in preview_preprocessing.get("source_color_interpretation", [])]
@@ -196,11 +290,20 @@ class TifLoadWorker(QObject):
                 }
             if self._cancelled:
                 return
+            render_rgb = bounded_render_preview(rgb)
+            preview_preprocessing.update({
+                "analysis_preview_shape": [int(rgb.shape[0]), int(rgb.shape[1])],
+                "render_preview_shape": [
+                    int(render_rgb.shape[0]), int(render_rgb.shape[1])
+                ],
+                "render_preview_max_dimension": QT_RENDER_MAX_DIMENSION,
+            })
             self.progress.emit(75, "正在计算源影像完整性哈希...")
             source_sha256 = file_sha256(self.path)
             self.finished.emit({
                 "path": self.path,
                 "rgb": rgb,
+                "render_rgb": render_rgb,
                 "full_h": full_h,
                 "full_w": full_w,
                 "display_h": out_h,
@@ -232,26 +335,44 @@ class CacheRestoreWorker(QObject):
     finished = Signal(dict)
     error = Signal(str)
 
-    def __init__(self, path: str, expected_source_sha256: str = "", parent=None):
+    def __init__(self, path: str, expected_source_sha256: str = "", token=None, parent=None):
         super().__init__(parent)
         self.path = path
         self.expected_source_sha256 = str(expected_source_sha256 or "")
+        self.token = token
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
 
+    def _is_cancelled(self):
+        return self._cancelled or bool(getattr(self.token, "invalidated", False))
+
+    def _finish(self, status, result=None, error=""):
+        self.finished.emit({
+            "task_token": self.token,
+            "status": status,
+            "result": result,
+            "error": str(error or ""),
+        })
+
     def run(self):
         try:
+            if self._is_cancelled():
+                self._finish("cancelled")
+                return
             self.progress.emit(10, "正在读取项目缓存...")
             from cache import load_project_state, load_mask, load_mask_bundle
             from row_geometry import MASK_REGULARIZATION_VERSION
             saved = load_project_state(self.path, self.expected_source_sha256)
-            if self._cancelled or not saved:
-                self.finished.emit({"path": self.path, "saved": {}})
+            if self._is_cancelled():
+                self._finish("cancelled")
+                return
+            if not saved:
+                self._finish("completed", {"path": self.path, "saved": {}})
                 return
             from config import Config
-            from model import INFERENCE_PIPELINE_VERSION
+            from inference import INFERENCE_PIPELINE_VERSION
             from path_planner import PATH_PLANNING_VERSION
             from provenance import ProvenanceError, file_sha256, verify_stage_record
             cfg = Config()
@@ -351,9 +472,10 @@ class CacheRestoreWorker(QObject):
                 saved["auto_path_valid"] = False
                 saved["simulation_done"] = False
                 saved["export_done"] = False
-            if self._cancelled:
+            if self._is_cancelled():
+                self._finish("cancelled")
                 return
-            self.finished.emit({
+            self._finish("completed", {
                 "path": self.path,
                 "saved": saved,
                 "processed_cache_valid": processed_cache_valid,
@@ -368,7 +490,7 @@ class CacheRestoreWorker(QObject):
                 "proc_oy": proc_oy,
             })
         except Exception as e:
-            self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+            self._finish("failed", error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 class PipelineWorker(QObject):
@@ -414,7 +536,7 @@ class PipelineWorker(QObject):
 
             # ── Step 1: 推理 ──
             self.progress.emit(5, "正在执行 Tiled 推理...")
-            from model import TiledInference
+            from inference import TiledInference
             inference = TiledInference(self.model_engine)
             raw_mask = inference.run(
                 self.image,
@@ -524,16 +646,28 @@ class MaskProcessWorker(QObject):
     finished = Signal(dict)
     error = Signal(str)
 
-    def __init__(self, raw_mask: np.ndarray, geo, state, config: dict, parent=None):
+    def __init__(self, raw_mask: np.ndarray, geo, state, config: dict, token=None, parent=None):
         super().__init__(parent)
         self.raw_mask = raw_mask
         self.geo = geo
         self.state = state
         self.config = dict(config or {})
+        self.token = token
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
+
+    def _is_cancelled(self):
+        return self._cancelled or bool(getattr(self.token, "invalidated", False))
+
+    def _finish(self, status, result=None, error=""):
+        self.finished.emit({
+            "task_token": self.token,
+            "status": status,
+            "result": result,
+            "error": str(error or ""),
+        })
 
     def _emit_mask_progress(self, progress, message):
         """Forward mask-processing progress and yield to the GUI event loop.
@@ -558,7 +692,8 @@ class MaskProcessWorker(QObject):
         previous_cv_threads = None
         started_at = time.perf_counter()
         try:
-            if self._cancelled:
+            if self._is_cancelled():
+                self._finish("cancelled")
                 return
             try:
                 import cv2
@@ -570,7 +705,7 @@ class MaskProcessWorker(QObject):
             from mask_processor import process_mask
             self.progress.emit(35, "正在提取水稻行带...")
             config = dict(self.config)
-            config["_cancel_callback"] = lambda: self._cancelled
+            config["_cancel_callback"] = self._is_cancelled
             require_metric_scale(self.geo, self.state, self.raw_mask.shape)
             processed = process_mask(
                 self.raw_mask,
@@ -579,7 +714,8 @@ class MaskProcessWorker(QObject):
                 config=config,
                 progress_callback=self._emit_mask_progress,
             )
-            if self._cancelled:
+            if self._is_cancelled():
+                self._finish("cancelled")
                 return
             if processed is None:
                 raise RuntimeError("掩膜处理没有生成有效结果")
@@ -613,9 +749,12 @@ class MaskProcessWorker(QObject):
                 "input_nonzero_pixels": int(np.count_nonzero(self.raw_mask)),
             }
             self.progress.emit(95, "掩膜处理完成，正在刷新界面...")
-            self.finished.emit(processed)
+            if self._is_cancelled():
+                self._finish("cancelled")
+                return
+            self._finish("completed", processed)
         except Exception as e:
-            self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+            self._finish("failed", error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
         finally:
             if previous_cv_threads is not None:
                 try:
@@ -631,7 +770,7 @@ class PlanWorker(QObject):
     finished = Signal(dict)
     error = Signal(str)
 
-    def __init__(self, mask_result: dict, geo, state, config: dict, detected_mask=None, parent=None):
+    def __init__(self, mask_result: dict, geo, state, config: dict, detected_mask=None, token=None, parent=None):
         super().__init__(parent)
         from config import Config
 
@@ -644,10 +783,22 @@ class PlanWorker(QObject):
         self.config.update(dict(config or {}))
         self.config.setdefault("headland_damage_weight", 1.0)
         self.detected_mask = detected_mask
+        self.token = token
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
+
+    def _is_cancelled(self):
+        return self._cancelled or bool(getattr(self.token, "invalidated", False))
+
+    def _finish(self, status, result=None, error=""):
+        self.finished.emit({
+            "task_token": self.token,
+            "status": status,
+            "result": result,
+            "error": str(error or ""),
+        })
 
     def _emit_plan_progress(self, progress, message):
         try:
@@ -662,7 +813,8 @@ class PlanWorker(QObject):
     def run(self):
         started_at = time.perf_counter()
         try:
-            if self._cancelled:
+            if self._is_cancelled():
+                self._finish("cancelled")
                 return
             processed_mask = self.mask_result.get("processed_mask")
             if processed_mask is None:
@@ -675,7 +827,8 @@ class PlanWorker(QObject):
             planning_mask = build_band_mask(processed_mask.shape, wide_bands)
             if not np.any(planning_mask):
                 planning_mask = processed_mask
-            if self._cancelled:
+            if self._is_cancelled():
+                self._finish("cancelled")
                 return
             self.progress.emit(35, "正在计算作业线与转弯段...")
             config = dict(self.config)
@@ -697,7 +850,7 @@ class PlanWorker(QObject):
                 "forbidden_mask_confirmed",
                 forbidden_confirmed,
             )
-            config["_cancel_callback"] = lambda: self._cancelled
+            config["_cancel_callback"] = self._is_cancelled
             path_result = plan_path(
                 wide_bands, processed_mask, main_angle,
                 geo=self.geo,
@@ -707,7 +860,8 @@ class PlanWorker(QObject):
                 detected_mask=self.detected_mask,
                 planned_mask=planning_mask,
             )
-            if self._cancelled:
+            if self._is_cancelled():
+                self._finish("cancelled")
                 return
             from config import Config
             from path_planner import PATH_PLANNING_VERSION
@@ -750,11 +904,14 @@ class PlanWorker(QObject):
                 "band_count": len(wide_bands),
             }
             self.progress.emit(98, "路径规划完成，正在刷新界面...")
-            self.finished.emit({
+            if self._is_cancelled():
+                self._finish("cancelled")
+                return
+            self._finish("completed", {
                 "path": path_result,
                 "processed": self.mask_result,
                 "bands": wide_bands,
             })
         except Exception as e:
-            self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+            self._finish("failed", error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 

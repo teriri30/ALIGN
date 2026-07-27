@@ -7,17 +7,32 @@
   - pear:        Pear-shaped turning — R > ω/2 时的三圆相切转弯
   - fishtail:    Fishtail turning — 田头受限时的倒车折返
 """
-import math, csv, json, os, tempfile
+import math, csv, json, os, tempfile, hashlib
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 import cv2
 from shapely.geometry import LineString, Point, Polygon
 from config import Config, AppLogger
-from footprint_planner import generate_work_lines, validate_footprints
+from footprint_planner import (
+    assess_footprint_hard_constraints,
+    generate_work_lines,
+    validate_footprints,
+)
 from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
+from headland_turn_optimizer import build_turn_corridor_mask, has_non_degenerate_curve, polyline_inside_mask, select_turn_candidate
 
 
 PATH_PLANNING_VERSION = "footprint-path-v8"
+HEADLAND_TURN_OPTIMIZER_VERSION = "headland-turn-corridor-v1"
+
+
+def _finite_float(value):
+    """Return a finite numeric value, or ``None`` for missing/invalid metrics."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def build_band_mask(shape, bands: List[Dict]) -> np.ndarray:
@@ -437,7 +452,7 @@ def _sample_arc(center, radius, start_angle, sweep_angle, mpp, minimum=6):
 
 
 def _turn_clearance_px(clearance_m, mpp):
-    return max(0.0, float(clearance_m)) / max(mpp, 1e-6)
+    return float(clearance_m) / max(mpp, 1e-6)
 
 
 def _turn_bow(start: Tuple[float, float], end: Tuple[float, float],
@@ -985,6 +1000,39 @@ def _select_turn_strategy(
     fallback_from = None
     fallback_reason = ""
 
+    def build_decision(strategy, reason):
+        effective = str(strategy)
+        signature = hashlib.sha256(
+            json.dumps(
+                {
+                    "requested_strategy": requested,
+                    "candidate_strategy": requested,
+                    "effective_strategy": effective,
+                    "pass_spacing_m": round(spacing, 9),
+                    "turn_radius_m": round(radius, 9),
+                    "headland_limited": bool(headland_limited),
+                    "fallback_reason": fallback_reason,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "requested_strategy": requested,
+            "candidate_strategy": requested,
+            "effective_strategy": effective,
+            # Compatibility for existing consumers; use effective_strategy for
+            # new records so requested/candidate/effective remain distinct.
+            "strategy": effective,
+            "reason": reason,
+            "fallback_from": fallback_from,
+            "fallback_reason": fallback_reason,
+            "pass_spacing_m": spacing,
+            "turn_radius_m": radius,
+            "geometry_signature": signature,
+        }
+
     # DECISION-010: omega/2 below R is never an executable semicircle.
     if (
         spacing < two_radius - 1e-6
@@ -997,15 +1045,7 @@ def _select_turn_strategy(
             f"below R={radius:.2f}m; using {TURN_STRATEGY_LABELS[strategy]} "
             "instead of a subminimum-radius semicircle"
         )
-        return {
-            "requested_strategy": requested,
-            "strategy": strategy,
-            "reason": fallback_reason,
-            "fallback_from": fallback_from,
-            "fallback_reason": fallback_reason if fallback_from else "",
-            "pass_spacing_m": spacing,
-            "turn_radius_m": radius,
-        }
+        return build_decision(strategy, fallback_reason)
 
     if requested == "auto":
         if spacing < two_radius - tolerance:
@@ -1047,15 +1087,7 @@ def _select_turn_strategy(
                 "按实际相邻端点生成近半圆连接，并在风险提示中报告半径不足"
             )
 
-    return {
-        "requested_strategy": requested,
-        "strategy": strategy,
-        "reason": reason,
-        "fallback_from": fallback_from,
-        "fallback_reason": fallback_reason,
-        "pass_spacing_m": spacing,
-        "turn_radius_m": radius,
-    }
+    return build_decision(strategy, reason)
 
 
 def assess_turn_strategy(
@@ -1296,6 +1328,7 @@ def _align_short_turn_anchors(
     correction is refused without a verified in-field segment.
     """
     cfg = dict(config or {})
+    # DECISION-015: finite semantic-corridor search preserves per-turn attribution.
     anchors = [
         {
             "start": (float(line[0][0]), float(line[0][1])),
@@ -1399,6 +1432,26 @@ def _align_short_turn_anchors(
     return anchors, diagnostics
 
 
+def _headland_space_is_limited(
+    start: Tuple[float, float],
+    work_direction: Tuple[float, float],
+    field_polygon,
+    required_depth_px: float,
+) -> bool:
+    """Pre-screen whether the forward headland probe fits inside the field."""
+    if field_polygon is None:
+        return False
+    depth = max(0.0, float(required_depth_px))
+    norm = math.hypot(float(work_direction[0]), float(work_direction[1]))
+    if depth <= 0.0 or norm <= 1e-9:
+        return False
+    target = (
+        float(start[0]) + float(work_direction[0]) / norm * depth,
+        float(start[1]) + float(work_direction[1]) / norm * depth,
+    )
+    return not _segment_inside_field_boundary([start, target], field_polygon)
+
+
 def _connect_work_lines(
         work_lines: List[List[Tuple[float, float]]],
         geo=None,
@@ -1408,6 +1461,7 @@ def _connect_work_lines(
         config: Optional[Dict] = None,
         return_diagnostics: bool = False,
         global_main_angle: Optional[float] = None,
+        processed_mask: Optional[np.ndarray] = None,
 ):
     """Connect ordered coverage passes with direction-aware headland turns."""
     if not work_lines:
@@ -1497,6 +1551,7 @@ def _connect_work_lines(
     fallback_reasons = []
     boundary_adjustments = []
     boundary_hard_reasons = []
+    display_only_connectors = []
     field_polygon = _field_boundary_local_polygon(state)
     alignment_angle = global_main_angle
     alignment_direction_source = "global_main_angle"
@@ -1561,20 +1616,30 @@ def _connect_work_lines(
         if gap_m <= 1e-9:
             gap_m = math.hypot(lateral_x, lateral_y) * mpp
         pass_spacings_m.append(gap_m)
+        headland_limited = _headland_space_is_limited(
+            start,
+            work_direction,
+            field_polygon,
+            required_depth_px=(2.0 * min_turn_radius_m + clearance_m) / max(mpp, 1e-9),
+        )
         decision = _select_turn_strategy(
             requested_strategy,
             gap_m,
             min_turn_radius_m,
+            headland_limited=headland_limited,
         )
         selected_strategy = decision["strategy"]
         turn_decisions.append({
             "transition_index": index,
             "requested_strategy": decision.get("requested_strategy"),
+            "candidate_strategy": decision.get("candidate_strategy"),
+            "effective_strategy": decision.get("effective_strategy", selected_strategy),
             "strategy": selected_strategy,
             "pass_spacing_m": float(gap_m),
             "turn_radius_m": float(min_turn_radius_m),
             "reason": decision.get("reason", ""),
             "fallback_reason": decision.get("fallback_reason", ""),
+            "geometry_signature": decision.get("geometry_signature", ""),
             "crop_exit": [float(line[-1][0]), float(line[-1][1])],
             "turn_start": [float(start[0]), float(start[1])],
             "turn_end": [float(end[0]), float(end[1])],
@@ -1594,6 +1659,25 @@ def _connect_work_lines(
                 clearance_m,
                 inner=(selected_strategy == "alpha"),
             )
+            base_turn_parts = list(turn_parts)
+            turn_parts, optimization = _optimize_headland_turn(
+                base_turn_parts, start, end, work_direction, turn_sign,
+                selected_strategy,
+                mpp=mpp,
+                min_turn_radius_m=min_turn_radius_m,
+                clearance_m=clearance_m,
+                processed_mask=processed_mask,
+                field_polygon=field_polygon,
+                geo=geo,
+                state=state,
+                config=cfg,
+                validation_work_lines=oriented,
+                validation_turn_index=index,
+            )
+            turn_decisions[-1]["headland_turn_optimization"] = optimization
+            if optimization.get("fallback_reason"):
+                turn_decisions[-1]["fallback_reason"] = optimization["fallback_reason"]
+                fallback_reasons.append(optimization["fallback_reason"])
             reverse_leaves_boundary = (
                 field_polygon is not None
                 and any(
@@ -1604,15 +1688,24 @@ def _connect_work_lines(
             if reverse_leaves_boundary:
                 direct = [start, end]
                 if _segment_inside_field_boundary(direct, field_polygon):
+                    connector_index = len(full_path)
                     full_path.append(direct)
                     segment_types.append("turn")
-                    boundary_adjustments.append(
-                        "倒车折返会越出框选田块，已退化为边界内端点连接"
-                    )
-                    boundary_hard_reasons.append(
+                    reason = (
                         "reverse turn geometry degraded to a straight segment because no "
                         "kinematically valid reverse manoeuvre fit inside the field boundary"
                     )
+                    boundary_adjustments.append("倒车折返会越出框选田块，已退化为边界内端点连接")
+                    boundary_hard_reasons.append(reason)
+                    connector = {
+                        "segment_index": connector_index,
+                        "transition_index": index,
+                        "display_only_connector": True,
+                        "kinematically_infeasible": True,
+                        "reason": reason,
+                    }
+                    display_only_connectors.append(connector)
+                    turn_decisions[-1].update(connector)
                 else:
                     boundary_adjustments.append(
                         "倒车折返仍可能越出框选田块，请调整边界/起终点或手动编辑路线"
@@ -1636,13 +1729,45 @@ def _connect_work_lines(
                 clearance_m,
                 field_polygon,
             )
+            base_turn_parts = [(turn, "turn")]
+            turn_parts, optimization = _optimize_headland_turn(
+                base_turn_parts, start, end, work_direction, turn_sign,
+                selected_strategy,
+                mpp=mpp,
+                min_turn_radius_m=min_turn_radius_m,
+                clearance_m=clearance_m,
+                processed_mask=processed_mask,
+                field_polygon=field_polygon,
+                geo=geo,
+                state=state,
+                config=cfg,
+                validation_work_lines=oriented,
+                validation_turn_index=index,
+            )
+            turn_decisions[-1]["headland_turn_optimization"] = optimization
+            if optimization.get("fallback_reason"):
+                turn_decisions[-1]["fallback_reason"] = optimization["fallback_reason"]
+                fallback_reasons.append(optimization["fallback_reason"])
+            if optimization.get("optimization_applied") and turn_parts:
+                turn = turn_parts[0][0]
+                boundary_reason = None
             if boundary_reason:
                 boundary_adjustments.append(boundary_reason)
                 if len(turn) <= 2:
-                    boundary_hard_reasons.append(
+                    reason = (
                         "turn geometry degraded to a straight segment because no "
                         "kinematically valid curve fit inside the field boundary"
                     )
+                    boundary_hard_reasons.append(reason)
+                    connector = {
+                        "segment_index": len(full_path),
+                        "transition_index": index,
+                        "display_only_connector": True,
+                        "kinematically_infeasible": True,
+                        "reason": reason,
+                    }
+                    display_only_connectors.append(connector)
+                    turn_decisions[-1].update(connector)
             full_path.append(turn)
             segment_types.append("turn")
         if math.hypot(
@@ -1699,6 +1824,9 @@ def _connect_work_lines(
         "requested_strategy": requested_strategy,
         "used_strategies": used_strategies,
         "fallback_reasons": fallback_reasons,
+        "display_only_connectors": display_only_connectors,
+        "kinematically_infeasible": bool(display_only_connectors),
+        "machine_executable": not bool(display_only_connectors),
         "boundary_constraints": {
             "field_boundary_present": field_polygon is not None,
             "turns_adjusted": len(boundary_adjustments),
@@ -1895,28 +2023,35 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         issues.append(
             f"履带进入禁行区 {forbidden_overlap:.1f}% > {max_forbidden:.1f}%"
         )
-    machine_outside = footprint.get("machine_outside_field_pct")
+    machine_outside = _finite_float(footprint.get("machine_outside_field_pct"))
+    machine_outside_limit = _finite_float(max_machine_outside)
     if max_machine_outside is not None:
-        if machine_outside is None:
-            issues.append("缺少整机平面包络田块越界校验")
-        elif machine_outside > max_machine_outside:
+        if machine_outside_limit is None:
+            issues.append("整机平面包络田块越界门限无效")
+        elif machine_outside is None:
+            issues.append("整机平面包络田块越界指标无效")
+        elif machine_outside > machine_outside_limit:
             issues.append(
                 f"整机平面包络越出田块 {machine_outside:.1f}% "
-                f"> {max_machine_outside:.1f}%"
+                f"> {machine_outside_limit:.1f}%"
             )
-    machine_forbidden = footprint.get("machine_forbidden_overlap_pct")
+    machine_forbidden = _finite_float(footprint.get("machine_forbidden_overlap_pct"))
+    machine_forbidden_limit = _finite_float(max_machine_forbidden)
     if max_machine_forbidden is not None:
-        if machine_forbidden is None:
-            issues.append("缺少整机平面包络禁行区校验")
-        elif machine_forbidden > max_machine_forbidden:
+        if machine_forbidden_limit is None:
+            issues.append("整机平面包络禁行区门限无效")
+        elif machine_forbidden is None:
+            issues.append("整机平面包络禁行区指标无效")
+        elif machine_forbidden > machine_forbidden_limit:
             issues.append(
                 f"整机平面包络进入禁行区 {machine_forbidden:.1f}% "
-                f"> {max_machine_forbidden:.1f}%"
+                f"> {machine_forbidden_limit:.1f}%"
             )
     if crossing_count > 0:
         issues.append(f"非相邻作业线交叉 {crossing_count} 处")
 
     result = {
+        **footprint,
         "valid": len(issues) == 0,
         "total_length_m": float(total_length_m),
         "work_length_m": float(work_length_m),
@@ -1950,7 +2085,6 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
                 else index % 2 == 1
             )
         ),
-        **footprint,
     }
     return result
 
@@ -2334,59 +2468,79 @@ def _candidate_strategies_for_request(requested_strategy: str) -> List[str]:
 
 
 def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
-    """Rank candidate routes by agronomic safety first, then efficiency.
+    """Rank candidate routes by executable safety and body-crop risk.
 
     Lower score is better. The score intentionally penalizes invalid geometry,
     crop-core rolling, field-boundary excursions and self-crossings far more
     than a modest length increase. DECISION-012 preserves physical canopy
-    rolling as an unweighted measurement. DECISION-013 uses the separately
-    named agronomic damage cost as the first route objective after hard
-    validity constraints; physical rolling remains the next criterion.
+    Headland rolling remains a reported measurement but never selects a turn
+    strategy. Strategy choice uses body/core crop risk, boundary/forbidden
+    safety, coverage and route efficiency. DECISION-013 keeps weighted
+    headland damage as a report-only research metric.
     """
+    def metric(value, *, default, higher_is_better=False):
+        number = _finite_float(value)
+        if number is None:
+            return float("-inf") if higher_is_better else float("inf")
+        return number
+
     ranked = []
     for candidate in candidates or []:
         item = dict(candidate)
-        validation = item.get("validation") or {}
+        validation = dict(item.get("validation") or {})
         assessment = item.get("turn_assessment") or {}
         segment_types = item.get("segment_types") or []
+        required_values = {
+            "rolling_body_pct": validation.get("rolling_body_pct"),
+            "track_core_overlap_pct": validation.get("track_core_overlap_pct", 0.0),
+            "track_outside_field_pct": validation.get("track_outside_field_pct", 0.0),
+            "track_outside_support_pct": validation.get("track_outside_support_pct", 0.0),
+            "track_uncertain_overlap_pct": validation.get("track_uncertain_overlap_pct", 0.0),
+            "track_forbidden_overlap_pct": validation.get("track_forbidden_overlap_pct", 0.0),
+            "total_length_m": validation.get("total_length_m", 0.0),
+        }
+        invalid_metric_names = [
+            name for name, value in required_values.items()
+            if value is not None and _finite_float(value) is None
+        ]
+        if invalid_metric_names:
+            validation["valid"] = False
+            issues = list(validation.get("issues") or [])
+            issues.append("候选排序指标无效: " + ", ".join(invalid_metric_names))
+            validation["issues"] = issues
+            item["validation"] = validation
         valid_penalty = 0.0 if validation.get("valid", False) else 10000.0
         hard_penalty = 1500.0 * len(assessment.get("hard_reasons") or [])
         crossing_penalty = 1200.0 * float(assessment.get("turn_self_crossing_count", 0) or 0)
-        rolling_value = validation.get("rolling_canopy_pct")
-        rolling_missing = rolling_value is None
-        rolling_canopy = (
-            101.0 if rolling_missing else float(rolling_value or 0.0)
+        body_rolling_value = validation.get("rolling_body_pct")
+        body_rolling_missing = body_rolling_value is None
+        rolling_body = (
+            metric(body_rolling_value, default=101.0)
+            if not body_rolling_missing else 101.0
         )
-        damage_value = validation.get("agronomic_damage_cost_m2")
-        damage_missing = damage_value is None
-        # Legacy/synthetic candidates may not carry the v8 metric. Falling
-        # back to physical rolling preserves deterministic ordering without
-        # inventing a field-calibration weight.
-        agronomic_damage = (
-            rolling_canopy if damage_missing else float(damage_value or 0.0)
-        )
-        core_overlap = float(validation.get("track_core_overlap_pct", 0.0) or 0.0)
-        outside = float(validation.get("track_outside_field_pct", 0.0) or 0.0)
-        outside_support = float(validation.get("track_outside_support_pct", 0.0) or 0.0)
-        uncertain_overlap = float(validation.get("track_uncertain_overlap_pct", 0.0) or 0.0)
-        forbidden_overlap = float(validation.get("track_forbidden_overlap_pct", 0.0) or 0.0)
+        core_overlap = metric(validation.get("track_core_overlap_pct", 0.0), default=float("inf"))
+        outside = metric(validation.get("track_outside_field_pct", 0.0), default=float("inf"))
+        outside_support = metric(validation.get("track_outside_support_pct", 0.0), default=float("inf"))
+        uncertain_overlap = metric(validation.get("track_uncertain_overlap_pct", 0.0), default=float("inf"))
+        forbidden_overlap = metric(validation.get("track_forbidden_overlap_pct", 0.0), default=float("inf"))
         profile = str(validation.get("validation_profile", "research"))
         semantic_weight = 1.0 if profile == "research" else 4.0
-        coverage = float(
+        coverage = metric(
             validation.get(
                 "crop_mask_geometric_coverage_pct",
                 validation.get("planned_target_geometric_coverage_pct", 0.0),
-            ) or 0.0
+            ),
+            default=float("-inf"),
+            higher_is_better=True,
         )
-        total_length = float(validation.get("total_length_m", 0.0) or 0.0)
+        total_length = metric(validation.get("total_length_m", 0.0), default=float("inf"))
         reverse_turns = sum(1 for value in segment_types if str(value).startswith("turn_reverse"))
         unload_visits = sum(1 for value in segment_types if value == "unload")
         score = (
             valid_penalty * 100000000.0
             + hard_penalty * 1000000.0
             + crossing_penalty * 1000000.0
-            + agronomic_damage * 1000000.0
-            + rolling_canopy * 1000.0
+            + rolling_body * 1000.0
             + core_overlap * 80.0
             + outside * 120.0
             + outside_support * 25.0 * semantic_weight
@@ -2401,11 +2555,8 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
             "valid_penalty": valid_penalty,
             "hard_reason_count": len(assessment.get("hard_reasons") or []),
             "turn_self_crossing_count": int(assessment.get("turn_self_crossing_count", 0) or 0),
-            "rolling_canopy_pct": None if rolling_missing else rolling_canopy,
-            "agronomic_damage_cost_m2": (
-                None if damage_missing else agronomic_damage
-            ),
-            "headland_damage_weight": validation.get("headland_damage_weight"),
+            "rolling_body_pct": None if body_rolling_missing else rolling_body,
+            "rolling_headland_pct_report_only": validation.get("rolling_headland_pct"),
             "track_core_overlap_pct": core_overlap,
             "track_outside_field_pct": outside,
             "track_outside_support_pct": outside_support,
@@ -2420,10 +2571,8 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
             0 if validation.get("valid", False) else 1,
             len(assessment.get("hard_reasons") or []),
             int(assessment.get("turn_self_crossing_count", 0) or 0),
-            1 if damage_missing else 0,
-            agronomic_damage,
-            1 if rolling_missing else 0,
-            rolling_canopy,
+            1 if body_rolling_missing else 0,
+            rolling_body,
             forbidden_overlap,
             outside,
             outside_support,
@@ -2435,6 +2584,30 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
         )
         ranked.append(item)
     return sorted(ranked, key=lambda value: value["candidate_rank_key"])
+
+
+def _deduplicate_path_candidates(candidates: List[Dict]) -> List[Dict]:
+    """Collapse candidates that produced the same actual strategy sequence and geometry."""
+    unique = []
+    by_signature = {}
+    for candidate in candidates or []:
+        assessment = candidate.get("turn_assessment") or {}
+        actual = tuple(str(value) for value in assessment.get("used_strategies") or [])
+        geometry = tuple(
+            tuple((round(float(x), 6), round(float(y), 6)) for x, y in segment)
+            for segment in candidate.get("path_segments") or []
+        )
+        signature = (actual, tuple(candidate.get("segment_types") or []), geometry)
+        label = str(candidate.get("strategy", ""))
+        existing = by_signature.get(signature)
+        if existing is None:
+            item = dict(candidate)
+            item["equivalent_candidate_labels"] = [label]
+            by_signature[signature] = item
+            unique.append(item)
+        elif label not in existing["equivalent_candidate_labels"]:
+            existing["equivalent_candidate_labels"].append(label)
+    return unique
 
 
 def _build_planning_factor_report(
@@ -2489,6 +2662,8 @@ def _build_planning_factor_report(
             "exit_local": local(exit_point),
             "unload_count": len(unload_points),
             "unload_local": [local(point) for point in unload_points],
+            "unload_semantics": "select_one_nearest_route_end",
+            "unload_scheduling_enabled": False,
         },
         "route_structure": {
             "work_line_count": len(work_lines),
@@ -2515,8 +2690,12 @@ def _prepare_work_line_layout(
 ) -> Tuple[List[List[Tuple[float, float]]], Dict]:
     """Select the declared work-line generator without silent mode fallback."""
     cfg = dict(config or {})
-    mode = str(cfg.get("work_line_mode", "footprint_optimized")).strip().lower()
+    mode = str(
+        cfg.get("work_line_mode", "band_centerline_with_footprint_validation")
+    ).strip().lower()
     if mode == "footprint_optimized":
+        mode = "band_centerline_with_footprint_validation"
+    if mode == "band_centerline_with_footprint_validation":
         if not wide_bands:
             work_lines, layout = [], {
                 "reason": "no_valid_four_row_centerlines",
@@ -2685,8 +2864,10 @@ def plan_path(wide_bands: List[Dict],
             config=cfg,
             return_diagnostics=True,
             global_main_angle=main_angle,
+            processed_mask=processed_mask,
         )
         candidate_assessment["user_requested_strategy"] = turn_strategy
+        candidate_assessment["candidate_strategy"] = strategy_key
         for decision in candidate_assessment.get("turn_decisions", []) or []:
             decision["user_requested_strategy"] = turn_strategy
             decision["candidate_strategy"] = strategy_key
@@ -2715,6 +2896,14 @@ def plan_path(wide_bands: List[Dict],
             )
         )
         candidate_assessment["turn_self_crossing_count"] = turn_self_crossings
+        candidate_assessment["machine_executable"] = bool(
+            candidate_assessment.get("machine_executable", True)
+            and not candidate_assessment.get("kinematically_infeasible", False)
+        )
+        if not candidate_assessment["machine_executable"]:
+            candidate_assessment.setdefault("hard_reasons", []).append(
+                "display-only straight connector is kinematically infeasible"
+            )
         if turn_self_crossings > 0:
             candidate_assessment.setdefault("hard_reasons", []).append(
                 f"所选策略生成的转弯轨迹存在{turn_self_crossings}处自交"
@@ -2740,6 +2929,28 @@ def plan_path(wide_bands: List[Dict],
             candidate_validation["issues"] = issues
         return {
             "strategy": strategy_key,
+            "user_requested_strategy": turn_strategy,
+            "candidate_strategy": strategy_key,
+            "effective_strategies": list(
+                (candidate_assessment.get("used_strategies") or [])
+            ),
+            "geometry_signature": hashlib.sha256(
+                json.dumps(
+                    {
+                        "segment_types": candidate_types,
+                        "path_segments": [
+                            [
+                                [round(float(point[0]), 6), round(float(point[1]), 6)]
+                                for point in segment
+                            ]
+                            for segment in candidate_segments
+                        ],
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
             "path_segments": candidate_segments,
             "segment_types": candidate_types,
             "validation": candidate_validation,
@@ -2751,6 +2962,7 @@ def plan_path(wide_bands: List[Dict],
     for strategy_key in _candidate_strategies_for_request(turn_strategy):
         abort_if_cancelled()
         candidate_results.append(evaluate_strategy(strategy_key))
+    candidate_results = _deduplicate_path_candidates(candidate_results)
     ranked_candidates = _rank_path_candidates(candidate_results)
     selected_candidate = ranked_candidates[0] if ranked_candidates else evaluate_strategy(turn_strategy)
     path_segments = selected_candidate["path_segments"]
@@ -2759,6 +2971,11 @@ def plan_path(wide_bands: List[Dict],
     turn_assessment = selected_candidate["turn_assessment"]
     turn_assessment["selected_candidate_strategy"] = selected_candidate.get("strategy")
     turn_assessment["user_requested_strategy"] = turn_strategy
+    turn_assessment["candidate_strategy"] = selected_candidate.get("candidate_strategy")
+    turn_assessment["effective_strategies"] = list(
+        selected_candidate.get("effective_strategies") or []
+    )
+    turn_assessment["geometry_signature"] = selected_candidate.get("geometry_signature", "")
     turn_assessment["candidate_score"] = selected_candidate.get("candidate_score")
     turn_assessment["candidate_metrics"] = selected_candidate.get("candidate_metrics", {})
     turn_assessment["candidate_count"] = len(ranked_candidates)
@@ -2846,6 +3063,13 @@ def plan_path(wide_bands: List[Dict],
         "path_candidates": [
             {
                 "strategy": item.get("strategy"),
+                "user_requested_strategy": item.get("user_requested_strategy", turn_strategy),
+                "candidate_strategy": item.get("candidate_strategy", item.get("strategy")),
+                "effective_strategies": item.get("effective_strategies", []),
+                "geometry_signature": item.get("geometry_signature", ""),
+                "machine_executable": bool(
+                    (item.get("turn_assessment") or {}).get("machine_executable", False)
+                ),
                 "score": item.get("candidate_score"),
                 "metrics": item.get("candidate_metrics", {}),
                 "validation": item.get("validation", {}),
@@ -2862,3 +3086,182 @@ def plan_path(wide_bands: List[Dict],
         execution_config=cfg,
     )
     return result
+
+def _turn_parts_for_candidate(start, end, work_direction, turn_sign, mpp, min_turn_radius_m, selected_strategy, clearance_m):
+    if selected_strategy in ("fishtail", "alpha"):
+        return _turn_reverse_segments(
+            start, end, work_direction, mpp, min_turn_radius_m, clearance_m,
+            inner=selected_strategy == "alpha",
+        )
+    turn_function = TURN_STRATEGIES.get(selected_strategy, _turn_bow)
+    return [(turn_function(
+        start, end, work_direction, turn_sign, mpp, min_turn_radius_m, clearance_m
+    ), "turn")]
+
+def _turn_parts_length_m(parts, mpp):
+    return sum(
+        math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+        for path, _segment_type in parts
+        for a, b in zip(path, path[1:])
+    ) * float(mpp)
+
+def _turn_parts_have_curve(parts):
+    for path, segment_type in parts:
+        if str(segment_type) == "turn_reverse":
+            continue
+        if has_non_degenerate_curve([path]):
+            return True
+    return False
+
+def _optimize_headland_turn(
+    base_parts, start, end, work_direction, turn_sign, selected_strategy,
+    *, mpp, min_turn_radius_m, clearance_m, processed_mask, field_polygon,
+    geo, state, config, validation_work_lines=None, validation_turn_index=None,
+):
+    """Validate one fixed strategy geometry without searching headland offsets."""
+    cfg = dict(config or {})
+    diagnostics = {
+        "optimizer_version": "headland-turn-corridor-v1",
+        "optimization_applied": False,
+        "fallback_reason": "",
+        "candidate_count": 0,
+        "safe_candidate_count": 0,
+    }
+    if field_polygon is None:
+        diagnostics["fallback_reason"] = "field_boundary_missing"
+        return base_parts, diagnostics
+    if not bool(cfg.get("headland_turn_optimization_enabled", True)):
+        diagnostics["fallback_reason"] = "headland_turn_optimization_disabled"
+        return base_parts, diagnostics
+    if processed_mask is None:
+        diagnostics["fallback_reason"] = "processed_mask_missing"
+        return base_parts, diagnostics
+    headland = cfg.get("headland_mask")
+    if headland is None or not np.any(np.asarray(headland) > 0):
+        diagnostics["fallback_reason"] = "headland_mask_missing"
+        return base_parts, diagnostics
+    try:
+        metric_scale = float(mpp)
+    except (TypeError, ValueError):
+        metric_scale = float("nan")
+    if not math.isfinite(metric_scale) or metric_scale <= 0:
+        diagnostics["fallback_reason"] = "metric_scale_missing"
+        return base_parts, diagnostics
+    shape = np.asarray(processed_mask).shape[:2]
+    corridor, corridor_diag = build_turn_corridor_mask(
+        shape,
+        field_boundary=field_polygon,
+        planning_support_mask=cfg.get("planning_support_mask"),
+        headland_mask=headland,
+        uncertain_residual_mask=cfg.get("uncertain_mask"),
+        forbidden_mask=cfg.get("forbidden_mask"),
+        endpoints=[start, end],
+        corridor_radius_px=(
+            2.0 * float(min_turn_radius_m) + abs(float(clearance_m)) + 3.0
+        ) / metric_scale,
+    )
+    diagnostics["corridor"] = corridor_diag
+    if not np.any(corridor > 0):
+        diagnostics["fallback_reason"] = "empty_turn_corridor"
+        return base_parts, diagnostics
+    candidates = []
+    # The selected strategy and requested clearance define the geometry.  Do
+    # not search alternative offsets here: headland/crop evidence is report
+    # data and must not move a turn.  The single candidate only passes through
+    # the existing hard-constraint validation below.
+    offsets = [float(clearance_m)]
+    seen_offsets = set()
+    for offset in offsets:
+        if round(offset, 9) in seen_offsets:
+            continue
+        seen_offsets.add(round(offset, 9))
+        hard_reasons = []
+        parts = base_parts
+        paths = [path for path, _segment_type in parts]
+        if not paths or not _turn_parts_have_curve(parts):
+            hard_reasons.append("display_only_connector")
+        if paths and field_polygon is not None and any(
+            not _segment_inside_field_boundary(path, field_polygon) for path in paths
+        ):
+            hard_reasons.append("outside_field")
+        if paths and not polyline_inside_mask(paths, corridor):
+            hard_reasons.append("corridor_violation")
+        validation = {}
+        if paths and not hard_reasons:
+            try:
+                validation_paths = paths
+                validation_types = [segment_type for _path, segment_type in parts]
+                local_validation_config = dict(cfg)
+                # This pass only checks the fixed turn footprint. Whole-route
+                # crop overlap and coverage gates are applied once by
+                # validate_path() after all turns have been assembled.
+                local_validation_config.update({
+                    "max_track_core_overlap_pct": 100.0,
+                    "min_geometric_coverage_pct": 0.0,
+                })
+                validation = validate_footprints(
+                    validation_paths, processed_mask, geo=geo, state=state,
+                    config=local_validation_config,
+                    harvester=_harvester_specs(state),
+                    segment_types=validation_types,
+                    headland_mask=headland,
+                    support_mask=cfg.get("planning_support_mask"),
+                    uncertain_mask=cfg.get("uncertain_mask"),
+                    forbidden_mask=cfg.get("forbidden_mask"),
+                )
+            except (TypeError, ValueError, RuntimeError):
+                validation = {}
+                hard_reasons.append("footprint_validation_unavailable")
+        outside = _finite_float(validation.get("turn_outside_field_pct"))
+        if outside is None and validation:
+            outside = _finite_float(validation.get("track_outside_field_pct"))
+        if outside is None and paths and not any(
+            not _segment_inside_field_boundary(path, field_polygon)
+            for path in paths
+        ) and not hard_reasons:
+            hard_reasons.append("outside_field_metric_missing")
+        elif outside is not None and outside > 0.0:
+            hard_reasons.append("outside_field")
+        forbidden = _finite_float(validation.get("turn_forbidden_overlap_area_m2"))
+        if forbidden is None and validation and cfg.get("forbidden_mask") is not None:
+            forbidden_pct = _finite_float(validation.get("track_forbidden_overlap_pct"))
+            forbidden = forbidden_pct
+        if cfg.get("forbidden_mask") is not None and forbidden is None and paths:
+            hard_reasons.append("forbidden_overlap_metric_missing")
+        elif forbidden is not None and forbidden > 0.0:
+            hard_reasons.append("forbidden_overlap")
+        if paths and validation:
+            formal = assess_footprint_hard_constraints(
+                validation,
+                local_validation_config,
+            )
+            validation["formal_hard_reasons"] = list(formal["hard_reasons"])
+            validation["formal_validation_issues"] = list(formal["issues"])
+            hard_reasons.extend(formal["hard_reasons"])
+        metrics = dict(validation)
+        metrics["turn_length_m"] = _turn_parts_length_m(parts, metric_scale) if parts else float("inf")
+        metrics["turn_curvature_penalty"] = abs(float(offset))
+        candidates.append({
+            "candidate_id": f"{selected_strategy}:fixed:{offset:.6f}",
+            "parts": parts,
+            "path": paths,
+            "hard_reasons": sorted(set(hard_reasons)),
+            "validation_issues": list(validation.get("formal_validation_issues") or validation.get("issues") or []),
+            "metrics": metrics,
+        })
+    selected = select_turn_candidate(
+        candidates,
+        fallback_candidate={"candidate_id": "original", "parts": base_parts},
+        fallback_reason="no_safe_turn_candidate",
+    )
+    diagnostics.update(selected.get("diagnostics") or {})
+    diagnostics["rejected_candidates"] = selected.get("rejected_candidates", [])
+    chosen = selected.get("selected")
+    if chosen is None or chosen.get("candidate_id") == "original":
+        return base_parts, diagnostics
+    # Validation accepted the requested fixed geometry; no geometry
+    # optimization or headland-dependent offset was applied.
+    diagnostics["optimization_applied"] = False
+    diagnostics["selected_candidate_id"] = chosen.get("candidate_id", "")
+    diagnostics["selected_metrics"] = dict(chosen.get("metrics") or {})
+    return base_parts, diagnostics

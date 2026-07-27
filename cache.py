@@ -161,21 +161,26 @@ def save_mask(tif_path: str, mask: np.ndarray, offset_x: int = 0, offset_y: int 
                 os.remove(temporary)
         except OSError:
             pass
-    if meta:
-        save_meta(tif_path, meta)
+    if meta and not save_meta(tif_path, meta, commit_callback=commit_callback):
+        return False
     return True
 
 
-def save_meta(tif_path: str, meta: dict):
+def save_meta(tif_path: str, meta: dict, commit_callback=None) -> bool:
     """保存项目元数据，不要求掩码一定存在。"""
     if not tif_path:
-        return
+        return False
+    if commit_callback is not None and not bool(commit_callback()):
+        return False
     with _project_lock(tif_path):
+        if commit_callback is not None and not bool(commit_callback()):
+            return False
         d = _cache_dir(tif_path)
         os.makedirs(d, exist_ok=True)
         merged = _load_meta_from_dir(d)
         merged.update(meta or {})
         _atomic_write_json(_meta_path(tif_path), merged)
+    return True
 
 
 def _jsonable(value):
@@ -239,6 +244,7 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
 
     payload = {
         "schema": PROJECT_STATE_SCHEMA,
+        "project_generation": int(getattr(state, "project_generation", 0) or 0),
         "source_identity": source_identity(tif_path),
         "source_sha256": source_sha256,
         "source_metadata": _jsonable(getattr(state, "source_metadata", {}) or {}),
@@ -264,6 +270,9 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "mask_result": _mask_result_summary(getattr(state, "mask_result", None)),
         "mask_provenance": _jsonable(getattr(state, "mask_provenance", {}) or {}),
         "harvester_params": _jsonable(getattr(state, "harvester_params", {})),
+        "harvester_params_confirmed": bool(
+            getattr(state, "harvester_params_confirmed", False)
+        ),
         "turn_strategy": str(getattr(state, "turn_strategy", "bow") or "bow"),
         "entry_point": _jsonable(getattr(state, "entry_point", None)),
         "exit_point": _jsonable(getattr(state, "exit_point", None)),
@@ -286,6 +295,8 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "auto_path_desc": str(getattr(state, "auto_path_desc", "") or ""),
         "path_provenance": _jsonable(getattr(state, "path_provenance", {}) or {}),
         "path_runtime": _jsonable(getattr(state, "path_runtime", {}) or {}),
+        "path_validation": _jsonable(getattr(state, "path_validation", {}) or {}),
+        "path_artifact": _jsonable(getattr(state, "path_artifact", {}) or {}),
         "auto_path": auto_path,
         "auto_path_geo": _jsonable(getattr(state, "auto_path_geo", [])),
         "path_points": _jsonable(getattr(state, "path_points", [])),
@@ -316,22 +327,36 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
     return payload
 
 
-def _write_project_state_payload(tif_path: str, payload: Dict[str, Any]) -> None:
+def _write_project_state_payload(tif_path: str, payload: Dict[str, Any]) -> bool:
     if not tif_path or not payload:
-        return
+        return False
     os.makedirs(_cache_dir(tif_path), exist_ok=True)
-    _atomic_write_json(_project_state_path(tif_path), payload, compact=True)
+    target = _project_state_path(tif_path)
+    incoming_generation = int(payload.get("project_generation", 0) or 0)
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            current_generation = int((json.load(handle) or {}).get("project_generation", 0) or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        current_generation = -1
+    if incoming_generation < current_generation:
+        return False
+    _atomic_write_json(target, payload, compact=True)
+    return True
 
 
-def save_project_state(tif_path: str, state, stage: str = "") -> None:
+def save_project_state(tif_path: str, state, stage: str = "", commit_callback=None) -> bool:
     """Serialize one project's state in call order without temp-file collisions."""
     if not tif_path or state is None:
-        return
+        return False
     state_lock = getattr(state, "state_lock", None)
     with state_lock if state_lock is not None else nullcontext():
         payload = _build_project_state_payload(tif_path, state, stage)
+    if commit_callback is not None and not bool(commit_callback()):
+        return False
     with _project_lock(tif_path):
-        _write_project_state_payload(tif_path, payload)
+        if commit_callback is not None and not bool(commit_callback()):
+            return False
+        return _write_project_state_payload(tif_path, payload)
 
 
 def request_project_state_save(

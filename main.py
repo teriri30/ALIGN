@@ -3,7 +3,7 @@ import os, sys
 REUI_DIR = os.path.dirname(os.path.abspath(__file__))
 if REUI_DIR not in sys.path: sys.path.insert(0, REUI_DIR)
 try:
-    from env_setup import ensure_environment
+    from startup import ensure_environment
     if not ensure_environment(): sys.exit(0)
 except Exception as exc:
     print(f"环境检查失败，程序已停止: {exc}", file=sys.stderr)

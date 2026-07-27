@@ -2,6 +2,7 @@
 launcher.py - 项目管理器
 """
 import os, json
+from builtin_test_assets import builtin_test_image
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
@@ -20,6 +21,23 @@ def save_recent(recent):
     try:
         with open(RECENT_FILE,"w",encoding="utf-8") as f: json.dump(recent[:20],f,ensure_ascii=False,indent=2)
     except: pass
+
+def project_entries():
+    """Return the stable built-in test image followed by valid recent files."""
+    entries = []
+    test_image = builtin_test_image()
+    if test_image:
+        entries.append({"kind": "builtin_test", "label": "内置测试影像", "path": test_image})
+    seen = {os.path.normcase(os.path.abspath(item["path"])) for item in entries}
+    for path in load_recent():
+        if not os.path.isfile(path):
+            continue
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        entries.append({"kind": "recent", "label": "最近项目", "path": path})
+    return entries
 
 class LauncherDialog(QDialog):
     file_selected = Signal(str)
@@ -46,7 +64,7 @@ class LauncherDialog(QDialog):
         bi.setObjectName("primary"); bi.setFixedWidth(200); bi.setMinimumHeight(40)
         bi.clicked.connect(self._on_import)
         bl.addStretch(); bl.addWidget(bi); bl.addStretch(); lo.addLayout(bl)
-        lr = QLabel("\u6700\u8fd1\u6253\u5f00\u7684\u9879\u76ee")
+        lr = QLabel("内置测试影像与最近项目")
         lr.setStyleSheet(f"font-size:12px;color:{COLORS['text_dim']};font-weight:500;")
         lo.addWidget(lr)
         self.list_widget = QListWidget(); self._refresh_list()
@@ -61,10 +79,13 @@ class LauncherDialog(QDialog):
         lo.addLayout(bt)
     def _refresh_list(self):
         self.list_widget.clear()
-        for p in self._recent:
-            if os.path.exists(p):
-                i = QListWidgetItem(f"{os.path.basename(p)}  ({p})")
-                i.setData(Qt.UserRole,p); self.list_widget.addItem(i)
+        for entry in project_entries():
+            p = entry["path"]
+            prefix = "[内置测试]" if entry["kind"] == "builtin_test" else "[最近]"
+            i = QListWidgetItem(f"{prefix} {os.path.basename(p)}  ({p})")
+            i.setData(Qt.UserRole,p)
+            i.setData(Qt.UserRole + 1, entry["kind"])
+            self.list_widget.addItem(i)
     def _on_import(self):
         paths,_ = QFileDialog.getOpenFileNames(self,"\u9009\u62e9\u6b63\u5c04\u5f71\u50cf","","GeoTIFF (*.tif *.tiff);;\u6240\u6709\u6587\u4ef6 (*)")
         if paths:
@@ -75,7 +96,7 @@ class LauncherDialog(QDialog):
             self._refresh_list(); self.file_selected.emit(paths[0]); self.accept()
     def _on_delete(self):
         i = self.list_widget.currentItem()
-        if i:
+        if i and i.data(Qt.UserRole + 1) != "builtin_test":
             p = i.data(Qt.UserRole)
             if p in self._recent: self._recent.remove(p); save_recent(self._recent); self._refresh_list()
     def _on_open_selected(self):

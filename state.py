@@ -66,6 +66,7 @@ class AppState:
         self.display_scale_x: float = 1.0  # 原图宽度 / 显示宽度
         self.display_scale_y: float = 1.0  # 原图高度 / 显示高度
         self.source_sha256: str = ""
+        self.project_generation: int = 0
         self.source_metadata: Dict[str, Any] = {}
         self.raster_preprocessing: Dict[str, Any] = {}
 
@@ -118,6 +119,8 @@ class AppState:
         self.plan_progress: float = 0.0             # 0.0~1.0
         self.path_provenance: Dict[str, Any] = {}
         self.path_runtime: Dict[str, Any] = {}
+        self.path_validation: Dict[str, Any] = {}
+        self.path_artifact: Dict[str, Any] = {}
 
         self.smooth_running: bool = False
         self.smooth_progress: float = 0.0
@@ -153,6 +156,7 @@ class AppState:
         self.forbidden_regions_confirmed: bool = False
 
         self.harvester_params: Dict[str, float] = {}
+        self.harvester_params_confirmed: bool = False
 
         # 进场/离场点
         self.entry_point: Optional[Tuple[float, float]] = None   # 像素坐标 (x, y)
@@ -202,6 +206,12 @@ class AppState:
         self.current_model_name: str = ""      # 当前加载的模型名
         self.current_model_path: str = ""      # 当前加载的模型完整路径
         self.model_sha256: str = ""
+        # Cached identity is historical until it is verified against the
+        # currently loaded ModelEngine. It is never an executable model.
+        self.historical_model_name: str = ""
+        self.historical_model_path: str = ""
+        self.historical_model_sha256: str = ""
+        self.cache_model_matches_active_engine: bool = True
         self.model_dropdown_open: bool = False  # 模型下拉菜单是否展开
         self.model_dropdown_rect = None         # 下拉菜单按钮的 hitbox（x1,y1,x2,y2）
         self.model_dropdown_items: List[Dict] = []  # 下拉菜单项 [{name, path, is_import}]
@@ -271,11 +281,14 @@ class AppState:
         fields = (
             "field_boundary", "field_area_m2", "field_original_boundary",
             "forbidden_regions", "forbidden_regions_confirmed",
-            "current_model_name", "current_model_path",
+            "current_model_name", "current_model_path", "model_sha256",
+            "historical_model_name", "historical_model_path", "historical_model_sha256",
+            "cache_model_matches_active_engine",
             "mask_raw", "inference_original_mask", "mask_offset_x", "mask_offset_y",
             "inference_done", "mask_processed", "mask_result",
             "smooth_original_mask", "smoothed_result", "_show_original",
             "band_list", "corridors", "harvester_params", "turn_strategy",
+            "harvester_params_confirmed",
             "entry_point", "exit_point", "unload_points", "unload_point",
             "entry_point_locked", "exit_point_locked", "unload_point_locked",
             "path_points", "path_status", "auto_path", "auto_path_planned",
@@ -285,7 +298,8 @@ class AppState:
             "last_planned_target_geometric_coverage_pct",
             "last_detected_mask_geometric_coverage_pct", "last_field_efficiency",
             "last_total_path_m", "last_work_path_m", "last_turn_path_m",
-            "last_entry_exit_path_m",
+            "last_entry_exit_path_m", "path_validation", "path_provenance",
+            "path_runtime", "path_artifact",
         )
         return {
             "kind": "system",
@@ -310,7 +324,8 @@ class AppState:
             "last_detected_mask_geometric_coverage_pct",
             "last_field_efficiency", "last_total_path_m",
             "last_work_path_m", "last_turn_path_m",
-            "last_entry_exit_path_m",
+            "last_entry_exit_path_m", "path_validation", "path_provenance",
+            "path_runtime", "path_artifact",
         )
         return {
             "kind": "route_edit",
@@ -379,6 +394,10 @@ class AppState:
             self.auto_path_geo = deepcopy(snapshot.get("auto_path_geo", []))
             self.auto_path_valid = bool(snapshot.get("auto_path_valid", False))
             self.auto_path_desc = str(snapshot.get("auto_path_desc", ""))
+            self.path_validation = deepcopy(snapshot.get("path_validation", {}))
+            self.path_provenance = deepcopy(snapshot.get("path_provenance", {}))
+            self.path_runtime = deepcopy(snapshot.get("path_runtime", {}))
+            self.path_artifact = deepcopy(snapshot.get("path_artifact", {}))
             # 恢复掩膜处理状态
             self.mask_processed = bool(snapshot.get("mask_processed", False))
             self.mask_result = snapshot.get("mask_result")

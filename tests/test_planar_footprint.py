@@ -5,6 +5,23 @@ from footprint_planner import validate_footprints
 from harvester_geometry import planar_geometry_m
 
 
+def test_pose_track_visits_use_union_inside_local_bounding_box():
+    from footprint_planner import _accumulate_pose_track_visit
+
+    visits = np.zeros((100, 120), dtype=np.uint32)
+    left = np.array([[10, 20], [30, 20], [30, 40], [10, 40]], dtype=np.int32)
+    right = np.array([[25, 20], [45, 20], [45, 40], [25, 40]], dtype=np.int32)
+
+    local_shape = _accumulate_pose_track_visit(visits, left, right)
+
+    assert local_shape[0] <= 21
+    assert local_shape[1] <= 36
+    assert visits[30, 15] == 1
+    assert visits[30, 27] == 1
+    assert visits[30, 40] == 1
+    assert visits[0, 0] == 0
+
+
 def _params(track_length=1.6):
     return {
         "cutter_width_m": 2.2,
@@ -104,6 +121,40 @@ def test_machine_candidate_validation_rejects_machine_envelope_risk(monkeypatch)
     assert result["machine_outside_field_pct"] == pytest.approx(0.1)
     assert result["validation_limits_pct"]["machine_outside_field"] == pytest.approx(0.0)
     assert any("整机平面包络越出田块" in issue for issue in result["issues"])
+
+
+@pytest.mark.parametrize("metric", [float("nan"), float("inf"), "invalid"])
+def test_machine_candidate_validation_rejects_non_finite_machine_envelope_metric(monkeypatch, metric):
+    import path_planner
+
+    footprint = {
+        "track_core_overlap_pct": 0.0,
+        "planned_target_geometric_coverage_pct": 100.0,
+        "track_outside_field_pct": 0.0,
+        "track_outside_support_pct": 0.0,
+        "track_uncertain_overlap_pct": 0.0,
+        "track_forbidden_overlap_pct": 0.0,
+        "machine_outside_field_pct": metric,
+        "machine_forbidden_overlap_pct": 0.0,
+    }
+    monkeypatch.setattr(path_planner, "validate_footprints", lambda *_args, **_kwargs: footprint)
+
+    result = path_planner.validate_path(
+        [[(1.0, 1.0), (2.0, 1.0)]],
+        np.ones((20, 20), dtype=np.uint8) * 255,
+        0.0,
+        geo=_Geo(),
+        state=_State(),
+        segment_types=["work"],
+        config={
+            "validation_profile": "machine_candidate",
+            "max_track_core_overlap_pct": 100.0,
+            "min_geometric_coverage_pct": 0.0,
+        },
+    )
+
+    assert result["valid"] is False
+    assert "整机平面包络田块越界指标无效" in result["issues"]
 
 
 def test_validation_identifies_rigid_planar_footprint_model():

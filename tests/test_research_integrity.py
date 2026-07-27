@@ -131,14 +131,14 @@ def test_all_nodata_raster_window_has_a_distinct_failure_type():
 
 def test_legacy_export_engine_is_fail_closed(tmp_path):
     """DECISION-001: legacy exporters cannot bypass the formal export gate."""
-    from export import ExportEngine
+    from export_guard import ExportEngine
     from state import AppState
 
     state = AppState()
     state.path_points = [(0.0, 0.0), (1.0, 1.0)]
     state.path_status = [1, 1]
 
-    with pytest.raises(RuntimeError, match="已禁用"):
+    with pytest.raises(RuntimeError, match="ExportEngine"):
         ExportEngine(object(), state).export_to_file(str(tmp_path / "unsafe.path"))
 
 
@@ -146,7 +146,7 @@ def test_cache_restore_rejects_old_mask_when_model_file_changes(tmp_path, monkey
     """DECISION-002: cache restoration rejects evidence from a changed model."""
     import cache
     from config import Config
-    from model import INFERENCE_PIPELINE_VERSION
+    from inference import INFERENCE_PIPELINE_VERSION
     from provenance import file_sha256, make_stage_record
     from pyside6_app.workers import CacheRestoreWorker
     from state import AppState
@@ -194,9 +194,11 @@ def test_cache_restore_rejects_old_mask_when_model_file_changes(tmp_path, monkey
     worker.finished.connect(results.append)
     worker.run()
 
-    assert results[0]["saved"]["inference_done"] is False
-    assert results[0]["raw_mask"] is None
-    assert any("AI 掩膜缓存失效" in item for item in results[0]["cache_validation_messages"])
+    assert results[0]["status"] == "completed"
+    restored = results[0]["result"]
+    assert restored["saved"]["inference_done"] is False
+    assert restored["raw_mask"] is None
+    assert any(item.startswith("AI ") for item in restored["cache_validation_messages"])
 
 
 def test_cache_loader_never_reuses_same_shape_mask_from_another_source(tmp_path, monkeypatch):
@@ -265,7 +267,7 @@ def test_metric_processing_rejects_anisotropic_raster_pixels():
             return 0.03
 
     state = type("State", (), {"mask_offset_x": 0, "mask_offset_y": 0})()
-    with pytest.raises(RuntimeError, match="横纵尺度差异过大"):
+    with pytest.raises(RuntimeError, match="ratio="):
         require_metric_scale(AnisotropicGeo(), state, (100, 100))
 
 
@@ -275,9 +277,9 @@ def test_builtin_model_registry_matches_present_weight_files():
     from pathlib import Path
     from provenance import file_sha256
 
-    model_dir = Path(__file__).with_name("data") / "models"
+    model_dir = Path(__file__).resolve().parents[1] / "data" / "models"
     registry = json.loads((model_dir / "model_registry.json").read_text(encoding="utf-8"))
-    assert registry["schema"] == 1
+    assert registry["schema"] == 2
     for item in registry["models"]:
         weight = model_dir / item["name"]
         if weight.exists():

@@ -26,5 +26,11 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "PROJ_LIB=$proj_data"
           Add-Content -Path $env:GITHUB_ENV -Value "PROJ_DATA=$proj_data"
           Write-Host "PROJ paths set to: $proj_data"
-      - run: python -m compileall -q .
-      - run: python -m pytest -q
+      - name: Static checks
+        run: ruff check --select E9,F63,F7,F82 .
+      - name: Compile source
+        run: python -m compileall -q .
+      - name: Run tests with coverage
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q --cov=. --cov-report=term --cov-fail-under=35

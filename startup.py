@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-env_setup.py — 环境自检 + 一键安装模块
+startup.py — 环境自检 + 一键安装模块
 
 仅使用 Python 标准库，在导入任何第三方包之前运行。
 检测核心依赖是否齐全，缺失时弹出 tkinter 对话框让用户一键安装。
@@ -13,6 +13,7 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
+from pathlib import Path
 from runtime_env import configure_geospatial_environment
 
 
@@ -21,19 +22,37 @@ configure_geospatial_environment()
 PIP_INSTALL_TIMEOUT_SECONDS = int(os.environ.get("REUI_PIP_TIMEOUT_SECONDS", "1800"))
 
 # ── 依赖清单 ──────────────────────────────────────────────
-# (显示名, import模块名, pip包名, conda包名)
-# conda_package=None 表示仅 pip 可用
-DEPENDENCIES = [
-    ("NumPy",        "numpy",        "numpy==2.2.6",           "numpy"),
-    ("OpenCV",       "cv2",          "opencv-python==4.13.0.92", "opencv"),
-    ("Pillow",       "PIL",          "Pillow==12.1.1",         "pillow"),
-    ("PySide6",      "PySide6",      "PySide6==6.11.1",       None),
-    ("PyProj",       "pyproj",       "pyproj==3.7.1",         "pyproj"),
-    ("Rasterio",     "rasterio",     "rasterio==1.4.4",       "rasterio"),
-    ("Shapely",      "shapely",      "shapely==2.1.2",        "shapely"),
-    ("Affine",       "affine",       "affine==2.4.0",         "affine"),
-    ("SciPy",        "scipy",        "scipy==1.15.3",         "scipy"),
-    ("Ultralytics",  "ultralytics",  "ultralytics==8.3.163",  None),
+# 版本唯一来源为 requirements-core.txt；这里只维护显示名、导入名和 conda 名。
+_DEPENDENCY_METADATA = {
+    "numpy": ("NumPy", "numpy", "numpy"),
+    "opencv-python": ("OpenCV", "cv2", "opencv"),
+    "Pillow": ("Pillow", "PIL", "pillow"),
+    "PySide6": ("PySide6", "PySide6", None),
+    "pyproj": ("PyProj", "pyproj", "pyproj"),
+    "rasterio": ("Rasterio", "rasterio", "rasterio"),
+    "shapely": ("Shapely", "shapely", "shapely"),
+    "affine": ("Affine", "affine", "affine"),
+    "scipy": ("SciPy", "scipy", "scipy"),
+}
+
+
+def _core_requirements():
+    path = Path(__file__).with_name("requirements-core.txt")
+    packages = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        spec = raw.strip()
+        if not spec or spec.startswith("#"):
+            continue
+        distribution = spec.split("==", 1)[0]
+        if distribution not in _DEPENDENCY_METADATA:
+            continue
+        display_name, import_name, conda_name = _DEPENDENCY_METADATA[distribution]
+        packages.append((display_name, import_name, spec, conda_name))
+    return packages
+
+
+DEPENDENCIES = _core_requirements() + [
+    ("Ultralytics", "ultralytics", "ultralytics==8.3.163", None),
 ]
 
 

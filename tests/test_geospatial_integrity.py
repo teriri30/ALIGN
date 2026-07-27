@@ -8,13 +8,14 @@ import xml.etree.ElementTree as ET
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+import numpy as np
 from affine import Affine
 from pyproj import Transformer
 from PySide6.QtWidgets import QApplication
 
 from geo import GeoUtils
 from pyside6_app.main_window import MainWindow
-from pyside6_app.workers import display_affine
+from pyside6_app.workers import bounded_render_preview, display_affine, preview_shape
 
 
 def _real_geo():
@@ -27,7 +28,7 @@ def _real_geo():
 
 def _window_with_path():
     import numpy as np
-    from model import INFERENCE_PIPELINE_VERSION
+    from inference import INFERENCE_PIPELINE_VERSION
     from path_planner import PATH_PLANNING_VERSION
     from provenance import file_sha256, make_stage_record
     from row_geometry import MASK_REGULARIZATION_VERSION
@@ -99,34 +100,33 @@ def _window_with_path():
         mask_provenance=mask_record,
         path_provenance=path_record,
     )
-    window._pipeline_result = {
-        "path": {
-            "full_path": path_geometry,
-            "segment_types": ["work"],
-            "geo_points": [
-                {
-                    "lon": 1.0,
-                    "lat": 1.0,
-                    "pixel_x": 10.25,
-                    "pixel_y": 20.75,
-                    "segment_index": 0,
-                    "point_index": 0,
-                    "segment_type": "work",
-                },
-                {
-                    "lon": 2.0,
-                    "lat": 2.0,
-                    "pixel_x": 15.5,
-                    "pixel_y": 25.125,
-                    "segment_index": 0,
-                    "point_index": 1,
-                    "segment_type": "work",
-                },
-            ],
-            "validation": {"valid": True},
-            "provenance": path_record,
-        }
-    }
+    window._store_path_result({
+        "full_path": path_geometry,
+        "segment_types": ["work"],
+        "geo_points": [
+            {
+                "lon": 1.0,
+                "lat": 1.0,
+                "pixel_x": 10.25,
+                "pixel_y": 20.75,
+                "segment_index": 0,
+                "point_index": 0,
+                "segment_type": "work",
+            },
+            {
+                "lon": 2.0,
+                "lat": 2.0,
+                "pixel_x": 15.5,
+                "pixel_y": 25.125,
+                "segment_index": 0,
+                "point_index": 1,
+                "segment_type": "work",
+            },
+        ],
+        "validation": {"valid": True},
+        "is_valid": True,
+        "provenance": path_record,
+    })
     return window
 
 
@@ -175,6 +175,93 @@ def test_display_affine_uses_exact_non_divisible_raster_ratio():
         source * (full_w, full_h), abs=1e-9
     )
     assert transformed.a != pytest.approx((source * Affine.scale(4, 4)).a, abs=1e-12)
+
+
+def test_preview_shape_bounds_render_pixels_without_changing_source_footprint():
+    """DECISION-003/004: UI rendering may shrink, but its affine still covers the source."""
+    source = Affine(0.0035, 0.0, 447411.3937887839, 0.0, -0.0035, 3385528.6805868475)
+    full_h, full_w = 32190, 22012
+
+    display_h, display_w = preview_shape(full_h, full_w, 4096)
+    transformed = display_affine(source, full_w, full_h, display_w, display_h)
+
+    assert (display_h, display_w) == (4096, 2801)
+    assert max(display_h, display_w) <= 4096
+    assert transformed * (display_w, display_h) == pytest.approx(
+        source * (full_w, full_h), abs=1e-9
+    )
+
+
+def test_low_resolution_render_keeps_logical_analysis_coordinates():
+    """DECISION-004: a smaller Qt texture must not alter mask/path scene coordinates."""
+    from pyside6_app.image_view import ImageViewer
+
+    QApplication.instance() or QApplication([])
+    viewer = ImageViewer()
+    viewer.set_image(
+        np.zeros((2, 4, 3), dtype=np.uint8),
+        logical_shape=(4, 8),
+    )
+
+    bounds = viewer._pixmap_item.sceneBoundingRect()
+    assert viewer._image_shape == (4, 8)
+    assert bounds.width() == pytest.approx(8.0)
+    assert bounds.height() == pytest.approx(4.0)
+
+
+def test_bounded_render_preview_limits_texture_without_mutating_analysis_pixels():
+    """DECISION-004: render decimation is a separate UI artifact."""
+    analysis_rgb = np.arange(5 * 10 * 3, dtype=np.uint8).reshape(5, 10, 3)
+
+    render_rgb = bounded_render_preview(analysis_rgb, max_dimension=4)
+
+    assert analysis_rgb.shape == (5, 10, 3)
+    assert render_rgb.shape == (2, 4, 3)
+    assert max(render_rgb.shape[:2]) <= 4
+
+
+def test_tif_load_commit_clears_previous_project_analysis(tmp_path, monkeypatch):
+    from pyside6_app.main_window import MainWindow
+    from state import AutoPathSegment
+
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    source = tmp_path / "new.tif"
+    source.write_bytes(b"source")
+    monkeypatch.setattr(window, "_queue_cache_restore_after_current_worker", lambda _path: None)
+    window.state.field_boundary = [(1.0, 1.0), (5.0, 1.0), (5.0, 5.0)]
+    window.state.mask_raw = np.ones((2, 2), dtype=np.uint8)
+    window.state.mask_result = {"processed_mask": np.ones((2, 2), dtype=np.uint8)}
+    window.state.inference_done = True
+    window.state.mask_processed = True
+    window.state.auto_path = [AutoPathSegment()]
+    window.state.auto_path_planned = True
+    window._pipeline_result = {"path": {"is_valid": True}}
+
+    window._on_tif_load_done({
+        "path": str(source),
+        "rgb": np.zeros((5, 5, 3), dtype=np.uint8),
+        "full_h": 5,
+        "full_w": 5,
+        "display_h": 5,
+        "display_w": 5,
+        "downsample": 1,
+        "transformer": None,
+        "transform": None,
+        "crs": None,
+        "source_sha256": "new-source",
+        "source_metadata": {},
+        "preview_preprocessing": {},
+    })
+
+    assert window.state.field_boundary == []
+    assert window.state.mask_raw is None
+    assert window.state.mask_result is None
+    assert window.state.inference_done is False
+    assert window.state.mask_processed is False
+    assert window.state.auto_path == []
+    assert window.state.auto_path_planned is False
+    assert window._pipeline_result is None
 
 
 def test_tif_loader_builds_wgs84_transformer_from_source_crs(tmp_path):
@@ -319,7 +406,7 @@ def test_export_blocks_path_points_outside_loaded_image():
     window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)
     window._pipeline_result["path"]["full_path"] = [[(10.0, 10.0), (25.0, 10.0)]]
 
-    with pytest.raises(ValueError, match="超出影像范围"):
+    with pytest.raises(ValueError, match="pixel="):
         window._geo_export_payload()
 
 
@@ -333,7 +420,7 @@ def test_export_blocks_when_loaded_geotiff_changes_on_disk(tmp_path):
     window._tif_source_identity = source_identity(str(source))
     source.write_bytes(b"changed")
 
-    with pytest.raises(ValueError, match="加载后已发生变化"):
+    with pytest.raises(ValueError, match="GeoTIFF"):
         window._geo_export_payload()
 
 
@@ -394,7 +481,7 @@ def test_all_export_formats_round_trip_the_same_wgs84_points(tmp_path, monkeypat
         assert actual[1] == pytest.approx(reference[1], abs=1e-8)
 
 
-def test_project_cache_is_rejected_when_source_file_changes(tmp_path, monkeypatch):
+def test_cache_is_rejected_when_source_file_changes(tmp_path, monkeypatch):
     import cache
     from state import AppState
 
@@ -412,7 +499,7 @@ def test_project_cache_is_rejected_when_source_file_changes(tmp_path, monkeypatc
 
 
 def test_legacy_export_engine_is_disabled_to_prevent_bypassing_export_gate(tmp_path):
-    from export import ExportEngine
+    from export_guard import ExportEngine
     from state import AppState
 
     state = AppState()
@@ -420,6 +507,6 @@ def test_legacy_export_engine_is_disabled_to_prevent_bypassing_export_gate(tmp_p
     state.path_status = [0]
     output = tmp_path / "legacy.path"
 
-    with pytest.raises(RuntimeError, match="已禁用"):
+    with pytest.raises(RuntimeError, match="ExportEngine"):
         ExportEngine(_real_geo()[0], state).export_to_file(str(output))
     assert not output.exists()

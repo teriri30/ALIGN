@@ -85,3 +85,39 @@ def test_route_edit_insert_delete_drag_and_sync_auto_path():
     window._route_edit_delete_point(1)
     assert window.state.path_points == [(0.0, 0.0), (10.0, 0.0)]
     assert window.state.path_status == [1]
+
+
+def test_stale_plan_worker_result_is_ignored():
+    window = _window()
+    window.state.project_generation = 5
+    window.state.plan_running = True
+    window._pipeline_result = {"path": {"sentinel": "current"}}
+
+    window._active_plan_generation = 4
+    window._on_plan_worker_done({"path": {"sentinel": "stale"}})
+
+    assert window._pipeline_result == {"path": {"sentinel": "current"}}
+    assert window.state.plan_running is True
+
+
+def test_route_drag_release_commits_geometry_and_invalidates_validation():
+    window = _window()
+    window._route_edit_active = True
+    window._route_drag_idx = 1
+    window.state.path_points = [(0.0, 0.0), (5.0, 3.0), (10.0, 0.0)]
+    window.state.path_status = [1, 1]
+    window.state.auto_path_valid = True
+    window._pipeline_result = {
+        "path": {
+            "full_path": [[(0.0, 0.0), (5.0, 0.0), (10.0, 0.0)]],
+            "validation": {"valid": True},
+            "is_valid": True,
+        }
+    }
+
+    window._on_viewer_mouse_released(5.0, 3.0, 1)
+
+    assert window._route_drag_idx == -1
+    assert window.state.auto_path_valid is False
+    assert window._pipeline_result["path"]["full_path"][0][1] == (5.0, 3.0)
+    assert window._pipeline_result["path"]["validation"]["valid"] is False

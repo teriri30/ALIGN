@@ -172,7 +172,7 @@ def test_auto_start_does_not_load_bundled_tif_without_user_choice(monkeypatch):
             return 0
 
     monkeypatch.setattr("pyside6_app.main_window.LauncherDialog", RejectingLauncher)
-    monkeypatch.setattr("sys.argv", ["pyside6_main.py"])
+    monkeypatch.setattr("sys.argv", ["main.py"])
     monkeypatch.setattr(window, "_load_tif_path", lambda path: loaded.append(path))
 
     window._auto_start()
@@ -195,7 +195,7 @@ def test_auto_start_loads_launcher_selected_path(monkeypatch):
             return 1
 
     monkeypatch.setattr("pyside6_app.main_window.LauncherDialog", AcceptingLauncher)
-    monkeypatch.setattr("sys.argv", ["pyside6_main.py"])
+    monkeypatch.setattr("sys.argv", ["main.py"])
     monkeypatch.setattr("pyside6_app.main_window.QTimer.singleShot", lambda _ms, fn: fn())
     monkeypatch.setattr(window, "_load_tif_path", lambda path: loaded.append(path))
 
@@ -325,13 +325,13 @@ def test_segment_uses_source_geotiff_instead_of_downsampled_preview(monkeypatch)
     calls = []
 
     class FakeRunner:
-        def __init__(self, state, model_engine, geo):
+        def __init__(self, state, model_engine, geo, **_kwargs):
             pass
 
         def start_from_tif(self, tif_path, display_shape, field_boundary, downsample):
             calls.append((tif_path, display_shape, field_boundary, downsample))
 
-    monkeypatch.setattr("model.InferenceRunner", FakeRunner)
+    monkeypatch.setattr("inference.InferenceRunner", FakeRunner)
 
     window._on_segment()
 
@@ -349,7 +349,7 @@ def test_source_tif_inference_streams_oversized_crop_at_source_tile_size(monkeyp
     import types
 
     import cache
-    import model
+    import inference
     import provenance
     from raster_preprocessing import EmptyRasterWindowError
     from state import AppState
@@ -361,10 +361,10 @@ def test_source_tif_inference_streams_oversized_crop_at_source_tile_size(monkeyp
     state.current_model_name = "model.pt"
     state.source_sha256 = "source-sha"
     state.model_sha256 = "model-sha"
-    engine = model.ModelEngine()
+    engine = inference.ModelEngine()
     engine._loaded = True
     engine._model = object()
-    runner = model.InferenceRunner(state, engine, geo=None)
+    runner = inference.InferenceRunner(state, engine, geo=None)
     runner.cfg.update_section("model", {"max_source_crop_pixels": 36_000_000})
     calls = {}
 
@@ -471,11 +471,11 @@ def test_source_tif_inference_rejects_crop_with_only_nodata_tiles(monkeypatch):
     """DECISION-004: an entirely empty crop must not become a valid background result."""
     import pytest
 
-    import model
+    import inference
     from raster_preprocessing import EmptyRasterWindowError
     from state import AppState
 
-    runner = model.InferenceRunner(AppState(), model.ModelEngine(), geo=None)
+    runner = inference.InferenceRunner(AppState(), inference.ModelEngine(), geo=None)
     monkeypatch.setattr(
         "raster_preprocessing.read_rgb_raster",
         lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -593,6 +593,9 @@ def test_recommended_harvester_params_sync_state_when_same_as_config(monkeypatch
     window.state.mask_result = {"processed_mask": raw}
     window.state.entry_point = (1, 1)
     window.state.exit_point = (2, 2)
+    window.state.entry_point_locked = True
+    window.state.exit_point_locked = True
+    window.state.harvester_params_confirmed = True
     window.state.harvester_params = {}
     window.cfg._raw.setdefault("harvester", {})["cutter_forward_offset_m"] = None
     defaults = window._effective_harvester_params({})
@@ -619,9 +622,13 @@ def test_recommended_harvester_params_sync_state_when_same_as_config(monkeypatch
 
 
 def test_restore_visual_prefers_planned_path_over_boundary_only(monkeypatch):
+    from state import AutoPathSegment
+
     window = _window()
     called = []
-    window._pipeline_result = {"path": {"full_path": [[(0, 0), (5, 0)]], "segment_types": ["work"]}}
+    window.state.auto_path_segments = [
+        AutoPathSegment(points=[(0, 0), (5, 0)], segment_type="work")
+    ]
     window.state.auto_path_planned = True
     monkeypatch.setattr(window, "_show_path", lambda path: called.append(("path", path)))
 
@@ -750,6 +757,9 @@ def test_path_planning_action_stays_clickable_when_only_cutter_offset_is_missing
     }
     state.entry_point = (1, 1)
     state.exit_point = (2, 2)
+    state.entry_point_locked = True
+    state.exit_point_locked = True
+    state.harvester_params_confirmed = True
 
     statuses = derive_task_statuses(state, has_image=True)
     panel = _window().task_panel
@@ -759,6 +769,118 @@ def test_path_planning_action_stays_clickable_when_only_cutter_offset_is_missing
     assert statuses["params"].text == "缺割刀前置"
     assert statuses["plan"].status == "available"
     assert panel._task_widgets["plan"]._action_btn.isEnabled()
+
+
+def test_mask_completion_stops_at_parameter_confirmation_before_path_planning():
+    from state import AppState
+    from pyside6_app.task_state import derive_task_statuses
+
+    raw = np.ones((3, 3), dtype=np.uint8)
+    state = AppState()
+    state.tif_path = "dummy.tif"
+    state.field_boundary = [(0, 0), (1, 0), (1, 1)]
+    state.inference_done = True
+    state.mask_raw = raw
+    state.mask_processed = True
+    state.mask_result = {"processed_mask": raw}
+    state.harvester_params = {
+        "cutter_width_m": 2.15,
+        "cutter_forward_offset_m": 0.65,
+        "track_width_m": 0.40,
+        "track_gauge_m": 1.00,
+        "wheelbase_m": 1.80,
+        "track_length_m": 1.70,
+        "turn_radius_m": 0.90,
+    }
+    state.entry_point = (1, 1)
+    state.exit_point = (2, 2)
+
+    statuses = derive_task_statuses(state, has_image=True)
+    assert statuses["params"].status == "available"
+    assert statuses["entry"].status == "available"
+    assert statuses["exit"].status == "available"
+    assert statuses["plan"].status == "pending"
+
+
+def test_path_planning_unlocks_only_after_parameters_and_recommended_points_are_confirmed():
+    from state import AppState
+    from pyside6_app.task_state import derive_task_statuses
+
+    raw = np.ones((3, 3), dtype=np.uint8)
+    state = AppState()
+    state.tif_path = "dummy.tif"
+    state.field_boundary = [(0, 0), (1, 0), (1, 1)]
+    state.inference_done = True
+    state.mask_raw = raw
+    state.mask_processed = True
+    state.mask_result = {"processed_mask": raw}
+    state.harvester_params = {
+        "cutter_width_m": 2.15,
+        "cutter_forward_offset_m": 0.65,
+        "track_width_m": 0.40,
+        "track_gauge_m": 1.00,
+        "wheelbase_m": 1.80,
+        "track_length_m": 1.70,
+        "turn_radius_m": 0.90,
+    }
+    state.harvester_params_confirmed = True
+    state.entry_point = (1, 1)
+    state.exit_point = (2, 2)
+    state.entry_point_locked = True
+    state.exit_point_locked = True
+
+    statuses = derive_task_statuses(state, has_image=True)
+    assert statuses["params"].status == "done"
+    assert statuses["entry"].status == "done"
+    assert statuses["exit"].status == "done"
+    assert statuses["plan"].status == "available"
+
+
+def test_recommended_service_point_confirmation_is_explicit_and_stepwise():
+    window = _window()
+    window.state.entry_point = (10, 20)
+    window.state.exit_point = (30, 40)
+    window.state.entry_point_locked = False
+    window.state.exit_point_locked = False
+
+    window._on_toggle_entry_exit("entry")
+    assert window.state.entry_point_locked is True
+    assert window.state.exit_point_locked is False
+    assert window.state.entry_exit_mode is False
+
+    window._on_toggle_entry_exit("exit")
+    assert window.state.exit_point_locked is True
+    assert window.state.entry_exit_mode is False
+
+
+def test_unchanged_harvester_parameters_can_still_be_confirmed(monkeypatch):
+    window = _window()
+    defaults = window._effective_harvester_params({})
+    defaults["cutter_forward_offset_m"] = 0.65
+    window.state.harvester_params = dict(defaults)
+    window.state.harvester_params_confirmed = False
+    monkeypatch.setattr(
+        window.cfg,
+        "update_section",
+        lambda *args, **kwargs: window.cfg.snapshot(),
+    )
+
+    assert window._apply_harvester_params(defaults, "custom") is True
+    assert window.state.harvester_params_confirmed is True
+
+
+def test_harvester_parameter_confirmation_is_persisted_in_project_state(tmp_path):
+    import cache
+    from state import AppState
+
+    tif = tmp_path / "field.tif"
+    tif.write_bytes(b"field")
+    state = AppState()
+    state.harvester_params = {"cutter_width_m": 2.15}
+    state.harvester_params_confirmed = True
+    payload = cache._build_project_state_payload(str(tif), state, "params_confirmed")
+
+    assert payload["harvester_params_confirmed"] is True
 
 
 def test_undo_redo_buttons_follow_history_stack_state():
@@ -1224,6 +1346,47 @@ def test_mask_overlay_draws_headland_and_uncertain_as_separate_layers(monkeypatc
     assert calls[1][0] is uncertain
     assert calls[2][0] is body
     assert len({calls[0][1], calls[1][1], calls[2][1]}) == 3
+
+
+def test_source_resolution_mask_is_normalised_to_display_coordinates():
+    """Source-resolution masks must share the viewer's display coordinate space."""
+    window = _window()
+    window._tif_rgb = np.zeros((10, 20, 3), dtype=np.uint8)
+    window.state.safe_update(
+        source_img_h=20,
+        source_img_w=40,
+        display_h=10,
+        display_w=20,
+        mask_offset_x=8,
+        mask_offset_y=4,
+    )
+    source_mask = np.zeros((10, 12), dtype=np.uint8)
+
+    normalised, x, y = window._normalise_mask_for_overlay(source_mask)
+
+    assert normalised.shape == (5, 6)
+    assert (x, y) == (4, 2)
+
+
+def test_source_resolution_mask_overlay_stays_inside_base_image():
+    window = _window()
+    window._tif_rgb = np.zeros((10, 20, 3), dtype=np.uint8)
+    window.image_view.set_image(window._tif_rgb)
+    window.state.safe_update(
+        source_img_h=20,
+        source_img_w=40,
+        display_h=10,
+        display_w=20,
+        mask_offset_x=8,
+        mask_offset_y=4,
+    )
+    source_mask = np.full((10, 12), 255, dtype=np.uint8)
+
+    window._show_mask_overlay(source_mask)
+
+    base_bounds = window.image_view.viewer._pixmap_item.sceneBoundingRect()
+    overlay_bounds = window.image_view.viewer._overlay_group[0].sceneBoundingRect()
+    assert base_bounds.contains(overlay_bounds)
 
 
 def test_mask_diagnostic_bundle_preserves_stages_and_flags_detached_components(tmp_path):

@@ -35,6 +35,75 @@ class LoadingProgress(QDialog):
             self.lbl_detail.setText(str(detail))
 
 
+class PaperExperimentDialog(QDialog):
+    """Configure a reproducible current-project paper experiment."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("论文消融实验中心")
+        self.resize(620, 480)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "对当前项目快照运行掩膜基线、完整规则化和六种调头策略对比。"
+            "实验不会覆盖当前界面结果；失败组会保留在结果表中。"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.mask_check = QCheckBox("掩膜处理对比：原始分割掩膜 vs 完整规则化")
+        self.mask_check.setChecked(True)
+        self.path_check = QCheckBox("路径策略对比：弓形、半圆、梨形、鱼尾、Alpha、自动优选")
+        self.path_check.setChecked(True)
+        layout.addWidget(self.mask_check)
+        layout.addWidget(self.path_check)
+
+        truth_row = QHBoxLayout()
+        self.truth_path = ""
+        self.truth_label = QLabel("未提供人工真值（不计算 IoU、Dice、Precision、Recall）")
+        self.truth_label.setWordWrap(True)
+        truth_button = QPushButton("选择真值掩膜…")
+        truth_button.clicked.connect(self._choose_truth)
+        truth_row.addWidget(self.truth_label, 1)
+        truth_row.addWidget(truth_button)
+        layout.addLayout(truth_row)
+
+        model_note = QLabel(
+            "多模型对比：为避免把当前模型掩膜冒充其他模型结果，本入口暂不执行批量模型推理。"
+            "模型间对比应在相同数据划分和原始 GeoTIFF 推理设置下单独运行。"
+        )
+        model_note.setWordWrap(True)
+        model_note.setStyleSheet(f"color:{COLORS['text_dim']};")
+        layout.addWidget(model_note)
+        layout.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("选择位置并开始")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _choose_truth(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择人工真值二值掩膜", "", "Mask image (*.png *.tif *.tiff *.bmp)"
+        )
+        if path:
+            self.truth_path = path
+            self.truth_label.setText(path)
+
+    def options(self):
+        return {
+            "include_mask": self.mask_check.isChecked(),
+            "include_path": self.path_check.isChecked(),
+            "ground_truth_path": self.truth_path,
+        }
+
+    def accept(self):
+        if not self.mask_check.isChecked() and not self.path_check.isChecked():
+            QMessageBox.warning(self, "没有实验组", "请至少选择一类实验。")
+            return
+        super().accept()
+
+
 class HarvesterParamsDialog(QDialog):
     def __init__(self, params=None, parent=None):
         super().__init__(parent)
@@ -305,7 +374,7 @@ class ModelManagerDialog(QDialog):
         folder = QFileDialog.getExistingDirectory(self, "选择模型文件夹", "")
         if not folder:
             return
-        from model import scan_model_dir
+        from inference import scan_model_dir
         found = scan_model_dir(folder)
         if not found:
             item = QListWidgetItem("未在所选文件夹中找到 .pt 模型")

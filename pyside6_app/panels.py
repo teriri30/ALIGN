@@ -239,7 +239,7 @@ class TaskPanel(QWidget):
     plan_requested = Signal()
     simulate_requested = Signal()
     params_requested = Signal()
-    entry_exit_toggle = Signal()
+    entry_exit_toggle = Signal(str)
     export_geojson_requested = Signal()
     export_csv_requested = Signal()
     export_img_requested = Signal()
@@ -392,7 +392,11 @@ class TaskPanel(QWidget):
             "export": self.export_geojson_requested,
         }
         sig = mapping.get(tid)
-        if sig: sig.emit()
+        if sig:
+            if tid in {"entry", "exit", "unload"}:
+                self.entry_exit_toggle.emit(tid)
+            else:
+                sig.emit()
 
     def _refresh_cards(self):
         first = 0
@@ -439,20 +443,26 @@ class TaskPanel(QWidget):
             text=text,
             status=status,
         )
-        self._refresh_cards()
+        if not getattr(self, "_applying_task_statuses", False):
+            self._refresh_cards()
 
     def apply_task_statuses(self, statuses):
-        for tid in TASK_ORDER:
-            st = statuses.get(tid)
-            if not st:
-                continue
-            self.set_task_status(tid, st.status, text=st.text)
-            if st.action:
-                self.set_task_action(tid, st.action)
-            else:
-                task_def = _task_def(tid)
-                if task_def:
-                    self.set_task_action(tid, task_def["action"])
+        self._applying_task_statuses = True
+        try:
+            for tid in TASK_ORDER:
+                st = statuses.get(tid)
+                if not st:
+                    continue
+                self.set_task_status(tid, st.status, text=st.text)
+                if st.action:
+                    self.set_task_action(tid, st.action)
+                else:
+                    task_def = _task_def(tid)
+                    if task_def:
+                        self.set_task_action(tid, task_def["action"])
+        finally:
+            self._applying_task_statuses = False
+        self._refresh_cards()
 
     def set_task_action(self, tid, text):
         row = self._task_widgets.get(tid)
@@ -705,11 +715,11 @@ class RouteInfoPanel(QWidget):
         readiness = data.get("machine_readiness", {}) or {}
         trial_ready = bool(readiness.get("controlled_trial_ready", False))
         if not bool(validation.get("valid", False)):
-            execution_label = "不建议导出"
+            execution_label = "路径校验未通过"
         elif trial_ready:
-            execution_label = "可田间试验（需人工看护）"
+            execution_label = "路径校验通过"
         else:
-            execution_label = "需人工复核"
+            execution_label = "待补充试验记录"
         self._safety.setText(f"路径状态：{execution_label}")
         blockers = list(readiness.get("controlled_trial_blockers") or [])
         blocker_labels = {
@@ -725,7 +735,7 @@ class RouteInfoPanel(QWidget):
         }
         readable_blockers = [blocker_labels.get(value, value) for value in blockers]
         limits = validation.get("validation_limits_pct", {}) or {}
-        details = [f"还需完成: {'；'.join(readable_blockers)}" if blockers else "田间试验检查已通过"]
+        details = [f"待补充: {'；'.join(readable_blockers)}" if blockers else "田间试验检查已通过"]
         if limits:
             details.append(
                 "阈值(%): 田界<={track_outside_field:g}, 支撑<={track_outside_support:g}, "

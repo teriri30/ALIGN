@@ -16,25 +16,27 @@ from PySide6.QtWidgets import (
 from config import Config, AppLogger, save_json_atomic
 from state import AppState, AutoPathSegment, PathPoint
 from geo import GeoUtils
-from model import ModelEngine, scan_model_dir
+from inference import ModelEngine, scan_model_dir
 from pyside6_app.image_view import ImageViewerGroup
 from pyside6_app.panels import TaskPanel, ParamPanel, LogPanel, RouteInfoPanel
 from pyside6_app.top_bar import TopToolbar
 from pyside6_app.workers import (
     PipelineWorker, MaskProcessWorker, PlanWorker, TifLoadWorker,
-    CacheRestoreWorker, MaskDiagnosticExportWorker,
+    CacheRestoreWorker, MaskDiagnosticExportWorker, PaperExperimentWorker,
 )
 from pyside6_app.event_handler import EventBridge
 from pyside6_app.dialogs import (
     HarvesterParamsDialog, ModelManagerDialog, SettingsDialog,
     ProjectLogDialog, ReportDialog, DiagnosisDialog, LoadingProgress,
-    MachineRecommendationDialog,
+    MachineRecommendationDialog, PaperExperimentDialog,
 )
 from pyside6_app.launcher import LauncherDialog
 from pyside6_app.styles import COLORS, ThemeManager, ThemeMode, THEMES, build_stylesheet
 from pyside6_app.task_state import TASK_ORDER, TASK_LABELS, derive_task_statuses, rollback_summary
 from workflow import WorkflowUpdater, AnimationEngine
 from project_log import ProjectJournal
+from task_lifecycle import admit_task_result, make_task_token
+from pyside6_app.project_session import cached_path_restore_plan, reset_project_state
 
 
 class MainWindow(QMainWindow):
@@ -92,6 +94,13 @@ class MainWindow(QMainWindow):
         self._worker_thread: Optional[QThread] = None
         self._worker: Optional[PipelineWorker] = None
         self._task_cancel_requested = False
+        self._active_inference_token = None
+        self._active_inference_runner = None
+        self._active_mask_token = None
+        self._active_plan_token = None
+        self._active_paper_experiment_token = None
+        self._active_cache_restore_token = None
+        self._active_plan_generation = None
         self._close_after_worker_cancel = False
         self._close_cancel_started_at = 0.0
         self._close_cancel_warning_shown = False
@@ -101,6 +110,7 @@ class MainWindow(QMainWindow):
         self._log.info("desktop startup complete")
         if not os.environ.get("REUI_DISABLE_AUTO_START"):
             QTimer.singleShot(300, self._auto_start)
+
 
     # UI 构建
 
@@ -208,6 +218,9 @@ class MainWindow(QMainWindow):
         self._add_action(tm, "设置...", "Ctrl+Shift+S", self._on_settings_dialog)
         self._add_action(tm, "项目日志...", None, self._on_project_log)
         self._add_action(tm, "系统诊断...", None, self._on_diagnose)
+
+        em = mb.addMenu("实验")
+        self._add_action(em, "论文消融实验中心...", None, self._on_paper_experiments)
     def _add_action(self, menu, text, shortcut, slot):
         act = QAction(text, self)
         if shortcut: act.setShortcut(QKeySequence(shortcut))
@@ -324,6 +337,8 @@ class MainWindow(QMainWindow):
         worker.progress.connect(self._on_progress)
         worker.error.connect(self._on_worker_error)
         self._worker_thread.started.connect(worker.run)
+        worker.finished.connect(self._worker_thread.quit)
+        worker.error.connect(self._worker_thread.quit)
         self._worker_thread.finished.connect(worker.deleteLater)
         self._worker_thread.finished.connect(self._clear_background_worker_refs)
         self._worker_thread.start()
@@ -336,9 +351,25 @@ class MainWindow(QMainWindow):
 
     def _cancel_background_worker(self):
         """Request cancellation without treating it as a processing failure."""
-        if not self._has_background_worker():
+        inference_runner = getattr(self, '_active_inference_runner', None)
+        inference_running = bool(getattr(self.state, 'inference_running', False) and inference_runner)
+        if not self._has_background_worker() and not inference_running:
             return
         self._task_cancel_requested = True
+        inference_token = getattr(self, '_active_inference_token', None)
+        if inference_token is not None:
+            inference_token.invalidate()
+        if inference_runner is not None:
+            inference_runner.cancel()
+        for token_name in (
+            "_active_mask_token",
+            "_active_plan_token",
+            "_active_cache_restore_token",
+            "_active_paper_experiment_token",
+        ):
+            token = getattr(self, token_name, None)
+            if token is not None:
+                token.invalidate()
         if getattr(self.state, 'mask_processing_running', False):
             self.state.mask_processing_running = False
             self.state.mask_processing_progress = 0.0
@@ -353,8 +384,27 @@ class MainWindow(QMainWindow):
         self.log_panel.info("已请求取消当前任务")
         if hasattr(self, 'btn_cancel_task'):
             self.btn_cancel_task.setEnabled(False)
-        if self._worker_thread:
-            self._worker_thread.quit()
+
+    def _invalidate_active_inference_runner(self):
+        """Prevent a prior project or model inference from committing later."""
+        token = getattr(self, "_active_inference_token", None)
+        if token is not None:
+            token.invalidate()
+        runner = getattr(self, "_active_inference_runner", None)
+        if runner is not None:
+            runner.cancel()
+        self._active_inference_token = None
+        self._active_inference_runner = None
+        self._pending_segment_display = False
+
+    def _release_finished_inference_runner(self):
+        """Release a naturally completed runner after its terminal state is visible."""
+        runner = getattr(self, "_active_inference_runner", None)
+        if runner is None or bool(runner.is_running()):
+            return False
+        self._active_inference_runner = None
+        self._active_inference_token = None
+        return True
 
     def _finish_cancelled_background_worker(self):
         if getattr(self.state, 'mask_processing_running', False):
@@ -473,7 +523,14 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, title, message)
 
     @Slot(dict)
-    def _on_mask_worker_done(self, processed):
+    def _on_mask_worker_done(self, payload):
+        processed = self._unwrap_task_result("mask", payload)
+        if processed is None:
+            self._finish_failed_task_completion(
+                "mask", payload, "掩膜处理", "process",
+            )
+            self._clear_task_token_if_current("mask", payload)
+            return
         self.state.mask_processing_running = False
         self.state.mask_processing_progress = 1.0
         self.progress_bar.hide()
@@ -482,11 +539,82 @@ class MainWindow(QMainWindow):
         self.top_toolbar.set_progress(0)
         self.top_toolbar.set_worker_cancel_visible(False)
         self._apply_mask_process_result(processed)
-        if self._worker_thread:
-            self._worker_thread.quit()
+        self._active_mask_token = None
+
+    def _admit_task_completion(self, task_type, token):
+        """Reject cancelled or stale worker output before it mutates project state."""
+        active_token = getattr(self, f"_active_{task_type}_token", None)
+        if active_token is not None and token is not active_token:
+            return False
+        if token is not None:
+            return admit_task_result(token, self.state)
+        generation = getattr(self, f"_active_{task_type}_generation", None)
+        if generation is not None:
+            return int(generation) == int(getattr(self.state, "project_generation", 0) or 0)
+        return not bool(getattr(self, "_task_cancel_requested", False))
+
+    def _unwrap_task_result(self, task_type, payload):
+        """Return an admitted completed worker result, otherwise fail closed."""
+        if not isinstance(payload, dict):
+            return None
+        active_token = getattr(self, f"_active_{task_type}_token", None)
+        is_envelope = "status" in payload or "task_token" in payload
+        if not is_envelope:
+            if active_token is not None or not self._admit_task_completion(task_type, None):
+                return None
+            return payload
+        token = payload.get("task_token")
+        if token is not active_token or payload.get("status") != "completed":
+            return None
+        if not self._admit_task_completion(task_type, token):
+            return None
+        result = payload.get("result")
+        return result if isinstance(result, dict) else None
+
+    def _clear_task_token_if_current(self, task_type, payload):
+        """Release a terminal token only when the completing worker owns it."""
+        if not isinstance(payload, dict):
+            return
+        token = payload.get("task_token")
+        name = f"_active_{task_type}_token"
+        if token is not None and token is getattr(self, name, None):
+            setattr(self, name, None)
+
+    def _finish_failed_task_completion(self, task_type, payload, label, task_id):
+        """DECISION-002/007: clear only the active task after an owned failure."""
+        if not isinstance(payload, dict) or payload.get("status") != "failed":
+            return False
+        token = payload.get("task_token")
+        if token is not getattr(self, f"_active_{task_type}_token", None):
+            return False
+        if not self._admit_task_completion(task_type, token):
+            return False
+        if task_type == "mask":
+            self.state.mask_processing_running = False
+            self.state.mask_processing_progress = 0.0
+        elif task_type == "plan":
+            self.state.plan_running = False
+            self.state.plan_progress = 0.0
+        self.progress_bar.hide()
+        if hasattr(self, "btn_cancel_task"):
+            self.btn_cancel_task.hide()
+        self.top_toolbar.set_progress(0)
+        self.top_toolbar.set_worker_cancel_visible(False)
+        self.task_panel.set_task_status(task_id, "failed", text="失败")
+        self.lbl_status.setText(f"{label}失败")
+        self.log_panel.error(f"{label}失败: {str(payload.get('error') or '未知错误')}")
+        self._clear_task_token_if_current(task_type, payload)
+        return True
 
     @Slot(dict)
-    def _on_plan_worker_done(self, result):
+    def _on_plan_worker_done(self, payload):
+        result = self._unwrap_task_result("plan", payload)
+        if result is None:
+            self._finish_failed_task_completion(
+                "plan", payload, "路径规划", "plan",
+            )
+            self._clear_task_token_if_current("plan", payload)
+            return
         self.state.plan_running = False
         self.state.plan_progress = 1.0
         self.progress_bar.hide()
@@ -510,9 +638,9 @@ class MainWindow(QMainWindow):
         validation = path_result.get("validation", {}) or {}
         if validation:
             self._show_validation_report(path_result, validation)
-            self._warn_path_validation_issues(path_result)
-        if self._worker_thread:
-            self._worker_thread.quit()
+            QTimer.singleShot(0, lambda path=path_result: self._warn_path_validation_issues(path))
+        self._active_plan_token = None
+        self._active_plan_generation = None
 
     def _set_theme_mode(self, mode):
         self._theme_mgr.set_mode(mode)
@@ -558,20 +686,24 @@ class MainWindow(QMainWindow):
         return self._model_registry().get(os.path.basename(str(model_path)), {})
 
     def _builtin_model_list(self, model_dir=None):
+        from builtin_test_assets import builtin_test_models
+
         model_dir = model_dir or self._builtin_model_dir()
         registry = self._model_registry(model_dir)
-        names = list(registry) or [
-            "yolo11m_seg_best.pt", "yolo11s_seg_best.pt", "yolov8s_seg_best.pt"
-        ]
-        return [
-            {
-                "name": name,
-                "path": os.path.join(model_dir, name),
-                "sha256": str(registry.get(name, {}).get("sha256", "")),
-            }
-            for name in names
-            if os.path.isfile(os.path.join(model_dir, name))
-        ]
+        models = []
+        for model in builtin_test_models(existing_only=True):
+            item = dict(model)
+            registry_item = registry.get(os.path.basename(item["path"]), {})
+            if registry_item.get("sha256"):
+                item["sha256"] = str(registry_item["sha256"])
+            models.append(item)
+        return models
+
+    @staticmethod
+    def _is_trusted_builtin_model_path(model_path):
+        from builtin_test_assets import builtin_test_model_entry
+
+        return bool(builtin_test_model_entry(model_path))
 
     def _refresh_builtin_models(self):
         merged = []
@@ -626,6 +758,7 @@ class MainWindow(QMainWindow):
         if self._has_background_worker():
             QMessageBox.warning(self, "任务正在运行", "当前已有耗时任务正在执行，请等待完成后再打开影像。")
             return
+        self._invalidate_active_inference_runner()
         # Clear the previous image's transform immediately. A CRS-less image
         # must never inherit geographic coordinates from the prior project.
         self.geo.clear()
@@ -645,6 +778,7 @@ class MainWindow(QMainWindow):
         try:
             path = result["path"]
             rgb = result["rgb"]
+            render_rgb = result.get("render_rgb", rgb)
             full_h = int(result["full_h"])
             full_w = int(result["full_w"])
             out_h = int(result["display_h"])
@@ -678,6 +812,9 @@ class MainWindow(QMainWindow):
                     f"{result.get('geo_error') or 'missing CRS'}"
                 )
             self._log.info(f"read image: 3 bands, {out_w}x{out_h}")
+            reset_project_state(self.state)
+            self._pipeline_result = None
+            self._service_points_visible = False
             self._tif_rgb = rgb
             self._tif_path = path
             from cache import source_identity
@@ -698,7 +835,7 @@ class MainWindow(QMainWindow):
                 raster_preprocessing=dict(result.get("preview_preprocessing") or {}),
             )
             self.top_toolbar.set_filename(path)
-            self.image_view.set_image(rgb)
+            self.image_view.set_image(render_rgb, logical_shape=rgb.shape[:2])
             try:
                 if self.geo.is_ready():
                     cx, cy = full_w // 2, full_h // 2
@@ -753,9 +890,12 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda p=path: self._start_cache_restore(p))
 
     def _start_cache_restore(self, path):
+        token = make_task_token(self.state, "cache_restore")
+        self._active_cache_restore_token = token
         worker = CacheRestoreWorker(
             path,
             expected_source_sha256=str(getattr(self.state, "source_sha256", "") or ""),
+            token=token,
         )
         worker.finished.connect(self._on_cache_restore_done)
         if not self._start_background_worker(
@@ -764,12 +904,78 @@ class MainWindow(QMainWindow):
             warn_if_busy=False,
         ):
             self._log.info("cache restore skipped: background worker busy")
+            token.invalidate()
+            self._clear_task_token_if_current(
+                "cache_restore", {"task_token": token},
+            )
+            return
+
+    @staticmethod
+    def _cache_model_identity_updates(saved):
+        """Keep cache model metadata historical until that weight is loaded again."""
+        return {
+            "historical_model_name": str(saved.get("current_model_name", "") or ""),
+            "historical_model_path": str(saved.get("current_model_path", "") or ""),
+            "historical_model_sha256": str(saved.get("model_sha256", "") or ""),
+        }
+
+    @staticmethod
+    def _cache_model_matches_active_engine(state, engine):
+        """DECISION-002/006: cache provenance only matches the loaded weight bytes."""
+        historical_path = str(getattr(state, "historical_model_path", "") or "")
+        historical_sha256 = str(getattr(state, "historical_model_sha256", "") or "")
+        if not historical_path and not historical_sha256:
+            return True
+        if not historical_path or not historical_sha256:
+            return False
+        if engine is None or not bool(getattr(engine, "is_loaded", lambda: False)()):
+            return False
+        engine_path = str(getattr(engine, "_model_path", "") or "")
+        active_path = str(getattr(state, "current_model_path", "") or "")
+        active_sha256 = str(getattr(state, "model_sha256", "") or "")
+        try:
+            from provenance import file_sha256
+
+            engine_sha256 = file_sha256(engine_path)
+        except (OSError, ValueError):
+            return False
+        try:
+            same_path = (
+                os.path.normcase(os.path.abspath(historical_path))
+                == os.path.normcase(os.path.abspath(engine_path))
+                == os.path.normcase(os.path.abspath(active_path))
+            )
+        except (OSError, ValueError):
+            return False
+        return bool(
+            same_path
+            and historical_sha256 == engine_sha256
+            and active_sha256 == engine_sha256
+        )
+
+    def _sync_cache_model_identity(self):
+        """Record whether restored historical cache evidence matches the active engine."""
+        matches = self._cache_model_matches_active_engine(self.state, self.model_engine)
+        self.state.cache_model_matches_active_engine = matches
+        return matches
 
     @Slot(dict)
     def _on_cache_restore_done(self, payload):
-        self._restore_cache_payload(payload)
-        if self._worker_thread:
-            self._worker_thread.quit()
+        result = self._unwrap_task_result("cache_restore", payload)
+        if result is not None:
+            self._restore_cache_payload(result)
+        elif (
+            isinstance(payload, dict)
+            and payload.get("status") == "failed"
+            and self._admit_task_completion(
+                "cache_restore", payload.get("task_token")
+            )
+        ):
+            self.lbl_status.setText("项目缓存恢复失败")
+            self.log_panel.error(
+                f"项目缓存恢复失败: {str(payload.get('error') or '未知错误')}"
+            )
+        self._clear_task_token_if_current("cache_restore", payload)
 
     def _restore_cache_payload(self, payload):
         """Apply project cache already loaded by CacheRestoreWorker."""
@@ -786,6 +992,10 @@ class MainWindow(QMainWindow):
             proc_ox = int(payload.get("proc_ox", 0) or 0)
             proc_oy = int(payload.get("proc_oy", 0) or 0)
             processed_layers = payload.get("processed_layers") or {}
+            path_restore = cached_path_restore_plan(
+                saved,
+                path_cache_valid=bool(payload.get("path_cache_valid")),
+            )
             restored_state = {
                 k: v for k, v in saved.items()
                 if k in (
@@ -793,34 +1003,32 @@ class MainWindow(QMainWindow):
                     'forbidden_regions', 'forbidden_regions_confirmed',
                     'unload_points', 'unload_point', 'entry_point_locked',
                     'exit_point_locked', 'unload_point_locked', 'workflow_step',
-                    'inference_done', 'mask_processed', 'auto_path_planned',
-                    'auto_path_valid', 'auto_path_desc', 'auto_path_geo',
-                    'path_points', 'path_status', 'simulation_done', 'export_done',
-                    'turn_strategy', 'current_model_name', 'current_model_path',
+                    'inference_done', 'mask_processed', 'simulation_done', 'export_done',
+                    'turn_strategy',
                     'source_sha256', 'source_metadata', 'raster_preprocessing',
-                    'model_sha256', 'inference_provenance', 'mask_provenance',
-                    'path_provenance', 'inference_runtime', 'path_runtime',
+                    'inference_provenance', 'mask_provenance',
+                    'inference_runtime',
                     'last_total_path_m', 'last_work_path_m', 'last_turn_path_m',
                     'last_entry_exit_path_m', 'last_crop_mask_geometric_coverage_pct',
                     'last_planned_target_geometric_coverage_pct', 'last_detected_mask_geometric_coverage_pct',
                     'last_rolling_rate', 'last_field_efficiency',
                 )
             }
+            restored_state.update(self._cache_model_identity_updates(saved))
+            restored_state.update(path_restore["state_updates"])
             restored_state['harvester_params'] = self._effective_harvester_params(
                 saved.get('harvester_params') or {}
             )
-            if saved.get('auto_path_planned'):
-                restored_state.update(
-                    auto_path_valid=False,
-                    simulation_done=False,
-                    export_done=False,
-                )
             self.state.safe_update(**restored_state)
+            if not self._sync_cache_model_identity():
+                self.log_panel.warn("缓存模型仅作为历史记录；请加载与缓存哈希一致的模型后再重新识别")
             self.log_panel.info("已恢复最近项目；任务状态将按实际缓存内容同步")
             for message in payload.get("cache_validation_messages", []) or []:
                 self.log_panel.warn(str(message))
 
-            self._service_points_visible = bool(saved.get('auto_path_planned') and processed_cache_valid)
+            self._service_points_visible = bool(
+                path_restore["restore_editable_path"] and processed_cache_valid
+            )
 
             if raw_mask is not None:
                 self.state.mask_raw = raw_mask
@@ -884,14 +1092,19 @@ class MainWindow(QMainWindow):
                 self._suggest_service_points()
                 self._service_points_visible = True
                 self._refresh_service_points_panel()
-            if saved.get('auto_path_planned'):
+            if path_restore["restore_editable_path"]:
                 restored_path = self._restore_cached_path_geometry(saved)
                 if restored_path:
                     self.route_info.update_route(restored_path, restored_path.get("validation", {}))
-            if saved.get('auto_path_planned') and self.state.mask_processed:
+            elif path_restore["historical_path_present"]:
+                self.log_panel.warn(
+                    "缓存路线缺少可编辑的 canonical segment 语义，已仅作为历史记录处理"
+                )
+            if path_restore["restore_editable_path"] and self.state.mask_processed:
                 self.task_panel.set_task_status("plan", "done")
-            if self._pipeline_result is None and saved.get('auto_path_planned'):
+            if self._pipeline_result is None and path_restore["historical_path_present"]:
                 self._log.info("cached path state restored without full path geometry")
+            self._restore_visual_from_state()
         except Exception as e:
             self._log.info(f"cache restore failed: {e}")
 
@@ -908,6 +1121,85 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log_panel.error(f"项目保存失败: {e}")
             QMessageBox.warning(self, "项目保存失败", str(e))
+
+    def _on_paper_experiments(self):
+        raw_mask = getattr(self.state, "mask_raw", None)
+        if not isinstance(raw_mask, np.ndarray) or self._tif_rgb is None:
+            QMessageBox.warning(
+                self,
+                "实验前提不足",
+                "请先完成影像导入和 AI 识别。实验中心仅对当前项目的冻结快照运行，不会覆盖界面结果。",
+            )
+            return
+        dialog = PaperExperimentDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        options = dialog.options()
+        output_dir = QFileDialog.getExistingDirectory(self, "选择实验结果目录", "")
+        if not output_dir:
+            return
+        ground_truth = None
+        truth_path = str(options.get("ground_truth_path", "") or "")
+        if truth_path:
+            ground_truth = cv2.imread(truth_path, cv2.IMREAD_GRAYSCALE)
+            if ground_truth is None:
+                QMessageBox.warning(self, "真值掩膜不可用", f"无法读取人工真值掩膜：{truth_path}")
+                return
+        from paper_experiments import PaperExperimentRunner, default_experiment_plan
+
+        plan = default_experiment_plan([])
+        if not options.get("include_mask"):
+            plan["mask_cases"] = []
+        if not options.get("include_path"):
+            plan["path_cases"] = []
+        runner = PaperExperimentRunner(
+            raw_mask=raw_mask,
+            source_image=self._tif_rgb,
+            state=self.state,
+            geo=self.geo,
+            output_dir=output_dir,
+            mask_config=self.cfg.section("mask_processing"),
+            path_config=self.cfg.section("path_planning"),
+            ground_truth_mask=ground_truth,
+        )
+        token = make_task_token(self.state, "paper_experiment")
+        self._active_paper_experiment_token = token
+        worker = PaperExperimentWorker(runner, plan, token=token)
+        worker.finished.connect(self._on_paper_experiments_done)
+        self.lbl_status.setText("论文实验运行中...")
+        if not self._start_background_worker(worker, "论文实验已开始；当前界面状态不会被实验过程修改。"):
+            token.invalidate()
+            self._clear_task_token_if_current(
+                "paper_experiment", {"task_token": token},
+            )
+            self.lbl_status.setText("论文实验未启动")
+
+    @Slot(dict)
+    def _on_paper_experiments_done(self, payload):
+        result = self._unwrap_task_result("paper_experiment", payload)
+        if result is None:
+            if (
+                isinstance(payload, dict)
+                and payload.get("status") == "failed"
+                and self._admit_task_completion(
+                    "paper_experiment", payload.get("task_token")
+                )
+            ):
+                self.lbl_status.setText("论文实验失败")
+                self.log_panel.error(
+                    f"论文实验失败: {str(payload.get('error') or '未知错误')}"
+                )
+            self._clear_task_token_if_current("paper_experiment", payload)
+            return
+        output_dir = str(result.get("output_dir", "") or "")
+        self.progress_bar.hide()
+        self.top_toolbar.set_progress(0)
+        self.top_toolbar.set_worker_cancel_visible(False)
+        self.lbl_status.setText("论文实验资料包已生成")
+        self.log_panel.success(f"论文实验资料包：{output_dir}")
+        self._clear_task_token_if_current("paper_experiment", payload)
+        if self._worker_thread:
+            self._worker_thread.quit()
 
     def _on_open_tif(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1054,6 +1346,7 @@ class MainWindow(QMainWindow):
             self.log_panel.info("已取消加载未经确认的外部模型")
             return False
         try:
+            self._invalidate_active_inference_runner()
             previous_path = str(getattr(self.state, 'current_model_path', '') or '')
             previous_sha256 = str(getattr(self.state, 'model_sha256', '') or '')
             from provenance import file_sha256
@@ -1075,6 +1368,7 @@ class MainWindow(QMainWindow):
             self.state.current_model_name = name
             self.state.current_model_path = path
             self.state.model_sha256 = model_sha256
+            self._sync_cache_model_identity()
             if previous_path and (
                 os.path.abspath(previous_path) != os.path.abspath(path)
                 or (previous_sha256 and previous_sha256 != model_sha256)
@@ -1137,10 +1431,68 @@ class MainWindow(QMainWindow):
             self.log_panel.info("没有可重做操作")
             self.top_toolbar.refresh_actions(self.state)
 
+    def _path_result_from_state(self):
+        """Build the current route projection from AppState-owned route fields.
+
+        Undo/redo restores AppState, not the transient pipeline cache.  Rebuilding
+        here prevents a later pipeline result from being rendered or exported as
+        if it were the restored route.
+        """
+        segments = list(getattr(self.state, "auto_path_segments", []) or [])
+        if not segments:
+            segments = list(getattr(self.state, "auto_path", []) or [])
+        full_path, segment_types, segment_lengths_m = [], [], []
+        for index, segment in enumerate(segments):
+            points = self._coerce_points(getattr(segment, "points", None))
+            if len(points) < 2:
+                continue
+            full_path.append(points)
+            segment_types.append(
+                str(getattr(segment, "segment_type", "") or "work")
+            )
+            segment_lengths_m.append(
+                float(getattr(segment, "length_m", 0.0) or self._segment_length(points))
+            )
+        if not full_path:
+            return {}
+        validation = dict(getattr(self.state, "path_validation", {}) or {})
+        artifact = dict(getattr(self.state, "path_artifact", {}) or {})
+        metadata = {
+            key: artifact[key]
+            for key in (
+                "turn_assessment",
+                "planning_factors",
+                "requested_strategy",
+                "coordinate_space",
+                "machine_readiness",
+                "path_candidates",
+                "layout",
+            )
+            if key in artifact
+        }
+        return self._normalise_path_result(
+            {
+                **metadata,
+                "full_path": full_path,
+                "segment_types": segment_types,
+                "segment_lengths_m": segment_lengths_m,
+                "is_valid": bool(
+                    getattr(self.state, "auto_path_valid", False)
+                    and validation.get("valid", False)
+                ),
+                "validation": validation,
+                "description": str(getattr(self.state, "auto_path_desc", "") or ""),
+                "geo_points": list(getattr(self.state, "auto_path_geo", []) or []),
+                "provenance": dict(getattr(self.state, "path_provenance", {}) or {}),
+                "runtime": dict(getattr(self.state, "path_runtime", {}) or {}),
+            }
+        )
+
     def _restore_visual_from_state(self):
         self.top_toolbar.refresh_actions(self.state)
-        path_result = (self._pipeline_result or {}).get("path", {})
+        path_result = self._path_result_from_state()
         if getattr(self.state, 'auto_path_planned', False) and path_result:
+            self._pipeline_result = {"path": path_result}
             self._show_path(path_result)
             return
         result = getattr(self.state, 'mask_result', None)
@@ -1161,6 +1513,7 @@ class MainWindow(QMainWindow):
         if tid not in TASK_ORDER:
             return
         label = TASK_LABELS.get(tid, tid)
+
         if QMessageBox.question(
             self,
             f"确认回退“{label}”",
@@ -1336,6 +1689,8 @@ class MainWindow(QMainWindow):
             auto_path_desc="",
             path_provenance={},
             path_runtime={},
+            path_validation={},
+            path_artifact={},
             path_points=[],
             path_status=[],
             simulation_done=False,
@@ -1499,6 +1854,7 @@ class MainWindow(QMainWindow):
     def _on_viewer_mouse_released(self, x, y, button):
         if self._route_edit_active and self._route_drag_idx >= 0:
             self._route_drag_idx = -1
+            self._sync_auto_path_from_editable_route()
             return
         self.event_bridge.on_mouse_released(x, y, button)
 
@@ -1860,7 +2216,19 @@ class MainWindow(QMainWindow):
         if exit_pt and (not getattr(self.state, 'exit_point', None) or not getattr(self.state, 'exit_point_locked', False)):
             self.state.exit_point = self._constrain_point_to_field(exit_pt)
 
-    def _on_toggle_entry_exit(self):
+    def _on_toggle_entry_exit(self, target=None):
+        if target in ("entry", "exit"):
+            point_name = f"{target}_point"
+            lock_name = f"{target}_point_locked"
+            if getattr(self.state, point_name, None):
+                self.state.safe_update(**{lock_name: True, "entry_exit_mode": False})
+                self._service_points_visible = True
+                self._refresh_service_points_panel()
+                self._sync_task_statuses()
+            return
+        self._toggle_entry_exit_mode()
+
+    def _toggle_entry_exit_mode(self):
         self.state.entry_exit_mode = not getattr(self.state, 'entry_exit_mode', False)
         self._sync_drawing_mode()
         self._entry_exit_click_idx = 0
@@ -1923,6 +2291,13 @@ class MainWindow(QMainWindow):
         if not self.model_engine.is_loaded():
             QMessageBox.warning(self, "提示", "请先加载模型")
             return
+        if not self._sync_cache_model_identity():
+            QMessageBox.warning(
+                self,
+                "历史缓存模型不匹配",
+                "当前已加载模型与恢复缓存记录的权重身份不一致。请加载匹配的模型后重新运行识别。",
+            )
+            return
         model_path = str(getattr(self.state, "current_model_path", "") or "")
         if model_path:
             try:
@@ -1959,8 +2334,15 @@ class MainWindow(QMainWindow):
         self.task_panel.set_task_status("segment", "in_progress", 5)
         self.lbl_status.setText("AI 识别中...")
 
-        from model import InferenceRunner
-        runner = InferenceRunner(self.state, self.model_engine, self.geo)
+        from inference import InferenceRunner
+        self._active_inference_token = make_task_token(self.state, 'inference')
+        runner = InferenceRunner(
+            self.state,
+            self.model_engine,
+            self.geo,
+            token=self._active_inference_token,
+        )
+        self._active_inference_runner = runner
         runner.start_from_tif(
             self._tif_path,
             self._tif_rgb.shape[:2],
@@ -2051,13 +2433,16 @@ class MainWindow(QMainWindow):
                 getattr(self.state, "forbidden_regions_confirmed", False)
             ),
         }
+        self._active_plan_token = make_task_token(self.state, "plan")
         worker = PlanWorker(
             mask_result,
             self.geo,
             self.state,
             path_config,
             detected_mask=getattr(self.state, 'inference_original_mask', None),
+            token=self._active_plan_token,
         )
+        self._active_plan_generation = self._active_plan_token.project_generation
         worker.finished.connect(self._on_plan_worker_done)
         self.state.plan_running = True
         self.state.plan_progress = 0.05
@@ -2066,7 +2451,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(5)
         self.task_panel.set_task_status("plan", "in_progress", 5)
         self.lbl_status.setText("路径规划中...")
-        if not self._start_background_worker(worker, "路径规划已开始，可继续查看当前结果；完成后会自动刷新。"):
+        if not self._start_background_worker(worker, "路径规划已开始：按所选转弯策略生成轨迹，田头碾压不参与策略选择。"):
             self.state.plan_running = False
             self.state.plan_progress = 0.0
             self.progress_bar.hide()
@@ -2200,7 +2585,7 @@ class MainWindow(QMainWindow):
 
     def _verify_scientific_provenance(self, path_result):
         """Verify every cached artifact against current inputs before export."""
-        from model import INFERENCE_PIPELINE_VERSION
+        from inference import INFERENCE_PIPELINE_VERSION
         from path_planner import PATH_PLANNING_VERSION
         from provenance import ProvenanceError, file_sha256, verify_stage_record
         from row_geometry import MASK_REGULARIZATION_VERSION
@@ -2308,8 +2693,7 @@ class MainWindow(QMainWindow):
             from cache import source_identity
             if source_identity(self._tif_path) != self._tif_source_identity:
                 raise ValueError("GeoTIFF 文件在加载后已发生变化，请重新打开影像并重新规划")
-        pr = self._pipeline_result or {}
-        path_result = self._normalise_path_result(pr.get("path", {}))
+        path_result = self._path_result_from_state()
         if not path_result.get("ordered_segments"):
             raise ValueError("当前没有可导出的路径，请先生成路径")
         validation = path_result.get("validation", {}) or {}
@@ -2324,6 +2708,8 @@ class MainWindow(QMainWindow):
         hard_reasons = list(
             (path_result.get("turn_assessment", {}) or {}).get("hard_reasons") or []
         )
+        if bool((path_result.get("turn_assessment", {}) or {}).get("kinematically_infeasible")):
+            hard_reasons.append("路径包含仅供显示的不可执行直线连接")
         if not path_valid or hard_reasons:
             issues = list(validation.get("issues") or []) + hard_reasons
             detail = "；".join(str(item) for item in issues[:5]) or "路径未经验证"
@@ -2410,9 +2796,6 @@ class MainWindow(QMainWindow):
             segment_types=segment_types,
         )
         path_result["geo_points"] = geo_points
-        result = dict(self._pipeline_result or {})
-        result["path"] = path_result
-        self._pipeline_result = result
         self.state.auto_path_geo = geo_points
         return path_result, geo_points
 
@@ -2517,11 +2900,11 @@ class MainWindow(QMainWindow):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         scientific_code = code_identity(project_root, [
             "geo.py",
-            "model.py",
+            "inference.py",
             "raster_preprocessing.py",
             "mask_processor.py",
             "row_geometry.py",
-            "planning.py",
+            "coverage.py",
             "footprint_planner.py",
             "path_planner.py",
             "provenance.py",
@@ -2789,6 +3172,19 @@ class MainWindow(QMainWindow):
 
         geo_points = normalised.get("geo_points", [])
         validation = normalised.get("validation", {}) or {}
+        path_artifact = {
+            key: self._manifest_jsonable(normalised[key])
+            for key in (
+                "turn_assessment",
+                "planning_factors",
+                "requested_strategy",
+                "coordinate_space",
+                "machine_readiness",
+                "path_candidates",
+                "layout",
+            )
+            if key in normalised
+        }
         state_updates = dict(
             auto_path=auto_segments,
             auto_path_segments=auto_segments,
@@ -2798,8 +3194,10 @@ class MainWindow(QMainWindow):
             auto_path_planned=bool(auto_segments),
             path_points=flat_points,
             path_status=flat_status,
+            path_validation=dict(validation),
             path_provenance=dict(normalised.get("provenance") or {}),
             path_runtime=dict(normalised.get("runtime") or {}),
+            path_artifact=path_artifact,
         )
         metric_state_fields = {
             "last_rolling_rate": "rolling_canopy_pct",
@@ -2869,7 +3267,10 @@ class MainWindow(QMainWindow):
         validation = path_result.get("validation", {}) or {}
         tracks_count = len(path_result.get("tracks", [])) if tracks_count is None else tracks_count
         turns_count = len(path_result.get("formal_turns", path_result.get("turns", []))) if turns_count is None else turns_count
-        parts = [f"路径规划完成: {tracks_count} 条作业线, {turns_count} 条正式调头段", f"调头方式：{self._turn_strategy_label(path_result)}"]
+        parts = [
+            f"路径规划完成: {tracks_count} 条作业线, {turns_count} 条正式调头段",
+            f"调头方式：{self._turn_strategy_label(path_result)}",
+        ]
         total = validation.get("total_length_m", path_result.get("total_length_m"))
         work = validation.get("work_length_m", path_result.get("work_length_m"))
         turn = validation.get("turn_length_m", path_result.get("turn_length_m"))
@@ -3123,7 +3524,14 @@ class MainWindow(QMainWindow):
         )
         mask_config = self.cfg.section("mask_processing")
         mask_config["strength"] = self._mask_processing_strength
-        worker = MaskProcessWorker(mask, self.geo, self.state, mask_config)
+        self._active_mask_token = make_task_token(self.state, "mask")
+        worker = MaskProcessWorker(
+            mask,
+            self.geo,
+            self.state,
+            mask_config,
+            token=self._active_mask_token,
+        )
         worker.finished.connect(self._on_mask_worker_done)
         self.state.mask_processing_running = True
         self.state.mask_processing_progress = 0.05
@@ -3261,6 +3669,38 @@ class MainWindow(QMainWindow):
                                                  src_x0:src_x0 + (dst_x1 - dst_x0)]
         return out
 
+    def _normalise_mask_for_overlay(self, mask):
+        """Return a mask and offset in the viewer's display coordinate space."""
+        if mask is None:
+            return None, 0, 0
+        mask = np.asarray(mask)
+        if mask.ndim < 2 or mask.size == 0:
+            return mask, 0, 0
+
+        display_h, display_w = self._tif_rgb.shape[:2]
+        source_h = int(getattr(self.state, "source_img_h", 0) or 0)
+        source_w = int(getattr(self.state, "source_img_w", 0) or 0)
+        mask_h, mask_w = mask.shape[:2]
+        offset_x = int(getattr(self.state, "mask_offset_x", 0) or 0)
+        offset_y = int(getattr(self.state, "mask_offset_y", 0) or 0)
+        scale_x = float(source_w) / float(display_w) if source_w > display_w else 1.0
+        scale_y = float(source_h) / float(display_h) if source_h > display_h else 1.0
+        source_space = bool(
+            scale_x > 1.0 and scale_y > 1.0 and
+            (mask_h > display_h or mask_w > display_w or
+             offset_x + mask_w > display_w or offset_y + mask_h > display_h)
+        )
+        if source_space:
+            import cv2
+            mask = cv2.resize(
+                mask,
+                (max(1, int(round(mask_w / scale_x))), max(1, int(round(mask_h / scale_y)))),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            offset_x = int(round(offset_x / scale_x))
+            offset_y = int(round(offset_y / scale_y))
+        return mask, offset_x, offset_y
+
     def _overlay_mask_in_place(self, ov, mask):
         """Overlay full-size or cropped masks without allocating full-size temp images."""
         if ov is None or mask is None:
@@ -3311,20 +3751,18 @@ class MainWindow(QMainWindow):
             self.image_view.set_image(self._tif_rgb)
         else:
             viewer.clear_overlays()
-        full_h, full_w = self._tif_rgb.shape[:2]
-        mask_h, mask_w = mask.shape[:2]
-        if (mask_h, mask_w) == (full_h, full_w):
-            mask_x = mask_y = 0
-        else:
-            mask_x = int(getattr(self.state, 'mask_offset_x', 0) or 0)
-            mask_y = int(getattr(self.state, 'mask_offset_y', 0) or 0)
+        mask, mask_x, mask_y = self._normalise_mask_for_overlay(mask)
         mask_result = getattr(self.state, 'mask_result', None) or {}
         headland = mask_result.get("headland_mask") if isinstance(mask_result, dict) else None
-        if isinstance(headland, np.ndarray) and headland.shape[:2] == mask.shape[:2]:
-            viewer.draw_mask_overlay(headland, mask_x, mask_y, color=(210, 230, 120))
+        if isinstance(headland, np.ndarray):
+            headland, headland_x, headland_y = self._normalise_mask_for_overlay(headland)
+            if headland.shape[:2] == mask.shape[:2]:
+                viewer.draw_mask_overlay(headland, headland_x, headland_y, color=(210, 230, 120))
         uncertain = mask_result.get("uncertain_residual_mask") if isinstance(mask_result, dict) else None
-        if isinstance(uncertain, np.ndarray) and uncertain.shape[:2] == mask.shape[:2]:
-            viewer.draw_mask_overlay(uncertain, mask_x, mask_y, color=(170, 170, 190))
+        if isinstance(uncertain, np.ndarray):
+            uncertain, uncertain_x, uncertain_y = self._normalise_mask_for_overlay(uncertain)
+            if uncertain.shape[:2] == mask.shape[:2]:
+                viewer.draw_mask_overlay(uncertain, uncertain_x, uncertain_y, color=(170, 170, 190))
         viewer.draw_mask_overlay(mask, mask_x, mask_y)
         boundary = getattr(self.state, 'field_boundary', [])
         if boundary and len(boundary) >= 3:
@@ -3345,17 +3783,17 @@ class MainWindow(QMainWindow):
         mask_result = getattr(self.state, 'mask_result', None)
         disp_mask = mask_result.get("processed_mask", mask) if mask_result else mask
         if disp_mask is not None:
-            if disp_mask.shape[:2] == self._tif_rgb.shape[:2]:
-                mask_x = mask_y = 0
-            else:
-                mask_x = int(getattr(self.state, 'mask_offset_x', 0) or 0)
-                mask_y = int(getattr(self.state, 'mask_offset_y', 0) or 0)
+            disp_mask, mask_x, mask_y = self._normalise_mask_for_overlay(disp_mask)
             headland = mask_result.get("headland_mask") if isinstance(mask_result, dict) else None
-            if isinstance(headland, np.ndarray) and headland.shape[:2] == disp_mask.shape[:2]:
-                viewer.draw_mask_overlay(headland, mask_x, mask_y, color=(210, 230, 120))
+            if isinstance(headland, np.ndarray):
+                headland, headland_x, headland_y = self._normalise_mask_for_overlay(headland)
+                if headland.shape[:2] == disp_mask.shape[:2]:
+                    viewer.draw_mask_overlay(headland, headland_x, headland_y, color=(210, 230, 120))
             uncertain = mask_result.get("uncertain_residual_mask") if isinstance(mask_result, dict) else None
-            if isinstance(uncertain, np.ndarray) and uncertain.shape[:2] == disp_mask.shape[:2]:
-                viewer.draw_mask_overlay(uncertain, mask_x, mask_y, color=(170, 170, 190))
+            if isinstance(uncertain, np.ndarray):
+                uncertain, uncertain_x, uncertain_y = self._normalise_mask_for_overlay(uncertain)
+                if uncertain.shape[:2] == disp_mask.shape[:2]:
+                    viewer.draw_mask_overlay(uncertain, uncertain_x, uncertain_y, color=(170, 170, 190))
             viewer.draw_mask_overlay(disp_mask, mask_x, mask_y)
         boundary = getattr(self.state, 'field_boundary', [])
         if boundary and len(boundary) >= 3:
@@ -3989,13 +4427,17 @@ class MainWindow(QMainWindow):
         if not changed:
             if state_needs_sync():
                 self.state.harvester_params = params
+                self.state.harvester_params_confirmed = True
                 self._sync_task_statuses()
                 self.log_panel.info(f"{source}农机参数与当前配置一致，已应用到当前任务")
                 return True
-            self.log_panel.info(f"{source}农机参数与当前配置一致")
-            return False
+            self.state.harvester_params_confirmed = True
+            self._sync_task_statuses()
+            self.log_panel.info(f"{source}农机参数与当前配置一致，已确认")
+            return True
         self._save_system_undo("修改农机参数")
         self.state.harvester_params = params
+        self.state.harvester_params_confirmed = True
         config_snapshot = self.cfg.update_section("harvester", params)
         cfg_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -4120,7 +4562,7 @@ class MainWindow(QMainWindow):
             )
             message += "\n\n建议：可切换调头方式重算，或进入“编辑路线”横向微调作业线/转弯段。"
             self.log_panel.warn("路径风险提示: " + "；".join(str(x) for x in issues[:3]))
-            QMessageBox.warning(self, "路径风险提示", message)
+            self.lbl_status.setText("路径已生成，存在风险，禁止正式导出")
         elif warnings:
             self.log_panel.warn("调头方式提示: " + "；".join(str(x) for x in warnings[:3]))
 
@@ -4233,12 +4675,25 @@ class MainWindow(QMainWindow):
         st.auto_path_planned = True
         st.auto_path_valid = False
         st.auto_path_desc = "路线已手动编辑，作物掩膜几何覆盖率与碾压率需重新规划后评估"
+        st.path_validation = {
+            "valid": False,
+            "issues": [
+                "route was manually edited; rerun planning before scientific evaluation or formal export"
+            ],
+        }
         st.path_provenance = {}
         st.path_runtime = {}
+        st.path_artifact = {}
         st.last_work_path_m = sum(item.length_m for item in segments if item.segment_type == "work")
         st.last_turn_path_m = sum(item.length_m for item in segments if item.segment_type.startswith("turn"))
         st.last_entry_exit_path_m = sum(item.length_m for item in segments if item.segment_type in ("entry", "exit"))
         st.last_total_path_m = st.last_work_path_m + st.last_turn_path_m + st.last_entry_exit_path_m
+        st.path_validation.update(
+            total_length_m=float(st.last_total_path_m),
+            work_length_m=float(st.last_work_path_m),
+            turn_length_m=float(st.last_turn_path_m),
+            entry_exit_length_m=float(st.last_entry_exit_path_m),
+        )
         st.simulation_done = False
         st.export_done = False
         path_result = {
@@ -4246,19 +4701,11 @@ class MainWindow(QMainWindow):
             "segment_types": segment_types,
             "segment_lengths_m": [float(segment.length_m) for segment in segments],
             "geo_points": geo_points,
-            "validation": {
-                "valid": False,
-                "issues": ["路线已手动编辑，作物掩膜几何覆盖率与碾压率需重新规划后评估"],
-                "total_length_m": float(st.last_total_path_m),
-                "work_length_m": float(st.last_work_path_m),
-                "turn_length_m": float(st.last_turn_path_m),
-            },
+            "validation": dict(st.path_validation),
             "is_valid": False,
             "description": st.auto_path_desc,
         }
-        result = dict(self._pipeline_result or {})
-        result["path"] = self._normalise_path_result(path_result)
-        self._pipeline_result = result
+        self._pipeline_result = {"path": self._normalise_path_result(path_result)}
         self.route_info.update_from_auto_path(st.auto_path)
 
     def _route_segment_from_points(self, points, status, status_to_type):
@@ -4408,6 +4855,7 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_status.setText("就绪")
     def _refresh_state(self):
+        self._release_finished_inference_runner()
         self.top_toolbar.refresh_actions(self.state)
         mask_result = getattr(self.state, "mask_result", None)
         self.task_panel.set_mask_diagnostic_available(

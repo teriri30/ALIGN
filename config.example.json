@@ -46,7 +46,7 @@
     "entry_speed_mps": 0.8
   },
   "path_planning": {
-    "work_line_mode": "footprint_optimized",
+    "work_line_mode": "band_centerline_with_footprint_validation",
     "validation_profile": "field_trial",
     "min_turn_radius_m": 1.0,
     "planning_max_dim": 3600,
@@ -63,7 +63,8 @@
     "max_track_outside_support_pct": 5.0,
     "max_track_uncertain_overlap_pct": 10.0,
     "max_track_forbidden_overlap_pct": 0.0,
-    "headland_damage_weight": 1.0
+    "headland_damage_weight": 1.0,
+    "headland_turn_optimization_enabled": true
   },
   "mask_processing": {
     "strength": "standard",

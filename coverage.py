@@ -8,6 +8,7 @@ from shapely.geometry import Polygon, LineString, Point
 from config import Config, AppLogger
 from state import AppState, BandInstance, Corridor, AutoPathSegment, PathPoint
 from geo import GeoUtils
+from row_orientation import estimate_mask_axis_fitline
 
 
 def _contour_points(contour) -> np.ndarray:
@@ -705,11 +706,7 @@ def _tensor_orientation_hist(texture: np.ndarray, support: np.ndarray, mpp: floa
 
 
 def _fitline_fallback_angle(mask: np.ndarray) -> float:
-    pts = cv2.findNonZero(mask)
-    if pts is None or len(pts) < 20:
-        return 0.0
-    vx, vy, _, _ = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
-    return _wrap_half_turn(math.atan2(float(vy[0]), float(vx[0])))
+    return estimate_mask_axis_fitline(mask)
 
 
 def _estimate_row_angle(mask: np.ndarray, geo: Optional[GeoUtils] = None, state: Optional[AppState] = None,

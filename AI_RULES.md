@@ -35,11 +35,11 @@
 修改以下文件时必须先搜索其决策锚点：
 
 - `geo.py`
-- `model.py`
+- `inference.py`
 - `raster_preprocessing.py`
 - `mask_processor.py`
 - `row_geometry.py`
-- `planning.py`
+- `coverage.py`
 - `path_planner.py`
 - `pyside6_app/main_window.py`
 - `pyside6_app/workers.py`

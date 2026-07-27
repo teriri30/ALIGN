@@ -12,7 +12,7 @@ EXPECTED_MODEL_DEFAULTS = {
 
 
 def test_tiled_inference_defaults_match_run_documentation():
-    from model import TiledInference
+    from inference import TiledInference
 
     signature = inspect.signature(TiledInference.run)
     assert signature.parameters["capture_sz"].default == EXPECTED_MODEL_DEFAULTS["capture_size"]
@@ -54,7 +54,7 @@ def test_config_defaults_match_model_defaults_when_config_file_is_missing():
 
 
 def test_config_json_model_defaults_match_code_defaults():
-    config_path = Path(__file__).with_name("config.example.json")
+    config_path = Path(__file__).resolve().parents[1] / "config.example.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     model_config = config["model"]
 

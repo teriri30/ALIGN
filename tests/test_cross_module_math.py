@@ -13,6 +13,7 @@ def _candidate(strategy, rolling, core):
             "valid": True,
             "validation_profile": "field_trial",
             "rolling_canopy_pct": rolling,
+            "rolling_body_pct": rolling,
             "track_core_overlap_pct": core,
             "track_outside_field_pct": 0.0,
             "track_outside_support_pct": 0.0,
@@ -26,7 +27,7 @@ def _candidate(strategy, rolling, core):
     }
 
 
-def test_valid_candidate_ranking_uses_expected_canopy_rolling_as_primary_metric():
+def test_valid_candidate_ranking_uses_body_rolling_as_primary_crop_metric():
     from path_planner import _rank_path_candidates
 
     ranked = _rank_path_candidates([
@@ -35,23 +36,46 @@ def test_valid_candidate_ranking_uses_expected_canopy_rolling_as_primary_metric(
     ])
 
     assert ranked[0]["strategy"] == "less_crushing"
-    assert ranked[0]["candidate_metrics"]["rolling_canopy_pct"] == 1.0
+    assert ranked[0]["candidate_metrics"]["rolling_body_pct"] == 1.0
 
 
-def test_agronomic_damage_cost_precedes_physical_rolling_for_calibrated_candidates():
-    """DECISION-013: planning cost and physical rolling remain distinct."""
+def test_strategy_ranking_ignores_headland_rolling_and_uses_body_risk():
+    from path_planner import _rank_path_candidates
+
+    low_headland = _candidate("low_headland", rolling=1.0, core=2.0)
+    low_headland["validation"].update({
+        "rolling_body_pct": 4.0,
+        "rolling_headland_pct": 0.0,
+        "agronomic_damage_cost_m2": 1.0,
+        "total_length_m": 100.0,
+    })
+    high_headland = _candidate("high_headland", rolling=80.0, core=2.0)
+    high_headland["validation"].update({
+        "rolling_body_pct": 1.0,
+        "rolling_headland_pct": 95.0,
+        "agronomic_damage_cost_m2": 500.0,
+        "total_length_m": 90.0,
+    })
+
+    ranked = _rank_path_candidates([low_headland, high_headland])
+
+    assert ranked[0]["strategy"] == "high_headland"
+    assert ranked[0]["candidate_metrics"]["rolling_body_pct"] == 1.0
+
+
+def test_headland_weighted_damage_is_report_only_for_strategy_ranking():
     from path_planner import _rank_path_candidates
 
     lower_physical = _candidate("lower_physical", rolling=1.0, core=1.0)
-    lower_physical["validation"]["agronomic_damage_cost_m2"] = 3.0
+    lower_physical["validation"]["agronomic_damage_cost_m2"] = 500.0
     lower_agronomic = _candidate("lower_agronomic", rolling=2.0, core=1.0)
     lower_agronomic["validation"]["agronomic_damage_cost_m2"] = 1.0
 
     ranked = _rank_path_candidates([lower_physical, lower_agronomic])
 
-    assert ranked[0]["strategy"] == "lower_agronomic"
-    assert ranked[0]["candidate_metrics"]["rolling_canopy_pct"] == 2.0
-    assert ranked[0]["candidate_metrics"]["agronomic_damage_cost_m2"] == 1.0
+    assert ranked[0]["strategy"] == "lower_physical"
+    assert ranked[0]["candidate_metrics"]["rolling_body_pct"] == 1.0
+    assert "agronomic_damage_cost_m2" not in ranked[0]["candidate_metrics"]
 
 
 def test_headland_weight_changes_planning_cost_without_changing_physical_rolling():
@@ -115,6 +139,135 @@ def test_headland_damage_weight_rejects_zero_cost_crop():
 
     with pytest.raises(ConfigValidationError):
         validate_config({"path_planning": {"headland_damage_weight": 0.0}})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_config_rejects_non_finite_numbers(value):
+    from config import ConfigValidationError, validate_config
+
+    with pytest.raises(ConfigValidationError, match="finite"):
+        validate_config({"path_planning": {"max_track_core_overlap_pct": value}})
+
+
+def test_work_line_mode_uses_truthful_footprint_validation_name(monkeypatch):
+    import path_planner
+
+    processed = np.ones((20, 30), dtype=np.uint8) * 255
+    wide_bands = [{
+        "id": 1,
+        "contour": np.asarray([[2, 4], [12, 4], [12, 15], [2, 15]], dtype=np.int32),
+        "centerline": [(2.0, 9.0), (12.0, 9.0)],
+    }]
+
+    class State:
+        mask_raw = processed
+        mask_offset_x = 0
+        mask_offset_y = 0
+        harvester_params = {}
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 1.0
+
+    lines, layout = path_planner._prepare_work_line_layout(
+        wide_bands,
+        processed,
+        0.0,
+        geo=Geo(),
+        state=State(),
+        config={"work_line_mode": "band_centerline_with_footprint_validation"},
+    )
+
+    assert lines
+    assert layout["work_line_mode"] == "band_centerline_with_footprint_validation"
+    assert layout["footprint_optimization_scope"] == "validation_only"
+
+
+def test_headland_space_precheck_marks_outward_probe_outside_field_as_limited():
+    from path_planner import _headland_space_is_limited
+    import numpy as np
+
+    field = np.asarray([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)], dtype=float)
+
+    assert _headland_space_is_limited(
+        start=(9.5, 5.0),
+        work_direction=(1.0, 0.0),
+        field_polygon=field,
+        required_depth_px=2.0,
+    ) is True
+    assert _headland_space_is_limited(
+        start=(5.0, 5.0),
+        work_direction=(1.0, 0.0),
+        field_polygon=field,
+        required_depth_px=2.0,
+    ) is False
+
+
+def test_candidate_dedup_uses_actual_strategy_sequence_and_geometry():
+    from path_planner import _deduplicate_path_candidates
+
+    base = {
+        "path_segments": [[(0.0, 0.0), (1.0, 0.0)]],
+        "segment_types": ["turn"],
+        "validation": {"valid": True},
+        "turn_assessment": {"used_strategies": ["pear"]},
+    }
+    candidates = [
+        {**base, "strategy": "bow"},
+        {**base, "strategy": "semicircle"},
+        {**base, "strategy": "pear"},
+    ]
+
+    unique = _deduplicate_path_candidates(candidates)
+
+    assert len(unique) == 1
+    assert unique[0]["equivalent_candidate_labels"] == ["bow", "semicircle", "pear"]
+
+
+def test_unload_points_are_declared_as_end_route_candidates():
+    from path_planner import _build_planning_factor_report
+
+    class State:
+        harvester_params = {
+            "cutter_width_m": 2.15,
+            "cutter_forward_offset_m": 1.0,
+            "track_width_m": 0.4,
+            "track_gauge_m": 1.6,
+            "wheelbase_m": 1.8,
+            "track_length_m": 1.7,
+            "turn_radius_m": 0.9,
+        }
+        mask_offset_x = 0
+        mask_offset_y = 0
+        entry_point = (0.0, 0.0)
+        exit_point = (10.0, 10.0)
+        unload_points = [(8.0, 8.0), (9.0, 9.0)]
+        unload_point = None
+
+    summary = _build_planning_factor_report(State(), [], None)
+
+    assert summary["service_points"]["unload_semantics"] == "select_one_nearest_route_end"
+    assert summary["service_points"]["unload_count"] == 2
+
+
+def test_candidate_ranking_rejects_non_finite_metrics_deterministically():
+    from path_planner import _rank_path_candidates
+
+    invalid = _candidate("invalid", rolling=float("nan"), core=0.0)
+    invalid["validation"]["rolling_body_pct"] = float("nan")
+    finite = _candidate("finite", rolling=1.0, core=0.0)
+
+    first = _rank_path_candidates([invalid, finite])
+    second = _rank_path_candidates([finite, invalid])
+
+    assert first[0]["strategy"] == "finite"
+    assert second[0]["strategy"] == "finite"
+    assert first[-1]["validation"]["valid"] is False
 
 
 def test_plan_worker_executes_the_same_persisted_headland_weight_it_records(monkeypatch):
@@ -370,6 +523,7 @@ def test_footprint_optimized_layout_preserves_four_row_band_centerlines(monkeypa
     )
 
     assert layout["source"] == "four_row_band_centerlines"
-    assert layout["work_line_mode"] == "footprint_optimized"
+    assert layout["work_line_mode"] == "band_centerline_with_footprint_validation"
+    assert layout["footprint_optimization_scope"] == "validation_only"
     assert work_lines[0][0] == pytest.approx((2.0, 9.0))
     assert work_lines[0][-1] == pytest.approx((12.0, 9.0))
