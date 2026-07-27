@@ -20,9 +20,14 @@ logs/
 docs/archive/*decompiled*
 
 # Large local assets
+# The three trusted built-in comparison weights are part of the portable app.
+# Keep arbitrary/local weights ignored, but explicitly ship the registered files.
 data/models/*.pt
 data/models/*.pth
 data/models/*.onnx
+!data/models/yolo11m_seg_best.pt
+!data/models/yolo11s_seg_best.pt
+!data/models/yolov8s_seg_best.pt
 data/tif/
 *.tif
 *.tiff
