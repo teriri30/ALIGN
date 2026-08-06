@@ -24,8 +24,8 @@
 ## 掩膜语义层
 
 - `processed_mask`：经过验证、可作为作物主体和作业线依据的区域。
-- `headland_mask`：方向和位置证据支持的田头作物候选，用于田头碾压统计和全田真实作物碾压并集，不等同于低质量主体；与主体重叠的像素只计一次。
-- `headland_corridor_mask`：仅在田块端部、跨越足够多行且具有连续横向证据时重建的完整田头走廊；其语义优先于纵向规则化主体。
+- `headland_mask`：方向和位置证据支持的田头作物候选，用于田头碾压统计和全田真实作物碾压并集，不等同于低质量主体；与主体重叠的像素只计一次。生成前先记录规则化主体的连通区域分区；只有通过区域轴向跨度、端部邻接和跨行支持率分类的候选种子才可进入该层。
+- `headland_corridor_mask`：仅在规则化纵向行带的轴向端部、跨越足够多行且具有连续横向证据时重建的完整田头走廊；田头与主体粘连时可记录 `terminal_dense_seed` 作为补充种子来源，其语义优先于纵向规则化主体。接受后的走廊按平滑逐列端点墙在米制最大深度内展开，并与原始作物支持相交，不得填成矩形。端点墙只采纳达到 `headland_terminal_wall_min_axial_span_ratio` 的长跨度横截行，并记录参考跨度、可信行数和被拒短行数；稀疏纵向行尾、区域分界和内部短片段不得作为田头端点。`diagnostics.region_partition` 保存区域数量、边界框、端部分类、候选支持率和拒绝原因；未经区域分类接受的种子不进入 `headland_mask`。
 - `uncertain_residual_mask`：不能可靠归属到主体或田头的原始残差，只用于显示和中性场地支撑。
 - `planning_support_mask`：场地支撑并集，只用于越界/支撑判断，不得替代 `processed_mask` 计算作物覆盖或碾压。
 - `forbidden_regions`：用户在显示坐标中确认的禁行多边形；规划时按掩膜偏移栅格化，不得由不确定残差自动生成。
@@ -33,6 +33,16 @@
 这些数组与处理后主体保存在同一个原子 NPZ 产物中；项目 JSON 只保存轻量元数据。
 
 ## 路径段语义
+
+### 种植区域分类与分区路径（DECISION-017）
+
+- `layout.planting_region_classification` 保存分类器版本、宽度阈值、模糊保护带、逐带宽度/法向位置/结论/理由、分类计数、是否混合田块以及自动规划是否允许。类型只能是 `wide_narrow_rows`、`uniform_block` 或 `ambiguous`。
+- `layout.work_regions` 保存区域标识、类型、来源带、法向位置、作业线数量和来源语义；不得内嵌重复的完整作业线数组。`layout.region_execution_order` 保存实际完成顺序；有起点时 `region_order_rule=nearest_entry_region_then_distance_tiebreak`，无起点时使用稳定回退顺序，不得以“左区/右区”表达类型。
+- UI/项目快照中的带记录用 `planning_contour` 保存最多 256 点的轻量规划边界，原始稠密 `contour` 不进入轻量状态。等距区诊断的 `reference_geometry_source` 必须说明使用 `contour`、`planning_contour` 或历史兼容的 `compact_centerline_and_mask`。
+- 宽窄行区的 `line_source=four_row_band_centerlines`；等距区的 `line_source=cutter_width_uniform_swaths`。混合田块的套圈排序仅在各区域内部进行，`turn_assessment.contour_ordering.no_cross_region_pairing=true`；所有区域的 `shared_headland_wall_projections_px` 和逐侧 `shared_turn_clearance_m_by_side` 必须相同，后者记录 `shared_turn_clearance_scope=all_classified_regions`。套圈调头方向使用同一主航线轴，不得由单条短线尾部改变；局部凹边界只能使全田同侧切线共同内移。
+- `turn_assessment.region_routes` 保存每区独立套圈诊断；`turn_assessment.region_transfers` 保存相邻区域间唯一 `turn_aux` 的起终点、策略、长度、田界检查、曲线非退化检查和机器可执行结论。任何转场失败都使整条候选失败关闭。
+- `layout.coverage_gap_recovery` 保存规划期漏线恢复版本、正常四行间距、异常间距倍数、来源带、目标法向位置、`phase_method`、左右稳定队列数量、中心线支持率、横截面轴向支持率/平均占用率、轴向长度比、被明确忽略的窄带标识与 `recovered_band_ids`。两侧相位证据不对称时从较长稳定队列外推，证据相当时才取中点；机器中心线可位于四行作物之间，不能因中心像素为空而漏掉整带。窄带中心不得提升为四行作业线，且处理后掩膜的原始分类不得被覆盖。
+- `turn_assessment.service_points.exit_route` 保存离场模式。`direct_same_headland` 只允许短边田头内接驳；若直达存在显著主航线轴向跨度，则使用 `retrace_last_harvested_work_then_exit_headland`，把沿已收割作业线的返回段标为 `turn_reverse`、只把田头接驳标为 `exit`，并记录返回距离和田界检查，禁止输出跨田斜向 `exit`。
 
 - `work`：由作物中心线支持、启用割刀几何覆盖计算的作业段。
 - `turn_approach`：从作物端点到校正转弯锚点的田头直行段，不计入割台作物覆盖。
@@ -56,6 +66,9 @@
 
 碾压模型只使用左右履带矩形扫掠，不把机身或割刀计入碾压。割刀线只参与主体作物掩膜几何覆盖率。通过硬约束的候选路径按主体碾压、核心区重叠、语义风险、几何覆盖率和长度排序；田头碾压及田头加权农业损伤只作报告，不得影响转弯策略。`rolling_crop_pct` 已废止，不得导出或作为兼容别名继续产生第二种“碾压率”定义。无掩膜区域不得仅凭分割结果自动视为确认无作物道路。
 
+- `work_line_mode=footprint_optimized`时，`requested_work_line_mode`记录请求模式，`work_line_mode`记录实际执行模式。成功结果必须同时包含`optimization_complete=true`、`footprint_optimization_scope=centerline_anchored_lateral_search`、相等且大于零的`baseline_pass_count/optimized_pass_count`，以及逐线横移和目标代价诊断；不完整或无改进时如实回退为`band_centerline_with_footprint_validation`。
+- 横向优化保留完整基准/优化工作线足迹关键指标摘要。正式比较必须使用与最终完整路径验证相同的 `detected_mask`、`planned_mask`、规划支撑、不确定区和确认禁行区证据。接受条件为：履带核心重叠、田界越界、语义支撑区、不确定区和确认禁行区均不得恶化，规划目标几何覆盖率不得下降，且至少一项指标严格改善；任一关键指标缺失、非有限或恶化都必须回退基准中心线。`machine_readiness` 只有在 `formal_comparison.accepted=true`、无退化/无效指标、至少一项严格改善且基准/优化摘要的核心重叠、规划覆盖率和田界越界均为有限数值时，才能通过该优化证据门禁。
+- 中心线锚定优化只能在`lateral_search_m`限定范围内横移，保留四行带基准线的数量、排序和纵向范围。确认禁行区候选不可选，非有限搜索参数必须在配置边界拒绝。
 - `crop_mask_geometric_coverage_pct`：割刀有效割幅线段沿全部 `work` 段扫掠后，与处理后作物主体掩膜的交集面积 / 作物主体掩膜面积。
 - `planned_target_geometric_coverage_pct`：同一割刀扫掠区域对规划目标掩膜的几何覆盖比例，是路径有效性的默认覆盖门限。
 - `detected_mask_geometric_coverage_pct`：同一割刀扫掠区域对原始识别掩膜的几何覆盖比例，只用于对照诊断。
@@ -67,6 +80,8 @@
 任何米制掩膜、路径和足迹函数缺少有效地理配准或掩膜状态时必须失败关闭，不得回退为约定像素比例。农机平面几何所需字段必须完整传入，不得在几何模块内部补造缺失尺寸。
 
 视觉作物端点不得直接冒充物理转弯锚点；新增 `turn_approach` 必须保留在框选田块内并记录校正距离。
+
+起点/终点拖动时显示的田头吸附点和青色正交接驳只属于 UI `preview_only` 状态，不得写入 `auto_path`、路径 provenance、验证指标或导出文件。鼠标释放后保存纠正后的最终服务点，使旧路径失效，并由正式规划链重新生成 canonical 路径。
 
 ## 导出清单
 
@@ -94,7 +109,7 @@
 
 诊断标志只用于定位异常，不得自动删除作物主体；算法调整必须结合原始影像和真实田块证据。
 
-田头走廊修复必须满足端部位置、跨行连续性、原始田头种子占比和最大主体切入深度四项约束。走廊确认后，主体掩膜、行带轮廓和中心线必须同步裁剪；被移出的原始像素转入田头层，不得丢弃。内部横向结构和稀疏端部碎片不得自动升级为田头走廊。
+田头走廊修复必须满足端部位置、跨行连续性、原始田头种子占比和最大主体切入深度四项约束。走廊确认后按规则化主体端点走势建立平滑端墙，只保留真实原始作物支持；主体掩膜、行带轮廓和中心线必须同步裁剪，被移出的原始像素转入田头层，不得丢弃。内部横向结构和稀疏端部碎片不得自动升级为田头走廊。
 
 ## 论文实验资料包
 
@@ -114,6 +129,7 @@
 - 文件末尾写入配置中的 `$INFM` 记录。
 - 以上为当前软件兼容格式；目标收获机字段、状态码、索引和结束记录在 `path_protocol` 中记录。
 - manifest 必须记录 `candidate_machine_path=true`、`terminal_protocol_validated` 及完整 `path_protocol`。
+- manifest 的 `analysis.layout` 必须保留实际工作线模式、正式基准/优化比较和关键指标摘要；路径阶段 `artifact_sha256` 必须同时绑定 `full_path`、`segment_types` 与 `layout`。修改优化标签、比较结论或指标摘要后，正式导出和缓存恢复校验必须失败。
 ## 分段足迹和田头转弯指标
 
 - `segment_metrics` 与 `turn_segment_metrics` 来自同一 `plan_pose` 采样和 `planar_rigid_footprint_v2` 有向左右履带矩形；每段至少记录 `segment_type`、`length_m`、独占 `track_swept_area_m2`、主体/田头/不确定区/禁行区重叠面积、田界越界面积与 `agronomic_damage_cost_m2`。
@@ -121,5 +137,7 @@
 - `track_access_count_dtype=uint32` 的访问计数图用于 `track_rolling_visit_once_area_m2` 和 `track_rolling_visit_twice_or_more_area_m2`；这些是二维几何模型指标，不等于土壤压实或产量损失。
 - 转弯层另报 `headland_turn_track_overlap_area_m2`、`headland_turn_rolling_pct`、`turn_body_overlap_area_m2`、`turn_uncertain_overlap_area_m2`、`turn_forbidden_overlap_area_m2`、`turn_outside_field_pct`、`turn_cost_m2` 和 `turn_repeat_twice_or_more_area_m2`。田头指标只作报告，不进入候选排序；田界、确认禁行区和运动学仍是硬约束。
 - 规划器保留 `requested_strategy`、`candidate_strategy`、`effective_strategy` 和 `fallback_reason`；`headland_turn_optimization_enabled` 只控制有限转弯候选选择，默认启用，不能把工作线推离四行带中心线。
+- `contour` 套圈策略记录 `ordering_strategy=contour`、`contour_ordering.algorithm_version`、`ordered_original_indices`、`normal_positions`、`headland_wall_projections_px`、`shared_turn_clearance_m_by_side`、`shared_turn_clearance_scope`、`turn_distances_m`、`turn_distances_nonincreasing` 和 `center_single_finish`。顺序固定为法向两侧向中心配对；宽间距局部转弯请求为 `bow`，中心间距仅在显式米制容差内允许用保持共同切线位置的小半圆，超过容差仍受最小半径安全回退。横向切线属于正式 `turn` 段并进入足迹归因，不得产生绕过路径协议的 `connector` 类型，也不得把合成闭合轮廓当作作业段。
+<!-- DECISION-016: contour ordering remains bound to crop-supported centerlines. -->
 - 每个转弯候选在软代价排序前必须携带正式足迹验证的显式 `valid=True`、空 `issues`、`track_core_overlap_pct`、`planned_target_geometric_coverage_pct` 和 `track_outside_field_pct`；配置提供 `planning_support_mask`、`uncertain_mask` 或 `forbidden_mask` 时，还必须分别提供对应的履带重叠指标。缺失或超限均进入 `rejected_candidates`，不得按零值补齐。
 <!-- DECISION-015: segment footprint and headland-turn metric contract. -->

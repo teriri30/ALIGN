@@ -6,6 +6,7 @@
   - semicircle:  Semicircular turning — R ≈ ω/2 时的半圆转弯
   - pear:        Pear-shaped turning — R > ω/2 时的三圆相切转弯
   - fishtail:    Fishtail turning — 田头受限时的倒车折返
+  - contour:     Contour/spiral ordering — 外圈向内访问现有作业中心线
 """
 import math, csv, json, os, tempfile, hashlib
 from typing import List, Tuple, Optional, Dict
@@ -15,15 +16,287 @@ from shapely.geometry import LineString, Point, Polygon
 from config import Config, AppLogger
 from footprint_planner import (
     assess_footprint_hard_constraints,
+    compare_work_line_footprints,
     generate_work_lines,
+    summarize_work_line_footprint,
     validate_footprints,
 )
 from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
 from headland_turn_optimizer import build_turn_corridor_mask, has_non_degenerate_curve, polyline_inside_mask, select_turn_candidate
 
 
-PATH_PLANNING_VERSION = "footprint-path-v8"
+PATH_PLANNING_VERSION = "footprint-path-v15"
 HEADLAND_TURN_OPTIMIZER_VERSION = "headland-turn-corridor-v1"
+
+
+def _contour_order_work_lines(
+    work_lines: List[List[Tuple[float, float]]],
+    field_polygon: Optional[np.ndarray],
+    main_angle: Optional[float] = None,
+) -> Tuple[List[List[Tuple[float, float]]], Dict]:
+    """DECISION-016: order crop-supported four-row lines outside-in.
+
+    This is the *order* part of a contour/spiral baseline. It does not invent
+    a closed boundary contour: every returned pass remains an existing
+    crop-supported work line. The normal-axis records are visited from the two
+    outside edges toward the middle (low, high, low+1, high-1, ...), which is
+    the order needed before building progressively shorter headland crossings.
+    """
+    diagnostics = {
+        "ordering": "contour_outside_in_nested",
+        "algorithm_version": "contour-order-v3",
+        "field_boundary_required": False,
+        "fallback_reason": "",
+    }
+    if not work_lines:
+        diagnostics["fallback_reason"] = "no_work_lines"
+        return [], diagnostics
+
+    angle = None
+    if main_angle is not None and math.isfinite(float(main_angle)):
+        angle = float(main_angle)
+    else:
+        weighted_cos = 0.0
+        weighted_sin = 0.0
+        for line in work_lines:
+            points = np.asarray(line, dtype=np.float64)
+            if points.ndim != 2 or points.shape[0] < 2:
+                continue
+            dx = float(points[-1][0] - points[0][0])
+            dy = float(points[-1][1] - points[0][1])
+            weight = math.hypot(dx, dy)
+            if weight <= 1e-9:
+                continue
+            line_angle = math.atan2(dy, dx)
+            weighted_cos += weight * math.cos(2.0 * line_angle)
+            weighted_sin += weight * math.sin(2.0 * line_angle)
+        if weighted_cos or weighted_sin:
+            angle = 0.5 * math.atan2(weighted_sin, weighted_cos)
+    if angle is None:
+        diagnostics["fallback_reason"] = "direction_unavailable"
+        return [list(line) for line in work_lines], diagnostics
+
+    nx, ny = -math.sin(angle), math.cos(angle)
+    records = []
+    for index, line in enumerate(work_lines):
+        points = np.asarray(line, dtype=np.float64)
+        if (
+            points.ndim != 2
+            or points.shape[0] < 2
+            or points.shape[1] != 2
+            or not np.all(np.isfinite(points))
+        ):
+            diagnostics["fallback_reason"] = "invalid_work_line"
+            return [list(item) for item in work_lines], diagnostics
+        midpoint = points.mean(axis=0)
+        pos = float(midpoint[0] * nx + midpoint[1] * ny)
+        records.append({"index": index, "line": list(line), "pos": pos})
+    records.sort(key=lambda item: (round(item["pos"], 6), item["index"]))
+
+    nested = []
+    left, right = 0, len(records) - 1
+    while left <= right:
+        nested.append(records[left])
+        left += 1
+        if left <= right:
+            nested.append(records[right])
+            right -= 1
+    diagnostics["ordered_original_indices"] = [item["index"] for item in nested]
+    diagnostics["normal_positions"] = [item["pos"] for item in nested]
+    diagnostics["sorted_normal_positions"] = [item["pos"] for item in records]
+    diagnostics["main_angle_rad"] = float(angle)
+    diagnostics["fallback_reason"] = None
+    return [item["line"] for item in nested], diagnostics
+
+
+def _build_contour_connector_anchors(
+    oriented_lines: List[List[Tuple[float, float]]],
+    main_angle: float,
+    field_polygon: Optional[np.ndarray],
+    mpp: float,
+    config: Optional[Dict] = None,
+) -> Tuple[List[Dict[str, Tuple[float, float]]], Dict]:
+    """DECISION-016: build the two shared headland walls for nested loops.
+
+    Work lines are already ordered ``left-1, right-1, left-2, right-2, ...``
+    and oriented alternately.  Every endpoint on the same physical field end
+    is projected to one common axial wall.  The following bow turns therefore
+    place their transverse tangent on the same headland line; their lateral
+    spans shrink monotonically as the route moves inward.
+
+    The transverse span is intentionally *not* capped at a few metres: the
+    first loop crosses from the left outer pass to the right outer pass.  Only
+    the along-row endpoint compensation is bounded.  This helper does not
+    mutate the supplied geometry.  The caller may merge a boundary-checked,
+    cohort-supported axial correction into the work line under DECISION-010.
+    """
+    cfg = dict(config or {})
+    diagnostics = {
+        "enabled": True,
+        "algorithm_version": "contour-connectors-v2",
+        "connector_count": 0,
+        "shared_headland_lines": False,
+        "center_single_finish": bool(len(oriented_lines) % 2),
+        "fallback_reason": None,
+        "boundary_supported": field_polygon is not None,
+    }
+    if len(oriented_lines) < 2:
+        diagnostics["fallback_reason"] = "fewer_than_two_lines"
+        return [], diagnostics
+    if field_polygon is None:
+        diagnostics["fallback_reason"] = "missing_field_boundary"
+        return [], diagnostics
+    direction = np.asarray(
+        (math.cos(float(main_angle)), math.sin(float(main_angle))),
+        dtype=np.float64,
+    )
+    try:
+        max_extension_m = float(
+            cfg.get(
+                "contour_max_endpoint_extension_m",
+                cfg.get("endpoint_extension_max_m", 4.0),
+            )
+        )
+    except (TypeError, ValueError):
+        max_extension_m = 4.0
+    if not math.isfinite(max_extension_m) or max_extension_m < 0.0:
+        diagnostics["fallback_reason"] = "invalid_endpoint_extension_limit"
+        return [], diagnostics
+
+    endpoint_records = []
+    low_projections = []
+    high_projections = []
+    for line_index, line in enumerate(oriented_lines):
+        if len(line) < 2:
+            diagnostics["fallback_reason"] = "invalid_work_line"
+            return [], diagnostics
+        start = np.asarray(line[0], dtype=np.float64)
+        end = np.asarray(line[-1], dtype=np.float64)
+        if not np.all(np.isfinite(start)) or not np.all(np.isfinite(end)):
+            diagnostics["fallback_reason"] = "invalid_work_line"
+            return [], diagnostics
+        start_projection = float(start @ direction)
+        end_projection = float(end @ direction)
+        if abs(start_projection - end_projection) <= 1e-9:
+            diagnostics["fallback_reason"] = "work_line_axial_extent_degenerate"
+            return [], diagnostics
+        start_side = "low" if start_projection < end_projection else "high"
+        end_side = "high" if start_side == "low" else "low"
+        low_projections.append(min(start_projection, end_projection))
+        high_projections.append(max(start_projection, end_projection))
+        endpoint_records.append({
+            "line_index": line_index,
+            "start": start,
+            "end": end,
+            "start_projection": start_projection,
+            "end_projection": end_projection,
+            "start_side": start_side,
+            "end_side": end_side,
+        })
+
+    # Use the outer envelope of crop-supported endpoints.  This never truncates
+    # a longer crop pass; shorter endpoints may be extended only within the
+    # explicit compensation limit and the selected field boundary.
+    wall_projection = {
+        "low": float(min(low_projections)),
+        "high": float(max(high_projections)),
+    }
+    forced_walls = cfg.get("_contour_forced_wall_projections")
+    if isinstance(forced_walls, dict):
+        forced_low = _finite_float(forced_walls.get("low"))
+        forced_high = _finite_float(forced_walls.get("high"))
+        if (
+            forced_low is not None
+            and forced_high is not None
+            and forced_high > forced_low
+        ):
+            wall_projection = {"low": forced_low, "high": forced_high}
+            diagnostics["shared_headland_scope"] = "all_classified_regions"
+        else:
+            diagnostics["shared_headland_scope"] = "current_region"
+    else:
+        diagnostics["shared_headland_scope"] = "current_region"
+    anchors = [
+        {
+            "start": (float(line[0][0]), float(line[0][1])),
+            "end": (float(line[-1][0]), float(line[-1][1])),
+        }
+        for line in oriented_lines
+    ]
+    endpoint_adjustments = []
+    for record in endpoint_records:
+        line_index = record["line_index"]
+        for endpoint_name in ("start", "end"):
+            endpoint = record[endpoint_name]
+            projection = record[f"{endpoint_name}_projection"]
+            side = record[f"{endpoint_name}_side"]
+            target_projection = wall_projection[side]
+            target = endpoint + direction * (target_projection - projection)
+            extension_m = float(np.linalg.norm(target - endpoint) * mpp)
+            if extension_m > max_extension_m + 1e-6:
+                diagnostics["fallback_reason"] = "headland_wall_extension_too_long"
+                diagnostics["failed_line"] = line_index
+                diagnostics["failed_endpoint"] = endpoint_name
+                diagnostics["failed_extension_m"] = extension_m
+                return [], diagnostics
+            if extension_m > 1e-7 and not _segment_inside_field_boundary(
+                [tuple(endpoint), tuple(target)], field_polygon
+            ):
+                diagnostics["fallback_reason"] = "headland_wall_extension_leaves_boundary"
+                diagnostics["failed_line"] = line_index
+                diagnostics["failed_endpoint"] = endpoint_name
+                return [], diagnostics
+            anchors[line_index][endpoint_name] = tuple(map(float, target))
+            endpoint_adjustments.append(extension_m)
+
+    turn_distances_m = []
+    transition_walls = []
+    for transition_index in range(len(oriented_lines) - 1):
+        current_target = np.asarray(
+            anchors[transition_index]["end"], dtype=np.float64
+        )
+        next_target = np.asarray(
+            anchors[transition_index + 1]["start"], dtype=np.float64
+        )
+        current_projection = float(current_target @ direction)
+        next_projection = float(next_target @ direction)
+        if abs(current_projection - next_projection) * mpp > 1e-6:
+            diagnostics["fallback_reason"] = "transition_endpoints_not_on_shared_wall"
+            diagnostics["failed_transition"] = transition_index
+            return [], diagnostics
+        span_m = float(np.linalg.norm(next_target - current_target) * mpp)
+        if not math.isfinite(span_m) or span_m <= 1e-9:
+            diagnostics["fallback_reason"] = "transition_span_degenerate"
+            diagnostics["failed_transition"] = transition_index
+            return [], diagnostics
+        side = endpoint_records[transition_index]["end_side"]
+        if side != endpoint_records[transition_index + 1]["start_side"]:
+            diagnostics["fallback_reason"] = "transition_endpoints_on_opposite_walls"
+            diagnostics["failed_transition"] = transition_index
+            return [], diagnostics
+        turn_distances_m.append(span_m)
+        transition_walls.append(side)
+        diagnostics["connector_count"] += 1
+
+    if any(
+        later > earlier + 1e-6
+        for earlier, later in zip(turn_distances_m, turn_distances_m[1:])
+    ):
+        diagnostics["fallback_reason"] = "turn_distance_does_not_shrink_inward"
+        diagnostics["turn_distances_m"] = turn_distances_m
+        return [], diagnostics
+
+    diagnostics.update({
+        "fallback_reason": None,
+        "shared_headland_lines": True,
+        "headland_wall_projections_px": wall_projection,
+        "transition_walls": transition_walls,
+        "turn_distances_m": turn_distances_m,
+        "turn_distances_nonincreasing": True,
+        "max_endpoint_extension_m": max(endpoint_adjustments, default=0.0),
+        "configured_max_endpoint_extension_m": max_extension_m,
+    })
+    return anchors, diagnostics
 
 
 def _finite_float(value):
@@ -41,6 +314,8 @@ def build_band_mask(shape, bands: List[Dict]) -> np.ndarray:
     contours = []
     for band in bands:
         contour = band.get("contour")
+        if contour is None:
+            contour = band.get("planning_contour")
         if contour is None:
             continue
         contour = np.asarray(contour, dtype=np.int32)
@@ -358,6 +633,8 @@ def _adjust_turn_to_field_boundary(
     selected_strategy: str,
     clearance_m: float,
     polygon: Optional[np.ndarray],
+    semicircle_radius_tolerance_m: float = 0.0,
+    semicircle_tangent_radius_m: Optional[float] = None,
 ) -> Tuple[List[Tuple[float, float]], str, Optional[str]]:
     """Generate a turn, shrinking outward clearance when it would leave the selected field."""
     turn_function = TURN_STRATEGIES.get(selected_strategy, _turn_bow)
@@ -368,15 +645,28 @@ def _adjust_turn_to_field_boundary(
             clearances.append(value)
     best_turn = None
     for value in clearances:
-        turn = turn_function(
-            start,
-            end,
-            work_direction,
-            turn_sign,
-            mpp,
-            min_turn_radius_m,
-            value,
-        )
+        if selected_strategy == "semicircle":
+            turn = turn_function(
+                start,
+                end,
+                work_direction,
+                turn_sign,
+                mpp,
+                min_turn_radius_m,
+                value,
+                radius_tolerance_m=semicircle_radius_tolerance_m,
+                tangent_radius_m=semicircle_tangent_radius_m,
+            )
+        else:
+            turn = turn_function(
+                start,
+                end,
+                work_direction,
+                turn_sign,
+                mpp,
+                min_turn_radius_m,
+                value,
+            )
         if best_turn is None:
             best_turn = turn
         if _segment_inside_field_boundary(turn, polygon):
@@ -520,7 +810,10 @@ def _turn_bow(start: Tuple[float, float], end: Tuple[float, float],
 def _turn_semicircle(start: Tuple[float, float], end: Tuple[float, float],
                      work_dir: Tuple[float, float], perp_sign: float,
                      mpp: float, min_radius_m: float,
-                     clearance_m: float = 0.0) -> List[Tuple[float, float]]:
+                     clearance_m: float = 0.0,
+                     radius_tolerance_m: float = 0.0,
+                     tangent_radius_m: Optional[float] = None,
+                     ) -> List[Tuple[float, float]]:
     """Pure semicircular turn whose radius is half the pass spacing."""
     start_v, end_v, distance, lateral, outward = _turn_frame(
         start, end, work_dir
@@ -528,12 +821,25 @@ def _turn_semicircle(start: Tuple[float, float], end: Tuple[float, float],
     if distance < 2.0 or lateral is None:
         return [start, end]
     physical_radius_m = distance * max(mpp, 1e-6) * 0.5
-    if physical_radius_m < float(min_radius_m) - 1e-6:
+    radius_tolerance_m = max(0.0, float(radius_tolerance_m))
+    if physical_radius_m < float(min_radius_m) - radius_tolerance_m - 1e-6:
         raise ValueError(
             f"semicircle radius {physical_radius_m:.3f} m is below the "
             f"minimum turn radius {float(min_radius_m):.3f} m"
         )
-    clearance = _turn_clearance_px(clearance_m, mpp)
+    tangent_radius_m = max(
+        physical_radius_m,
+        float(tangent_radius_m)
+        if tangent_radius_m is not None
+        else physical_radius_m,
+    )
+    # DECISION-016: a near-threshold centre turn stays on the same
+    # headland tangent as the R-radius bows by moving the smaller arc outward
+    # by exactly its audited radius shortfall.
+    clearance = _turn_clearance_px(
+        float(clearance_m) + tangent_radius_m - physical_radius_m,
+        mpp,
+    )
     start_out = start_v + outward * clearance
     end_out = end_v + outward * clearance
     center = (start_out + end_out) * 0.5
@@ -888,6 +1194,8 @@ def _turn_outward_u(start: Tuple[float, float], end: Tuple[float, float],
 TURN_STRATEGY_ALIASES = {
     "uturn": "bow",
     "bulb": "pear",
+    "spiral": "contour",
+    "round_and_round": "contour",
 }
 
 TURN_STRATEGY_LABELS = {
@@ -896,6 +1204,7 @@ TURN_STRATEGY_LABELS = {
     "pear": "梨形转弯",
     "fishtail": "鱼尾折返",
     "alpha": "紧凑α折返",
+    "contour": "套圈收割（外圈向内）",
     "auto": "按行距自适应组合",
 }
 
@@ -911,6 +1220,8 @@ TURN_STRATEGIES = {
     "pear": _turn_pear,
     "fishtail": _turn_fishtail,
     "alpha": _turn_alpha,
+    # ``contour`` changes pass order; wide local turns use a shared-line bow.
+    "contour": _turn_bow,
     # Backward-compatible project/cache keys.
     "uturn": _turn_bow,
     "bulb": _turn_pear,
@@ -981,6 +1292,7 @@ def _select_turn_strategy(
     pass_spacing_m: float,
     turn_radius_m: float,
     headland_limited: bool = False,
+    geometry_tolerance_m: Optional[float] = None,
 ) -> Dict:
     """Choose an executable turn strategy for one adjacent-pass transition.
 
@@ -996,7 +1308,13 @@ def _select_turn_strategy(
     spacing = max(0.0, float(pass_spacing_m))
     radius = max(1e-6, float(turn_radius_m))
     tolerance = max(0.05, radius * 0.05)
+    radius_tolerance = (
+        max(0.0, float(geometry_tolerance_m))
+        if geometry_tolerance_m is not None
+        else max(0.05, radius * 0.05)
+    )
     two_radius = 2.0 * radius
+    radius_shortfall = max(0.0, radius - spacing * 0.5)
     fallback_from = None
     fallback_reason = ""
 
@@ -1011,6 +1329,8 @@ def _select_turn_strategy(
                     "pass_spacing_m": round(spacing, 9),
                     "turn_radius_m": round(radius, 9),
                     "headland_limited": bool(headland_limited),
+                    "geometry_tolerance_m": round(radius_tolerance, 9),
+                    "radius_shortfall_m": round(radius_shortfall, 9),
                     "fallback_reason": fallback_reason,
                 },
                 ensure_ascii=True,
@@ -1030,21 +1350,32 @@ def _select_turn_strategy(
             "fallback_reason": fallback_reason,
             "pass_spacing_m": spacing,
             "turn_radius_m": radius,
+            "geometry_tolerance_m": radius_tolerance,
+            "radius_shortfall_m": radius_shortfall,
             "geometry_signature": signature,
         }
 
     # DECISION-010: omega/2 below R is never an executable semicircle.
-    if (
-        spacing < two_radius - 1e-6
-        and requested in {"auto", "bow", "semicircle"}
-    ):
-        strategy = "fishtail" if headland_limited else "pear"
+    # 小间距（ω<2R）优先梨形：fishtail 倒车折返在田头空间不足时容易退化为
+    # 直线连接（被足迹验证判为不可行）；pear 前进-倒车-前进在窄田头更稳健。
+    if spacing < two_radius - 1e-6 and requested in {
+        "auto", "bow", "semicircle"
+    }:
         fallback_from = None if requested == "auto" else requested
-        fallback_reason = (
-            f"omega={spacing:.2f}m gives omega/2={spacing * 0.5:.2f}m "
-            f"below R={radius:.2f}m; using {TURN_STRATEGY_LABELS[strategy]} "
-            "instead of a subminimum-radius semicircle"
-        )
+        if radius_shortfall <= radius_tolerance + 1e-9:
+            strategy = "semicircle"
+            fallback_reason = (
+                f"omega={spacing:.2f}m gives a {radius_shortfall:.3f}m "
+                "radius shortfall within the audited geometry tolerance; "
+                "using a shared-tangent near-semicircle"
+            )
+        else:
+            strategy = "pear"
+            fallback_reason = (
+                f"omega={spacing:.2f}m gives omega/2={spacing * 0.5:.2f}m "
+                f"below R={radius:.2f}m; using {TURN_STRATEGY_LABELS[strategy]} "
+                "instead of a subminimum-radius semicircle"
+            )
         return build_decision(strategy, fallback_reason)
 
     if requested == "auto":
@@ -1103,6 +1434,12 @@ def assess_turn_strategy(
     and fishtail for R > omega/2 when reversing is acceptable.
     """
     selected = normalize_turn_strategy(strategy)
+    ordering_strategy = selected
+    if selected == "contour":
+        # The nested contour needs a shared transverse tangent.  Bow geometry
+        # supplies it for omega >= 2R; DECISION-010 still replaces an
+        # impossible central bow with a radius-safe alternative.
+        selected = "bow"
     spacings = [
         float(value)
         for value in pass_spacings_m
@@ -1162,8 +1499,9 @@ def assess_turn_strategy(
             hard_reasons.append(f"未知转弯策略: {strategy}")
 
     return {
-        "strategy": selected,
-        "label": TURN_STRATEGY_LABELS.get(selected, selected),
+        "strategy": ordering_strategy,
+        "turn_geometry_strategy": selected,
+        "label": TURN_STRATEGY_LABELS.get(ordering_strategy, ordering_strategy),
         "feasible": not hard_reasons,
         "needs_confirmation": bool(hard_reasons),
         "hard_reasons": hard_reasons,
@@ -1397,18 +1735,55 @@ def _align_short_turn_anchors(
             outlier_threshold_m = side_thresholds_m[side]
             if not outward or extension_m < outlier_threshold_m:
                 continue
+            # 短带通常只是田头断行：若相邻带的同侧端点（按空间侧，而非
+            # start/end 名称——蛇形反转后名称可能不对应同侧）比自身更靠近
+            # 目标，允许延长到相邻带端点（有作物证据，不受 max_extension_m
+            # 限制，仍受田界检查约束）。
+            neighbor_same_side = None
+            for neighbor_index in (line_index - 1, line_index + 1):
+                if not (0 <= neighbor_index < len(work_lines)):
+                    continue
+                neighbor_values = endpoint_projections[neighbor_index]
+                candidate = min(neighbor_values) if low_side else max(neighbor_values)
+                if neighbor_same_side is None or (
+                    (candidate - projection) * (target_projection - projection)
+                    > (neighbor_same_side - projection) * (target_projection - projection)
+                ):
+                    neighbor_same_side = candidate
+            capped_to_neighbor = False
+            if neighbor_same_side is not None:
+                # 邻居不在目标反方向即可作为证据（等距区细分线端点彼此对齐，
+                # 邻居与自身同位置时乘积为 0，同样允许延长到田头线）。
+                toward_target = (
+                    (neighbor_same_side - projection) * (target_projection - projection)
+                    >= 0
+                )
+                if toward_target:
+                    # 延长目标取邻居与中位目标中较远者：有相邻带作物证据时
+                    # 不受 max_extension_m 限制（仍受田界检查约束）。等距区
+                    # 细分线比相邻带短（区域真实形状），必须延长到相邻带
+                    # 同侧端点，田头转弯才能保持短小。
+                    if abs(neighbor_same_side - projection) > abs(delta_px):
+                        delta_px = neighbor_same_side - projection
+                    capped_to_neighbor = True
+                    extension_m = abs(delta_px) * mpp
             target = (
                 float(point[0] + direction[0] * delta_px),
                 float(point[1] + direction[1] * delta_px),
             )
             blocked_reason = ""
-            if extension_m > max_extension_m:
+            if extension_m > max_extension_m and not capped_to_neighbor:
                 blocked_reason = "extension_limit"
             elif field_polygon is None:
                 blocked_reason = "missing_field_boundary"
             elif not _segment_inside_field_boundary([point, target], field_polygon):
                 blocked_reason = "outside_field_boundary"
             if blocked_reason:
+                blocked_reason = (
+                    blocked_reason
+                    if not capped_to_neighbor
+                    else f"{blocked_reason}_neighbor_evidence"
+                )
                 diagnostics["blocked_endpoint_count"] += 1
                 diagnostics["blocked"].append({
                     "line_index": line_index,
@@ -1452,6 +1827,80 @@ def _headland_space_is_limited(
     return not _segment_inside_field_boundary([start, target], field_polygon)
 
 
+def _build_exit_service_route(
+    last_work_line: List[Tuple[float, float]],
+    exit_point: Tuple[float, float],
+    main_angle: float,
+    mpp: float,
+    field_polygon,
+    config: Optional[Dict] = None,
+) -> Tuple[List[Tuple[float, float]], Dict]:
+    """Use harvested geometry when the exit lies on the opposite headland."""
+    cfg = dict(config or {})
+    line = [tuple(map(float, point)) for point in (last_work_line or [])]
+    target = tuple(map(float, exit_point))
+    report = {
+        "algorithm_version": "harvested-exit-route-v1",
+        "mode": "direct_same_headland",
+        "retrace_last_work": False,
+        "direct_axial_distance_m": None,
+        "selected_axial_distance_m": None,
+        "inside_field_boundary": True,
+    }
+    if len(line) < 2:
+        report["mode"] = "direct_no_work_geometry"
+        return ([line[-1], target] if line else [target]), report
+
+    direction = np.asarray(
+        [math.cos(float(main_angle)), math.sin(float(main_angle))],
+        dtype=np.float64,
+    )
+    current = np.asarray(line[-1], dtype=np.float64)
+    opposite = np.asarray(line[0], dtype=np.float64)
+    target_array = np.asarray(target, dtype=np.float64)
+    current_axial_m = abs(float((target_array - current) @ direction)) * mpp
+    opposite_axial_m = abs(float((target_array - opposite) @ direction)) * mpp
+    current_distance_m = float(np.linalg.norm(target_array - current) * mpp)
+    opposite_distance_m = float(np.linalg.norm(target_array - opposite) * mpp)
+    tolerance_m = max(
+        1.0,
+        float(cfg.get("service_headland_axial_tolerance_m", 3.0)),
+    )
+    use_opposite = bool(
+        current_axial_m > tolerance_m
+        and opposite_axial_m + 1e-6 < current_axial_m
+        and opposite_distance_m < current_distance_m
+    )
+    if use_opposite:
+        route = list(reversed(line))
+        if math.hypot(
+            route[-1][0] - target[0], route[-1][1] - target[1]
+        ) > 1e-7:
+            route.append(target)
+        report.update({
+            "mode": "retrace_last_harvested_work_then_exit_headland",
+            "retrace_last_work": True,
+            "selected_axial_distance_m": opposite_axial_m,
+            "retrace_distance_m": float(sum(
+                math.hypot(b[0] - a[0], b[1] - a[1])
+                for a, b in zip(route[:-1], route[1:-1])
+            ) * mpp),
+        })
+    else:
+        route = [tuple(current), target]
+        report["selected_axial_distance_m"] = current_axial_m
+    report.update({
+        "direct_axial_distance_m": current_axial_m,
+        "current_distance_m": current_distance_m,
+        "opposite_endpoint_distance_m": opposite_distance_m,
+        "headland_axial_tolerance_m": tolerance_m,
+        "inside_field_boundary": bool(
+            _segment_inside_field_boundary(route, field_polygon)
+        ),
+    })
+    return route, report
+
+
 def _connect_work_lines(
         work_lines: List[List[Tuple[float, float]]],
         geo=None,
@@ -1478,6 +1927,9 @@ def _connect_work_lines(
     clearance_m = max(
         float(cfg.get("turn_outward_clearance_m", 0.6)),
         float(cfg.get("turn_safety_margin_m", 0.1)),
+    )
+    turn_radius_geometry_tolerance_m = max(
+        0.0, float(cfg.get("turn_radius_geometry_tolerance_m", 0.05))
     )
     requested_strategy = (
         "auto"
@@ -1506,21 +1958,102 @@ def _connect_work_lines(
     def to_local(point):
         return (float(point[0]) - ox, float(point[1]) - oy) if point else None
 
+    include_entry_service = bool(cfg.get("_include_entry_service", True))
+    include_exit_service = bool(cfg.get("_include_exit_service", True))
     entry_point = to_local(entry_global)
+    if "_route_start_reference_local" in cfg:
+        reference = cfg.get("_route_start_reference_local")
+        entry_point = (
+            (float(reference[0]), float(reference[1]))
+            if reference is not None
+            else None
+        )
     exit_point = to_local(exit_global)
     unload_points = [to_local(point) for point in unload_globals if point]
     ordered_lines = [list(line) for line in work_lines]
+    contour_ordering = {
+        "ordering": "snake_row_order",
+        "algorithm_version": "contour-order-v1",
+        "field_boundary_required": False,
+        "fallback_reason": None,
+    }
+    turn_request_strategy = requested_strategy
+    if requested_strategy == "contour":
+        ordered_lines, contour_ordering = _contour_order_work_lines(
+            ordered_lines,
+            _field_boundary_local_polygon(state),
+            main_angle=(
+                float(global_main_angle)
+                if global_main_angle is not None
+                and math.isfinite(float(global_main_angle))
+                else None
+            ),
+        )
+        # Wide nested-loop transitions use the two-quarter-arc bow geometry so
+        # their transverse tangents overlap on one headland line.  The central
+        # transition still goes through DECISION-010 fallback when omega < 2R.
+        turn_request_strategy = "bow"
     if entry_point and len(ordered_lines) >= 2:
         first_distance = min(
             math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
             for point in (ordered_lines[0][0], ordered_lines[0][-1])
         )
-        last_distance = min(
-            math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
-            for point in (ordered_lines[-1][0], ordered_lines[-1][-1])
-        )
-        if last_distance < first_distance:
-            ordered_lines.reverse()
+        if requested_strategy == "contour":
+            # The first two lines are the two outside edges.  Select the nearer
+            # edge without reversing the whole nested sequence (which would
+            # incorrectly start at the centre and work outward).
+            other_distance = min(
+                math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
+                for point in (ordered_lines[1][0], ordered_lines[1][-1])
+            )
+            if other_distance < first_distance:
+                for pair_index in range(0, len(ordered_lines) - 1, 2):
+                    ordered_lines[pair_index], ordered_lines[pair_index + 1] = (
+                        ordered_lines[pair_index + 1],
+                        ordered_lines[pair_index],
+                    )
+                for key in ("ordered_original_indices", "normal_positions"):
+                    values = list(contour_ordering.get(key) or [])
+                    for pair_index in range(0, len(values) - 1, 2):
+                        values[pair_index], values[pair_index + 1] = (
+                            values[pair_index + 1],
+                            values[pair_index],
+                        )
+                    contour_ordering[key] = values
+                contour_ordering["outside_side_reversed_for_entry"] = True
+            else:
+                contour_ordering["outside_side_reversed_for_entry"] = False
+        else:
+            last_distance = min(
+                math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
+                for point in (ordered_lines[-1][0], ordered_lines[-1][-1])
+            )
+            if last_distance < first_distance:
+                ordered_lines.reverse()
+
+    alignment_angle = global_main_angle
+    alignment_direction_source = "global_main_angle"
+    if alignment_angle is None or not math.isfinite(float(alignment_angle)):
+        contour_angle = contour_ordering.get("main_angle_rad")
+        if contour_angle is not None and math.isfinite(float(contour_angle)):
+            alignment_angle = float(contour_angle)
+            alignment_direction_source = "contour_order_axial_mean"
+        else:
+            weighted_cos = 0.0
+            weighted_sin = 0.0
+            for line in ordered_lines:
+                if len(line) < 2:
+                    continue
+                dx = float(line[-1][0] - line[0][0])
+                dy = float(line[-1][1] - line[0][1])
+                weight = math.hypot(dx, dy)
+                if weight <= 1e-9:
+                    continue
+                angle = math.atan2(dy, dx)
+                weighted_cos += weight * math.cos(2.0 * angle)
+                weighted_sin += weight * math.sin(2.0 * angle)
+            alignment_angle = 0.5 * math.atan2(weighted_sin, weighted_cos)
+            alignment_direction_source = "all_work_lines_axial_mean"
 
     start_reversed = False
     if entry_point and ordered_lines and len(ordered_lines[0]) >= 2:
@@ -1538,6 +2071,17 @@ def _connect_work_lines(
     oriented = []
     for index, line in enumerate(ordered_lines):
         points = list(line)
+        if requested_strategy == "contour" and len(points) >= 2:
+            direction = (
+                math.cos(float(alignment_angle)),
+                math.sin(float(alignment_angle)),
+            )
+            axial_delta = (
+                (float(points[-1][0]) - float(points[0][0])) * direction[0]
+                + (float(points[-1][1]) - float(points[0][1])) * direction[1]
+            )
+            if axial_delta < 0.0:
+                points.reverse()
         if bool(index % 2) ^ start_reversed:
             points.reverse()
         if len(points) >= 2:
@@ -1552,25 +2096,11 @@ def _connect_work_lines(
     boundary_adjustments = []
     boundary_hard_reasons = []
     display_only_connectors = []
+    exit_service_route = {
+        "algorithm_version": "harvested-exit-route-v1",
+        "mode": "not_requested",
+    }
     field_polygon = _field_boundary_local_polygon(state)
-    alignment_angle = global_main_angle
-    alignment_direction_source = "global_main_angle"
-    if alignment_angle is None or not math.isfinite(float(alignment_angle)):
-        weighted_cos = 0.0
-        weighted_sin = 0.0
-        for line in oriented:
-            if len(line) < 2:
-                continue
-            dx = float(line[-1][0] - line[0][0])
-            dy = float(line[-1][1] - line[0][1])
-            weight = math.hypot(dx, dy)
-            if weight <= 1e-9:
-                continue
-            angle = math.atan2(dy, dx)
-            weighted_cos += weight * math.cos(2.0 * angle)
-            weighted_sin += weight * math.sin(2.0 * angle)
-        alignment_angle = 0.5 * math.atan2(weighted_sin, weighted_cos)
-        alignment_direction_source = "all_work_lines_axial_mean"
     turn_anchors, endpoint_alignment = _align_short_turn_anchors(
         oriented,
         main_angle=float(alignment_angle),
@@ -1580,9 +2110,180 @@ def _connect_work_lines(
     )
     endpoint_alignment["direction_source"] = alignment_direction_source
 
-    endpoint_alignment["path_reference_shift_applied"] = False
+    contour_connector_anchors = []
+    contour_connector_diagnostics = {
+        "enabled": requested_strategy == "contour",
+        "fallback_reason": "not_requested",
+    }
+    if requested_strategy == "contour":
+        contour_seed_lines = []
+        for line_index, line in enumerate(oriented):
+            seed = list(line)
+            if line_index < len(turn_anchors):
+                seed[0] = turn_anchors[line_index]["start"]
+                seed[-1] = turn_anchors[line_index]["end"]
+            contour_seed_lines.append(seed)
+        contour_connector_anchors, contour_connector_diagnostics = (
+            _build_contour_connector_anchors(
+                contour_seed_lines,
+                float(alignment_angle),
+                field_polygon,
+                mpp,
+                config=cfg,
+            )
+        )
+        if contour_connector_anchors:
+            # A boundary-supported contour owns its endpoint geometry.  Do
+            # not subsequently replace these common pair anchors with the
+            # cohort/MAD short-line anchors; doing so recreates the long chord.
+            turn_anchors = contour_connector_anchors
+            endpoint_alignment["contour_boundary_anchors_applied"] = True
+        else:
+            endpoint_alignment["contour_boundary_anchors_applied"] = False
+            contour_connector_diagnostics["fallback_only"] = True
 
-    if entry_point and oriented:
+    contour_route_mode = bool(contour_connector_anchors)
+    contour_fallback_reason = contour_connector_diagnostics.get("fallback_reason")
+    if requested_strategy == "contour" and not contour_route_mode:
+        # A failed contour-geometry attempt is explicit: do not silently
+        # present the ordinary U-turn path as a successful 套圈 route.
+        fallback_reasons.append(
+            f"contour_geometry_unavailable:{contour_fallback_reason or 'unknown'}"
+        )
+        boundary_hard_reasons.append(
+            f"contour geometry unavailable: {contour_fallback_reason or 'unknown'}"
+        )
+
+    # 锚点延长合并进作业线本身：锚点沿主方向延长（同法向、叉积小）时，
+    # 直接把作业线端点延伸到锚点位置。否则转弯段会包含数十米的
+    # turn_approach 空驶（用户视角的"长转弯"），且直线看起来没有走完；
+    # 合并后作业线完整延伸到田头，转弯保持短小。侧面调整（法向偏移大）
+    # 仍保留 approach 段。
+    if oriented and turn_anchors:
+        direction_x = math.cos(float(alignment_angle))
+        direction_y = math.sin(float(alignment_angle))
+        merge_side_tolerance_px = 0.3 / max(mpp, 1e-9)
+        max_merge_distance_px = 40.0 / max(mpp, 1e-9)
+        for line_index, line in enumerate(oriented):
+            if len(line) < 2 or line_index >= len(turn_anchors):
+                continue
+            for endpoint_name, point_index in (("start", 0), ("end", -1)):
+                anchor = turn_anchors[line_index].get(endpoint_name)
+                if anchor is None:
+                    continue
+                point = line[point_index]
+                dx = anchor[0] - point[0]
+                dy = anchor[1] - point[1]
+                distance = math.hypot(dx, dy)
+                if distance < 1e-6 or distance > max_merge_distance_px:
+                    continue
+                # 锚点必须沿主方向延长（叉积小）；偏离超过 0.3m 视为侧面调整
+                if abs(dx * direction_y - dy * direction_x) > merge_side_tolerance_px:
+                    continue
+                line[point_index] = anchor
+        endpoint_alignment["long_anchor_extensions_merged_into_work_lines"] = True
+
+    endpoint_alignment["path_reference_shift_applied"] = False
+    turn_optimizer_cfg = dict(cfg)
+    if requested_strategy == "contour":
+        # The optimizer may move individual turns off the common headland
+        # tangent.  Nested-loop geometry is already a finite, auditable
+        # candidate and proceeds directly to the same formal footprint gates.
+        turn_optimizer_cfg["headland_turn_optimization_enabled"] = False
+
+    contour_shared_clearance = {"low": clearance_m, "high": clearance_m}
+    contour_clearance_records = []
+    if requested_strategy == "contour" and len(oriented) >= 2:
+        axial = np.asarray((
+            math.cos(float(alignment_angle)),
+            math.sin(float(alignment_angle)),
+        ), dtype=np.float64)
+        clearance_candidates = []
+        for scale in (1.0, 0.5, 0.25, 0.0):
+            value = max(0.0, float(clearance_m) * scale)
+            if value not in clearance_candidates:
+                clearance_candidates.append(value)
+        safe_by_side = {"low": [], "high": []}
+        for transition_index in range(len(oriented) - 1):
+            line = oriented[transition_index]
+            start = turn_anchors[transition_index]["end"]
+            end = turn_anchors[transition_index + 1]["start"]
+            direction = np.asarray(start, dtype=np.float64) - np.asarray(
+                line[-2], dtype=np.float64
+            )
+            if float(np.dot(axial, direction)) < 0.0:
+                direction = -axial
+            else:
+                direction = axial.copy()
+            work_direction = (float(direction[0]), float(direction[1]))
+            side = "high" if float(np.dot(direction, axial)) >= 0.0 else "low"
+            lateral = np.asarray(end, dtype=np.float64) - np.asarray(
+                start, dtype=np.float64
+            )
+            gap_m = abs(float(
+                direction[0] * lateral[1] - direction[1] * lateral[0]
+            )) * mpp
+            if gap_m <= 1e-9:
+                gap_m = float(np.linalg.norm(lateral) * mpp)
+            decision = _select_turn_strategy(
+                "bow",
+                gap_m,
+                min_turn_radius_m,
+                geometry_tolerance_m=turn_radius_geometry_tolerance_m,
+            )
+            strategy = str(decision["strategy"])
+            function = TURN_STRATEGIES.get(strategy, _turn_bow)
+            selected_clearance = 0.0
+            for candidate_clearance in clearance_candidates:
+                if strategy == "semicircle":
+                    candidate = function(
+                        start, end, work_direction, 1.0, mpp,
+                        min_turn_radius_m, candidate_clearance,
+                        radius_tolerance_m=turn_radius_geometry_tolerance_m,
+                        tangent_radius_m=min_turn_radius_m,
+                    )
+                else:
+                    candidate = function(
+                        start, end, work_direction, 1.0, mpp,
+                        min_turn_radius_m, candidate_clearance,
+                    )
+                if _segment_inside_field_boundary(candidate, field_polygon):
+                    selected_clearance = candidate_clearance
+                    break
+            safe_by_side[side].append(selected_clearance)
+            contour_clearance_records.append({
+                "transition_index": int(transition_index),
+                "headland_side": side,
+                "individually_safe_clearance_m": float(selected_clearance),
+                "strategy": strategy,
+            })
+        for side in ("low", "high"):
+            if safe_by_side[side]:
+                contour_shared_clearance[side] = float(min(safe_by_side[side]))
+        forced_clearances = cfg.get(
+            "_contour_forced_turn_clearance_m_by_side"
+        )
+        clearance_scope = "current_region"
+        if isinstance(forced_clearances, dict):
+            for side in ("low", "high"):
+                forced_value = _finite_float(forced_clearances.get(side))
+                if forced_value is not None and forced_value >= 0.0:
+                    contour_shared_clearance[side] = min(
+                        float(contour_shared_clearance[side]),
+                        float(forced_value),
+                    )
+            clearance_scope = "all_classified_regions"
+        contour_connector_diagnostics["shared_turn_clearance_m_by_side"] = dict(
+            contour_shared_clearance
+        )
+        contour_connector_diagnostics["shared_turn_clearance_scope"] = (
+            clearance_scope
+        )
+        contour_connector_diagnostics["turn_clearance_records"] = (
+            contour_clearance_records
+        )
+
+    if include_entry_service and entry_point and oriented:
         full_path.append([entry_point, oriented[0][0]])
         segment_types.append("entry")
     for index, line in enumerate(oriented):
@@ -1606,6 +2307,31 @@ def _connect_work_lines(
                 direction_x / direction_norm,
                 direction_y / direction_norm,
             )
+        if requested_strategy == "contour":
+            # DECISION-016: every nested turn uses the same audited main-line
+            # axis.  A short/noisy local centreline tail must not rotate one
+            # bow and destroy the shared, overlapping headland tangent.
+            axial = np.asarray((
+                math.cos(float(alignment_angle)),
+                math.sin(float(alignment_angle)),
+            ), dtype=np.float64)
+            if float(np.dot(axial, (direction_x, direction_y))) < 0.0:
+                axial *= -1.0
+            work_direction = (float(axial[0]), float(axial[1]))
+        alignment_axis = np.asarray((
+            math.cos(float(alignment_angle)),
+            math.sin(float(alignment_angle)),
+        ), dtype=np.float64)
+        headland_side = (
+            "high"
+            if float(np.dot(alignment_axis, work_direction)) >= 0.0
+            else "low"
+        )
+        turn_clearance_m = (
+            float(contour_shared_clearance[headland_side])
+            if requested_strategy == "contour"
+            else float(clearance_m)
+        )
         lateral_x = end[0] - start[0]
         lateral_y = end[1] - start[1]
         cross = work_direction[0] * lateral_y - work_direction[1] * lateral_x
@@ -1620,13 +2346,15 @@ def _connect_work_lines(
             start,
             work_direction,
             field_polygon,
-            required_depth_px=(2.0 * min_turn_radius_m + clearance_m) / max(mpp, 1e-9),
+            required_depth_px=(2.0 * min_turn_radius_m + turn_clearance_m)
+            / max(mpp, 1e-9),
         )
         decision = _select_turn_strategy(
-            requested_strategy,
+            turn_request_strategy,
             gap_m,
             min_turn_radius_m,
             headland_limited=headland_limited,
+            geometry_tolerance_m=turn_radius_geometry_tolerance_m,
         )
         selected_strategy = decision["strategy"]
         turn_decisions.append({
@@ -1637,6 +2365,14 @@ def _connect_work_lines(
             "strategy": selected_strategy,
             "pass_spacing_m": float(gap_m),
             "turn_radius_m": float(min_turn_radius_m),
+            "geometry_tolerance_m": float(
+                decision.get("geometry_tolerance_m", 0.0)
+            ),
+            "radius_shortfall_m": float(
+                decision.get("radius_shortfall_m", 0.0)
+            ),
+            "shared_headland_side": headland_side,
+            "shared_clearance_m": turn_clearance_m,
             "reason": decision.get("reason", ""),
             "fallback_reason": decision.get("fallback_reason", ""),
             "geometry_signature": decision.get("geometry_signature", ""),
@@ -1645,6 +2381,9 @@ def _connect_work_lines(
             "turn_end": [float(end[0]), float(end[1])],
             "crop_entry": [float(next_line[0][0]), float(next_line[0][1])],
         })
+        if requested_strategy == "contour":
+            turn_decisions[-1]["ordering_strategy"] = "contour"
+            turn_decisions[-1]["turn_request_strategy"] = "bow"
         if decision.get("fallback_reason"):
             fallback_reasons.append(decision["fallback_reason"])
         used_strategies.append(selected_strategy)
@@ -1656,7 +2395,7 @@ def _connect_work_lines(
                 work_direction,
                 mpp,
                 min_turn_radius_m,
-                clearance_m,
+                turn_clearance_m,
                 inner=(selected_strategy == "alpha"),
             )
             base_turn_parts = list(turn_parts)
@@ -1665,17 +2404,23 @@ def _connect_work_lines(
                 selected_strategy,
                 mpp=mpp,
                 min_turn_radius_m=min_turn_radius_m,
-                clearance_m=clearance_m,
+                clearance_m=turn_clearance_m,
                 processed_mask=processed_mask,
                 field_polygon=field_polygon,
                 geo=geo,
                 state=state,
-                config=cfg,
+                config=turn_optimizer_cfg,
                 validation_work_lines=oriented,
                 validation_turn_index=index,
             )
             turn_decisions[-1]["headland_turn_optimization"] = optimization
-            if optimization.get("fallback_reason"):
+            optimizer_reason = optimization.get("fallback_reason")
+            if (
+                requested_strategy == "contour"
+                and optimizer_reason == "headland_turn_optimization_disabled"
+            ):
+                optimization["disabled_for_contour_shared_headland"] = True
+            elif optimizer_reason:
                 turn_decisions[-1]["fallback_reason"] = optimization["fallback_reason"]
                 fallback_reasons.append(optimization["fallback_reason"])
             reverse_leaves_boundary = (
@@ -1726,8 +2471,19 @@ def _connect_work_lines(
                 mpp,
                 min_turn_radius_m,
                 selected_strategy,
-                clearance_m,
+                turn_clearance_m,
                 field_polygon,
+                semicircle_radius_tolerance_m=(
+                    turn_radius_geometry_tolerance_m
+                    if selected_strategy == "semicircle"
+                    else 0.0
+                ),
+                semicircle_tangent_radius_m=(
+                    min_turn_radius_m
+                    if requested_strategy == "contour"
+                    and selected_strategy == "semicircle"
+                    else None
+                ),
             )
             base_turn_parts = [(turn, "turn")]
             turn_parts, optimization = _optimize_headland_turn(
@@ -1735,17 +2491,23 @@ def _connect_work_lines(
                 selected_strategy,
                 mpp=mpp,
                 min_turn_radius_m=min_turn_radius_m,
-                clearance_m=clearance_m,
+                clearance_m=turn_clearance_m,
                 processed_mask=processed_mask,
                 field_polygon=field_polygon,
                 geo=geo,
                 state=state,
-                config=cfg,
+                config=turn_optimizer_cfg,
                 validation_work_lines=oriented,
                 validation_turn_index=index,
             )
             turn_decisions[-1]["headland_turn_optimization"] = optimization
-            if optimization.get("fallback_reason"):
+            optimizer_reason = optimization.get("fallback_reason")
+            if (
+                requested_strategy == "contour"
+                and optimizer_reason == "headland_turn_optimization_disabled"
+            ):
+                optimization["disabled_for_contour_shared_headland"] = True
+            elif optimizer_reason:
                 turn_decisions[-1]["fallback_reason"] = optimization["fallback_reason"]
                 fallback_reasons.append(optimization["fallback_reason"])
             if optimization.get("optimization_applied") and turn_parts:
@@ -1777,7 +2539,7 @@ def _connect_work_lines(
             full_path.append([end, next_line[0]])
             segment_types.append("turn_approach")
 
-    if exit_point and oriented:
+    if include_exit_service and exit_point and oriented:
         route_end = oriented[-1][-1]
         remaining_unloads = list(unload_points)
         if remaining_unloads:
@@ -1794,7 +2556,32 @@ def _connect_work_lines(
                 segment_types.append("unload")
                 route_end = unload_point
         if math.hypot(exit_point[0] - route_end[0], exit_point[1] - route_end[1]) > 1e-6:
-            full_path.append([route_end, exit_point])
+            if remaining_unloads:
+                exit_route = [route_end, exit_point]
+                exit_service_route = {
+                    "algorithm_version": "harvested-exit-route-v1",
+                    "mode": "direct_from_explicit_unload_point",
+                    "inside_field_boundary": bool(
+                        _segment_inside_field_boundary(
+                            [route_end, exit_point], field_polygon
+                        )
+                    ),
+                }
+            else:
+                exit_route, exit_service_route = _build_exit_service_route(
+                    oriented[-1],
+                    exit_point,
+                    float(alignment_angle),
+                    mpp,
+                    field_polygon,
+                    config=cfg,
+                )
+            if exit_service_route.get("retrace_last_work") and len(exit_route) >= 3:
+                full_path.append(exit_route[:-1])
+                segment_types.append("turn_reverse")
+                full_path.append([exit_route[-2], exit_route[-1]])
+            else:
+                full_path.append(exit_route)
             segment_types.append("exit")
     non_work_boundary_violations = _non_work_boundary_violations(
         full_path,
@@ -1822,11 +2609,13 @@ def _connect_work_lines(
     diagnostics = {
         **assessment,
         "requested_strategy": requested_strategy,
+        "ordering_strategy": requested_strategy,
+        "contour_ordering": contour_ordering,
         "used_strategies": used_strategies,
         "fallback_reasons": fallback_reasons,
         "display_only_connectors": display_only_connectors,
         "kinematically_infeasible": bool(display_only_connectors),
-        "machine_executable": not bool(display_only_connectors),
+        "machine_executable": not bool(display_only_connectors or boundary_hard_reasons),
         "boundary_constraints": {
             "field_boundary_present": field_polygon is not None,
             "turns_adjusted": len(boundary_adjustments),
@@ -1836,11 +2625,15 @@ def _connect_work_lines(
         "pass_spacings_m": pass_spacings_m,
         "turn_decisions": turn_decisions,
         "endpoint_alignment": endpoint_alignment,
+        "contour_connector": contour_connector_diagnostics,
+        "contour_route_mode": contour_route_mode,
         "service_points": {
-            "entry_present": entry_point is not None,
-            "exit_present": exit_point is not None,
-            "unload_count": len(unload_points),
+            "entry_present": bool(include_entry_service and entry_point is not None),
+            "exit_present": bool(include_exit_service and exit_point is not None),
+            "unload_count": len(unload_points) if include_exit_service else 0,
             "unload_visit_count": sum(1 for item in segment_types if item == "unload"),
+            "route_start_reference_present": entry_point is not None,
+            "exit_route": exit_service_route,
         },
     }
     if return_diagnostics:
@@ -1888,7 +2681,8 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
     3. 转弯半径是否满足
     4. 路径交叉检测
 
-    full_path 中偶数索引为工作段，奇数索引为转弯段。
+    提供 ``segment_types`` 时按段语义区分 ``work``、转弯和进出场段；
+    只有缺少语义标签的历史路径才回退到偶数索引兼容规则。
     注意: full_path 和 mask 必须在同一坐标系中（均为局部裁切坐标或均为全图坐标）。
     若检测到路径坐标超出 mask 范围，将自动回退到局部坐标进行验证。
 
@@ -1948,7 +2742,10 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
     turn_length_m = turn_length_px * mpp
     entry_exit_length_m = entry_exit_length_px * mpp
     total_length_m = work_length_m + turn_length_m + entry_exit_length_m
-    crossing_count = _count_path_intersections_proper(full_path)
+    crossing_count = _count_path_intersections_proper(
+        full_path,
+        segment_types=segment_types,
+    )
     issues = []
 
     profile = str(cfg.get("validation_profile", "field_trial"))
@@ -2273,16 +3070,29 @@ def auto_validate_path(full_path: List[List[Tuple[float, float]]],
 
 
 def _count_path_intersections_proper(
-        full_path: List[List[Tuple[float, float]]]) -> int:
-    """统计非相邻工作段之间的交叉次数。
+        full_path: List[List[Tuple[float, float]]],
+        segment_types: Optional[List[str]] = None) -> int:
+    """统计非相邻作业段之间的真实交叉次数。
 
-    使用线段-线段交叉检测（参数化方法），
-    仅检查间隔 ≥ 2 的工作段对（跳过相邻段，它们通过转弯段连接属于正常）。
+    路径现在允许在第一条作业线前包含 ``entry``，在最后一条作业线后
+    包含 ``exit``，并且区域转场还可能插入 ``turn_aux``。因此不能再用
+    段索引的奇偶性推断作业段；有语义标签时只统计 ``segment_type ==
+    "work"`` 的段。没有标签的旧调用仍保留原有的偶数索引兼容行为。
     """
-    # 提取所有工作段
-    work_segs = []
-    for i in range(0, len(full_path), 2):
-        work_segs.append((i, full_path[i]))
+    if segment_types and len(segment_types) >= len(full_path):
+        work_segs = [
+            (index, segment)
+            for index, (segment, segment_type) in enumerate(
+                zip(full_path, segment_types)
+            )
+            if str(segment_type) == "work"
+        ]
+    else:
+        # Historical canonical paths had work segments at even indices.
+        work_segs = [
+            (index, full_path[index])
+            for index in range(0, len(full_path), 2)
+        ]
 
     cross_count = 0
     for a_idx in range(len(work_segs)):
@@ -2463,7 +3273,7 @@ def _candidate_strategies_for_request(requested_strategy: str) -> List[str]:
     """
     requested = str(requested_strategy or "auto").strip().lower()
     if requested == "auto":
-        return ["semicircle", "bow", "pear", "fishtail", "alpha"]
+        return ["contour", "semicircle", "bow", "pear", "fishtail", "alpha"]
     return [normalize_turn_strategy(requested)]
 
 
@@ -2679,6 +3489,447 @@ def _build_planning_factor_report(
 #  6. 完整路径规划管道
 # ═══════════════════════════════════════════════════════════════
 
+def _optimized_centerline_topology_preserved(
+    baseline_lines,
+    optimized_lines,
+    main_angle,
+) -> bool:
+    """Keep one-to-one pass order and reject any crossing optimized lines."""
+    if len(optimized_lines) != len(baseline_lines) or not optimized_lines:
+        return False
+    values = []
+    profiles = []
+    normal = np.asarray(
+        [-math.sin(main_angle), math.cos(main_angle)], dtype=np.float64
+    )
+    sample_positions = np.linspace(0.0, 1.0, 33)
+    for line in optimized_lines:
+        points = np.asarray(line, dtype=np.float64)
+        if (
+            points.ndim != 2
+            or points.shape[0] < 2
+            or points.shape[1] != 2
+            or not np.all(np.isfinite(points))
+        ):
+            return False
+        projected = points @ normal
+        values.append(float(np.median(projected)))
+        distances = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        cumulative = np.concatenate(([0.0], np.cumsum(distances)))
+        if cumulative[-1] <= 1e-9:
+            return False
+        profiles.append(
+            np.interp(
+                sample_positions,
+                cumulative / cumulative[-1],
+                projected,
+            )
+        )
+    if any(right <= left + 1e-9 for left, right in zip(values, values[1:])):
+        return False
+    for left_profile, right_profile in zip(profiles, profiles[1:]):
+        if np.any(right_profile <= left_profile + 1e-9):
+            return False
+    for left_index, left in enumerate(optimized_lines):
+        for right in optimized_lines[left_index + 1:]:
+            if _segments_intersect_count(left, right) > 0:
+                return False
+    return True
+
+
+def _validate_work_line_layout(
+    work_lines,
+    processed_mask,
+    *,
+    geo,
+    state,
+    config,
+    detected_mask=None,
+    planned_mask=None,
+):
+    """Run formal footprint metrics on work segments before accepting lateral shifts."""
+    return validate_footprints(
+        work_lines,
+        processed_mask,
+        geo=geo,
+        state=state,
+        harvester=_harvester_specs(state),
+        config=config,
+        segment_types=["work"] * len(work_lines),
+        detected_mask=(detected_mask if detected_mask is not None else processed_mask),
+        planned_mask=(planned_mask if planned_mask is not None else processed_mask),
+    )
+
+
+def _uniform_zone_reference_geometry(
+    zone_band: Dict,
+    main_angle: float,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
+    """Return axial support points and centroid from compact or full band data.
+
+    The UI deliberately removes dense contours before keeping a mask result in
+    application state.  Uniform-zone planning must therefore remain possible
+    from the compact four-row record: its centerline defines the axial extent,
+    while the raw/processed mask still owns the actual transverse support.
+    """
+    contour_value = zone_band.get("contour")
+    contour_source = "contour"
+    if contour_value is None:
+        contour_value = zone_band.get("planning_contour")
+        contour_source = "planning_contour"
+    if contour_value is not None:
+        contour = np.asarray(contour_value, dtype=np.float64).reshape(-1, 2)
+        if len(contour) >= 3 and np.all(np.isfinite(contour)):
+            return contour, contour.mean(axis=0), contour_source
+
+    centerline_value = zone_band.get("centerline")
+    if centerline_value is not None:
+        centerline = np.asarray(centerline_value, dtype=np.float64).reshape(-1, 2)
+        if len(centerline) >= 2 and np.all(np.isfinite(centerline)):
+            centroid_value = zone_band.get("centroid")
+            centroid = None
+            if centroid_value is not None:
+                candidate = np.asarray(centroid_value, dtype=np.float64).reshape(-1)
+                if len(candidate) >= 2 and np.all(np.isfinite(candidate[:2])):
+                    centroid = candidate[:2]
+            if centroid is None:
+                centroid = centerline.mean(axis=0)
+            return centerline, centroid, "compact_centerline_and_mask"
+
+    bbox_value = zone_band.get("bbox")
+    if bbox_value is not None:
+        bbox = np.asarray(bbox_value, dtype=np.float64).reshape(-1)
+        if len(bbox) >= 4 and np.all(np.isfinite(bbox[:4])):
+            x, y, width, height = map(float, bbox[:4])
+            if width > 0.0 and height > 0.0:
+                points = np.asarray([
+                    (x, y), (x + width, y),
+                    (x + width, y + height), (x, y + height),
+                ], dtype=np.float64)
+                return points, points.mean(axis=0), "compact_bbox_and_mask"
+    return None, None, "missing_reference_geometry"
+
+
+def _generate_uniform_zone_lines(
+    zone_band: Dict,
+    main_angle: float,
+    spacing_m: float,
+    geo=None,
+    state=None,
+    mask: Optional[np.ndarray] = None,
+    inner_limit_offset: Optional[float] = None,
+) -> List[List[Tuple[float, float]]]:
+    """在等距种植大片区域内按固定间距生成平行作业线（常规全覆盖）。
+
+    大片等距区（剖面宽 >> 割幅）无法用一条中心线覆盖，按割幅间距沿
+    法向逐条生成与主方向平行的作业线。宽度与线段必须基于真实掩膜：
+    contour 只是边界跟踪的骨架（可能远窄于实际种植区），掩膜才是
+    实际可作业范围。
+    """
+    points, centroid, _geometry_source = _uniform_zone_reference_geometry(
+        zone_band,
+        main_angle,
+    )
+    if points is None or centroid is None:
+        return []
+    mpp = meters_per_pixel(
+        getattr(state, "mask_raw", None)
+        if state is not None and getattr(state, "mask_raw", None) is not None
+        else np.zeros((2, 2), dtype=np.uint8),
+        geo,
+        state,
+    )
+    spacing_px = max(1e-6, float(spacing_m) / max(mpp, 1e-9))
+    direction = np.asarray([math.cos(float(main_angle)), math.sin(float(main_angle))])
+    normal = np.asarray([-direction[1], direction[0]])
+    cx, cy = float(centroid[0]), float(centroid[1])
+    # ``white_at`` interprets ``t_off`` as a displacement from the centroid.
+    # Using absolute projections here adds the centroid projection twice and
+    # clips roughly half of an otherwise full-length rectangular work line.
+    # DECISION-016: keep the scan and reconstruction in one local axial frame.
+    along = (points - centroid) @ direction
+    t_lo, t_hi = float(along.min()), float(along.max())
+    mask_h, mask_w = (mask.shape[:2] if mask is not None else (0, 0))
+    # 等距区是完整大片：优先用原始推理掩膜（processed_mask 经黏连切割
+    # 后大片可能被切成碎片），保证细分线横贯整个种植区。
+    # DECISION-009/017: this mask is the crop body after terminal headlands
+    # have been separated.  Raw inference is only a compatibility fallback;
+    # otherwise uniform work lines would continue through headland crop.
+    zone_mask = mask
+    if zone_mask is None and state is not None:
+        raw = getattr(state, "mask_raw", None)
+        if raw is not None and getattr(raw, "ndim", 0) == 2:
+            zone_mask = raw
+    zone_mask_h, zone_mask_w = (
+        zone_mask.shape[:2] if zone_mask is not None else (0, 0)
+    )
+
+    def white_at(n_off: float, t_off: float) -> bool:
+        x = int(round(cx + normal[0] * n_off + direction[0] * t_off))
+        y = int(round(cy + normal[1] * n_off + direction[1] * t_off))
+        if zone_mask is None or not (0 <= x < zone_mask_w and 0 <= y < zone_mask_h):
+            return False
+        return bool(zone_mask[y, x] > 100)
+
+    # 法向范围：从质心沿法向扫掩膜（真实宽度，contour 骨架可能偏窄）
+    n_lo = 0
+    while n_lo > -4000 and white_at(n_lo, 0.0):
+        n_lo -= 2
+    n_hi = 0
+    while n_hi < 4000 and white_at(n_hi, 0.0):
+        n_hi += 2
+    # 内侧限制：等距区与相邻带在掩膜上可能相连（无间隙），细分线不得
+    # 越过相邻带中心线 -1m 安全带（避免作业线落到相邻 4 行带上）。
+    if inner_limit_offset is not None:
+        if inner_limit_offset < 0:
+            n_lo = max(n_lo, inner_limit_offset)
+        else:
+            n_hi = min(n_hi, inner_limit_offset)
+    if n_hi - n_lo < spacing_px * 0.5:
+        return []
+
+    lines = []
+    position = n_lo + spacing_px * 0.5
+    while position < n_hi:
+        # 该法向位置沿主向扫描白色 run；合并小间隙（≤60px≈0.8m，断行）
+        # 后取最长段作为作业线，横贯整个等距种植区
+        t_start = int(t_lo) - 30
+        t_end = int(t_hi) + 30
+        white_positions = [
+            t_off for t_off in range(t_start, t_end)
+            if white_at(position, float(t_off))
+        ]
+        if white_positions:
+            segments = []
+            seg_start = white_positions[0]
+            prev = white_positions[0]
+            for value in white_positions[1:]:
+                if value - prev > 60:
+                    segments.append((seg_start, prev))
+                    seg_start = value
+                prev = value
+            segments.append((seg_start, prev))
+            longest = max(segments, key=lambda seg: seg[1] - seg[0])
+            if longest[1] - longest[0] >= 4:
+                p1 = (cx + normal[0] * position + direction[0] * longest[0],
+                      cy + normal[1] * position + direction[1] * longest[0])
+                p2 = (cx + normal[0] * position + direction[0] * longest[1],
+                      cy + normal[1] * position + direction[1] * longest[1])
+                lines.append([p1, p2])
+        position += spacing_px
+    return lines
+
+
+def _uniform_zone_inner_limit(
+    zone_band: Dict,
+    other_bands: List[Dict],
+    main_angle: float,
+    geo=None,
+    state=None,
+) -> Optional[float]:
+    """等距区的内侧法向限制（质心坐标系）。
+
+    等距区与相邻种植带在掩膜上可能相连（无间隙），细分作业线若按掩膜
+    白色范围延伸会落到相邻带上。取相邻带（法向最近的 4 行带）中心线
+    位置并回退 1m 安全带作为内限。
+    """
+    _points, centroid, _geometry_source = _uniform_zone_reference_geometry(
+        zone_band,
+        main_angle,
+    )
+    if centroid is None:
+        return None
+    direction = np.asarray([math.cos(float(main_angle)), math.sin(float(main_angle))])
+    normal = np.asarray([-direction[1], direction[0]])
+    zone_n = float(centroid @ normal)
+    neighbor_n = None
+    for band in other_bands:
+        centerline = band.get("centerline")
+        if not centerline or len(centerline) < 2:
+            continue
+        band_n = float(np.asarray(centerline, dtype=np.float64).mean(axis=0) @ normal)
+        distance = band_n - zone_n
+        if abs(distance) < 0.01:
+            continue
+        if neighbor_n is None or abs(distance) < abs(neighbor_n - zone_n):
+            neighbor_n = band_n
+    if neighbor_n is None:
+        return None
+    mpp = meters_per_pixel(
+        getattr(state, "mask_raw", None)
+        if state is not None and getattr(state, "mask_raw", None) is not None
+        else np.zeros((2, 2), dtype=np.uint8),
+        geo,
+        state,
+    )
+    safety_px = max(1.0, 1.0 / max(mpp, 1e-9))
+    direction_sign = 1.0 if neighbor_n > zone_n else -1.0
+    inner_n = neighbor_n - direction_sign * safety_px
+    return float(inner_n - zone_n)
+
+
+def _band_normal_position(
+    band: Dict,
+    main_angle: float,
+) -> Optional[float]:
+    """Return a stable normal-axis position without assuming left/right semantics."""
+    centerline = band.get("centerline")
+    points = np.asarray(
+        [] if centerline is None else centerline,
+        dtype=np.float64,
+    )
+    if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] != 2:
+        contour_value = band.get("contour")
+        if contour_value is None:
+            contour_value = band.get("planning_contour")
+        contour = np.asarray(
+            [] if contour_value is None else contour_value,
+            dtype=np.float64,
+        )
+        if contour.ndim != 2 or contour.shape[0] < 3 or contour.shape[1] != 2:
+            return None
+        points = contour
+    normal = np.asarray(
+        (-math.sin(float(main_angle)), math.cos(float(main_angle))),
+        dtype=np.float64,
+    )
+    return float(np.median(points @ normal))
+
+
+def _classify_planting_regions(
+    bands: List[Dict],
+    main_angle: float,
+    config: Optional[Dict] = None,
+) -> Tuple[List[Dict], Dict]:
+    """DECISION-017: classify planting geometry before choosing path geometry.
+
+    The decision uses measured band width, never an image-side label.  A broad
+    connected band is a uniform-spacing block; ordinary extracted four-row
+    bands remain centerline-constrained wide/narrow rows.  Measurements near
+    the decision boundary are explicit ``ambiguous`` evidence and fail closed.
+    """
+    cfg = dict(config or {})
+    try:
+        threshold_m = float(cfg.get("uniform_zone_min_width_m", 2.5))
+    except (TypeError, ValueError):
+        threshold_m = 2.5
+    try:
+        ambiguity_margin_m = float(
+            cfg.get("planting_region_ambiguity_margin_m", 0.25)
+        )
+    except (TypeError, ValueError):
+        ambiguity_margin_m = 0.25
+    threshold_m = max(0.1, threshold_m)
+    ambiguity_margin_m = max(0.0, min(ambiguity_margin_m, threshold_m * 0.8))
+    lower_m = threshold_m - ambiguity_margin_m
+    upper_m = threshold_m + ambiguity_margin_m
+
+    records = []
+    any_measured_width = False
+    for index, band in enumerate(bands or []):
+        widths = {}
+        for key in ("profile_width_m", "width_m"):
+            value = band.get(key)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number) and number > 0.0:
+                widths[key] = number
+        any_measured_width = any_measured_width or bool(widths)
+        effective_width_m = max(widths.values()) if widths else None
+        record = {
+            "band_index": int(index),
+            "band_id": band.get("id"),
+            "profile_width_m": widths.get("profile_width_m"),
+            "width_m": widths.get("width_m"),
+            "effective_width_m": effective_width_m,
+            "normal_position": _band_normal_position(band, main_angle),
+        }
+        records.append(record)
+
+    for record in records:
+        width_m = record["effective_width_m"]
+        if width_m is None:
+            if any_measured_width:
+                classification = "ambiguous"
+                reason = "missing_width_measurement_in_measured_cohort"
+            else:
+                # Backward-compatible contract: callers historically pass a
+                # list already named/typed as extracted four-row wide bands.
+                classification = "wide_narrow_rows"
+                reason = "four_row_input_contract_without_width_measurement"
+        elif width_m <= lower_m:
+            classification = "wide_narrow_rows"
+            reason = "effective_width_below_guarded_uniform_threshold"
+        elif width_m >= upper_m:
+            classification = "uniform_block"
+            reason = "effective_width_above_guarded_uniform_threshold"
+        else:
+            classification = "ambiguous"
+            reason = "effective_width_inside_ambiguity_guard_band"
+        record["classification"] = classification
+        record["reason"] = reason
+
+    groups = []
+    regular_records = [
+        item for item in records if item["classification"] == "wide_narrow_rows"
+    ]
+    if regular_records:
+        groups.append({
+            "region_id": "wide_narrow_rows_1",
+            "kind": "wide_narrow_rows",
+            "band_indices": [item["band_index"] for item in regular_records],
+            "band_ids": [item["band_id"] for item in regular_records],
+            "normal_position": float(np.median([
+                item["normal_position"]
+                for item in regular_records
+                if item["normal_position"] is not None
+            ])) if any(
+                item["normal_position"] is not None for item in regular_records
+            ) else None,
+        })
+    for group_index, record in enumerate(
+        item for item in records if item["classification"] == "uniform_block"
+    ):
+        groups.append({
+            "region_id": f"uniform_block_{group_index + 1}",
+            "kind": "uniform_block",
+            "band_indices": [record["band_index"]],
+            "band_ids": [record["band_id"]],
+            "normal_position": record["normal_position"],
+        })
+
+    ambiguous = [
+        item for item in records if item["classification"] == "ambiguous"
+    ]
+    diagnostics = {
+        "algorithm_version": "planting-region-classifier-v1",
+        "classification_basis": "measured_band_width_not_image_side",
+        "uniform_threshold_m": threshold_m,
+        "ambiguity_margin_m": ambiguity_margin_m,
+        "guard_band_m": [lower_m, upper_m],
+        "records": records,
+        "counts": {
+            "wide_narrow_rows": len(regular_records),
+            "uniform_block": sum(
+                item["classification"] == "uniform_block" for item in records
+            ),
+            "ambiguous": len(ambiguous),
+        },
+        "mixed_field": bool(regular_records) and any(
+            item["classification"] == "uniform_block" for item in records
+        ),
+        "automatic_planning_allowed": not ambiguous and bool(groups),
+        "hard_reasons": [
+            "planting region classification is ambiguous for band "
+            f"{item['band_id']}"
+            for item in ambiguous
+        ],
+    }
+    return groups, diagnostics
+
+
 def _prepare_work_line_layout(
     wide_bands: List[Dict],
     processed_mask: np.ndarray,
@@ -2687,15 +3938,223 @@ def _prepare_work_line_layout(
     state=None,
     config: Optional[Dict] = None,
     progress_callback=None,
-) -> Tuple[List[List[Tuple[float, float]]], Dict]:
+    detected_mask: Optional[np.ndarray] = None,
+    planned_mask: Optional[np.ndarray] = None,
+    return_regions: bool = False,
+):
     """Select the declared work-line generator without silent mode fallback."""
     cfg = dict(config or {})
     mode = str(
         cfg.get("work_line_mode", "band_centerline_with_footprint_validation")
     ).strip().lower()
-    if mode == "footprint_optimized":
-        mode = "band_centerline_with_footprint_validation"
-    if mode == "band_centerline_with_footprint_validation":
+    # 等距区分离：剖面宽度远大于正常作物带（正常约 1m）的带是整片等距
+    # 种植区（如右侧 12.45m 宽的大片区域），一趟割幅收不完，必须按割幅
+    # 细分多条平行作业线（常规全覆盖），而不是过滤掉或只提一条中心线。
+    region_groups, region_classification = _classify_planting_regions(
+        wide_bands,
+        main_angle,
+        config=cfg,
+    )
+    if not region_classification["automatic_planning_allowed"]:
+        empty_input = not wide_bands
+        layout = {
+            "reason": (
+                "no_valid_four_row_centerlines"
+                if empty_input
+                else "ambiguous_planting_region_classification"
+            ),
+            "planting_region_classification": region_classification,
+            "work_regions": [],
+            "footprint_optimization_scope": (
+                "not_run" if mode == "footprint_optimized" else "validation_only"
+            ),
+            "optimization_complete": False,
+            "work_line_mode": (
+                "band_centerline_with_footprint_validation"
+                if mode == "footprint_optimized"
+                else mode
+            ),
+            "requested_work_line_mode": mode,
+        }
+        if return_regions:
+            return [], layout, []
+        return [], layout
+    regular_group = next(
+        (item for item in region_groups if item["kind"] == "wide_narrow_rows"),
+        None,
+    )
+    workable_bands = [
+        wide_bands[index] for index in (regular_group or {}).get("band_indices", [])
+    ]
+    uniform_groups = [
+        item for item in region_groups if item["kind"] == "uniform_block"
+    ]
+    uniform_zones = [
+        wide_bands[item["band_indices"][0]] for item in uniform_groups
+    ]
+    wide_bands = workable_bands
+    # DECISION-011: footprint_optimized means completed centerline-anchored
+    # lateral search; a requested mode may truthfully fall back.
+    if not wide_bands and uniform_zones:
+        work_lines = []
+        layout = {
+            "reason": "uniform_block_uses_cutter_width_swaths",
+            "footprint_optimization_scope": "not_applicable_to_uniform_block",
+            "optimization_complete": False,
+            "work_line_mode": "uniform_block_cutter_width_swaths",
+        }
+    elif mode == "footprint_optimized":
+        if not wide_bands:
+            return [], {
+                "reason": "no_valid_four_row_centerlines",
+                "footprint_optimization_scope": "not_run",
+                "optimization_complete": False,
+                "work_line_mode": "band_centerline_with_footprint_validation",
+                "requested_work_line_mode": mode,
+            }
+        baseline_lines, baseline_layout = prepare_band_centerlines(
+            wide_bands,
+            main_angle,
+            geo=geo,
+            state=state,
+            config=cfg,
+        )
+        if not baseline_lines:
+            work_lines = []
+            layout = dict(baseline_layout or {})
+            layout.update({
+                "reason": layout.get("reason", "no_valid_four_row_centerlines"),
+                "footprint_optimization_scope": "not_run",
+                "optimization_complete": False,
+                "work_line_mode": "band_centerline_with_footprint_validation",
+            })
+        else:
+            optimized_lines, optimization_layout = generate_work_lines(
+                processed_mask,
+                main_angle,
+                geo=geo,
+                state=state,
+                harvester=_harvester_specs(state),
+                config=cfg,
+                progress_callback=progress_callback,
+                baseline_lines=baseline_lines,
+            )
+            optimization_layout = dict(optimization_layout or {})
+            ordered_band_ids = list(
+                baseline_layout.get("ordered_band_ids") or []
+            )
+            diagnostics = optimization_layout.get("line_optimization")
+            if (
+                isinstance(diagnostics, list)
+                and len(diagnostics) == len(ordered_band_ids)
+            ):
+                bound_diagnostics = []
+                for index, (band_id, item) in enumerate(
+                    zip(ordered_band_ids, diagnostics)
+                ):
+                    diagnostic = dict(item) if isinstance(item, dict) else {}
+                    if diagnostic.get("line_index") != index:
+                        diagnostic["line_index"] = index
+                        diagnostic["optimized"] = False
+                    diagnostic["band_id"] = band_id
+                    bound_diagnostics.append(diagnostic)
+                optimization_layout["line_optimization"] = bound_diagnostics
+            else:
+                optimization_layout["line_optimization"] = []
+            identity_complete = (
+                len(optimization_layout["line_optimization"])
+                == len(ordered_band_ids)
+                and all(
+                    isinstance(item, dict)
+                    and item.get("line_index") == index
+                    and item.get("band_id") == band_id
+                    and item.get("optimized") is True
+                    for index, (band_id, item) in enumerate(
+                        zip(
+                            ordered_band_ids,
+                            optimization_layout["line_optimization"],
+                        )
+                    )
+                )
+            )
+            geometry_complete = (
+                optimization_layout.get("optimization_complete", True) is True
+                and len(optimized_lines) == len(baseline_lines)
+            )
+            if geometry_complete and not _optimized_centerline_topology_preserved(
+                baseline_lines, optimized_lines, main_angle
+            ):
+                optimization_layout["optimization_complete"] = False
+                optimization_layout["reason"] = (
+                    "optimized_centerline_topology_violation"
+                )
+            optimizer_claimed_complete = geometry_complete and identity_complete
+            optimization_complete = bool(optimizer_claimed_complete)
+            layout = dict(baseline_layout or {})
+            layout.update(optimization_layout)
+            if optimization_complete:
+                baseline_footprint = _validate_work_line_layout(
+                    baseline_lines,
+                    processed_mask,
+                    geo=geo,
+                    state=state,
+                    config=cfg,
+                    detected_mask=detected_mask,
+                    planned_mask=planned_mask,
+                )
+                optimized_footprint = _validate_work_line_layout(
+                    optimized_lines,
+                    processed_mask,
+                    geo=geo,
+                    state=state,
+                    config=cfg,
+                    detected_mask=detected_mask,
+                    planned_mask=planned_mask,
+                )
+                comparison = compare_work_line_footprints(
+                    baseline_footprint,
+                    optimized_footprint,
+                )
+                layout["formal_comparison"] = comparison
+                layout["baseline_footprint_metrics"] = summarize_work_line_footprint(
+                    baseline_footprint
+                )
+                layout["optimized_footprint_metrics"] = summarize_work_line_footprint(
+                    optimized_footprint
+                )
+                if comparison["accepted"]:
+                    work_lines = optimized_lines
+                    layout.update({
+                        "source": "four_row_band_centerlines_lateral_optimization",
+                        "footprint_optimization_scope": "centerline_anchored_lateral_search",
+                        "optimization_complete": True,
+                        "work_line_mode": "footprint_optimized",
+                    })
+                else:
+                    work_lines = baseline_lines
+                    layout.update({
+                        "source": "four_row_band_centerlines",
+                        "footprint_optimization_scope": "validation_only",
+                        "optimization_complete": False,
+                        "optimization_fallback_reason": (
+                            "formal_footprint_metric_degraded"
+                            if comparison["degraded_metrics"]
+                            else "formal_footprint_no_strict_improvement"
+                        ),
+                        "work_line_mode": "band_centerline_with_footprint_validation",
+                    })
+            else:
+                work_lines = baseline_lines
+                layout.update({
+                    "source": "four_row_band_centerlines",
+                    "footprint_optimization_scope": "validation_only",
+                    "optimization_complete": False,
+                    "optimization_fallback_reason": optimization_layout.get(
+                        "reason", "incomplete_centerline_optimization"
+                    ),
+                    "work_line_mode": "band_centerline_with_footprint_validation",
+                })
+    elif mode == "band_centerline_with_footprint_validation":
         if not wide_bands:
             work_lines, layout = [], {
                 "reason": "no_valid_four_row_centerlines",
@@ -2735,8 +4194,1051 @@ def _prepare_work_line_layout(
     else:
         raise ValueError(f"unsupported work_line_mode: {mode}")
     layout = dict(layout or {})
-    layout["work_line_mode"] = mode
+    regular_work_lines = list(work_lines)
+    # 等距区（大片等距种植区）按割幅细分平行作业线，与宽窄行中心线统筹
+    uniform_zone_lines = []
+    uniform_region_lines = []
+    if uniform_zones:
+        try:
+            spacing_m = float(cfg.get("uniform_zone_line_spacing_m") or 0.0)
+        except (TypeError, ValueError):
+            spacing_m = 0.0
+        if spacing_m <= 0.0:
+            try:
+                spacing_m = float(
+                    _harvester_specs(state).get("cutter_width_m")
+                    or 1.75
+                )
+            except (TypeError, ValueError, AttributeError):
+                spacing_m = 1.75
+        uniform_zone_report = []
+        for zone in uniform_zones:
+            _zone_points, _zone_centroid, zone_geometry_source = (
+                _uniform_zone_reference_geometry(zone, main_angle)
+            )
+            inner_limit_offset = _uniform_zone_inner_limit(
+                zone, workable_bands, main_angle, geo, state
+            )
+            zone_lines = _generate_uniform_zone_lines(
+                zone, main_angle, spacing_m, geo=geo, state=state,
+                mask=processed_mask,
+                inner_limit_offset=inner_limit_offset,
+            )
+            uniform_zone_lines.extend(zone_lines)
+            uniform_region_lines.append(list(zone_lines))
+            uniform_zone_report.append({
+                "id": zone.get("id"),
+                "profile_width_m": zone.get("profile_width_m"),
+                "line_spacing_m": spacing_m,
+                "line_count": len(zone_lines),
+                "reference_geometry_source": zone_geometry_source,
+            })
+        layout["uniform_zones"] = uniform_zone_report
+        layout["uniform_zone_line_count"] = len(uniform_zone_lines)
+        if uniform_zone_lines:
+            work_lines = uniform_zone_lines + list(work_lines)
+    excluded_bands = cfg.get("_excluded_wide_bands")
+    if excluded_bands:
+        layout["excluded_wide_bands"] = excluded_bands
+    layout.setdefault("work_line_mode", mode)
+    layout["requested_work_line_mode"] = mode
+    work_regions = []
+    if regular_group and regular_work_lines:
+        work_regions.append({
+            **regular_group,
+            "work_lines": regular_work_lines,
+            "line_count": len(regular_work_lines),
+            "line_source": "four_row_band_centerlines",
+        })
+    for group, zone_lines in zip(uniform_groups, uniform_region_lines):
+        if not zone_lines:
+            continue
+        work_regions.append({
+            **group,
+            "work_lines": zone_lines,
+            "line_count": len(zone_lines),
+            "line_source": "cutter_width_uniform_swaths",
+        })
+    layout["planting_region_classification"] = region_classification
+    layout["work_regions"] = [
+        {key: value for key, value in region.items() if key != "work_lines"}
+        for region in work_regions
+    ]
+    generated_region_ids = {item.get("region_id") for item in work_regions}
+    missing_region_ids = [
+        item.get("region_id")
+        for item in region_groups
+        if item.get("region_id") not in generated_region_ids
+    ]
+    if missing_region_ids:
+        layout["reason"] = "classified_region_has_no_valid_work_lines"
+        layout["region_generation_hard_reasons"] = [
+            f"classified region {region_id} has no valid work lines"
+            for region_id in missing_region_ids
+        ]
+        if return_regions:
+            return [], layout, []
+        return [], layout
+    if return_regions:
+        return work_lines, layout, work_regions
     return work_lines, layout
+
+
+def _recover_lattice_supported_work_bands(
+    wide_bands: List[Dict],
+    all_bands: Optional[List[Dict]],
+    processed_mask: np.ndarray,
+    main_angle: float,
+    *,
+    geo=None,
+    state=None,
+    config: Optional[Dict] = None,
+) -> Tuple[List[Dict], Dict]:
+    """DECISION-009/011/017: repair one evidenced four-row lattice omission.
+
+    A narrow-band centre is evidence for a two-row strip, not for a missing
+    four-row pass, so it must never be promoted.  An isolated gap close to two
+    regular four-row spacings may instead contribute one interpolated lattice
+    line when the complete line is supported by the processed crop-body mask.
+    """
+    cfg = dict(config or {})
+    original = [dict(item) for item in (wide_bands or [])]
+    report = {
+        "algorithm_version": "four-row-lattice-recovery-v2",
+        "enabled": bool(cfg.get("recover_missing_work_bands", True)),
+        "candidate_source": "regular_four_row_lattice_plus_processed_body_support",
+        "recovered_band_ids": [],
+        "records": [],
+        "reason": None,
+    }
+    if not report["enabled"]:
+        report["reason"] = "disabled"
+        return original, report
+    if len(original) < 3:
+        report["reason"] = "insufficient_band_evidence"
+        return original, report
+
+    region_groups, classification = _classify_planting_regions(
+        original, main_angle, config=cfg
+    )
+    regular_group = next(
+        (item for item in region_groups if item.get("kind") == "wide_narrow_rows"),
+        None,
+    )
+    regular_indices = list((regular_group or {}).get("band_indices") or [])
+    if len(regular_indices) < 3 or not classification.get(
+        "automatic_planning_allowed", False
+    ):
+        report["reason"] = "regular_region_unavailable"
+        return original, report
+
+    normal = np.asarray(
+        [-math.sin(float(main_angle)), math.cos(float(main_angle))],
+        dtype=np.float64,
+    )
+
+    def band_position(band):
+        points = np.asarray(band.get("centerline") or [], dtype=np.float64)
+        if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] != 2:
+            return None
+        if not np.all(np.isfinite(points)):
+            return None
+        return float(points.mean(axis=0) @ normal)
+
+    regular = []
+    for index in regular_indices:
+        position = band_position(original[index])
+        if position is not None:
+            regular.append((position, original[index]))
+    regular.sort(key=lambda item: item[0])
+    gaps_px = np.diff([item[0] for item in regular])
+    positive_gaps_px = gaps_px[np.isfinite(gaps_px) & (gaps_px > 1e-6)]
+    if positive_gaps_px.size < 2:
+        report["reason"] = "regular_spacing_unavailable"
+        return original, report
+
+    mpp = meters_per_pixel(processed_mask, geo, state)
+    nominal_spacing_m = float(np.median(positive_gaps_px) * mpp)
+    gap_multiplier = max(
+        1.25, float(cfg.get("missing_work_band_gap_multiplier", 1.45))
+    )
+    gap_threshold_m = nominal_spacing_m * gap_multiplier
+    integer_tolerance = max(
+        0.05, float(cfg.get("missing_work_band_integer_tolerance", 0.35))
+    )
+    min_support_ratio = float(np.clip(
+        cfg.get("missing_work_band_min_support_ratio", 0.65), 0.0, 1.0
+    ))
+    min_axial_ratio = float(np.clip(
+        cfg.get("missing_work_band_min_axial_ratio", 0.80), 0.0, 1.0
+    ))
+    max_missing_count = max(
+        1, int(cfg.get("missing_work_band_max_missing_count", 1))
+    )
+    phase_neighbor_tolerance = max(
+        0.05,
+        float(cfg.get("missing_work_band_phase_neighbor_tolerance", 0.35)),
+    )
+    cross_section_half_width_ratio = float(np.clip(
+        cfg.get("missing_work_band_cross_section_half_width_ratio", 0.50),
+        0.05,
+        1.0,
+    ))
+    min_cross_section_occupancy = float(np.clip(
+        cfg.get("missing_work_band_min_cross_section_occupancy", 0.12),
+        0.0,
+        1.0,
+    ))
+    interval_px = max(
+        2.0,
+        float(cfg.get("centerline_interval_m", 0.60)) / max(mpp, 1e-9),
+    )
+
+    direction = np.asarray(
+        [math.cos(float(main_angle)), math.sin(float(main_angle))],
+        dtype=np.float64,
+    )
+    regular_widths_m = []
+    regular_lengths_m = []
+    for _position, item in regular:
+        width = _finite_float(
+            item.get("profile_width_m", item.get("width_m"))
+        )
+        if width is not None and width > 0.0:
+            regular_widths_m.append(width)
+        points = np.asarray(item.get("centerline") or [], dtype=np.float64)
+        regular_lengths_m.append(float(
+            np.linalg.norm(np.diff(points, axis=0), axis=1).sum() * mpp
+        ))
+    if not regular_widths_m or not regular_lengths_m:
+        report["reason"] = "regular_geometry_unavailable"
+        return original, report
+    recovered_width_m = float(np.median(regular_widths_m))
+    median_length_m = float(np.median(regular_lengths_m))
+
+    existing_ids = {item.get("id") for item in original}
+    nonwide_positions = []
+    for item in all_bands or []:
+        if item.get("id") in existing_ids:
+            continue
+        position = band_position(item)
+        if position is not None:
+            nonwide_positions.append((position, item))
+
+    mask_h, mask_w = processed_mask.shape[:2]
+
+    def interpolate_line(left_band, right_band, fraction):
+        left_points = np.asarray(
+            left_band.get("centerline") or [], dtype=np.float64
+        )
+        right_points = np.asarray(
+            right_band.get("centerline") or [], dtype=np.float64
+        )
+        left_t = left_points @ direction
+        right_t = right_points @ direction
+        left_order = np.argsort(left_t)
+        right_order = np.argsort(right_t)
+        left_t, left_n = left_t[left_order], left_points[left_order] @ normal
+        right_t, right_n = right_t[right_order], right_points[right_order] @ normal
+        left_keep = np.concatenate(([True], np.diff(left_t) > 1e-6))
+        right_keep = np.concatenate(([True], np.diff(right_t) > 1e-6))
+        left_t, left_n = left_t[left_keep], left_n[left_keep]
+        right_t, right_n = right_t[right_keep], right_n[right_keep]
+        if left_t.size < 2 or right_t.size < 2:
+            return [], 0.0, 0.0, 0.0, 0.0
+        axial_lo = float(max(left_t[0], right_t[0]))
+        axial_hi = float(min(left_t[-1], right_t[-1]))
+        if axial_hi <= axial_lo:
+            return [], 0.0, 0.0, 0.0, 0.0
+        axial_length_m = (axial_hi - axial_lo) * mpp
+        axial_ratio = axial_length_m / max(median_length_m, 1e-9)
+        count = max(
+            2, int(math.ceil((axial_hi - axial_lo) / interval_px)) + 1
+        )
+        sample_t = np.linspace(axial_lo, axial_hi, count)
+        sample_n = (
+            (1.0 - fraction) * np.interp(sample_t, left_t, left_n)
+            + fraction * np.interp(sample_t, right_t, right_n)
+        )
+        points = sample_t[:, None] * direction + sample_n[:, None] * normal
+        x = np.rint(points[:, 0]).astype(np.int64)
+        y = np.rint(points[:, 1]).astype(np.int64)
+        inside = (x >= 0) & (x < mask_w) & (y >= 0) & (y < mask_h)
+        direct_support_ratio = float(
+            np.mean(processed_mask[y[inside], x[inside]] > 0)
+        ) if np.any(inside) else 0.0
+        half_width_px = max(
+            1.0,
+            recovered_width_m * cross_section_half_width_ratio
+            / max(mpp, 1e-9),
+        )
+        cross_count = max(
+            5,
+            int(math.ceil(
+                2.0 * half_width_px
+                / max(1.0, 0.08 / max(mpp, 1e-9))
+            )) + 1,
+        )
+        if cross_count % 2 == 0:
+            cross_count += 1
+        offsets = np.linspace(-half_width_px, half_width_px, cross_count)
+        cross_points = points[:, None, :] + offsets[None, :, None] * normal
+        cross_x = np.rint(cross_points[:, :, 0]).astype(np.int64)
+        cross_y = np.rint(cross_points[:, :, 1]).astype(np.int64)
+        cross_inside = (
+            (cross_x >= 0) & (cross_x < mask_w)
+            & (cross_y >= 0) & (cross_y < mask_h)
+        )
+        cross_evidence = np.zeros(cross_inside.shape, dtype=bool)
+        cross_evidence[cross_inside] = (
+            processed_mask[cross_y[cross_inside], cross_x[cross_inside]] > 0
+        )
+        cross_occupancy = np.mean(cross_evidence, axis=1)
+        support_ratio = float(np.mean(
+            cross_occupancy >= min_cross_section_occupancy
+        )) if cross_occupancy.size else 0.0
+        mean_cross_occupancy = float(np.mean(cross_occupancy)) \
+            if cross_occupancy.size else 0.0
+        return (
+            [tuple(map(float, point)) for point in points],
+            support_ratio,
+            axial_ratio,
+            direct_support_ratio,
+            mean_cross_occupancy,
+        )
+
+    def planning_contour(centerline):
+        points = np.asarray(centerline, dtype=np.float64)
+        half_width_px = max(
+            1.0, recovered_width_m * 0.5 / max(mpp, 1e-9)
+        )
+        upper = points + normal * half_width_px
+        lower = points - normal * half_width_px
+        return [
+            tuple(map(float, point))
+            for point in np.vstack((upper, lower[::-1]))
+        ]
+
+    regular_positions = np.asarray([item[0] for item in regular], dtype=np.float64)
+    nominal_spacing_px = nominal_spacing_m / max(mpp, 1e-9)
+
+    def phase_supported_target(gap_index):
+        left_indices = [gap_index]
+        cursor = gap_index
+        while cursor > 0:
+            local_gap = regular_positions[cursor] - regular_positions[cursor - 1]
+            if abs(local_gap / nominal_spacing_px - 1.0) > phase_neighbor_tolerance:
+                break
+            left_indices.insert(0, cursor - 1)
+            cursor -= 1
+        right_indices = [gap_index + 1]
+        cursor = gap_index + 1
+        while cursor < len(regular_positions) - 1:
+            local_gap = regular_positions[cursor + 1] - regular_positions[cursor]
+            if abs(local_gap / nominal_spacing_px - 1.0) > phase_neighbor_tolerance:
+                break
+            right_indices.append(cursor + 1)
+            cursor += 1
+
+        def extrapolate(indices, toward):
+            values = regular_positions[indices]
+            steps = np.arange(values.size, dtype=np.float64)
+            slope, intercept = np.polyfit(steps, values, 1)
+            return float(intercept - slope if toward == "before" else (
+                intercept + slope * values.size
+            ))
+
+        if len(right_indices) >= 3 and len(right_indices) > len(left_indices):
+            return (
+                extrapolate(right_indices, "before"),
+                "extrapolated_from_longer_right_four_row_cohort",
+                len(left_indices),
+                len(right_indices),
+            )
+        if len(left_indices) >= 3 and len(left_indices) > len(right_indices):
+            return (
+                extrapolate(left_indices, "after"),
+                "extrapolated_from_longer_left_four_row_cohort",
+                len(left_indices),
+                len(right_indices),
+            )
+        return (
+            float((regular_positions[gap_index] + regular_positions[gap_index + 1]) * 0.5),
+            "midpoint_when_both_four_row_cohorts_are_equally_supported",
+            len(left_indices),
+            len(right_indices),
+        )
+
+    recovered = []
+    for gap_index, ((left_pos, left_band), (right_pos, right_band)) in enumerate(
+        zip(regular, regular[1:])
+    ):
+        gap_m = float((right_pos - left_pos) * mpp)
+        if gap_m <= gap_threshold_m:
+            continue
+        spacing_multiple = gap_m / max(nominal_spacing_m, 1e-9)
+        missing_count = max(0, int(round(spacing_multiple)) - 1)
+        ignored_nonwide_ids = [
+            item.get("id") for position, item in nonwide_positions
+            if left_pos < position < right_pos
+        ]
+        if (
+            missing_count != 1
+            or missing_count > max_missing_count
+            or abs(spacing_multiple - (missing_count + 1)) > integer_tolerance
+        ):
+            report["records"].append({
+                "between_band_ids": [left_band.get("id"), right_band.get("id")],
+                "gap_m": gap_m,
+                "spacing_multiple": spacing_multiple,
+                "recovered": False,
+                "ignored_nonwide_band_ids": ignored_nonwide_ids,
+                "reason": "gap_is_not_one_supported_four_row_lattice_omission",
+            })
+            continue
+        target_position, phase_method, left_cohort_count, right_cohort_count = (
+            phase_supported_target(gap_index)
+        )
+        min_subgap_px = nominal_spacing_px * 0.50
+        if (
+            target_position <= left_pos + min_subgap_px
+            or target_position >= right_pos - min_subgap_px
+        ):
+            target_position = (left_pos + right_pos) * 0.5
+            phase_method = "midpoint_after_phase_extrapolation_guard"
+        fraction = (target_position - left_pos) / max(
+            right_pos - left_pos, 1e-9
+        )
+        (
+            centerline,
+            support_ratio,
+            axial_ratio,
+            direct_support_ratio,
+            mean_cross_occupancy,
+        ) = interpolate_line(
+            left_band, right_band, fraction
+        )
+        if (
+            len(centerline) < 2
+            or support_ratio < min_support_ratio
+            or axial_ratio < min_axial_ratio
+        ):
+            report["records"].append({
+                "between_band_ids": [left_band.get("id"), right_band.get("id")],
+                "gap_m": gap_m,
+                "spacing_multiple": spacing_multiple,
+                "target_normal_position_px": target_position,
+                "phase_method": phase_method,
+                "phase_cohort_counts": [left_cohort_count, right_cohort_count],
+                "processed_body_support_ratio": support_ratio,
+                "processed_body_center_support_ratio": direct_support_ratio,
+                "processed_body_mean_cross_section_occupancy": (
+                    mean_cross_occupancy
+                ),
+                "min_cross_section_occupancy": min_cross_section_occupancy,
+                "axial_length_ratio": axial_ratio,
+                "ignored_nonwide_band_ids": ignored_nonwide_ids,
+                "recovered": False,
+                "reason": "interpolated_four_row_line_lacks_body_support",
+            })
+            continue
+        recovery_label = (
+            f"planning-gap-{left_band.get('id')}-{right_band.get('id')}-1"
+        )
+        synthetic_id = -1
+        while synthetic_id in existing_ids:
+            synthetic_id -= 1
+        existing_ids.add(synthetic_id)
+        contour = planning_contour(centerline)
+        contour_array = np.asarray(contour, dtype=np.float64)
+        promoted = {
+            "id": synthetic_id,
+            "centerline": centerline,
+            "planning_contour": contour,
+            "centroid": tuple(map(float, np.mean(centerline, axis=0))),
+            "bbox": (
+                float(contour_array[:, 0].min()),
+                float(contour_array[:, 1].min()),
+                float(np.ptp(contour_array[:, 0])),
+                float(np.ptp(contour_array[:, 1])),
+            ),
+            "profile_width_m": recovered_width_m,
+            "width_m": recovered_width_m,
+            "band_type": "wide",
+            "planning_recovered": True,
+            "planning_recovery_reason": (
+                "isolated_four_row_lattice_gap_with_processed_body_support"
+            ),
+            "planning_recovery_id": recovery_label,
+            "source_band_type": None,
+            "source_band_ids": [left_band.get("id"), right_band.get("id")],
+        }
+        recovered.append(promoted)
+        report["recovered_band_ids"].append(synthetic_id)
+        report["records"].append({
+            "between_band_ids": [left_band.get("id"), right_band.get("id")],
+            "recovered_band_id": synthetic_id,
+            "planning_recovery_id": recovery_label,
+            "gap_m": gap_m,
+            "spacing_multiple": spacing_multiple,
+            "target_normal_position_px": target_position,
+            "phase_method": phase_method,
+            "phase_cohort_counts": [left_cohort_count, right_cohort_count],
+            "processed_body_support_ratio": support_ratio,
+            "processed_body_center_support_ratio": direct_support_ratio,
+            "processed_body_mean_cross_section_occupancy": mean_cross_occupancy,
+            "min_cross_section_occupancy": min_cross_section_occupancy,
+            "axial_length_ratio": axial_ratio,
+            "ignored_nonwide_band_ids": ignored_nonwide_ids,
+            "recovered": True,
+            "reason": (
+                "isolated_four_row_lattice_gap_with_processed_body_support"
+            ),
+        })
+
+    report.update({
+        "nominal_regular_spacing_m": nominal_spacing_m,
+        "gap_threshold_m": gap_threshold_m,
+        "reason": "recovered" if recovered else "no_qualified_spacing_gap",
+    })
+    return original + recovered, report
+
+
+def _region_route_endpoint(
+    path_segments: List[List[Tuple[float, float]]],
+    segment_types: List[str],
+    first: bool,
+) -> Optional[Tuple[float, float]]:
+    pairs = list(zip(path_segments or [], segment_types or []))
+    iterator = pairs if first else reversed(pairs)
+    for segment, segment_type in iterator:
+        if segment_type == "work" and len(segment) >= 2:
+            point = segment[0] if first else segment[-1]
+            return (float(point[0]), float(point[1]))
+    return None
+
+
+def _build_inter_region_transfer(
+    previous_path: List[List[Tuple[float, float]]],
+    previous_types: List[str],
+    next_path: List[List[Tuple[float, float]]],
+    next_types: List[str],
+    *,
+    geo=None,
+    state=None,
+    min_turn_radius_m: float,
+    config: Optional[Dict] = None,
+) -> Tuple[List[Tuple[float, float]], Dict]:
+    """DECISION-017: build one formal, boundary-checked region transfer."""
+    cfg = dict(config or {})
+    start = _region_route_endpoint(previous_path, previous_types, first=False)
+    end = _region_route_endpoint(next_path, next_types, first=True)
+    diagnostics = {
+        "algorithm_version": "inter-region-transfer-v1",
+        "segment_type": "turn_aux",
+        "start": list(start) if start else None,
+        "end": list(end) if end else None,
+        "valid": False,
+        "machine_executable": False,
+        "hard_reasons": [],
+    }
+    if start is None or end is None:
+        diagnostics["hard_reasons"].append("missing region work endpoint")
+        return [], diagnostics
+
+    last_work = next(
+        (
+            segment for segment, segment_type in reversed(
+                list(zip(previous_path, previous_types))
+            )
+            if segment_type == "work" and len(segment) >= 2
+        ),
+        None,
+    )
+    dx = float(start[0] - last_work[-2][0])
+    dy = float(start[1] - last_work[-2][1])
+    norm = math.hypot(dx, dy)
+    if norm <= 1e-9:
+        diagnostics["hard_reasons"].append("previous region exit heading unavailable")
+        return [], diagnostics
+    work_direction = (dx / norm, dy / norm)
+    lateral_x = float(end[0] - start[0])
+    lateral_y = float(end[1] - start[1])
+    cross = work_direction[0] * lateral_y - work_direction[1] * lateral_x
+    turn_sign = 1.0 if cross >= 0.0 else -1.0
+    mask = (
+        getattr(state, "mask_raw", None)
+        if state is not None and getattr(state, "mask_raw", None) is not None
+        else np.zeros((2, 2), dtype=np.uint8)
+    )
+    mpp = meters_per_pixel(mask, geo, state)
+    spacing_m = abs(cross) * mpp
+    if spacing_m <= 1e-9:
+        spacing_m = math.hypot(lateral_x, lateral_y) * mpp
+    field_polygon = _field_boundary_local_polygon(state)
+    clearance_m = max(
+        float(cfg.get("turn_outward_clearance_m", 0.6)),
+        float(cfg.get("turn_safety_margin_m", 0.1)),
+    )
+    headland_limited = _headland_space_is_limited(
+        start,
+        work_direction,
+        field_polygon,
+        required_depth_px=(2.0 * min_turn_radius_m + clearance_m)
+        / max(mpp, 1e-9),
+    )
+    decision = _select_turn_strategy(
+        "bow",
+        spacing_m,
+        min_turn_radius_m,
+        headland_limited=headland_limited,
+        geometry_tolerance_m=max(
+            0.0, float(cfg.get("turn_radius_geometry_tolerance_m", 0.05))
+        ),
+    )
+    selected_strategy = str(decision["strategy"])
+    transfer, _, boundary_reason = _adjust_turn_to_field_boundary(
+        start,
+        end,
+        work_direction,
+        turn_sign,
+        mpp,
+        min_turn_radius_m,
+        selected_strategy,
+        clearance_m,
+        field_polygon,
+        semicircle_radius_tolerance_m=(
+            max(0.0, float(cfg.get("turn_radius_geometry_tolerance_m", 0.05)))
+            if selected_strategy == "semicircle"
+            else 0.0
+        ),
+    )
+    inside_boundary = _segment_inside_field_boundary(transfer, field_polygon)
+    curved = len(transfer) > 2 and has_non_degenerate_curve([transfer])
+    next_work = next(
+        (
+            segment for segment, segment_type in zip(next_path, next_types)
+            if segment_type == "work" and len(segment) >= 2
+        ),
+        None,
+    )
+    start_tangent = np.asarray(transfer[1], dtype=np.float64) - np.asarray(
+        transfer[0], dtype=np.float64
+    ) if len(transfer) >= 2 else np.zeros(2, dtype=np.float64)
+    end_tangent = np.asarray(transfer[-1], dtype=np.float64) - np.asarray(
+        transfer[-2], dtype=np.float64
+    ) if len(transfer) >= 2 else np.zeros(2, dtype=np.float64)
+    next_direction = (
+        np.asarray(next_work[1], dtype=np.float64)
+        - np.asarray(next_work[0], dtype=np.float64)
+        if next_work is not None
+        else np.zeros(2, dtype=np.float64)
+    )
+
+    def tangent_alignment(first_vector, second_vector):
+        denominator = float(np.linalg.norm(first_vector) * np.linalg.norm(second_vector))
+        if denominator <= 1e-9:
+            return None
+        return float(np.dot(first_vector, second_vector) / denominator)
+
+    start_alignment = tangent_alignment(
+        start_tangent, np.asarray(work_direction, dtype=np.float64)
+    )
+    end_alignment = tangent_alignment(end_tangent, next_direction)
+    diagnostics.update({
+        "strategy": selected_strategy,
+        "requested_strategy": "bow",
+        "decision": decision,
+        "distance_m": float(sum(
+            math.hypot(b[0] - a[0], b[1] - a[1])
+            for a, b in zip(transfer, transfer[1:])
+        ) * mpp),
+        "transverse_spacing_m": float(spacing_m),
+        "inside_field_boundary": bool(inside_boundary),
+        "non_degenerate_curve": bool(curved),
+        "start_heading_alignment_cos": start_alignment,
+        "end_heading_alignment_cos": end_alignment,
+        "boundary_adjustment_reason": boundary_reason,
+    })
+    if not inside_boundary:
+        diagnostics["hard_reasons"].append(
+            "inter-region transfer leaves field boundary"
+        )
+    if not curved:
+        diagnostics["hard_reasons"].append(
+            "inter-region transfer degraded to a straight connector"
+        )
+    tangent_min_cos = float(
+        cfg.get("inter_region_tangent_alignment_min_cos", 0.95)
+    )
+    diagnostics["tangent_alignment_min_cos"] = tangent_min_cos
+    if start_alignment is None or start_alignment < tangent_min_cos:
+        diagnostics["hard_reasons"].append(
+            "inter-region transfer is not tangent to previous work line"
+        )
+    if end_alignment is None or end_alignment < tangent_min_cos:
+        diagnostics["hard_reasons"].append(
+            "inter-region transfer is not tangent to next work line"
+        )
+    diagnostics["valid"] = not diagnostics["hard_reasons"]
+    diagnostics["machine_executable"] = diagnostics["valid"]
+    return transfer, diagnostics
+
+
+def _connect_work_regions(
+    work_regions: List[Dict],
+    *,
+    geo=None,
+    state=None,
+    min_turn_radius_m: float,
+    turn_strategy: str,
+    config: Optional[Dict] = None,
+    global_main_angle: Optional[float] = None,
+    processed_mask: Optional[np.ndarray] = None,
+) -> Tuple[List[List[Tuple[float, float]]], List[str], Dict, List[Dict]]:
+    """DECISION-017: finish each classified region before entering the next."""
+    cfg = dict(config or {})
+    entry_global = getattr(state, "entry_point", None) if state is not None else None
+    if entry_global is not None:
+        ox = float(getattr(state, "mask_offset_x", 0) or 0)
+        oy = float(getattr(state, "mask_offset_y", 0) or 0)
+        entry_reference = (
+            float(entry_global[0]) - ox,
+            float(entry_global[1]) - oy,
+        )
+    else:
+        entry_reference = None
+
+    def region_reference_distance(item):
+        if entry_reference is None:
+            return float("inf")
+        distances = [
+            math.hypot(
+                float(point[0]) - entry_reference[0],
+                float(point[1]) - entry_reference[1],
+            )
+            for line in (item.get("work_lines") or [])
+            if len(line) >= 2
+            for point in (line[0], line[-1])
+        ]
+        return min(distances) if distances else float("inf")
+
+    if entry_reference is not None:
+        ordered_regions = sorted(
+            work_regions or [],
+            key=lambda item: (
+                region_reference_distance(item),
+                float(item.get("normal_position"))
+                if item.get("normal_position") is not None
+                else float("inf"),
+                str(item.get("region_id", "")),
+            ),
+        )
+        region_order_rule = "nearest_entry_region_then_distance_tiebreak"
+    else:
+        ordered_regions = sorted(
+            work_regions or [],
+            key=lambda item: (
+                0 if item.get("kind") == "wide_narrow_rows" else 1,
+                float(item.get("normal_position"))
+                if item.get("normal_position") is not None
+                else float("inf"),
+                str(item.get("region_id", "")),
+            ),
+        )
+        region_order_rule = "stable_kind_order_without_entry_reference"
+    if len(ordered_regions) <= 1:
+        region = ordered_regions[0] if ordered_regions else {"work_lines": []}
+        path, types, assessment = _connect_work_lines(
+            region.get("work_lines") or [],
+            geo=geo,
+            state=state,
+            min_turn_radius_m=min_turn_radius_m,
+            turn_strategy=turn_strategy,
+            config=cfg,
+            return_diagnostics=True,
+            global_main_angle=global_main_angle,
+            processed_mask=processed_mask,
+        )
+        assessment["region_routes"] = [{
+            "region_id": region.get("region_id"),
+            "kind": region.get("kind"),
+            "line_count": int(region.get("line_count", 0)),
+            "assessment": assessment.copy(),
+        }] if ordered_regions else []
+        return path, types, assessment, ordered_regions
+
+    combined_path = []
+    combined_types = []
+    region_reports = []
+    transfer_reports = []
+    shared_contour_walls = None
+    if (
+        normalize_turn_strategy(turn_strategy) == "contour"
+        and global_main_angle is not None
+        and math.isfinite(float(global_main_angle))
+    ):
+        direction = np.asarray((
+            math.cos(float(global_main_angle)),
+            math.sin(float(global_main_angle)),
+        ), dtype=np.float64)
+        low_values = []
+        high_values = []
+        for region in ordered_regions:
+            for line in region.get("work_lines") or []:
+                if len(line) < 2:
+                    continue
+                endpoints = np.asarray((line[0], line[-1]), dtype=np.float64)
+                projections = endpoints @ direction
+                low_values.append(float(np.min(projections)))
+                high_values.append(float(np.max(projections)))
+        if low_values and high_values:
+            shared_contour_walls = {
+                "low": float(min(low_values)),
+                "high": float(max(high_values)),
+            }
+
+    # DECISION-016: all classified regions share the same physical headland
+    # lanes.  Audit every region first, then use the most restrictive safe
+    # clearance on each side for the final routes.  Without this field-level
+    # pass, a boundary notch in only one planting region moves that region's
+    # tangent inward while the neighbouring region keeps a different tangent.
+    shared_contour_clearances = None
+    if shared_contour_walls is not None:
+        clearance_samples = {"low": [], "high": []}
+        audit_previous_endpoint = None
+        for region_index, region in enumerate(ordered_regions):
+            audit_cfg = dict(cfg)
+            audit_cfg["_include_entry_service"] = region_index == 0
+            audit_cfg["_include_exit_service"] = (
+                region_index == len(ordered_regions) - 1
+            )
+            audit_cfg["_contour_forced_wall_projections"] = (
+                shared_contour_walls
+            )
+            if audit_previous_endpoint is not None:
+                audit_cfg["_route_start_reference_local"] = (
+                    audit_previous_endpoint
+                )
+            audit_path, audit_types, audit_assessment = _connect_work_lines(
+                region.get("work_lines") or [],
+                geo=geo,
+                state=state,
+                min_turn_radius_m=min_turn_radius_m,
+                turn_strategy=turn_strategy,
+                config=audit_cfg,
+                return_diagnostics=True,
+                global_main_angle=global_main_angle,
+                processed_mask=processed_mask,
+            )
+            safe_clearances = (
+                audit_assessment.get("contour_connector", {}).get(
+                    "shared_turn_clearance_m_by_side"
+                )
+                or {}
+            )
+            for side in ("low", "high"):
+                value = _finite_float(safe_clearances.get(side))
+                if value is not None and value >= 0.0:
+                    clearance_samples[side].append(float(value))
+            audit_previous_endpoint = _region_route_endpoint(
+                audit_path, audit_types, first=False
+            )
+        shared_contour_clearances = {
+            side: float(min(values))
+            for side, values in clearance_samples.items()
+            if values
+        }
+    previous_path = []
+    previous_types = []
+    previous_endpoint = None
+    for region_index, region in enumerate(ordered_regions):
+        region_cfg = dict(cfg)
+        region_cfg["_include_entry_service"] = region_index == 0
+        region_cfg["_include_exit_service"] = region_index == len(ordered_regions) - 1
+        if shared_contour_walls is not None:
+            region_cfg["_contour_forced_wall_projections"] = shared_contour_walls
+        if shared_contour_clearances:
+            region_cfg["_contour_forced_turn_clearance_m_by_side"] = (
+                shared_contour_clearances
+            )
+        if previous_endpoint is not None:
+            region_cfg["_route_start_reference_local"] = previous_endpoint
+        region_path, region_types, region_assessment = _connect_work_lines(
+            region.get("work_lines") or [],
+            geo=geo,
+            state=state,
+            min_turn_radius_m=min_turn_radius_m,
+            turn_strategy=turn_strategy,
+            config=region_cfg,
+            return_diagnostics=True,
+            global_main_angle=global_main_angle,
+            processed_mask=processed_mask,
+        )
+        if region_index > 0:
+            transfer, transfer_report = _build_inter_region_transfer(
+                previous_path,
+                previous_types,
+                region_path,
+                region_types,
+                geo=geo,
+                state=state,
+                min_turn_radius_m=min_turn_radius_m,
+                config=cfg,
+            )
+            transfer_report.update({
+                "from_region_id": ordered_regions[region_index - 1].get("region_id"),
+                "to_region_id": region.get("region_id"),
+                "segment_index": len(combined_path),
+            })
+            if transfer:
+                combined_path.append(transfer)
+                combined_types.append("turn_aux")
+            transfer_reports.append(transfer_report)
+        segment_offset = len(combined_path)
+        combined_path.extend(region_path)
+        combined_types.extend(region_types)
+        region_reports.append({
+            "region_id": region.get("region_id"),
+            "kind": region.get("kind"),
+            "line_count": int(region.get("line_count", 0)),
+            "segment_start_index": segment_offset,
+            "segment_end_index": len(combined_path) - 1,
+            "assessment": region_assessment,
+        })
+        previous_path = region_path
+        previous_types = region_types
+        previous_endpoint = _region_route_endpoint(
+            region_path, region_types, first=False
+        )
+
+    pass_spacings = [
+        float(value)
+        for report in region_reports
+        for value in (report["assessment"].get("pass_spacings_m") or [])
+    ]
+    assessment = assess_turn_strategy(
+        turn_strategy,
+        pass_spacings,
+        min_turn_radius_m,
+    )
+    hard_reasons = []
+    fallback_reasons = []
+    used_strategies = []
+    turn_decisions = []
+    boundary_adjustments = []
+    non_work_violations = []
+    display_only_connectors = []
+    for report in region_reports:
+        region_id = report["region_id"]
+        item = report["assessment"]
+        hard_reasons.extend(
+            f"{region_id}: {reason}" for reason in item.get("hard_reasons", [])
+        )
+        fallback_reasons.extend(item.get("fallback_reasons", []) or [])
+        used_strategies.extend(item.get("used_strategies", []) or [])
+        for decision in item.get("turn_decisions", []) or []:
+            bound = dict(decision)
+            bound["region_id"] = region_id
+            turn_decisions.append(bound)
+        constraints = item.get("boundary_constraints") or {}
+        boundary_adjustments.extend(constraints.get("adjustment_reasons") or [])
+        non_work_violations.extend(constraints.get("non_work_violations") or [])
+        display_only_connectors.extend(item.get("display_only_connectors") or [])
+    for transfer in transfer_reports:
+        if transfer.get("strategy"):
+            used_strategies.append(transfer["strategy"])
+        hard_reasons.extend(
+            f"{transfer.get('from_region_id')}->{transfer.get('to_region_id')}: {reason}"
+            for reason in transfer.get("hard_reasons", [])
+        )
+        if transfer.get("boundary_adjustment_reason"):
+            boundary_adjustments.append(transfer["boundary_adjustment_reason"])
+        if not transfer.get("machine_executable", False):
+            display_only_connectors.append({
+                "segment_index": transfer.get("segment_index"),
+                "display_only_connector": True,
+                "kinematically_infeasible": True,
+                "reason": "; ".join(transfer.get("hard_reasons") or []),
+                "role": "inter_region_transfer",
+            })
+    assessment.update({
+        "requested_strategy": normalize_turn_strategy(turn_strategy),
+        "ordering_strategy": normalize_turn_strategy(turn_strategy),
+        "contour_ordering": {
+            "ordering": "classified_regions_then_independent_contours",
+            "algorithm_version": "mixed-region-order-v2",
+            "region_order": [item.get("region_id") for item in ordered_regions],
+            "region_order_rule": region_order_rule,
+            "entry_reference_local": list(entry_reference)
+            if entry_reference is not None else None,
+            "entry_region_distances_px": {
+                str(item.get("region_id")): float(region_reference_distance(item))
+                for item in ordered_regions
+            } if entry_reference is not None else {},
+            "no_cross_region_pairing": True,
+            "shared_headland_wall_projections_px": shared_contour_walls,
+            "shared_turn_clearance_m_by_side": shared_contour_clearances,
+        },
+        "used_strategies": used_strategies,
+        "fallback_reasons": fallback_reasons,
+        "display_only_connectors": display_only_connectors,
+        "kinematically_infeasible": bool(display_only_connectors),
+        "machine_executable": not bool(hard_reasons or display_only_connectors),
+        "hard_reasons": hard_reasons,
+        "feasible": not hard_reasons,
+        "needs_confirmation": bool(hard_reasons),
+        "boundary_constraints": {
+            "field_boundary_present": _field_boundary_local_polygon(state) is not None,
+            "turns_adjusted": len(boundary_adjustments),
+            "adjustment_reasons": boundary_adjustments,
+            "non_work_violations": non_work_violations,
+        },
+        "pass_spacings_m": pass_spacings,
+        "turn_decisions": turn_decisions,
+        "endpoint_alignment": {"regions": [
+            report["assessment"].get("endpoint_alignment", {})
+            for report in region_reports
+        ]},
+        "contour_connector": {
+            "enabled": normalize_turn_strategy(turn_strategy) == "contour",
+            "algorithm_version": "mixed-region-contours-v1",
+            "regions": [
+                report["assessment"].get("contour_connector", {})
+                for report in region_reports
+            ],
+        },
+        "contour_route_mode": bool(region_reports) and all(
+            report["assessment"].get("contour_route_mode", False)
+            for report in region_reports
+        ),
+        "region_routes": region_reports,
+        "region_transfers": transfer_reports,
+        "service_points": {
+            "entry_present": bool(
+                (region_reports[0]["assessment"].get("service_points") or {}).get(
+                    "entry_present", False
+                )
+            ),
+            "exit_present": bool(
+                (region_reports[-1]["assessment"].get("service_points") or {}).get(
+                    "exit_present", False
+                )
+            ),
+            "unload_count": int(
+                (region_reports[-1]["assessment"].get("service_points") or {}).get(
+                    "unload_count", 0
+                )
+            ),
+            "unload_visit_count": sum(
+                segment_type == "unload" for segment_type in combined_types
+            ),
+            "exit_route": (
+                region_reports[-1]["assessment"].get("service_points") or {}
+            ).get("exit_route"),
+        },
+    })
+    return combined_path, combined_types, assessment, ordered_regions
 
 
 def plan_path(wide_bands: List[Dict],
@@ -2747,7 +5249,8 @@ def plan_path(wide_bands: List[Dict],
               progress_callback=None,
               obstacle_mask: Optional[np.ndarray] = None,
               detected_mask: Optional[np.ndarray] = None,
-              planned_mask: Optional[np.ndarray] = None) -> Dict:
+              planned_mask: Optional[np.ndarray] = None,
+              all_bands: Optional[List[Dict]] = None) -> Dict:
     """完整的路径规划管道。
 
     Args:
@@ -2818,22 +5321,51 @@ def plan_path(wide_bands: List[Dict],
 
     _report(0.12, "四行带中心线筛选")
     abort_if_cancelled()
-    work_lines, layout = _prepare_work_line_layout(
+    planning_bands, coverage_gap_recovery = _recover_lattice_supported_work_bands(
         wide_bands,
+        all_bands,
+        processed_mask,
+        main_angle,
+        geo=geo,
+        state=state,
+        config=cfg,
+    )
+    if coverage_gap_recovery.get("recovered_band_ids"):
+        recovered_mask = build_band_mask(processed_mask.shape, planning_bands)
+        if np.any(recovered_mask):
+            planned_mask = recovered_mask
+    work_lines, layout, work_regions = _prepare_work_line_layout(
+        planning_bands,
         processed_mask,
         main_angle,
         geo=geo,
         state=state,
         config=cfg,
         progress_callback=progress_callback,
+        detected_mask=detected_mask,
+        planned_mask=planned_mask,
+        return_regions=True,
     )
+    layout["coverage_gap_recovery"] = coverage_gap_recovery
+    # 等距区细分线不参与田头端点校正（已在掩膜边界正确截断）
     abort_if_cancelled()
     if not work_lines:
+        classification_reasons = list(
+            (layout.get("planting_region_classification") or {}).get(
+                "hard_reasons", []
+            )
+        )
+        generation_reasons = list(
+            layout.get("region_generation_hard_reasons") or []
+        )
+        hard_reasons = classification_reasons + generation_reasons
+        if not hard_reasons:
+            hard_reasons = ["未生成有效作业线"]
         return {
             "full_path": [],
             "segment_types": [],
             "geo_points": [],
-            "validation": {"valid": False, "issues": ["未生成有效作业线"]},
+            "validation": {"valid": False, "issues": hard_reasons},
             "is_valid": False,
             "description": "未生成有效作业线",
             "layout": layout,
@@ -2845,8 +5377,8 @@ def plan_path(wide_bands: List[Dict],
                     turn_strategy,
                 ),
                 "feasible": False,
-                "needs_confirmation": False,
-                "hard_reasons": ["未生成有效作业线"],
+                "needs_confirmation": True,
+                "hard_reasons": hard_reasons,
                 "warnings": [],
             },
         }
@@ -2855,16 +5387,36 @@ def plan_path(wide_bands: List[Dict],
 
     def evaluate_strategy(strategy_key: str) -> Dict:
         abort_if_cancelled()
-        candidate_segments, candidate_types, candidate_assessment = _connect_work_lines(
-            work_lines,
+        (
+            candidate_segments,
+            candidate_types,
+            candidate_assessment,
+            ordered_regions,
+        ) = _connect_work_regions(
+            work_regions,
             geo=geo,
             state=state,
             min_turn_radius_m=min_turn_radius,
             turn_strategy=strategy_key,
             config=cfg,
-            return_diagnostics=True,
             global_main_angle=main_angle,
             processed_mask=processed_mask,
+        )
+        layout["region_execution_order"] = [
+            {
+                "sequence": index + 1,
+                "region_id": region.get("region_id"),
+                "kind": region.get("kind"),
+                "line_count": int(region.get("line_count", 0)),
+            }
+            for index, region in enumerate(ordered_regions)
+        ]
+        layout["region_order_rule"] = (
+            (candidate_assessment.get("contour_ordering") or {}).get(
+                "region_order_rule", "nearest_entry_region_then_distance_tiebreak"
+            )
+            if len(ordered_regions) > 1
+            else "single_classified_region"
         )
         candidate_assessment["user_requested_strategy"] = turn_strategy
         candidate_assessment["candidate_strategy"] = strategy_key

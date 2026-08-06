@@ -18,8 +18,8 @@ TASK_DEFS = [
     {"id": "segment", "label": "AI识别", "hint": "使用模型分割作物行带。", "color": "#649C7E", "action": "运行"},
     {"id": "process", "label": "掩膜处理", "hint": "优化 AI 识别掩膜并提取作物行带。", "color": "#648C82", "action": "处理"},
     {"id": "params", "label": "农机参数", "hint": "设置农机参数。", "color": "#AC7E56", "action": "设置"},
-    {"id": "entry", "label": "起点", "hint": "布设或确认机具入田起点。", "color": "#589C94", "action": "布设"},
-    {"id": "exit", "label": "终点", "hint": "布设或确认机具离田终点。", "color": "#C76B6B", "action": "布设"},
+    {"id": "entry", "label": "起点", "hint": "布设、确认或直接拖动机具入田起点。", "color": "#589C94", "action": "布设"},
+    {"id": "exit", "label": "终点", "hint": "布设、确认或直接拖动机具离田终点。", "color": "#C76B6B", "action": "布设"},
     {"id": "unload", "label": "卸粮点", "hint": "按需要添加一个或多个卸粮点，可为空。", "color": "#C9A64A", "action": "布设"},
     {"id": "plan", "label": "路径规划", "hint": "生成作业路线。", "color": "#589862", "action": "生成"},
     {"id": "simulate", "label": "模拟演示", "hint": "沿规划路径模拟农机运动。", "color": "#4C8C7C", "action": "演示"},
@@ -31,8 +31,8 @@ STEP_GROUPS = [
     {"label": "田块圈选", "tasks": ["draw_field"]},
     {"label": "AI识别", "tasks": ["segment"]},
     {"label": "掩膜处理", "tasks": ["process"]},
-    {"label": "参数配置", "tasks": ["params", "entry", "exit", "unload"]},
-    {"label": "路径规划", "tasks": ["plan"]},
+    {"label": "参数配置", "tasks": ["params"]},
+    {"label": "路径规划", "tasks": ["entry", "exit", "unload", "plan"]},
     {"label": "模拟演示", "tasks": ["simulate"]},
     {"label": "路径导出", "tasks": ["export"]},
 ]
@@ -50,15 +50,15 @@ class TaskRow(QWidget):
         super().__init__(parent)
         self.setObjectName("taskRow")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setMinimumHeight(48)
+        self.setMinimumHeight(44)
         self.setStyleSheet("#taskRow{background:transparent;}")
         self.tid = task_def["id"]
         self._color = task_def["color"]
         self._done = False
         self._status_text = "待处理"
         lo = QHBoxLayout(self)
-        lo.setContentsMargins(8, 6, 8, 6)
-        lo.setSpacing(8)
+        lo.setContentsMargins(8, 3, 8, 3)
+        lo.setSpacing(7)
         self._badge = QLabel("")
         self._badge.setFixedSize(14, 14)
         self._badge.setStyleSheet(f"background:{task_def['color']};border-radius:3px;")
@@ -66,13 +66,17 @@ class TaskRow(QWidget):
         self._label = QLabel(task_def["label"])
         self._label.setFont(QFont("Microsoft YaHei UI", 10))
         self._label.setStyleSheet(f"color:{COLORS['text']};font-size:13px;font-family:{UI_FONT};")
+        self._label.setMinimumWidth(0)
         lo.addWidget(self._label, 1)
         self._status = QLabel(self._status_text)
         self._status.setFont(QFont("Microsoft YaHei UI", 9))
+        self._status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._status.setMinimumWidth(0)
         self._status.setStyleSheet(f"color:{COLORS['text_dim']};font-size:11px;font-family:{UI_FONT};")
         lo.addWidget(self._status)
         self._action_btn = QPushButton(task_def["action"])
-        self._action_btn.setFixedSize(48, 36)
+        self._action_btn.setMinimumSize(58, 28)
+        self._action_btn.setMaximumHeight(30)
         self._action_btn.setStyleSheet(
             f"QPushButton{{background:{task_def['color']};color:white;border:none;"
             f"border-radius:6px;font-size:12px;font-weight:600;padding:0;font-family:{UI_FONT};}}"
@@ -80,7 +84,8 @@ class TaskRow(QWidget):
         self._action_btn.clicked.connect(lambda: self.clicked.emit(self.tid))
         lo.addWidget(self._action_btn)
         self._delete_btn = QPushButton("回退")
-        self._delete_btn.setFixedSize(48, 36)
+        self._delete_btn.setMinimumSize(52, 28)
+        self._delete_btn.setMaximumHeight(30)
         self._delete_btn.setToolTip("回退到此步骤之前，并清除后续结果")
         self._delete_btn.setStyleSheet(
             "QPushButton{background:#7A4D3B;color:white;border:none;"
@@ -161,7 +166,9 @@ class StepCard(QWidget):
         super().__init__(parent)
         self.setObjectName("stepCard")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setMinimumHeight(38)
+        # 不设置固定最小高度：折叠时由布局按表头高度决定；
+        # 展开时最小高度必须覆盖内容，否则 QScrollArea 内布局会把卡片
+        # 压扁，内容互相覆盖（任务行被后面的智能推荐/禁行区/调头方式盖住）。
         self._rows = rows
         self._expanded = False
         lo = QVBoxLayout(self)
@@ -206,6 +213,20 @@ class StepCard(QWidget):
         self._expanded = bool(expanded)
         self._content.setVisible(self._expanded)
         self._toggle.setText("▾" if self._expanded else "▸")
+        self._sync_minimum_height()
+
+    def _sync_minimum_height(self):
+        """展开时把显式最小高度设为内容高度，折叠时回到表头高度。
+
+        QScrollArea 内布局只按各卡片的最小高度分配纵向空间
+        （QLayout::doResize 依据的也是显式最小值），如果展开的卡片
+        最小高度仍是表头高度，卡片会被压扁，内容互相覆盖。
+        """
+        if self._expanded:
+            hint = self.sizeHint()
+            self.setMinimumHeight(hint.height())
+        else:
+            self.setMinimumHeight(40)
 
     def refresh_state(self):
         task_rows = [row for row in self._rows if hasattr(row, "_done")]
@@ -250,6 +271,7 @@ class TaskPanel(QWidget):
     confirm_no_forbidden_requested = Signal()
     draw_forbidden_requested = Signal()
     route_edit_requested = Signal()
+    recommend_service_points_requested = Signal()
     step_deleted = Signal(str)
 
     def __init__(self, parent=None):
@@ -318,9 +340,25 @@ class TaskPanel(QWidget):
                     )
                     rows.append(self.model_combo)
                 if tid == "plan":
+                    # 任务行下方的设置区：分隔线 + 紧凑单行控件，
+                    # 与上方的 4 个任务行在视觉上区分开。
+                    sep = QFrame()
+                    sep.setFrameShape(QFrame.HLine)
+                    sep.setFixedHeight(1)
+                    sep.setStyleSheet(f"color:{COLORS.get('border', '#383848')};background:{COLORS.get('border', '#383848')};")
+                    rows.append(sep)
+                    self.recommend_service_points_btn = QPushButton("智能推荐起点 / 终点")
+                    self.recommend_service_points_btn.setToolTip(
+                        "根据处理后的作物行带方向和作业顺序推荐入田起点与离田终点；推荐后可在影像上直接拖动标记"
+                    )
+                    self.recommend_service_points_btn.setMinimumHeight(30)
+                    self.recommend_service_points_btn.clicked.connect(
+                        self.recommend_service_points_requested.emit
+                    )
+                    rows.append(self.recommend_service_points_btn)
                     forbidden_row = QWidget()
                     forbidden_layout = QHBoxLayout(forbidden_row)
-                    forbidden_layout.setContentsMargins(8, 0, 8, 2)
+                    forbidden_layout.setContentsMargins(8, 0, 8, 0)
                     forbidden_layout.setSpacing(6)
                     self.forbidden_status_label = QLabel("禁行区：未确认")
                     self.forbidden_status_label.setStyleSheet(
@@ -329,7 +367,7 @@ class TaskPanel(QWidget):
                     self.confirm_no_forbidden_btn = QPushButton("确认无")
                     self.draw_forbidden_btn = QPushButton("绘制")
                     for button in (self.confirm_no_forbidden_btn, self.draw_forbidden_btn):
-                        button.setMinimumHeight(28)
+                        button.setMinimumSize(52, 26)
                         button.setStyleSheet(
                             f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
                             f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;font-family:{UI_FONT};}}"
@@ -343,26 +381,34 @@ class TaskPanel(QWidget):
                     forbidden_layout.addWidget(self.confirm_no_forbidden_btn)
                     forbidden_layout.addWidget(self.draw_forbidden_btn)
                     rows.append(forbidden_row)
+                    turn_row = QWidget()
+                    turn_layout = QHBoxLayout(turn_row)
+                    turn_layout.setContentsMargins(8, 0, 8, 0)
+                    turn_layout.setSpacing(6)
                     turn_label = QLabel("调头方式")
-                    turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
+                    turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};")
                     self.turn_combo = QComboBox()
                     self.turn_combo.setToolTip("选择路径规划使用的调头/转弯方式，可重算对比不同效果")
-                    self.turn_combo.setMinimumHeight(30)
+                    self.turn_combo.setMinimumHeight(28)
                     self.turn_combo.setStyleSheet(
                         f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
                         f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
                     )
+                    # DECISION-016: contour is an auditable pass-order strategy.
+                    # 套圈收割为默认策略（置于首位）。
                     for label, key in [
-                        ("自动推荐", "auto"), ("弓形调头", "bow"), ("半圆调头", "semicircle"),
-                        ("梨形调头", "pear"), ("鱼尾折返", "fishtail"), ("紧凑 Alpha", "alpha")
+                        ("套圈收割（外圈向内）", "contour"), ("自动推荐", "auto"),
+                        ("弓形调头", "bow"), ("半圆调头", "semicircle"),
+                        ("梨形调头", "pear"), ("鱼尾折返", "fishtail"), ("紧凑 Alpha", "alpha"),
                     ]:
                         self.turn_combo.addItem(label, key)
                     self.turn_combo.currentIndexChanged.connect(self._on_turn_combo_changed)
-                    rows.append(turn_label)
-                    rows.append(self.turn_combo)
+                    turn_layout.addWidget(turn_label)
+                    turn_layout.addWidget(self.turn_combo, 1)
+                    rows.append(turn_row)
                     self.route_edit_btn = QPushButton("编辑路线")
                     self.route_edit_btn.setToolTip("进入人工路线编辑：Alt+左键在线段插点，拖动控制点，Backspace 删除选中点")
-                    self.route_edit_btn.setMinimumHeight(32)
+                    self.route_edit_btn.setMinimumHeight(30)
                     self.route_edit_btn.setStyleSheet(
                         f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
                         f"border:1px solid {COLORS['border']};border-radius:5px;padding:4px 8px;font-family:{UI_FONT};}}"
@@ -412,6 +458,9 @@ class TaskPanel(QWidget):
             # the narrow left splitter, especially after project restore.
             card.set_expanded(i == expanded)
         self._current_step = first
+        # 展开的卡片（如“路径规划”，内容较多）可能比可视区更高，
+        # 滚动到展开卡片，避免步骤推进时活动步骤被挤出可视区。
+        self._ensure_card_visible(expanded)
 
     def _on_card_toggled(self, index):
         card = self._step_cards[index]
@@ -561,7 +610,10 @@ class TaskPanel(QWidget):
             combo = getattr(self, combo_name, None)
             if combo:
                 combo.setStyleSheet(combo_style)
-        for button_name in ("route_edit_btn", "mask_diagnostic_btn"):
+        for button_name in (
+            "route_edit_btn", "mask_diagnostic_btn",
+            "recommend_service_points_btn",
+        ):
             button = getattr(self, button_name, None)
             if button:
                 button.setStyleSheet(

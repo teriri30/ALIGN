@@ -347,6 +347,10 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
     path_result = {
         "validation": {"valid": True, "issues": []},
         "planning_factors": {"harvester": {"track_width_m": 0.45}},
+        "layout": {
+            "work_line_mode": "band_centerline_with_footprint_validation",
+            "formal_comparison": {"accepted": False},
+        },
     }
     window.state.source_sha256 = "test-source-sha256"
 
@@ -357,6 +361,7 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
 
     assert manifest["output"]["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
     assert manifest["analysis"]["validation"]["valid"] is True
+    assert manifest["analysis"]["layout"] == path_result["layout"]
     assert manifest["application_version"]
     assert manifest["scientific_code"]["fingerprint"]
     assert manifest["source_image"]["sha256"] == "test-source-sha256"
@@ -365,18 +370,113 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
     assert manifest["integrity"]["config_sha256"]
     assert manifest["integrity"]["route_data_sha256"]
 
+    manual_review_output = tmp_path / "manual-review.path"
+    manual_review_output.write_text(
+        "$PATH,0,0,1,30,120,0,0,1*\n", encoding="utf-8"
+    )
+    path_result["machine_readiness"] = {"controlled_trial_ready": True}
+    manual_review_manifest_path = window._write_export_manifest(
+        str(manual_review_output), "$PATH", path_result, points
+    )
+    manual_review_manifest = json.loads(
+        open(manual_review_manifest_path, "r", encoding="utf-8").read()
+    )
+    assert manual_review_manifest["output"]["route_classification"] == "research_manual_review"
+    assert manual_review_manifest["output"]["usage_restriction"] == "RESEARCH_MANUAL_REVIEW_ONLY"
+    assert manual_review_manifest["output"]["machine_executable"] is False
+    assert manual_review_manifest["output"]["candidate_machine_path"] is True
+    assert manual_review_manifest["output"]["terminal_protocol_validated"] is False
+
+    from machine_route_validator import assess_machine_readiness
+
+    path_result.update({
+        "is_valid": True,
+        "validation": {
+            "valid": True,
+            "validation_profile": "machine_candidate",
+            "field_boundary_present": True,
+            "semantic_support_present": True,
+            "forbidden_mask_present": True,
+            "footprint_model": "planar_rigid_footprint_v2",
+            "footprint_reference_point": "track_contact_center",
+            "footprint_resolution_m": 0.05,
+            "machine_outside_field_pct": 0.0,
+            "machine_forbidden_overlap_pct": 0.0,
+            "validation_limits_pct": {
+                "machine_outside_field": 0.0,
+                "machine_forbidden_overlap": 0.0,
+            },
+        },
+        "layout": {
+            "work_line_mode": "footprint_optimized",
+            "optimization_complete": True,
+            "footprint_optimization_scope": "centerline_anchored_lateral_search",
+            "baseline_pass_count": 2,
+            "optimized_pass_count": 2,
+            "ordered_band_ids": ["band-a", "band-b"],
+            "line_optimization": [
+                {"line_index": 0, "band_id": "band-a", "optimized": True},
+                {"line_index": 1, "band_id": "band-b", "optimized": True},
+            ],
+            "formal_comparison": {
+                "accepted": True,
+                "degraded_metrics": [],
+                "improved_metrics": [
+                    "track_core_overlap_pct",
+                    "track_outside_support_pct",
+                ],
+                "invalid_metrics": [],
+            },
+            "baseline_footprint_metrics": {
+                "track_core_overlap_pct": 2.0,
+                "planned_target_geometric_coverage_pct": 95.0,
+                "track_outside_field_pct": 0.0,
+                "track_outside_support_pct": 1.0,
+                "track_forbidden_overlap_pct": 0.0,
+            },
+            "optimized_footprint_metrics": {
+                "track_core_overlap_pct": 1.0,
+                "planned_target_geometric_coverage_pct": 95.0,
+                "track_outside_field_pct": 0.0,
+                "track_outside_support_pct": 0.5,
+                "track_forbidden_overlap_pct": 0.0,
+            },
+        },
+        "turn_assessment": {"hard_reasons": []},
+        "planning_factors": {"harvester": {"track_width_m": 0.45}},
+    })
+    path_result["machine_readiness"] = assess_machine_readiness(
+        path_result,
+        {
+            "forbidden_mask_confirmed": True,
+            "geo_accuracy_report": {
+                "verified": True,
+                "rmse_m": 0.03,
+                "within_tolerance": True,
+            },
+            "vehicle_reference_point": "rear_axle_center",
+            "gnss_offset_m": [0.0, 0.0, 1.8],
+            "kinematic_model_validated": True,
+            "terminal_adapter": "verified_test_adapter",
+            "terminal_adapter_validated": True,
+            "field_tracking_report": {"verified": True},
+            "manual_review_signed": True,
+        },
+    )
+    assert path_result["machine_readiness"]["eligible_for_machine_export"] is True
+    assert path_result["machine_readiness"]["terminal_protocol_validated"] is True
+
     trial_output = tmp_path / "trial.path"
     trial_output.write_text("$PATH,0,0,1,30,120,0,0,1*\n", encoding="utf-8")
-    path_result["machine_readiness"] = {"controlled_trial_ready": True}
     trial_manifest_path = window._write_export_manifest(
         str(trial_output), "$PATH", path_result, points
     )
     trial_manifest = json.loads(open(trial_manifest_path, "r", encoding="utf-8").read())
     assert trial_manifest["output"]["route_classification"] == "controlled_field_trial"
     assert "LOW_SPEED_MANUAL_SUPERVISION" in trial_manifest["output"]["usage_restriction"]
-    assert trial_manifest["output"]["machine_executable"] is False
+    assert trial_manifest["output"]["machine_executable"] is True
     assert trial_manifest["output"]["candidate_machine_path"] is True
-    assert trial_manifest["output"]["terminal_protocol_validated"] is False
+    assert trial_manifest["output"]["terminal_protocol_validated"] is True
     assert trial_manifest["output"]["path_protocol"]["coordinate_order"] == [
         "latitude", "longitude"
     ]

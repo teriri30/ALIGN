@@ -26,6 +26,11 @@ _PACKAGED_MODEL_SPECS = (
         "filename": "yolov8s_seg_best.pt",
         "sha256": "103c2eadd2e6240819319b81f046549faaffa0f949368ec1d339e565241617b2",
     },
+    {
+        "name": "YOLO11s-seg（分蘖期12m）",
+        "filename": "yolo11s_seg_tiller12m_best.pt",
+        "sha256": "5f31cc3950fe803e0768b2763f0ee9dd2a3a01395aa67a362ee734d41f4d3969",
+    },
 )
 
 

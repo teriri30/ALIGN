@@ -3,7 +3,9 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+import pytest
 from affine import Affine
+from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QApplication
 
 from pyside6_app.main_window import MainWindow
@@ -93,6 +95,177 @@ def test_pipeline_step_results_update_state():
     assert window.state.mask_processed is True
     assert window.state.mask_result is processed
 
+
+def test_service_point_tasks_belong_to_path_planning_stage():
+    from pyside6_app.panels import STEP_GROUPS
+
+    parameter_group = next(group for group in STEP_GROUPS if group["label"] == "参数配置")
+    planning_group = next(group for group in STEP_GROUPS if group["label"] == "路径规划")
+
+    assert parameter_group["tasks"] == ["params"]
+    assert planning_group["tasks"] == ["entry", "exit", "unload", "plan"]
+
+
+def test_task_rows_stack_actions_below_summary_without_overlap():
+    window = _window()
+    window.resize(1200, 800)
+    window.show()
+    app = QApplication.instance()
+    app.processEvents()
+    panel = window.task_panel
+    card = panel._step_cards[5]
+    card.set_expanded(True)
+    for other in panel._step_cards:
+        if other is not card:
+            other.set_expanded(False)
+    app.processEvents()
+
+    for tid in ("entry", "exit", "unload", "plan"):
+        row = panel._task_widgets[tid]
+        assert row.minimumHeight() >= 40
+        assert not row._action_btn.geometry().intersects(row._delete_btn.geometry())
+        assert row._action_btn.geometry().width() >= 56
+        assert row._delete_btn.geometry().width() >= 50
+
+    assert panel.recommend_service_points_btn.minimumHeight() >= 30
+    assert panel.confirm_no_forbidden_btn.geometry().width() > 0
+    assert panel.draw_forbidden_btn.geometry().width() > 0
+    window.close()
+
+
+def test_planning_card_fully_expands_in_scroll_area_without_overlap():
+    """回归：展开的路径规划卡片必须在滚动区内撑开内容高度。
+
+    旧实现给 StepCard 设置了固定最小高度（仅表头高度），QScrollArea 内
+    布局只按各卡片最小高度分配空间，把展开的卡片压扁：任务行互相重叠，
+    后面的智能推荐/禁行区/调头方式控件盖住上方的任务行。
+
+    注意：窗口必须先真实显示（show + 事件循环）再展开，否则布局处于
+    半激活状态，几何结果不可信。
+    """
+    window = _window()
+    window.resize(1200, 800)
+    window.show()
+    app = QApplication.instance()
+    app.processEvents()
+    panel = window.task_panel
+    card = next(c for c in panel._step_cards if c._title.text().startswith("6."))
+    card.set_expanded(True)
+    for other in panel._step_cards:
+        if other is not card:
+            other.set_expanded(False)
+    app.processEvents()
+
+    rows = [panel._task_widgets[tid] for tid in ("entry", "exit", "unload", "plan")]
+    tops = [row.mapTo(panel, QPoint(0, 0)).y() for row in rows]
+    for i in range(1, len(rows)):
+        assert tops[i] >= tops[i - 1] + rows[i - 1].height() - 1, f"任务行 {rows[i].tid} 与上一行重叠"
+
+    # 卡片底部必须低于所有任务行（下方设置区可见），且设置区最后一个
+    # 控件（编辑路线）不越出卡片边界
+    card_bottom = card.mapTo(panel, QPoint(0, card.height())).y()
+    assert card_bottom > max(tops[i] + rows[i].height() for i in range(len(rows)))
+    edit_bottom = panel.route_edit_btn.mapTo(panel, QPoint(0, panel.route_edit_btn.height())).y()
+    assert edit_bottom <= card_bottom + 1
+
+    # 滚动区内容高度应大于视口（出现滚动条），而不是把卡片压扁
+    assert panel._scroll.widget().height() > panel._scroll.viewport().height()
+    window.close()
+
+
+def test_planning_panel_recommend_button_restores_start_and_end_recommendation(monkeypatch):
+    window = _window()
+    window.state.mask_processed = True
+    window.state.mask_result = {"wide_bands": [{}, {}], "main_angle": 0.0}
+    calls = []
+    monkeypatch.setattr(
+        window,
+        "_suggest_service_points",
+        lambda: (
+            calls.append("suggest"),
+            window.state.safe_update(
+                entry_point=(2.0, 3.0),
+                exit_point=(17.0, 18.0),
+            ),
+        ),
+    )
+
+    window.task_panel.recommend_service_points_btn.click()
+
+    assert calls == ["suggest"]
+    assert window.state.entry_point == (2.0, 3.0)
+    assert window.state.exit_point == (17.0, 18.0)
+    assert window._service_points_visible is True
+    window.close()
+
+
+def test_mask_processing_defers_service_points_until_path_planning(monkeypatch):
+    """DECISION-007/014: service points enter the workflow with route planning."""
+    window = _window()
+    raw = np.ones((20, 20), dtype=np.uint8) * 255
+    processed = {
+        "processed_mask": raw,
+        "main_angle": 0.0,
+        "wide_bands": [{"centerline": [(0, 0), (1, 1)]}],
+    }
+    suggestions = []
+    window.state.safe_update(
+        mask_raw=raw,
+        entry_point=(2, 2),
+        exit_point=(17, 17),
+        auto_path_planned=True,
+    )
+    monkeypatch.setattr(
+        window,
+        "_suggest_service_points",
+        lambda: suggestions.append("suggested"),
+    )
+
+    assert window._service_points_should_show() is False
+    window._apply_mask_process_result(processed)
+
+    assert suggestions == []
+    assert window._service_points_visible is False
+    assert window._service_points_should_show() is False
+
+    window._on_toggle_entry_exit()
+
+    assert suggestions == ["suggested"]
+    assert window._service_points_visible is True
+    assert window._service_points_should_show() is True
+
+def test_mask_processing_start_prompt_defers_service_points_to_path_planning(monkeypatch):
+    from pyside6_app import main_window
+    from pyside6_app import workers
+
+    window = _window()
+    window.state.mask_raw = np.ones((20, 20), dtype=np.uint8)
+    messages = []
+
+    class _Signal:
+        def connect(self, _callback):
+            return None
+
+    class _Worker:
+        def __init__(self, *_args, **_kwargs):
+            self.finished = _Signal()
+
+    monkeypatch.setattr(main_window, "MaskProcessWorker", _Worker)
+    monkeypatch.setattr(workers, "require_metric_scale", lambda *_args: None)
+    monkeypatch.setattr(window, "_has_background_worker", lambda: False)
+    monkeypatch.setattr(window, "_save_system_undo", lambda _label: None)
+    monkeypatch.setattr(window, "_invalidate_analysis_from", lambda *_args: None)
+    monkeypatch.setattr(
+        window,
+        "_start_background_worker",
+        lambda _worker, message: messages.append(message) or False,
+    )
+
+    window._on_mask_process()
+
+    assert messages == [
+        "掩膜处理已开始，完成后请进入“路径规划”布设起点、终点与卸粮点。"
+    ]
 
 def test_pending_segment_completion_enables_mask_process_action():
     window = _window()
@@ -853,6 +1026,92 @@ def test_recommended_service_point_confirmation_is_explicit_and_stepwise():
     assert window.state.entry_exit_mode is False
 
 
+def test_canvas_compare_toggles_source_image_and_current_result(monkeypatch):
+    """DECISION-004: 对比固定为原图与当前结果，不是相邻处理步骤。"""
+    window = _window()
+    calls = []
+    monkeypatch.setattr(
+        window.image_view,
+        "set_image",
+        lambda image: calls.append(("source", image is window._tif_rgb)),
+    )
+    monkeypatch.setattr(
+        window,
+        "_restore_visual_from_state",
+        lambda: calls.append(("current", True)),
+    )
+
+    window._on_toggle_mask_compare()
+    assert window._show_mask_before is True
+    assert calls == [("source", True)]
+
+    window._on_toggle_mask_compare()
+    assert window._show_mask_before is False
+    assert calls[-1] == ("current", True)
+
+
+def test_canvas_compare_preserves_zoom_rotation_and_image_location():
+    """DECISION-004: source/current comparison must stay on the same crop."""
+    window = _window()
+    window._tif_rgb = np.zeros((1000, 1200, 3), dtype=np.uint8)
+    window.image_view.set_image(window._tif_rgb)
+    window.resize(1000, 720)
+    window.show()
+    QApplication.processEvents()
+
+    viewer = window.image_view.viewer
+    viewer.resetTransform()
+    viewer.scale(20.0, 20.0)
+    viewer.set_rotation(7.0)
+    viewer._update_scene_rect_padding()
+    viewer.centerOn(735.0, 418.0)
+    QApplication.processEvents()
+
+    scale_before = viewer.get_view_scale()
+    center_before = viewer.mapToScene(viewer.viewport().rect().center())
+    window._on_toggle_mask_compare()
+    QApplication.processEvents()
+    center_source = viewer.mapToScene(viewer.viewport().rect().center())
+
+    assert viewer.get_view_scale() == pytest.approx(scale_before)
+    assert center_source.x() == pytest.approx(center_before.x(), abs=0.2)
+    assert center_source.y() == pytest.approx(center_before.y(), abs=0.2)
+
+    window._on_toggle_mask_compare()
+    QApplication.processEvents()
+    center_current = viewer.mapToScene(viewer.viewport().rect().center())
+    assert viewer.get_view_scale() == pytest.approx(scale_before)
+    assert center_current.x() == pytest.approx(center_before.x(), abs=0.2)
+    assert center_current.y() == pytest.approx(center_before.y(), abs=0.2)
+    window.close()
+
+
+def test_compact_mask_result_keeps_small_planning_contour():
+    """DECISION-009/017: UI 可删稠密轮廓，但必须保留轻量规划边界。"""
+    from path_planner import build_band_mask
+
+    window = _window()
+    contour = np.asarray(
+        [(2, 2), (17, 2), (17, 17), (2, 17)], dtype=np.float32
+    )
+    result = {
+        "wide_bands": [{
+            "id": 1,
+            "contour": contour,
+            "centerline": [(3.0, 9.0), (16.0, 9.0)],
+        }],
+        "narrow_bands": [],
+        "all_bands": [],
+    }
+
+    compact = window._compact_mask_result_for_ui(result)
+    band = compact["wide_bands"][0]
+
+    assert "contour" not in band
+    assert 3 <= len(band["planning_contour"]) <= 256
+    assert np.count_nonzero(build_band_mask((20, 20), [band])) > 0
+
+
 def test_unchanged_harvester_parameters_can_still_be_confirmed(monkeypatch):
     window = _window()
     defaults = window._effective_harvester_params({})
@@ -881,6 +1140,44 @@ def test_harvester_parameter_confirmation_is_persisted_in_project_state(tmp_path
     payload = cache._build_project_state_payload(str(tif), state, "params_confirmed")
 
     assert payload["harvester_params_confirmed"] is True
+
+
+def test_cache_restore_reenables_confirmed_parameters_after_processed_mask(monkeypatch):
+    """DECISION-002/013: restored domain state must drive the actionable task row."""
+    window = _window()
+    mask = np.ones((8, 8), dtype=np.uint8)
+    params = {
+        "cutter_width_m": 1.75,
+        "cutter_forward_offset_m": 1.35,
+        "track_width_m": 0.60,
+        "track_gauge_m": 1.00,
+        "wheelbase_m": 1.80,
+        "track_length_m": 1.70,
+        "turn_radius_m": 0.90,
+    }
+    monkeypatch.setattr(window, "_sync_cache_model_identity", lambda: True)
+    monkeypatch.setattr(window, "_restore_visual_from_state", lambda: None)
+
+    window._restore_cache_payload({
+        "path": "dummy.tif",
+        "saved": {
+            "inference_done": True,
+            "mask_processed": True,
+            "mask_result": {"main_angle": 0.0, "wide_bands": []},
+            "harvester_params": params,
+            "harvester_params_confirmed": True,
+        },
+        "raw_mask": mask,
+        "processed_mask": mask,
+        "processed_layers": {},
+        "processed_cache_valid": True,
+        "path_cache_valid": False,
+    })
+
+    row = window.task_panel._task_widgets["params"]
+    assert window.state.harvester_params_confirmed is True
+    assert row._done is True
+    assert row._action_btn.isEnabled()
 
 
 def test_undo_redo_buttons_follow_history_stack_state():
@@ -1093,7 +1390,9 @@ def test_candidate_scoring_prefers_safe_route_over_short_invalid_route():
 def test_auto_candidate_strategy_list_is_expanded_for_multi_strategy_planning():
     from path_planner import _candidate_strategies_for_request
 
-    assert _candidate_strategies_for_request("auto") == ["semicircle", "bow", "pear", "fishtail", "alpha"]
+    assert _candidate_strategies_for_request("auto") == [
+        "contour", "semicircle", "bow", "pear", "fishtail", "alpha"
+    ]
     assert _candidate_strategies_for_request("bow") == ["bow"]
 
 
@@ -1593,6 +1892,42 @@ def test_headland_corridor_does_not_cut_internal_transverse_structure():
     assert diagnostics["corridor_count"] == 0
 
 
+def test_terminal_separator_gap_disables_raw_row_follow_and_body_cut():
+    """DECISION-009: a clear wide-row gap owns the terminal wall."""
+    import cv2
+    from row_geometry import resolve_terminal_headland_overlap
+
+    raw = np.zeros((160, 240), dtype=np.uint8)
+    body = np.zeros_like(raw)
+    for y in range(24, 140, 18):
+        raw[y:y + 7, 20:160] = 255
+        body[y:y + 7, 20:160] = 255
+    # Leave a visible non-mask separator before the dense terminal strip.
+    raw[18:146, 175:205] = 255
+    seed = cv2.bitwise_and(raw, cv2.bitwise_not(body))
+
+    clean, _headland, corridor, diagnostics = resolve_terminal_headland_overlap(
+        raw,
+        body,
+        seed,
+        0.0,
+        0.1,
+        {
+            "headland_corridor_terminal_depth_m": 3.0,
+            "headland_corridor_max_body_cut_m": 3.0,
+            "headland_corridor_min_span_ratio": 0.5,
+            "headland_corridor_min_seed_ratio": 0.1,
+        },
+    )
+
+    assert diagnostics["terminal_separator"]["sides"] == ["end"]
+    assert diagnostics["terminal_shape"]["follow_raw_terminal"] is False
+    assert diagnostics["terminal_shape"]["effective_max_body_cut_m"] == 0.0
+    assert clean[60, 158] == 255
+    assert corridor[60, 165] == 0
+    assert corridor[60, 175] == 255
+
+
 def test_headland_corridor_rejects_sparse_terminal_evidence():
     from row_geometry import resolve_terminal_headland_overlap
 
@@ -1608,6 +1943,186 @@ def test_headland_corridor_rejects_sparse_terminal_evidence():
     assert np.array_equal(clean, rebuilt)
     assert np.count_nonzero(corridor) == 0
     assert diagnostics["corridor_count"] == 0
+
+
+def test_headland_corridor_recovers_dense_second_terminal_without_angle_seed():
+    """DECISION-009: connected terminal crop still supplies dense end evidence."""
+    from row_geometry import resolve_terminal_headland_overlap
+
+    raw = np.zeros((170, 260), dtype=np.uint8)
+    body = np.zeros_like(raw)
+    for y0 in (36, 76, 116):
+        body[y0:y0 + 10, 30:181] = 255
+    raw[:] = body
+    raw[24:150, 180:221] = 255
+    no_orientation_seed = np.zeros_like(raw)
+
+    clean, headland, corridor, diagnostics = resolve_terminal_headland_overlap(
+        raw,
+        body,
+        no_orientation_seed,
+        0.0,
+        0.1,
+        {
+            "headland_terminal_dense_seed_min_occupancy": 0.80,
+            "headland_terminal_dense_seed_min_depth_m": 0.2,
+            "headland_corridor_min_span_ratio": 0.5,
+        },
+    )
+
+    assert diagnostics["terminal_dense_seed"]["sides_added"] == ["end"]
+    assert diagnostics["corridor_count"] == 1
+    assert headland[80, 200] == 255
+    assert corridor[80, 200] == 255
+    assert clean[80, 180] == 0
+
+
+def test_headland_dense_seed_does_not_relabel_parallel_row_tails():
+    """DECISION-009: sparse longitudinal tails are body, not a headland."""
+    from row_geometry import resolve_terminal_headland_overlap
+
+    raw = np.zeros((170, 260), dtype=np.uint8)
+    body = np.zeros_like(raw)
+    for y0 in (36, 76, 116):
+        body[y0:y0 + 10, 30:181] = 255
+        raw[y0:y0 + 10, 30:221] = 255
+
+    clean, _headland, corridor, diagnostics = resolve_terminal_headland_overlap(
+        raw,
+        body,
+        np.zeros_like(raw),
+        0.0,
+        0.1,
+        {"headland_terminal_dense_seed_min_occupancy": 0.80},
+    )
+
+    assert diagnostics["terminal_dense_seed"]["sides_added"] == []
+    assert diagnostics["corridor_count"] == 0
+    assert np.array_equal(clean, body)
+    assert np.count_nonzero(corridor) == 0
+
+
+def test_terminal_headland_follows_curved_crop_support_not_rectangle():
+    """DECISION-009: an accepted headland expands along crop endpoints/support."""
+    from row_geometry import resolve_terminal_headland_overlap
+
+    raw = np.zeros((180, 260), dtype=np.uint8)
+    body = np.zeros_like(raw)
+    reference = np.zeros_like(raw)
+    seed = np.zeros_like(raw)
+    for row_y in range(25, 156):
+        endpoint = int(round(150.0 + 0.25 * row_y))
+        raw[row_y, endpoint:endpoint + 40] = 255
+        seed[row_y, endpoint:endpoint + 5] = 255
+    for row_y in range(30, 151, 20):
+        endpoint = int(round(150.0 + 0.25 * row_y))
+        body[row_y:row_y + 6, 25:endpoint + 1] = 255
+        reference[row_y:row_y + 6, 25:endpoint + 1] = 255
+    raw = np.maximum(raw, body)
+
+    _clean, headland, corridor, diagnostics = resolve_terminal_headland_overlap(
+        raw,
+        body,
+        seed,
+        0.0,
+        0.1,
+        {
+            "headland_corridor_close_m": 0.5,
+            "headland_corridor_terminal_depth_m": 4.0,
+            "headland_corridor_min_span_ratio": 0.6,
+            "headland_corridor_min_seed_ratio": 0.1,
+            "headland_terminal_follow_max_depth_m": 5.0,
+            "headland_terminal_wall_smooth_m": 0.5,
+        },
+        axial_reference_mask=reference,
+    )
+
+    # The same x is outside the shallow upper terminal but inside the lower,
+    # proving the corridor follows the sloped crop support instead of a box.
+    assert corridor[40, 210] == 0
+    assert corridor[140, 210] == 255
+    assert headland[140, 210] == 255
+    assert diagnostics["terminal_shape"]["accepted_sides"] == ["end"]
+    assert diagnostics["terminal_shape"]["raw_support_added_px"] > 0
+    assert diagnostics["terminal_shape"]["wall_source"] == (
+        "regularized_longitudinal_body_endpoints"
+    )
+
+
+def test_terminal_headland_wall_ignores_short_internal_work_fragment():
+    """DECISION-009: a short interior row cannot become a terminal wall."""
+    from row_geometry import resolve_terminal_headland_overlap
+
+    raw = np.zeros((180, 240), dtype=np.uint8)
+    reference = np.zeros_like(raw)
+    reference[20:55, 30:181] = 255
+    reference[120:160, 30:181] = 255
+    # Only a short fragment exists at the planting-region seam. The former
+    # per-row endpoint rule treated x=90 as the field start and painted it as
+    # a long yellow headland strip.
+    reference[55:120, 90:151] = 255
+    body = reference.copy()
+    seed = np.zeros_like(raw)
+    seed[20:160, 20:31] = 255
+    raw = np.maximum(reference, seed)
+
+    clean, headland, corridor, diagnostics = resolve_terminal_headland_overlap(
+        raw,
+        body,
+        seed,
+        0.0,
+        0.1,
+        {
+            "headland_corridor_close_m": 0.5,
+            "headland_corridor_terminal_depth_m": 2.0,
+            "headland_corridor_min_span_ratio": 0.6,
+            "headland_terminal_follow_max_depth_m": 4.5,
+            "headland_terminal_wall_min_axial_span_ratio": 0.72,
+        },
+        axial_reference_mask=reference,
+    )
+
+    assert corridor[85, 100] == 0
+    assert headland[85, 100] == 0
+    assert clean[85, 100] == 255
+    assert corridor[40, 25] == 255
+    assert diagnostics["terminal_shape"]["wall_rejected_short_row_count"] > 0
+
+
+def test_terminal_headland_classifies_regions_before_exposing_seed():
+    """DECISION-009: rejected interior region seeds never become yellow headland."""
+    import cv2
+    from row_geometry import resolve_terminal_headland_overlap
+
+    raw, body, terminal_seed = _synthetic_terminal_headland()
+    # Add a transverse interior residual at a planting-region seam.  It is
+    # intentionally large enough to survive morphology but does not touch a
+    # global terminal envelope.
+    raw[30:135, 96:108] = 255
+    interior_seed = np.zeros_like(raw)
+    interior_seed[30:135, 96:108] = 255
+    seed = cv2.bitwise_or(terminal_seed, interior_seed)
+
+    _clean, headland, corridor, diagnostics = resolve_terminal_headland_overlap(
+        raw,
+        body,
+        seed,
+        0.0,
+        0.1,
+        {
+            "headland_corridor_close_m": 0.5,
+            "headland_corridor_terminal_depth_m": 3.0,
+            "headland_corridor_min_span_ratio": 0.5,
+            "headland_corridor_min_seed_ratio": 0.10,
+            "headland_terminal_region_min_support_ratio": 0.55,
+        },
+        axial_reference_mask=body,
+    )
+
+    assert diagnostics["region_partition"]["region_count"] >= 2
+    assert diagnostics["region_partition"]["rejected_fragment_count"] >= 1
+    assert np.count_nonzero(corridor[:, 96:108]) == 0
+    assert np.count_nonzero(headland[:, 96:108]) == 0
 
 
 def test_band_geometry_is_clipped_to_resolved_body_component():

@@ -220,7 +220,7 @@ class AppState:
         self.mask_offset_y: int = 0            # mask_raw 相对于全图的 y 偏移
 
         # 转弯策略下拉选择
-        self.turn_strategy: str = "bow"         # 当前选择的转弯策略
+        self.turn_strategy: str = "contour"     # 当前选择的转弯策略（默认套圈收割）
         self.turn_dropdown_open: bool = False
         self.turn_dropdown_rect = None
         self.turn_dropdown_items: List[Dict] = [
@@ -401,7 +401,7 @@ class AppState:
             # 恢复掩膜处理状态
             self.mask_processed = bool(snapshot.get("mask_processed", False))
             self.mask_result = snapshot.get("mask_result")
-            self.turn_strategy = str(snapshot.get("turn_strategy", "bow"))
+            self.turn_strategy = str(snapshot.get("turn_strategy", "contour"))
         else:
             self.path_points = deepcopy(snapshot.get("points", []))
             self.path_status = deepcopy(snapshot.get("status", []))

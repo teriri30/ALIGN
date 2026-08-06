@@ -5,6 +5,7 @@ os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
 
 from PySide6.QtCore import QObject, QEventLoop, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import QApplication
+from shiboken6 import isValid
 
 from pyside6_app.main_window import MainWindow
 
@@ -69,6 +70,25 @@ def test_background_worker_uses_qt_safe_deletion_order():
         assert window._worker is None
 
     assert completed == [True] * 20
+    window.close()
+
+
+def test_worker_qobject_is_deleted_before_its_thread_event_loop_stops():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    worker = _LifecycleWorker()
+    destroyed = []
+    worker.destroyed.connect(lambda: destroyed.append(True))
+
+    assert window._start_background_worker(worker, "test", warn_if_busy=False)
+    loop = QEventLoop()
+    window._worker_thread.finished.connect(loop.quit)
+    QTimer.singleShot(2000, loop.quit)
+    loop.exec()
+    app.processEvents()
+
+    assert destroyed == [True]
+    assert not isValid(worker)
     window.close()
 
 

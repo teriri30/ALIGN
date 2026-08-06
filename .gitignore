@@ -28,6 +28,7 @@ data/models/*.onnx
 !data/models/yolo11m_seg_best.pt
 !data/models/yolo11s_seg_best.pt
 !data/models/yolov8s_seg_best.pt
+!data/models/yolo11s_seg_tiller12m_best.pt
 data/tif/
 *.tif
 *.tiff

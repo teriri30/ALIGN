@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-MASK_REGULARIZATION_VERSION = 7
+MASK_REGULARIZATION_VERSION = 13
 
 
 def odd_size(value: float, minimum: int = 3) -> int:
@@ -140,24 +140,27 @@ def _component_main_angle(mask: np.ndarray) -> float:
     ys, xs = np.where(mask > 0)
     if xs.size < 3:
         return 0.0
-    coords = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
-    coords -= coords.mean(axis=0)
-    cov = np.cov(coords.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    vec = eigvecs[:, int(np.argmax(eigvals))]
-    return math.atan2(float(vec[1]), float(vec[0])) % math.pi
+    centered_x = xs.astype(np.float64) - float(np.mean(xs))
+    centered_y = ys.astype(np.float64) - float(np.mean(ys))
+    xx = float(np.sum(centered_x * centered_x, dtype=np.float64))
+    xy = float(np.sum(centered_x * centered_y, dtype=np.float64))
+    yy = float(np.sum(centered_y * centered_y, dtype=np.float64))
+    return 0.5 * math.atan2(2.0 * xy, xx - yy) % math.pi
 
 
 def _component_elongation(mask: np.ndarray) -> float:
     ys, xs = np.where(mask > 0)
     if xs.size < 3:
         return 1.0
-    coords = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
-    coords -= coords.mean(axis=0)
-    cov = np.cov(coords.T)
-    eigvals, _ = np.linalg.eigh(cov)
-    eigvals = np.maximum(np.asarray(eigvals, dtype=np.float64), 1e-9)
-    return float(math.sqrt(float(eigvals.max() / eigvals.min())))
+    centered_x = xs.astype(np.float64) - float(np.mean(xs))
+    centered_y = ys.astype(np.float64) - float(np.mean(ys))
+    xx = float(np.sum(centered_x * centered_x, dtype=np.float64))
+    xy = float(np.sum(centered_x * centered_y, dtype=np.float64))
+    yy = float(np.sum(centered_y * centered_y, dtype=np.float64))
+    radius = math.hypot(xx - yy, 2.0 * xy)
+    largest = max((xx + yy + radius) * 0.5, 1e-9)
+    smallest = max((xx + yy - radius) * 0.5, 1e-9)
+    return float(math.sqrt(largest / smallest))
 
 
 def _component_extent_along_angle(mask: np.ndarray, angle: float) -> float:
@@ -352,15 +355,18 @@ def resolve_terminal_headland_overlap(
     main_angle: float,
     meters_per_px: float,
     config: Optional[Dict[str, Any]] = None,
+    axial_reference_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     """Give strong terminal headland corridors precedence over rebuilt rows.
 
     Headland is initially detected from ``raw & ~rebuilt`` and therefore has
     periodic holes wherever rebuilt longitudinal bands overlap a transverse
-    terminal strip.  Only fill those holes when the seed spans a substantial
-    fraction of the row lattice, lies near a body endpoint, has limited depth,
-    and retains enough original headland evidence.  This avoids turning an
-    internal ditch or a few terminal pixels into a field-wide cut.
+    terminal strip.  First partition the regularized reference body into
+    connected crop regions; then accept only candidates supported by trusted
+    long-span terminal regions.  A second component-span gate rejects detached
+    islands inside the same axial depth window.  This avoids turning an
+    internal ditch, a region seam, or a triangular terminal fragment into a
+    field-wide yellow corridor.
     """
     cfg = dict(config or {})
     raw = (np.asarray(raw_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
@@ -378,13 +384,83 @@ def resolve_terminal_headland_overlap(
         "envelope_added_px": 0,
         "rejected": {},
         "candidates": [],
+        # A terminal candidate is classified against the connected regions of
+        # the regularized row body before it is allowed into the semantic
+        # headland layer.  Keeping this report explicit makes it possible to
+        # audit why an interior region seam was rejected instead of silently
+        # painting it yellow.
+        "region_partition": {
+            "source": "axial_reference_connected_components",
+            "region_count": 0,
+            "regions": [],
+            "candidate_regions": [],
+            "rejected_fragment_count": 0,
+        },
+        "corridor_component_filter": {
+            "min_cross_row_span_ratio": float(cfg.get(
+                "headland_corridor_min_component_span_ratio",
+                cfg.get("headland_corridor_min_span_ratio", 0.45),
+            )),
+            "accepted_count": 0,
+            "accepted_envelope_fragment_count": 0,
+            "rejected_short_count": 0,
+            "rejected": [],
+        },
+        "terminal_dense_seed": {
+            "enabled": bool(cfg.get(
+                "headland_terminal_dense_seed_enabled", True
+            )),
+            "sides_added": [],
+            "sides_skipped": {},
+            "fallback_sides": [],
+            "selected_runs": {},
+            "fallback_min_occupancy": float(np.clip(
+                cfg.get("headland_terminal_dense_seed_fallback_occupancy", 0.65),
+                0.0,
+                1.0,
+            )),
+            "merge_gap_m": float(max(
+                0.0,
+                cfg.get("headland_terminal_dense_seed_gap_m", 1.0),
+            )),
+            "added_px": 0,
+        },
+        "terminal_shape": {
+            "configured_follow_raw_terminal": bool(cfg.get(
+                "headland_corridor_follow_raw_terminal", True
+            )),
+            "follow_raw_terminal": bool(cfg.get(
+                "headland_corridor_follow_raw_terminal", True
+            )),
+            "follow_raw_terminal_disabled_by_separator": False,
+            "separator_sides": [],
+            "effective_max_body_cut_m": None,
+            "effective_endpoint_margin_m": None,
+            "accepted_sides": [],
+            "raw_support_added_px": 0,
+            "wall_source": (
+                "regularized_longitudinal_body_endpoints"
+                if axial_reference_mask is not None
+                else "accepted_terminal_seed_envelope"
+            ),
+            "wall_min_axial_span_ratio": float(cfg.get(
+                "headland_terminal_wall_min_axial_span_ratio", 0.72
+            )),
+            "wall_reference_axial_span_px": 0.0,
+            "wall_trusted_row_count": 0,
+            "wall_rejected_short_row_count": 0,
+        },
+        "axial_reference_source": (
+            "regularized_longitudinal_body"
+            if axial_reference_mask is not None
+            else "merged_body_compatibility"
+        ),
     }
     if (
         not diagnostics["enabled"]
         or body.shape != raw.shape
         or seed.shape != raw.shape
         or cv2.countNonZero(body) == 0
-        or cv2.countNonZero(seed) == 0
         or not np.isfinite(float(meters_per_px))
         or float(meters_per_px) <= 0
     ):
@@ -398,13 +474,371 @@ def resolve_terminal_headland_overlap(
         body, matrix, (out_w, out_h), flags=cv2.INTER_NEAREST,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
+    axial_reference = (
+        (np.asarray(axial_reference_mask, dtype=np.uint8) > 0).astype(np.uint8)
+        * 255
+        if axial_reference_mask is not None
+        and np.asarray(axial_reference_mask).shape == body.shape
+        else body
+    )
+    reference_rotated = cv2.warpAffine(
+        axial_reference,
+        matrix,
+        (out_w, out_h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
     raw_rotated = cv2.warpAffine(
         raw, matrix, (out_w, out_h), flags=cv2.INTER_NEAREST,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
-    body_ys, body_xs = np.where(body_rotated > 0)
+    body_ys, body_xs = np.where(reference_rotated > 0)
     if body_xs.size == 0:
         return body, seed, empty, diagnostics
+
+    body_x_min, body_x_max = int(body_xs.min()), int(body_xs.max())
+    body_y_min, body_y_max = int(body_ys.min()), int(body_ys.max())
+    body_cross_span = max(1, body_y_max - body_y_min + 1)
+    terminal_depth_px = max(1, int(round(
+        float(cfg.get("headland_corridor_terminal_depth_m", 3.0))
+        / float(meters_per_px)
+    )))
+
+    # A wide, non-mask strip immediately beside the regularized body is a
+    # stronger terminal wall than the raw crop fragments that continue along
+    # individual rows.  The latter are what produced the finger-like yellow
+    # intrusions in real fields: ``follow_raw_terminal`` copied each fragment
+    # past the common wall and treated it as headland.  Detect the wall from
+    # cross-row occupancy, but only in a narrow endpoint neighbourhood so an
+    # interior row gap cannot become a field-wide headland.
+    separator_report = diagnostics["terminal_separator"] = {
+        "enabled": bool(cfg.get("headland_terminal_separator_enabled", True)),
+        "sides": [],
+        "selected_runs": {},
+        "typical_body_occupancy": 0.0,
+        "max_occupancy": 0.0,
+        "min_gap_px": 0,
+        "endpoint_tolerance_px": 0,
+    }
+    separator_sides = set()
+    separator_enabled = bool(separator_report["enabled"])
+    if separator_enabled:
+        axial_occupancy = np.mean(
+            raw_rotated[body_y_min:body_y_max + 1] > 0,
+            axis=0,
+        ).astype(np.float64)
+        separator_smooth_px = max(1.0, float(cfg.get(
+            "headland_terminal_separator_smooth_m", 0.08
+        )) / float(meters_per_px))
+        axial_occupancy = smooth_1d(axial_occupancy, separator_smooth_px)
+        body_occupancy = axial_occupancy[body_x_min:body_x_max + 1]
+        body_occupancy = body_occupancy[np.isfinite(body_occupancy)]
+        typical_body_occupancy = float(
+            np.percentile(body_occupancy, 50.0)
+            if body_occupancy.size else 0.0
+        )
+        configured_max_occupancy = cfg.get(
+            "headland_terminal_separator_max_occupancy"
+        )
+        if configured_max_occupancy is None:
+            max_occupancy = float(np.clip(
+                typical_body_occupancy * float(cfg.get(
+                    "headland_terminal_separator_occupancy_ratio", 0.82
+                )),
+                0.12,
+                0.90,
+            ))
+        else:
+            max_occupancy = float(np.clip(configured_max_occupancy, 0.0, 1.0))
+        min_gap_px = max(3, int(round(float(cfg.get(
+            "headland_terminal_separator_min_gap_m", 0.15
+        )) / float(meters_per_px))))
+        endpoint_tolerance_px = max(min_gap_px, int(round(float(cfg.get(
+            "headland_terminal_separator_endpoint_tolerance_m", 0.60
+        )) / float(meters_per_px))))
+        separator_report.update({
+            "typical_body_occupancy": typical_body_occupancy,
+            "max_occupancy": max_occupancy,
+            "min_gap_px": min_gap_px,
+            "endpoint_tolerance_px": endpoint_tolerance_px,
+        })
+
+        def terminal_gap(side: str):
+            search_depth = terminal_depth_px + endpoint_tolerance_px
+            if side == "start":
+                search_start = max(0, body_x_min - search_depth)
+                search_end = min(out_w, body_x_min + endpoint_tolerance_px + 1)
+            else:
+                search_start = max(0, body_x_max + 1 - endpoint_tolerance_px)
+                search_end = min(out_w, body_x_max + 1 + search_depth)
+            if search_end <= search_start:
+                return None
+            local_runs = [
+                (search_start + start, search_start + end)
+                for start, end in _runs(
+                    axial_occupancy[search_start:search_end] <= max_occupancy
+                )
+                if end - start >= min_gap_px
+            ]
+
+            def has_outer_terminal_support(item):
+                support_width = max(
+                    min_gap_px,
+                    int(round(float(cfg.get(
+                        "headland_terminal_separator_support_m", 0.15
+                    )) / float(meters_per_px))),
+                )
+                if side == "start":
+                    support_start = max(search_start, item[0] - support_width)
+                    support_end = item[0]
+                else:
+                    support_start = item[1]
+                    support_end = min(search_end, item[1] + support_width)
+                if support_end <= support_start:
+                    return False
+                support = axial_occupancy[support_start:support_end]
+                return bool(
+                    support.size >= min_gap_px
+                    and np.mean(support >= max_occupancy) >= 0.45
+                )
+
+            if side == "start":
+                candidates = [
+                    item for item in local_runs
+                    if item[1] >= body_x_min - endpoint_tolerance_px
+                    and has_outer_terminal_support(item)
+                ]
+                return max(candidates, key=lambda item: (item[1], item[1] - item[0])) if candidates else None
+            candidates = [
+                item for item in local_runs
+                if item[0] <= body_x_max + 1 + endpoint_tolerance_px
+                and has_outer_terminal_support(item)
+            ]
+            return min(candidates, key=lambda item: (item[0], -(item[1] - item[0]))) if candidates else None
+
+        for side in ("start", "end"):
+            selected = terminal_gap(side)
+            if selected is None:
+                continue
+            separator_sides.add(side)
+            separator_report["sides"].append(side)
+            separator_report["selected_runs"][side] = [
+                int(selected[0]), int(selected[1])
+            ]
+
+    separator_limited = bool(separator_sides)
+    separator_report["effective_wall_policy"] = (
+        "non_mask_terminal_gap" if separator_limited else "configured_terminal_support"
+    )
+    configured_body_cut_px = max(0, int(round(
+        float(cfg.get("headland_corridor_max_body_cut_m", 3.0))
+        / float(meters_per_px)
+    )))
+    configured_endpoint_margin_px = max(0, int(round(
+        float(cfg.get("headland_corridor_endpoint_margin_m", 0.30))
+        / float(meters_per_px)
+    )))
+    max_body_cut_px = 0 if separator_limited else configured_body_cut_px
+    endpoint_margin_px = 0 if separator_limited else configured_endpoint_margin_px
+    follow_raw_terminal = bool(cfg.get(
+        "headland_corridor_follow_raw_terminal", True
+    )) and not separator_limited
+    terminal_shape = diagnostics["terminal_shape"]
+    terminal_shape.update({
+        "follow_raw_terminal": bool(follow_raw_terminal),
+        "follow_raw_terminal_disabled_by_separator": bool(
+            separator_limited and cfg.get("headland_corridor_follow_raw_terminal", True)
+        ),
+        "separator_sides": sorted(separator_sides),
+        "effective_max_body_cut_m": float(max_body_cut_px * meters_per_px),
+        "effective_endpoint_margin_m": float(endpoint_margin_px * meters_per_px),
+    })
+
+    # Partition the reference body into connected crop regions first.  The
+    # old implementation classified every residual pixel against one global
+    # endpoint curve; a short fragment at a planting-region seam could then
+    # become a yellow headland.  Here each region gets its own axial span and
+    # terminal class.  Only rows belonging to a long region that actually
+    # reaches the global start/end envelope can support a terminal corridor.
+    region_report = diagnostics["region_partition"]
+    region_count, region_labels, region_stats, _ = cv2.connectedComponentsWithStats(
+        (reference_rotated > 0).astype(np.uint8), 8
+    )
+    region_report["region_count"] = max(0, int(region_count - 1))
+    reference_spans = []
+    region_records = []
+    for region_id in range(1, region_count):
+        region_area = int(region_stats[region_id, cv2.CC_STAT_AREA])
+        if region_area <= 0:
+            continue
+        rx = int(region_stats[region_id, cv2.CC_STAT_LEFT])
+        ry = int(region_stats[region_id, cv2.CC_STAT_TOP])
+        rw = int(region_stats[region_id, cv2.CC_STAT_WIDTH])
+        rh = int(region_stats[region_id, cv2.CC_STAT_HEIGHT])
+        region_mask = region_labels[ry:ry + rh, rx:rx + rw] == region_id
+        local_ys, local_xs = np.where(region_mask)
+        if local_xs.size == 0:
+            continue
+        start = rx + int(local_xs.min())
+        end = rx + int(local_xs.max())
+        span = max(1, end - start + 1)
+        reference_spans.append(float(span))
+        region_records.append({
+            "id": int(region_id),
+            "bbox": [rx, ry, rw, rh],
+            "area_px": region_area,
+            "axial_start_px": int(start),
+            "axial_end_px": int(end),
+            "axial_span_px": int(span),
+            "row_span_px": int(rh),
+        })
+    reference_span = float(np.percentile(reference_spans, 90.0)) if reference_spans else 0.0
+    region_min_span_ratio = float(np.clip(
+        cfg.get("headland_terminal_wall_min_axial_span_ratio", 0.72),
+        0.25,
+        1.0,
+    ))
+    min_region_support_ratio = float(np.clip(
+        cfg.get("headland_terminal_region_min_support_ratio", 0.55),
+        0.0,
+        1.0,
+    ))
+    terminal_region_rows = {"start": set(), "end": set()}
+    terminal_region_ids = {"start": [], "end": []}
+    for record in region_records:
+        trusted = (
+            reference_span <= 0.0
+            or float(record["axial_span_px"]) >= reference_span * region_min_span_ratio
+        )
+        near_start_region = record["axial_start_px"] <= body_x_min + terminal_depth_px
+        near_end_region = record["axial_end_px"] >= body_x_max - terminal_depth_px
+        classes = []
+        if trusted and near_start_region:
+            classes.append("start")
+            terminal_region_ids["start"].append(int(record["id"]))
+            terminal_region_rows["start"].update(
+                range(record["bbox"][1], record["bbox"][1] + record["bbox"][3])
+            )
+        if trusted and near_end_region:
+            classes.append("end")
+            terminal_region_ids["end"].append(int(record["id"]))
+            terminal_region_rows["end"].update(
+                range(record["bbox"][1], record["bbox"][1] + record["bbox"][3])
+            )
+        record.update({
+            "axial_span_ratio": float(
+                min(1.0, record["axial_span_px"] / max(reference_span, 1.0))
+            ),
+            "trusted_long_span": bool(trusted),
+            "terminal_class": classes or ["interior"],
+        })
+    region_report["regions"] = region_records
+    region_report["terminal_region_ids"] = terminal_region_ids
+    region_report["min_region_support_ratio"] = min_region_support_ratio
+
+    # DECISION-009: a transverse terminal crop strip can be connected to the
+    # longitudinal crop body, causing component PCA to hide it from the
+    # residual-orientation seed.  At a body endpoint only, a dense cross-row
+    # run outside the rebuilt axial envelope is independent supporting
+    # evidence.  Add it as a seed; the normal span/terminal/depth gates below
+    # still decide whether it is a real headland corridor.
+    dense_report = diagnostics["terminal_dense_seed"]
+    if dense_report["enabled"]:
+        seed_depth_px = max(1, int(round(
+            float(cfg.get("headland_terminal_dense_seed_depth_m", 4.0))
+            / float(meters_per_px)
+        )))
+        min_occupancy = float(np.clip(
+            cfg.get("headland_terminal_dense_seed_min_occupancy", 0.88),
+            0.0,
+            1.0,
+        ))
+        min_depth_px = max(1, int(round(
+            float(cfg.get("headland_terminal_dense_seed_min_depth_m", 0.15))
+            / float(meters_per_px)
+        )))
+        fallback_occupancy = float(np.clip(
+            cfg.get("headland_terminal_dense_seed_fallback_occupancy", 0.65),
+            0.0,
+            min_occupancy,
+        ))
+        dense_gap_px = max(0, int(round(
+            float(cfg.get("headland_terminal_dense_seed_gap_m", 1.0))
+            / float(meters_per_px)
+        )))
+
+        def dense_runs(occupancy, threshold):
+            return [
+                item for item in _merge_close_runs(
+                    _runs(occupancy >= threshold), dense_gap_px
+                )
+                if item[1] - item[0] >= min_depth_px
+            ]
+
+        def selected_run(runs, side):
+            if not runs:
+                return None
+            return (
+                max(runs, key=lambda item: item[1])
+                if side == "start"
+                else min(runs, key=lambda item: item[0])
+            )
+
+        for side, col_start, col_end in (
+            ("start", max(0, body_x_min - seed_depth_px), body_x_min),
+            ("end", body_x_max + 1, min(out_w, body_x_max + 1 + seed_depth_px)),
+        ):
+            if col_end <= col_start:
+                dense_report["sides_skipped"][side] = "empty_search_window"
+                continue
+            occupancy = np.mean(
+                raw_rotated[body_y_min:body_y_max + 1, col_start:col_end] > 0,
+                axis=0,
+            )
+            strict_runs = dense_runs(occupancy, min_occupancy)
+            fallback_runs = dense_runs(occupancy, fallback_occupancy)
+            strict_selected = selected_run(strict_runs, side)
+            fallback_selected = selected_run(fallback_runs, side)
+            selected = strict_selected
+            if fallback_selected is not None:
+                if strict_selected is None:
+                    selected = fallback_selected
+                    dense_report["fallback_sides"].append(side)
+                elif (
+                    fallback_selected[0] <= strict_selected[1] + dense_gap_px
+                    and fallback_selected[1] >= strict_selected[0] - dense_gap_px
+                ):
+                    selected = (
+                        min(strict_selected[0], fallback_selected[0]),
+                        max(strict_selected[1], fallback_selected[1]),
+                    )
+                    if selected != strict_selected:
+                        dense_report["fallback_sides"].append(side)
+            if selected is None:
+                dense_report["sides_skipped"][side] = "no_dense_terminal_run"
+                continue
+            run_start = col_start + int(selected[0])
+            run_end = col_start + int(selected[1])
+            dense_report["selected_runs"][side] = [run_start, run_end]
+            before = int(cv2.countNonZero(seed_rotated))
+            seed_roi = seed_rotated[
+                body_y_min:body_y_max + 1, run_start:run_end
+            ]
+            raw_roi = raw_rotated[
+                body_y_min:body_y_max + 1, run_start:run_end
+            ]
+            seed_roi[raw_roi > 0] = 255
+            added = max(0, int(cv2.countNonZero(seed_rotated)) - before)
+            if added:
+                dense_report["sides_added"].append(side)
+                dense_report["added_px"] += added
+            else:
+                dense_report["sides_skipped"][side] = (
+                    "orientation_seed_present"
+                    if cv2.countNonZero(seed_rotated[:, col_start:col_end]) > 0
+                    else "empty_dense_support"
+                )
 
     close_m = float(cfg.get("headland_corridor_close_m", 1.2))
     close_px = odd_size(close_m / float(meters_per_px), minimum=3)
@@ -426,24 +860,113 @@ def resolve_terminal_headland_overlap(
         (reconstructed > 0).astype(np.uint8), 8
     )
     diagnostics["candidate_count"] = max(0, int(count - 1))
-    body_x_min, body_x_max = int(body_xs.min()), int(body_xs.max())
-    body_y_min, body_y_max = int(body_ys.min()), int(body_ys.max())
-    body_cross_span = max(1, body_y_max - body_y_min + 1)
-    terminal_depth_px = max(1, int(round(
-        float(cfg.get("headland_corridor_terminal_depth_m", 3.0))
-        / float(meters_per_px)
-    )))
     min_span_ratio = float(cfg.get("headland_corridor_min_span_ratio", 0.45))
-    max_body_cut_px = max(1, int(round(
-        float(cfg.get("headland_corridor_max_body_cut_m", 3.0))
-        / float(meters_per_px)
-    )))
-    endpoint_margin_px = max(0, int(round(
-        float(cfg.get("headland_corridor_endpoint_margin_m", 0.30))
-        / float(meters_per_px)
-    )))
+    # ``max_body_cut_px``, ``endpoint_margin_px`` and ``follow_raw_terminal``
+    # are resolved above.  A detected separator deliberately overrides the
+    # permissive legacy defaults; otherwise the configured fallback remains
+    # unchanged for fields without a usable non-mask wall.
     min_seed_ratio = float(cfg.get("headland_corridor_min_seed_ratio", 0.12))
     corridor_rotated = np.zeros_like(seed_rotated)
+    # A real terminal strip is often broken into several raw components by
+    # furrows, shadows, or a region seam. Keep the accepted, row-wise terminal
+    # region separately so its boundary is continuous instead of inheriting
+    # every raw hole as a false main-work extension.
+    accepted_region_rotated = np.zeros_like(seed_rotated)
+    accepted_seed_rotated = np.zeros_like(seed_rotated)
+    follow_depth_px = max(1, int(round(
+        float(cfg.get("headland_terminal_follow_max_depth_m", 4.5))
+        / float(meters_per_px)
+    )))
+    wall_smooth_px = odd_size(
+        float(cfg.get("headland_terminal_wall_smooth_m", 0.8))
+        / float(meters_per_px),
+        minimum=1,
+    )
+    region_fill = bool(cfg.get(
+        "headland_corridor_fill_region",
+        cfg.get("headland_corridor_fill_envelope", True),
+    ))
+
+    def reference_endpoint_curve(side: str) -> np.ndarray:
+        # DECISION-009: an interior crop fragment or the boundary between two
+        # planting regions is not a physical field end. Build the terminal
+        # wall only from transverse rows whose longitudinal support spans most
+        # of the field, then interpolate across crop-row gaps.
+        values = np.full(out_h, np.nan, dtype=np.float64)
+        starts = np.full(out_h, np.nan, dtype=np.float64)
+        ends = np.full(out_h, np.nan, dtype=np.float64)
+        spans = np.zeros(out_h, dtype=np.float64)
+        for row_index in range(out_h):
+            columns = np.flatnonzero(reference_rotated[row_index] > 0)
+            if columns.size:
+                starts[row_index] = float(columns.min())
+                ends[row_index] = float(columns.max())
+                spans[row_index] = float(columns.max() - columns.min() + 1)
+        supported = spans > 0.0
+        if not np.any(supported):
+            return values
+        reference_span = float(np.percentile(spans[supported], 90.0))
+        min_span_ratio = float(np.clip(
+            cfg.get("headland_terminal_wall_min_axial_span_ratio", 0.72),
+            0.25,
+            1.0,
+        ))
+        trusted = supported & (spans >= reference_span * min_span_ratio)
+        if np.count_nonzero(trusted) < 2:
+            return values
+        values[trusted] = starts[trusted] if side == "start" else ends[trusted]
+        shape_report = diagnostics["terminal_shape"]
+        shape_report["wall_reference_axial_span_px"] = reference_span
+        shape_report["wall_trusted_row_count"] = int(np.count_nonzero(trusted))
+        shape_report["wall_rejected_short_row_count"] = int(np.count_nonzero(
+            supported & ~trusted
+        ))
+        valid = np.flatnonzero(np.isfinite(values))
+        if valid.size < 2:
+            return values
+        filled = np.interp(
+            np.arange(out_h, dtype=np.float64),
+            valid.astype(np.float64),
+            values[valid],
+        )
+        if wall_smooth_px > 1:
+            pad = wall_smooth_px // 2
+            kernel = np.ones(wall_smooth_px, dtype=np.float64) / wall_smooth_px
+            filled = np.convolve(
+                np.pad(filled, (pad, pad), mode="edge"),
+                kernel,
+                mode="valid",
+            )
+        return filled
+
+    endpoint_curves = {
+        "start": reference_endpoint_curve("start"),
+        "end": reference_endpoint_curve("end"),
+    }
+
+    def component_edge_curve(
+        component_mask: np.ndarray,
+        global_y: int,
+        global_x: int,
+        edge: str,
+    ) -> np.ndarray:
+        result = np.full(out_h, np.nan, dtype=np.float64)
+        for local_y in range(component_mask.shape[0]):
+            columns = np.flatnonzero(component_mask[local_y])
+            if columns.size:
+                result[global_y + local_y] = float(
+                    global_x + (
+                        columns.min() if edge == "low" else columns.max()
+                    )
+                )
+        valid = np.flatnonzero(np.isfinite(result))
+        if valid.size >= 2:
+            result[valid[0]:valid[-1] + 1] = np.interp(
+                np.arange(valid[0], valid[-1] + 1, dtype=np.float64),
+                valid.astype(np.float64),
+                result[valid],
+            )
+        return result
 
     def reject(reason: str):
         rejected = diagnostics["rejected"]
@@ -456,7 +979,7 @@ def resolve_terminal_headland_overlap(
         width = int(stats[label, cv2.CC_STAT_WIDTH])
         height = int(stats[label, cv2.CC_STAT_HEIGHT])
         component = labels[y:y + height, x:x + width] == label
-        span_ratio = float(height / body_cross_span)
+        span_ratio = float(min(1.0, height / body_cross_span))
         near_start = x <= body_x_min + terminal_depth_px
         near_end = x + width - 1 >= body_x_max - terminal_depth_px
         near_terminal = near_start or near_end
@@ -464,6 +987,28 @@ def resolve_terminal_headland_overlap(
             component & (seed_rotated[y:y + height, x:x + width] > 0)
         ))
         seed_ratio = float(seed_pixels / max(area, 1))
+        candidate_rows = np.flatnonzero(np.any(component, axis=1)) + y
+        reference_rows = [
+            int(row_index) for row_index in candidate_rows
+            if 0 <= int(row_index) < reference_rotated.shape[0]
+            and np.any(reference_rotated[int(row_index)] > 0)
+        ]
+        candidate_region_info = {
+            "bbox": [x, y, width, height],
+            "region_ids": {"start": [], "end": []},
+            "support_ratio": {"start": 0.0, "end": 0.0},
+        }
+        for side in ("start", "end"):
+            side_rows = terminal_region_rows[side]
+            support_ratio = (
+                float(np.mean([row in side_rows for row in reference_rows]))
+                if reference_rows else 0.0
+            )
+            candidate_region_info["support_ratio"][side] = support_ratio
+            candidate_region_info["region_ids"][side] = list(
+                terminal_region_ids[side]
+            )
+        region_report["candidate_regions"].append(candidate_region_info)
         reason = "accepted"
         if not near_terminal:
             reason = "not_terminal"
@@ -471,6 +1016,19 @@ def resolve_terminal_headland_overlap(
             reason = "insufficient_cross_row_span"
         elif seed_ratio < min_seed_ratio:
             reason = "insufficient_seed_support"
+        else:
+            supported_sides = [
+                side for side in ("start", "end")
+                if (
+                    (near_start if side == "start" else near_end)
+                    and candidate_region_info["support_ratio"][side]
+                    >= min_region_support_ratio
+                )
+            ]
+            if not supported_sides:
+                reason = "insufficient_terminal_region_support"
+            else:
+                candidate_region_info["accepted_sides"] = supported_sides
         diagnostics["candidates"].append({
             "bbox": [x, y, width, height],
             "depth_m": float(width * meters_per_px),
@@ -478,10 +1036,17 @@ def resolve_terminal_headland_overlap(
             "seed_ratio": seed_ratio,
             "near_start": bool(near_start),
             "near_end": bool(near_end),
+            "terminal_region_support": candidate_region_info["support_ratio"],
+            "terminal_region_ids": candidate_region_info["region_ids"],
             "decision": reason,
         })
         if reason != "accepted":
             reject(reason)
+            if reason in {
+                "insufficient_terminal_region_support",
+                "insufficient_cross_row_span",
+            }:
+                region_report["rejected_fragment_count"] += 1
             continue
         allowed_columns = np.zeros(width, dtype=bool)
         global_columns = np.arange(x, x + width)
@@ -493,8 +1058,72 @@ def resolve_terminal_headland_overlap(
         if not np.any(component):
             reject("outside_body_cut_depth")
             continue
+        # Preserve only the seed pixels belonging to a region-qualified
+        # terminal component.  Rejected residuals remain non-semantic evidence
+        # instead of being painted as headland merely because they were in the
+        # original orientation seed.
+        accepted_seed_rotated[y:y + height, x:x + width][component] = (
+            seed_rotated[y:y + height, x:x + width][component]
+        )
         envelope_fill = bool(cfg.get("headland_corridor_fill_envelope", True))
-        if envelope_fill:
+        if follow_raw_terminal:
+            low_edge = component_edge_curve(component, y, x, "low")
+            high_edge = component_edge_curve(component, y, x, "high")
+            component_rows = np.flatnonzero(np.any(component, axis=1)) + y
+            before = int(cv2.countNonZero(corridor_rotated))
+            accepted_sides = []
+            for side, accepted in (("start", near_start), ("end", near_end)):
+                if not accepted:
+                    continue
+                accepted_sides.append(side)
+                endpoint_curve = endpoint_curves[side]
+                for row_index in component_rows:
+                    endpoint = endpoint_curve[row_index]
+                    if not np.isfinite(endpoint):
+                        endpoint = (
+                            high_edge[row_index]
+                            if side == "start"
+                            else low_edge[row_index]
+                        )
+                    if side == "start":
+                        inner = max(endpoint, high_edge[row_index])
+                        outer = min(low_edge[row_index], endpoint - follow_depth_px)
+                        column_start = max(0, int(math.floor(outer)))
+                        column_end = min(
+                            out_w,
+                            int(math.ceil(inner + endpoint_margin_px)) + 1,
+                        )
+                    else:
+                        inner = min(endpoint, low_edge[row_index])
+                        outer = max(high_edge[row_index], endpoint + follow_depth_px)
+                        column_start = max(
+                            0,
+                            int(math.floor(inner - endpoint_margin_px)),
+                        )
+                        column_end = min(out_w, int(math.ceil(outer)) + 1)
+                    if column_end <= column_start:
+                        continue
+                    raw_row = raw_rotated[
+                        row_index, column_start:column_end
+                    ] > 0
+                    corridor_rotated[
+                        row_index, column_start:column_end
+                    ][raw_row] = 255
+                    if region_fill:
+                        accepted_region_rotated[
+                            row_index, column_start:column_end
+                        ] = 255
+            after = int(cv2.countNonZero(corridor_rotated))
+            added = max(0, after - before)
+            diagnostics["envelope_added_px"] += int(
+                max(0, added - int(np.count_nonzero(component)))
+            )
+            shape_report = diagnostics["terminal_shape"]
+            shape_report["raw_support_added_px"] += added
+            for side in accepted_sides:
+                if side not in shape_report["accepted_sides"]:
+                    shape_report["accepted_sides"].append(side)
+        elif envelope_fill:
             local_ys, local_xs = np.where(component)
             global_y0 = y + int(local_ys.min())
             global_y1 = y + int(local_ys.max()) + 1
@@ -527,6 +1156,10 @@ def resolve_terminal_headland_overlap(
             for rect_x0, rect_x1, rect_y0, rect_y1 in rectangles:
                 if rect_x1 > rect_x0 and rect_y1 > rect_y0:
                     corridor_rotated[rect_y0:rect_y1, rect_x0:rect_x1] = 255
+                    if region_fill:
+                        accepted_region_rotated[
+                            rect_y0:rect_y1, rect_x0:rect_x1
+                        ] = 255
             after = int(cv2.countNonZero(corridor_rotated))
             diagnostics["envelope_added_px"] += int(
                 max(0, after - before - int(np.count_nonzero(component)))
@@ -534,10 +1167,83 @@ def resolve_terminal_headland_overlap(
         else:
             target = corridor_rotated[y:y + height, x:x + width]
             target[component] = 255
+            if region_fill:
+                target = accepted_region_rotated[y:y + height, x:x + width]
+                target[component] = 255
         diagnostics["corridor_count"] += 1
 
+    accepted_terminal_sides = set()
+    for candidate in diagnostics["candidates"]:
+        if candidate.get("decision") != "accepted":
+            continue
+        if candidate.get("near_start"):
+            accepted_terminal_sides.add("start")
+        if candidate.get("near_end"):
+            accepted_terminal_sides.add("end")
+    diagnostics["terminal_shape"]["accepted_sides"] = sorted(
+        accepted_terminal_sides
+    )
+
+    # A morphology-closed candidate can contain a detached triangular/raw
+    # island at a region seam.  Classify the resulting corridor components a
+    # second time by their transverse span before warping back.  This is the
+    # region-boundary guard: a terminal corridor must cover a meaningful
+    # fraction of the row lattice, not merely fall inside the same axial depth
+    # window as a trusted terminal seed.
+    component_report = diagnostics["corridor_component_filter"]
+    component_min_span_ratio = float(np.clip(
+        component_report["min_cross_row_span_ratio"], 0.0, 1.0
+    ))
+    # Preserve every raw fragment that falls inside an accepted terminal
+    # envelope.  The envelope is bounded by the component-derived terminal
+    # walls, so this does not promote an interior seam outside the endpoint.
+    # ``accepted_region_rotated`` is the envelope built for region-qualified
+    # terminal candidates.  Keep the name consistent with the allocation
+    # above; using an undefined alias here made every accepted headland
+    # candidate fail before it could be returned to the semantic layers.
+    corridor_rotated = cv2.bitwise_or(
+        corridor_rotated, accepted_region_rotated
+    )
+    corridor_labels_count, corridor_labels, corridor_stats, _ = (
+        cv2.connectedComponentsWithStats(
+            (corridor_rotated > 0).astype(np.uint8), 8
+        )
+    )
+    filtered_corridor = np.zeros_like(corridor_rotated)
+    for component_label in range(1, corridor_labels_count):
+        component_area = int(corridor_stats[component_label, cv2.CC_STAT_AREA])
+        component_x = int(corridor_stats[component_label, cv2.CC_STAT_LEFT])
+        component_y = int(corridor_stats[component_label, cv2.CC_STAT_TOP])
+        component_width = int(corridor_stats[component_label, cv2.CC_STAT_WIDTH])
+        component_height = int(corridor_stats[component_label, cv2.CC_STAT_HEIGHT])
+        component_span_ratio = float(min(
+            1.0,
+            component_height / max(float(body_cross_span), 1.0),
+        ))
+        component_slice = corridor_labels[component_y:component_y + component_height,
+                                          component_x:component_x + component_width] == component_label
+        envelope_slice = accepted_region_rotated[
+            component_y:component_y + component_height,
+            component_x:component_x + component_width,
+        ] > 0
+        envelope_overlap = int(np.count_nonzero(component_slice & envelope_slice))
+        if component_span_ratio < component_min_span_ratio and envelope_overlap == 0:
+            component_report["rejected_short_count"] += 1
+            component_report["rejected"].append({
+                "area_px": component_area,
+                "top": component_y,
+                "height": component_height,
+                "cross_row_span_ratio": component_span_ratio,
+            })
+            continue
+        if component_span_ratio < component_min_span_ratio:
+            component_report["accepted_envelope_fragment_count"] += 1
+        filtered_corridor[corridor_labels == component_label] = 255
+        component_report["accepted_count"] += 1
+    corridor_rotated = filtered_corridor
+
     if cv2.countNonZero(corridor_rotated) == 0:
-        return body, seed, empty, diagnostics
+        return body, empty, empty, diagnostics
 
     inverse = cv2.invertAffineTransform(matrix)
     corridor = cv2.warpAffine(
@@ -552,8 +1258,17 @@ def resolve_terminal_headland_overlap(
     evidence = cv2.bitwise_or(raw, body)
     corridor = cv2.bitwise_and(corridor, evidence)
     clean_body = cv2.bitwise_and(body, cv2.bitwise_not(corridor))
+    accepted_seed = cv2.warpAffine(
+        accepted_seed_rotated,
+        inverse,
+        (body.shape[1], body.shape[0]),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    accepted_seed = (accepted_seed > 0).astype(np.uint8) * 255
     resolved_headland = cv2.bitwise_or(
-        seed, cv2.bitwise_and(corridor, raw)
+        accepted_seed, cv2.bitwise_and(corridor, raw)
     )
     diagnostics["corridor_px"] = int(cv2.countNonZero(corridor))
     diagnostics["removed_body_px"] = int(cv2.countNonZero(
@@ -775,12 +1490,22 @@ def estimate_row_angle(mask: np.ndarray) -> float:
         return 0.0
 
     step = max(1, xs.size // 400000)
-    coords = np.column_stack([xs[::step], ys[::step]]).astype(np.float64)
-    coords -= coords.mean(axis=0)
-    covariance = np.cov(coords.T)
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    vector = eigenvectors[:, int(np.argmax(eigenvalues))]
-    coarse = math.atan2(vector[1], vector[0]) % math.pi
+    sample_x = xs[::step].astype(np.float64)
+    sample_y = ys[::step].astype(np.float64)
+    sample_x -= float(np.mean(sample_x))
+    sample_y -= float(np.mean(sample_y))
+    # Closed-form principal-axis angle for a 2D covariance matrix.  Avoid
+    # np.cov/eigh here: this hot path only needs one angle, while the target
+    # Windows Conda runtime can abort inside its BLAS-backed covariance call.
+    # The common positive scale factor (N or N-1) cancels in atan2.
+    covariance_xx = float(np.sum(sample_x * sample_x, dtype=np.float64))
+    covariance_xy = float(np.sum(sample_x * sample_y, dtype=np.float64))
+    covariance_yy = float(np.sum(sample_y * sample_y, dtype=np.float64))
+    coarse = 0.5 * math.atan2(
+        2.0 * covariance_xy,
+        covariance_xx - covariance_yy,
+    ) % math.pi
+    coords = np.column_stack([sample_x, sample_y])
 
     best_angle = coarse
     best_score = -1.0
@@ -890,6 +1615,13 @@ def estimate_body_interval(
 
     band_signal = np.mean(foreground[band_selector], axis=0).astype(np.float64)
     gap_signal = np.mean(foreground[gap_selector], axis=0).astype(np.float64)
+    # Keep the unsmoothed cross-row evidence.  The quality signals below are
+    # intentionally smoothed to tolerate broken rows, but that same smoothing
+    # can smear a transverse headland into the first/last body columns.  A
+    # terminal guard must therefore use the local gap occupancy before the
+    # longitudinal smoothing step.
+    raw_band_signal = band_signal.copy()
+    raw_gap_signal = gap_signal.copy()
     continuity = np.zeros(width, dtype=np.float64)
     for start, end in runs:
         continuity += np.mean(foreground[start:end], axis=0) >= float(
@@ -919,6 +1651,37 @@ def estimate_body_interval(
     )
     continuity_threshold = float(config.get("body_continuity_min", 0.42))
     contrast_threshold = float(config.get("body_contrast_min", 0.08))
+    terminal_gap_min_occupancy = float(np.clip(
+        config.get(
+            "body_terminal_gap_min_occupancy",
+            max(0.20, contrast_threshold * 1.5),
+        ),
+        0.0,
+        1.0,
+    ))
+    terminal_gap_ratio = float(np.clip(
+        config.get("body_terminal_gap_ratio", 0.65),
+        0.0,
+        1.0,
+    ))
+    # A real row tail keeps the inter-row gaps mostly empty.  A transverse
+    # headland occupies both the detected row bands and their gaps.  Record
+    # this as endpoint evidence, but do not remove arbitrary interior runs:
+    # only overlap with the selected body's two ends is allowed to trim the
+    # interval below.
+    terminal_like = (
+        (raw_gap_signal >= terminal_gap_min_occupancy)
+        & (raw_gap_signal >= raw_band_signal * terminal_gap_ratio)
+        & (continuity >= max(0.30, continuity_threshold * 0.75))
+    )
+    terminal_gap_close_px = max(1, int(round(
+        float(config.get("body_support_extension_max_gap_m", 0.8))
+        / max(work_mpp, 1e-6)
+    )))
+    terminal_like = close_boolean_gaps(
+        terminal_like,
+        terminal_gap_close_px,
+    )
     body_candidate = (
         (quality >= quality_threshold)
         & (continuity >= continuity_threshold)
@@ -940,6 +1703,23 @@ def estimate_body_interval(
         return 0, width, {"reason": "no_body_run"}
 
     start, end = body_run
+    terminal_trim_start = None
+    terminal_trim_end = None
+    for terminal_start, terminal_end in _runs(terminal_like):
+        if terminal_start <= start < terminal_end:
+            terminal_trim_start = max(
+                int(start),
+                int(terminal_end),
+            )
+        if terminal_start < end <= terminal_end:
+            terminal_trim_end = min(
+                int(end),
+                int(terminal_start),
+            )
+    if terminal_trim_start is not None and terminal_trim_start < end:
+        start = terminal_trim_start
+    if terminal_trim_end is not None and start < terminal_trim_end:
+        end = terminal_trim_end
 
     # The high-quality body run is good for rejecting true headlands, but weak
     # end-row pixels can still be harvestable. Extend the interval through
@@ -956,6 +1736,7 @@ def estimate_body_interval(
     support_candidate = (
         (continuity >= support_min_continuity)
         & (contrast >= support_min_contrast)
+        & ~terminal_like
     )
     support_gap_px = odd_size(
         float(config.get("body_support_extension_max_gap_m", 0.8))
@@ -996,6 +1777,17 @@ def estimate_body_interval(
         "quality_threshold": quality_threshold,
         "support_extension_min_continuity": support_min_continuity,
         "support_extension_min_contrast": support_min_contrast,
+        "terminal_guard": {
+            "enabled": True,
+            "min_gap_occupancy": terminal_gap_min_occupancy,
+            "gap_to_band_ratio": terminal_gap_ratio,
+            "closed_gap_px": terminal_gap_close_px,
+            "trimmed_start_px": int(terminal_trim_start)
+            if terminal_trim_start is not None else None,
+            "trimmed_end_px": int(terminal_trim_end)
+            if terminal_trim_end is not None else None,
+            "candidate_run_count": int(len(_runs(terminal_like))),
+        },
         "mean_continuity": float(np.mean(continuity[start:end])),
         "mean_contrast": float(np.mean(contrast[start:end])),
         "body_start_work_px": int(start),
@@ -1009,9 +1801,15 @@ def estimate_body_interval(
 def classify_band_widths(
     bands: List[Dict],
     fallback_threshold_m: float = 0.55,
-    alternation_penalty: float = 0.35,
+    alternation_penalty: float = 0.0,
 ) -> Tuple[List[Dict], List[Dict], float]:
-    """Classify ordered bands with width evidence and a soft sequence prior."""
+    """Classify ordered bands with width evidence and a soft sequence prior.
+
+    alternation_penalty <= 0 disables the wide/narrow alternation prior:
+    等距种植区可能出现连续 4 行带，不能盲目按“隔一个”强制交替
+    （用户明确要求按检测宽度分类）。聚类前剔除离群值（田埂/边缘
+    残留带，如剖面宽 12m 的带），避免阈值被拉偏。
+    """
     if not bands:
         return [], [], fallback_threshold_m
     if len(bands) < 6:
@@ -1027,12 +1825,17 @@ def classify_band_widths(
         item.get("classification_width_m", item["width_m"])
         for item in bands
     ], dtype=np.float64)
-    center_a, center_b = np.quantile(widths, [0.25, 0.75])
+    # 剔除离群值，避免聚类中心被拉偏
+    median_w = float(np.median(widths))
+    core = widths[widths <= max(median_w * 3.0, median_w + 2.0)]
+    if len(core) < 4:
+        core = widths
+    center_a, center_b = np.quantile(core, [0.25, 0.75])
     for _ in range(20):
-        distance_a = np.abs(widths - center_a)
-        distance_b = np.abs(widths - center_b)
-        group_a = widths[distance_a <= distance_b]
-        group_b = widths[distance_a > distance_b]
+        distance_a = np.abs(core - center_a)
+        distance_b = np.abs(core - center_b)
+        group_a = core[distance_a <= distance_b]
+        group_b = core[distance_a > distance_b]
         if group_a.size == 0 or group_b.size == 0:
             break
         new_a = float(np.mean(group_a))
@@ -1048,6 +1851,9 @@ def classify_band_widths(
     high_count = int(np.count_nonzero(widths >= threshold))
     if separation < 0.16 or min(low_count, high_count) < 3:
         threshold = fallback_threshold_m
+        states = (widths >= threshold).astype(np.int8)
+    elif alternation_penalty <= 0.0:
+        # 纯宽度证据分类：等距区连续 4 行带保持 wide，不强制交替
         states = (widths >= threshold).astype(np.int8)
     else:
         scale = max((high - low) * 0.55, 0.06)
@@ -1300,7 +2106,8 @@ def regularize_crop_mask(
     profile_wide, profile_narrow, width_threshold = classify_band_widths(
         profile_bands,
         fallback_threshold_m=float(cfg.get("band_width_threshold_m", 0.55)),
-        alternation_penalty=float(cfg.get("band_alternation_penalty", 0.35)),
+        # 默认关闭宽窄交替强制（用户要求按检测宽度分类，等距区可连续 4 行）
+        alternation_penalty=float(cfg.get("band_alternation_penalty", 0.0)),
     )
     class_by_id = {
         item["id"]: item["band_type"]
@@ -1408,12 +2215,28 @@ def regularize_crop_mask(
             center_trusted & np.isfinite(center_observed)
         )
         if trusted_indices.size >= 2:
-            coefficients = np.polyfit(
-                xs[trusted_indices].astype(np.float64),
-                center_observed[trusted_indices],
-                1,
-            )
-            row_trend = np.polyval(coefficients, xs.astype(np.float64))
+            fit_x = xs[trusted_indices].astype(np.float64)
+            fit_y = center_observed[trusted_indices].astype(np.float64)
+            fit_x_mean = float(np.mean(fit_x))
+            fit_y_mean = float(np.mean(fit_y))
+            centered_x = fit_x - fit_x_mean
+            denominator = float(np.sum(centered_x * centered_x, dtype=np.float64))
+            if denominator > 1e-12:
+                slope = float(
+                    np.sum(
+                        centered_x * (fit_y - fit_y_mean),
+                        dtype=np.float64,
+                    )
+                    / denominator
+                )
+                intercept = fit_y_mean - slope * fit_x_mean
+                row_trend = slope * xs.astype(np.float64) + intercept
+            else:
+                row_trend = np.full_like(
+                    xs,
+                    fit_y_mean,
+                    dtype=np.float64,
+                )
             centers_i = row_trend + center_detail * (
                 centers_i - row_trend
             )
@@ -1517,10 +2340,16 @@ def regularize_crop_mask(
         sampled = [centerline_full[0]]
         last_point = centerline_full[0]
         for point in centerline_full[1:]:
-            if np.linalg.norm(point - last_point) >= interval_px:
+            if math.hypot(
+                float(point[0] - last_point[0]),
+                float(point[1] - last_point[1]),
+            ) >= interval_px:
                 sampled.append(point)
                 last_point = point
-        if np.linalg.norm(centerline_full[-1] - sampled[-1]) > 1.0:
+        if math.hypot(
+            float(centerline_full[-1, 0] - sampled[-1][0]),
+            float(centerline_full[-1, 1] - sampled[-1][1]),
+        ) > 1.0:
             sampled.append(centerline_full[-1])
 
         polygon_work = cv2.transform(
@@ -1636,6 +2465,7 @@ def regularize_crop_mask(
             angle,
             mpp,
             cfg,
+            axial_reference_mask=rebuilt,
         )
     )
     body_residual_mask = cv2.bitwise_and(

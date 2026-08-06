@@ -1,6 +1,31 @@
 import numpy as np
 
 
+def test_row_angle_estimation_does_not_depend_on_numpy_covariance(monkeypatch):
+    from row_geometry import estimate_row_angle
+
+    mask = np.zeros((400, 600), dtype=np.uint8)
+    for offset in range(-80, 81, 20):
+        points = np.asarray([
+            (x, int(round(0.35 * x + 120 + offset)))
+            for x in range(40, 560)
+        ], dtype=np.int32)
+        valid = (points[:, 1] >= 0) & (points[:, 1] < mask.shape[0])
+        mask[points[valid, 1], points[valid, 0]] = 255
+
+    monkeypatch.setattr(
+        np,
+        "cov",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("estimate_row_angle must not call np.cov")
+        ),
+    )
+
+    angle = estimate_row_angle(mask)
+
+    assert abs(angle - np.arctan(0.35)) < np.deg2rad(3.0)
+
+
 def test_regularize_output_preserves_raw_parallel_residual_in_processed_mask(monkeypatch):
     import row_geometry
 

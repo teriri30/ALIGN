@@ -92,7 +92,7 @@ def validate_config(raw: dict) -> dict:
         "band_centerline_with_footprint_validation",
     }:
         raise ConfigValidationError(
-            "work_line_mode must be band_centerline or "
+            "work_line_mode must be band_centerline, footprint_optimized, or "
             "band_centerline_with_footprint_validation"
         )
     if "validation_profile" in planning and str(planning["validation_profile"]) not in {
@@ -110,6 +110,13 @@ def validate_config(raw: dict) -> dict:
     _validated_number(planning, "endpoint_outlier_mad_scale", minimum=0.0)
     _validated_number(planning, "footprint_pose_step_m", minimum=0.01, maximum=0.20)
     _validated_number(planning, "pose_heading_window_m", minimum=0.01, maximum=2.0)
+    _validated_number(planning, "lateral_search_m", minimum=0.0)
+    _validated_number(planning, "lateral_step_m", minimum=0.0, strict_min=True)
+    _validated_number(planning, "lateral_smooth_penalty", minimum=0.0)
+    _validated_number(planning, "lateral_uncertain_penalty", minimum=0.0)
+    _validated_number(planning, "station_interval_m", minimum=0.0, strict_min=True)
+    _validated_number(planning, "station_window_m", minimum=0.0, strict_min=True)
+    _validated_number(planning, "path_smooth_m", minimum=0.0)
     for key in (
         "max_track_core_overlap_pct", "min_geometric_coverage_pct",
         "max_track_outside_field_pct", "max_track_outside_support_pct",
@@ -120,11 +127,65 @@ def validate_config(raw: dict) -> dict:
         planning, "headland_damage_weight",
         minimum=0.0, maximum=1.0, strict_min=True,
     )
+    _validated_number(
+        planning, "missing_work_band_gap_multiplier",
+        minimum=1.0,
+    )
+    _validated_number(
+        planning, "missing_work_band_integer_tolerance",
+        minimum=0.0, maximum=1.0, strict_min=True,
+    )
+    _validated_number(
+        planning, "missing_work_band_min_support_ratio",
+        minimum=0.0, maximum=1.0,
+    )
+    _validated_number(
+        planning, "missing_work_band_min_axial_ratio",
+        minimum=0.0, maximum=1.0,
+    )
+    _validated_number(
+        planning, "missing_work_band_max_missing_count",
+        minimum=1.0,
+    )
+    _validated_number(
+        planning, "missing_work_band_phase_neighbor_tolerance",
+        minimum=0.0,
+    )
+    _validated_number(
+        planning, "missing_work_band_cross_section_half_width_ratio",
+        minimum=0.0, maximum=1.0,
+    )
+    _validated_number(
+        planning, "missing_work_band_min_cross_section_occupancy",
+        minimum=0.0, maximum=1.0,
+    )
+    _validated_number(
+        planning, "service_headland_axial_tolerance_m",
+        minimum=0.0,
+    )
+    _validated_number(
+        planning, "inter_region_tangent_alignment_min_cos",
+        minimum=0.0, maximum=1.0,
+    )
+    _validated_number(
+        planning, "turn_radius_geometry_tolerance_m",
+        minimum=0.0,
+    )
+    _validated_number(
+        planning, "service_point_terminal_depth_m",
+        minimum=0.1, maximum=20.0,
+    )
     if "headland_turn_optimization_enabled" in planning and not isinstance(
         planning["headland_turn_optimization_enabled"], bool
     ):
         raise ConfigValidationError(
             "headland_turn_optimization_enabled must be boolean"
+        )
+    if "recover_missing_work_bands" in planning and not isinstance(
+        planning["recover_missing_work_bands"], bool
+    ):
+        raise ConfigValidationError(
+            "recover_missing_work_bands must be boolean"
         )
 
     mask = raw.get("mask_processing", {})
@@ -140,6 +201,24 @@ def validate_config(raw: dict) -> dict:
         mask["headland_corridor_fill_envelope"], bool
     ):
         raise ConfigValidationError("headland_corridor_fill_envelope must be boolean")
+    if "headland_corridor_follow_raw_terminal" in mask and not isinstance(
+        mask["headland_corridor_follow_raw_terminal"], bool
+    ):
+        raise ConfigValidationError(
+            "headland_corridor_follow_raw_terminal must be boolean"
+        )
+    if "headland_terminal_separator_enabled" in mask and not isinstance(
+        mask["headland_terminal_separator_enabled"], bool
+    ):
+        raise ConfigValidationError(
+            "headland_terminal_separator_enabled must be boolean"
+        )
+    if "headland_terminal_dense_seed_enabled" in mask and not isinstance(
+        mask["headland_terminal_dense_seed_enabled"], bool
+    ):
+        raise ConfigValidationError(
+            "headland_terminal_dense_seed_enabled must be boolean"
+        )
     _validated_number(mask, "max_work_dim", minimum=256)
     _validated_number(mask, "band_width_threshold_m", minimum=0.0, strict_min=True)
     for key in (
@@ -150,11 +229,48 @@ def validate_config(raw: dict) -> dict:
         "headland_corridor_depth_smooth_m",
         "headland_corridor_terminal_depth_m", "headland_corridor_max_body_cut_m",
         "headland_corridor_endpoint_margin_m",
+        "headland_terminal_follow_max_depth_m",
+        "headland_terminal_wall_smooth_m",
+        "headland_terminal_dense_seed_depth_m",
+        "headland_terminal_dense_seed_gap_m",
+        "headland_terminal_dense_seed_min_depth_m",
+        "headland_terminal_separator_smooth_m",
+        "headland_terminal_separator_min_gap_m",
+        "headland_terminal_separator_support_m",
+        "headland_terminal_separator_endpoint_tolerance_m",
     ):
         _validated_number(mask, key, minimum=0.0)
     _validated_number(mask, "residual_body_min_attach_ratio", minimum=0.0, maximum=1.0)
     _validated_number(mask, "headland_corridor_min_span_ratio", minimum=0.0, maximum=1.0)
+    _validated_number(
+        mask, "headland_corridor_min_component_span_ratio",
+        minimum=0.0, maximum=1.0,
+    )
     _validated_number(mask, "headland_corridor_min_seed_ratio", minimum=0.0, maximum=1.0)
+    _validated_number(
+        mask, "headland_terminal_dense_seed_min_occupancy",
+        minimum=0.0, maximum=1.0,
+    )
+    _validated_number(
+        mask, "headland_terminal_dense_seed_fallback_occupancy",
+        minimum=0.0, maximum=1.0,
+    )
+    _validated_number(
+        mask, "headland_terminal_wall_min_axial_span_ratio",
+        minimum=0.25, maximum=1.0,
+    )
+    _validated_number(
+        mask, "headland_terminal_region_min_support_ratio",
+        minimum=0.0, maximum=1.0,
+    )
+    _validated_number(
+        mask, "headland_terminal_separator_occupancy_ratio",
+        minimum=0.0, maximum=1.0,
+    )
+    _validated_number(
+        mask, "headland_terminal_separator_max_occupancy",
+        minimum=0.0, maximum=1.0,
+    )
 
     raster = raw.get("raster_preprocessing", {})
     if "mode" in raster and str(raster["mode"]) not in {
@@ -171,6 +287,16 @@ def validate_config(raw: dict) -> dict:
     geo = raw.get("geo", {})
     _validated_number(geo, "max_pixel_anisotropy_ratio", minimum=1.0)
     _validated_number(geo, "max_gsd_variation_ratio", minimum=0.0, maximum=1.0)
+
+    export = raw.get("export", {})
+    if not isinstance(export, dict):
+        raise ConfigValidationError("export must be an object")
+    if "gate_mode" in export and str(export["gate_mode"]) not in {
+        "fail_closed", "confirm",
+    }:
+        raise ConfigValidationError(
+            "export.gate_mode must be fail_closed or confirm"
+        )
     return raw
 
 def save_json_atomic(path: str, data: dict):

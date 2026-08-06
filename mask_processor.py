@@ -401,18 +401,31 @@ def classify_bands(bands: List[Dict],
     if not bands:
         return [], []
 
-    widths = np.array([b["width_m"] for b in bands])
+    # 优先使用剖面宽度（法向投影统计，更稳健；与导出诊断口径一致），
+    # 缺失时回退到 bbox 宽度 width_m。
+    widths = []
+    for band in bands:
+        value = band.get("profile_width_m")
+        if value is None:
+            value = band.get("width_m")
+        try:
+            widths.append(float(value) if value is not None else 0.0)
+        except (TypeError, ValueError):
+            widths.append(0.0)
+    widths = np.asarray(widths, dtype=np.float64)
 
     if auto_calibrate and len(bands) >= 4:
-        # 用简单双峰聚类（不依赖 sklearn）
+        # 用双峰聚类（不依赖 sklearn）。先剔除离群值（边缘残留/田埂带，
+        # 如剖面宽 12m 的带），否则最大间隙分界会被离群值拉偏。
         sorted_w = np.sort(widths)
-        # 找最大间隙作为分界点
-        gaps = np.diff(sorted_w)
-        if len(gaps) > 0:
-            split_idx = np.argmax(gaps) + 1
-            narrow_center = sorted_w[:split_idx].mean() if split_idx > 0 else sorted_w[0]
-            wide_center = sorted_w[split_idx:].mean() if split_idx < len(sorted_w) else sorted_w[-1]
-            calibrated_threshold = (narrow_center + wide_center) / 2
+        median_w = float(np.median(sorted_w))
+        core = sorted_w[sorted_w <= max(median_w * 3.0, median_w + 2.0)]
+        if len(core) >= 4:
+            gaps = np.diff(core)
+            split_idx = int(np.argmax(gaps)) + 1
+            narrow_center = float(core[:split_idx].mean())
+            wide_center = float(core[split_idx:].mean())
+            calibrated_threshold = (narrow_center + wide_center) / 2.0
 
             if abs(calibrated_threshold - user_threshold_m) < cluster_tolerance + 0.1:
                 threshold = calibrated_threshold
@@ -423,8 +436,8 @@ def classify_bands(bands: List[Dict],
     else:
         threshold = user_threshold_m
 
-    wide = [b for b in bands if b["width_m"] >= threshold]
-    narrow = [b for b in bands if b["width_m"] < threshold]
+    wide = [band for band, width in zip(bands, widths) if width >= threshold]
+    narrow = [band for band, width in zip(bands, widths) if width < threshold]
 
     return wide, narrow
 

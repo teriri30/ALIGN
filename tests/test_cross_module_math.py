@@ -6,6 +6,21 @@ import numpy as np
 import pytest
 
 
+def test_path_crossing_count_uses_segment_types_when_entry_or_aux_segments_exist():
+    from path_planner import _count_path_intersections_proper
+
+    full_path = [
+        [(0.0, 0.0), (10.0, 0.0)],   # entry
+        [(0.0, 2.0), (10.0, 2.0)],   # work 1
+        [(5.0, -1.0), (5.0, 3.0)],  # turn
+        [(7.0, 1.0), (7.0, 9.0)],   # work 2; parallel to the other work line
+        [(0.0, 5.0), (10.0, 5.0)],  # exit/auxiliary geometry
+    ]
+    segment_types = ["entry", "work", "turn", "work", "exit"]
+
+    assert _count_path_intersections_proper(full_path, segment_types) == 0
+
+
 def _candidate(strategy, rolling, core):
     return {
         "strategy": strategy,
@@ -147,6 +162,20 @@ def test_config_rejects_non_finite_numbers(value):
 
     with pytest.raises(ConfigValidationError, match="finite"):
         validate_config({"path_planning": {"max_track_core_overlap_pct": value}})
+
+
+@pytest.mark.parametrize("key,value", [
+    ("lateral_search_m", float("nan")),
+    ("lateral_search_m", -0.1),
+    ("lateral_step_m", 0.0),
+    ("lateral_step_m", float("inf")),
+    ("lateral_smooth_penalty", -0.1),
+])
+def test_config_rejects_invalid_lateral_optimization_numbers(key, value):
+    from config import ConfigValidationError, validate_config
+
+    with pytest.raises(ConfigValidationError):
+        validate_config({"path_planning": {key: value}})
 
 
 def test_work_line_mode_uses_truthful_footprint_validation_name(monkeypatch):
@@ -477,7 +506,8 @@ def test_work_line_reference_stays_on_crop_centerline_not_cutter_front():
     assert diagnostics["endpoint_alignment"]["path_reference_shift_applied"] is False
 
 
-def test_footprint_optimized_layout_preserves_four_row_band_centerlines(monkeypatch):
+def test_footprint_optimized_layout_optimizes_from_four_row_band_centerlines(monkeypatch):
+    """DECISION-011: real optimization starts from accepted band lines."""
     import path_planner
 
     processed = np.ones((20, 30), dtype=np.uint8) * 255
@@ -486,9 +516,21 @@ def test_footprint_optimized_layout_preserves_four_row_band_centerlines(monkeypa
         "contour": np.asarray([[2, 4], [12, 4], [12, 15], [2, 15]], dtype=np.int32),
         "centerline": [(2.0, 9.0), (12.0, 9.0)],
     }]
+    calls = []
 
-    def fake_generate_work_lines(*_args, **_kwargs):
-        raise AssertionError("footprint geometry must not rewrite work-line references")
+    def fake_generate_work_lines(*args, **kwargs):
+        calls.append((args, kwargs))
+        baselines = kwargs["baseline_lines"]
+        assert baselines[0][0] == pytest.approx((2.0, 9.0))
+        assert baselines[0][-1] == pytest.approx((12.0, 9.0))
+        return [[(2.0, 8.5), (12.0, 8.5)]], {
+            "source": "four_row_band_centerlines_lateral_optimization",
+            "footprint_optimization_scope": "centerline_anchored_lateral_search",
+            "optimized_pass_count": 1,
+            "line_optimization": [
+                {"line_index": 0, "optimized": True},
+            ],
+        }
 
     class State:
         mask_raw = processed
@@ -512,6 +554,18 @@ def test_footprint_optimized_layout_preserves_four_row_band_centerlines(monkeypa
             return 1.0
 
     monkeypatch.setattr(path_planner, "generate_work_lines", fake_generate_work_lines)
+    formal_results = iter([
+        {"track_core_overlap_pct": 10.0, "planned_target_geometric_coverage_pct": 70.0,
+         "track_outside_field_pct": 0.0, "track_outside_support_pct": 0.0,
+         "track_uncertain_overlap_pct": 0.0, "track_forbidden_overlap_pct": 0.0},
+        {"track_core_overlap_pct": 9.0, "planned_target_geometric_coverage_pct": 75.0,
+         "track_outside_field_pct": 0.0, "track_outside_support_pct": 0.0,
+         "track_uncertain_overlap_pct": 0.0, "track_forbidden_overlap_pct": 0.0},
+    ])
+    monkeypatch.setattr(
+        path_planner, "validate_footprints",
+        lambda *_args, **_kwargs: next(formal_results),
+    )
 
     work_lines, layout = path_planner._prepare_work_line_layout(
         wide_bands,
@@ -522,8 +576,425 @@ def test_footprint_optimized_layout_preserves_four_row_band_centerlines(monkeypa
         config={"work_line_mode": "footprint_optimized", "centerline_interval_m": 1.0},
     )
 
-    assert layout["source"] == "four_row_band_centerlines"
+    assert len(calls) == 1
+    assert layout["source"] == "four_row_band_centerlines_lateral_optimization"
+    assert layout["work_line_mode"] == "footprint_optimized"
+    assert layout["footprint_optimization_scope"] == "centerline_anchored_lateral_search"
+    assert layout["ordered_band_ids"] == [1]
+    assert layout["line_optimization"] == [
+        {"line_index": 0, "band_id": 1, "optimized": True},
+    ]
+    assert work_lines[0][0] == pytest.approx((2.0, 8.5))
+    assert work_lines[0][-1] == pytest.approx((12.0, 8.5))
+
+
+def test_real_footprint_optimization_keeps_centerline_topology_and_search_bounds():
+    from footprint_planner import generate_work_lines
+
+    processed = np.zeros((80, 120), dtype=np.uint8)
+    processed[12:28, 5:115] = 255
+    processed[52:68, 5:115] = 255
+    baselines = [
+        [(10.0, 20.0), (110.0, 20.0)],
+        [(10.0, 60.0), (110.0, 60.0)],
+    ]
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.10
+
+    class State:
+        field_boundary = [(0.0, 0.0), (119.0, 0.0), (119.0, 79.0), (0.0, 79.0)]
+        mask_offset_x = 0
+        mask_offset_y = 0
+        forbidden_regions = []
+
+    optimized, layout = generate_work_lines(
+        processed,
+        0.0,
+        geo=Geo(),
+        state=State(),
+        harvester={
+            "cutter_width_m": 1.6,
+            "track_width_m": 0.4,
+            "track_gauge_m": 1.0,
+        },
+        config={
+            "planning_resolution_m": 0.10,
+            "planning_max_dim": 1000,
+            "station_interval_m": 0.50,
+            "station_window_m": 0.20,
+            "lateral_search_m": 0.30,
+            "lateral_step_m": 0.10,
+            "lateral_smooth_penalty": 0.12,
+            "path_smooth_m": 0.50,
+            "headland_buffer_m": 0.0,
+        },
+        baseline_lines=baselines,
+    )
+
+    assert layout["optimization_complete"] is True
+    assert len(optimized) == len(baselines)
+    assert len(layout["line_optimization"]) == len(baselines)
+    assert all(
+        item["baseline_objective"] is None
+        or item["optimized_objective"] <= item["baseline_objective"] + 1e-9
+        for item in layout["line_optimization"]
+    )
+    for baseline, line in zip(baselines, optimized):
+        assert line[0][0] == pytest.approx(baseline[0][0], abs=1.0)
+        assert line[-1][0] == pytest.approx(baseline[-1][0], abs=1.0)
+        baseline_y = baseline[0][1]
+        assert max(abs(point[1] - baseline_y) for point in line) <= 3.0 + 1e-6
+
+
+def test_footprint_comparison_rejects_any_degraded_safety_metric():
+    from footprint_planner import compare_work_line_footprints
+
+    baseline = {
+        "track_core_overlap_pct": 10.0,
+        "planned_target_geometric_coverage_pct": 70.0,
+        "track_outside_field_pct": 1.0,
+        "track_outside_support_pct": 5.0,
+        "track_uncertain_overlap_pct": 4.0,
+        "track_forbidden_overlap_pct": 0.0,
+    }
+    optimized = dict(baseline)
+    optimized.update({"track_core_overlap_pct": 10.5, "planned_target_geometric_coverage_pct": 75.0})
+
+    comparison = compare_work_line_footprints(baseline, optimized)
+
+    assert comparison["accepted"] is False
+    assert comparison["degraded_metrics"] == ["track_core_overlap_pct"]
+
+
+def test_footprint_comparison_rejects_missing_required_metric():
+    from footprint_planner import compare_work_line_footprints
+
+    baseline = {
+        "planned_target_geometric_coverage_pct": 70.0,
+        "track_outside_field_pct": 0.0,
+    }
+    optimized = {
+        "planned_target_geometric_coverage_pct": 75.0,
+        "track_outside_field_pct": 0.0,
+    }
+
+    comparison = compare_work_line_footprints(baseline, optimized)
+
+    assert comparison["accepted"] is False
+    assert comparison["invalid_metrics"] == ["track_core_overlap_pct"]
+
+
+def test_footprint_comparison_accepts_non_degrading_strict_improvement():
+    from footprint_planner import compare_work_line_footprints
+
+    baseline = {
+        "track_core_overlap_pct": 10.0,
+        "planned_target_geometric_coverage_pct": 70.0,
+        "track_outside_field_pct": 1.0,
+        "track_outside_support_pct": 5.0,
+        "track_uncertain_overlap_pct": 4.0,
+        "track_forbidden_overlap_pct": 0.0,
+    }
+    optimized = dict(baseline)
+    optimized.update({
+        "track_core_overlap_pct": 9.0,
+        "planned_target_geometric_coverage_pct": 75.0,
+        "track_outside_support_pct": 4.0,
+    })
+
+    comparison = compare_work_line_footprints(baseline, optimized)
+
+    assert comparison["accepted"] is True
+    assert set(comparison["improved_metrics"]) == {
+        "track_core_overlap_pct",
+        "planned_target_geometric_coverage_pct",
+        "track_outside_support_pct",
+    }
+
+
+def test_interval_mean_treats_outside_profile_as_zero_without_index_error():
+    from footprint_planner import _interval_mean
+
+
+    cumulative = np.asarray([0.0, 1.0, 3.0, 6.0])
+
+    assert _interval_mean(cumulative, -5, -1) == 0.0
+    assert _interval_mean(cumulative, 4, 8) == 0.0
+    assert _interval_mean(cumulative, -2, 2) == pytest.approx(0.75)
+    assert _interval_mean(cumulative, 2, 8) == pytest.approx(0.5)
+
+
+def test_centerline_optimizer_rejects_mismatched_semantic_layer_shape():
+    from footprint_planner import _optimize_baseline_line
+
+    optimized, diagnostics = _optimize_baseline_line(
+        np.asarray([(1.0, 5.0), (8.0, 5.0)]),
+        np.zeros((10, 10), dtype=np.uint8),
+        np.zeros((10, 10), dtype=np.uint8),
+        np.ones((10, 10), dtype=np.uint8),
+        None,
+        np.zeros((8, 10), dtype=np.uint8),
+        0.1,
+        1.6,
+        0.4,
+        0.8,
+        {},
+    )
+
+    assert optimized is None
+    assert diagnostics["reason"] == "uncertain_shape_mismatch"
+
+
+def test_centerline_optimizer_avoids_uncertain_track_corridor():
+    from footprint_planner import _optimize_baseline_line
+
+
+    shape = (41, 61)
+    crop = np.zeros(shape, dtype=np.uint8)
+    core = np.zeros(shape, dtype=np.uint8)
+    support = np.ones(shape, dtype=np.uint8) * 255
+    uncertain = np.zeros(shape, dtype=np.uint8)
+    uncertain[14:18, :] = 255
+    uncertain[22:26, :] = 255
+    baseline = np.asarray([(5.0, 20.0), (55.0, 20.0)], dtype=np.float64)
+
+    optimized, diagnostics = _optimize_baseline_line(
+        baseline,
+        crop,
+        core,
+        support,
+        None,
+        uncertain,
+        0.10,
+        1.6,
+        0.4,
+        0.8,
+        {
+            "station_interval_m": 0.5,
+            "station_window_m": 0.2,
+            "lateral_search_m": 0.5,
+            "lateral_step_m": 0.1,
+            "lateral_smooth_penalty": 0.1,
+            "path_smooth_m": 0.5,
+            "lateral_uncertain_penalty": 20.0,
+        },
+    )
+
+    assert optimized is not None
+    assert diagnostics["max_abs_lateral_shift_m"] > 0.0
+    assert np.mean(optimized[:, 1]) != pytest.approx(20.0)
+
+
+def test_work_line_layout_falls_back_when_formal_metric_degrades(monkeypatch):
+    import path_planner
+
+    processed = np.ones((20, 30), dtype=np.uint8) * 255
+    wide_bands = [{"id": 1, "centerline": [(2.0, 9.0), (12.0, 9.0)]}]
+
+    class State:
+        mask_raw = processed
+        harvester_params = {
+            "cutter_width_m": 2.0, "cutter_forward_offset_m": 1.0,
+            "track_width_m": 0.4, "track_gauge_m": 1.0,
+            "wheelbase_m": 1.8, "track_length_m": 1.7, "turn_radius_m": 0.9,
+        }
+
+    class Geo:
+        def is_ready(self): return True
+        def meters_per_pixel(self, _x, _y): return 1.0
+
+    monkeypatch.setattr(path_planner, "generate_work_lines", lambda *_a, **_k: (
+        [[(2.0, 8.5), (12.0, 8.5)]], {
+            "optimization_complete": True,
+            "line_optimization": [
+                {"line_index": 0, "optimized": True},
+            ],
+        },
+    ))
+    validations = iter([
+        {"track_core_overlap_pct": 10.0, "planned_target_geometric_coverage_pct": 70.0,
+         "track_outside_field_pct": 0.0, "track_outside_support_pct": 0.0,
+         "track_uncertain_overlap_pct": 0.0, "track_forbidden_overlap_pct": 0.0},
+        {"track_core_overlap_pct": 11.0, "planned_target_geometric_coverage_pct": 75.0,
+         "track_outside_field_pct": 0.0, "track_outside_support_pct": 0.0,
+         "track_uncertain_overlap_pct": 0.0, "track_forbidden_overlap_pct": 0.0},
+    ])
+    monkeypatch.setattr(path_planner, "validate_footprints", lambda *_a, **_k: next(validations))
+
+    lines, layout = path_planner._prepare_work_line_layout(
+        wide_bands, processed, 0.0, geo=Geo(), state=State(),
+        config={"work_line_mode": "footprint_optimized"},
+    )
+
+    assert lines[0][0] == pytest.approx((2.0, 9.0))
     assert layout["work_line_mode"] == "band_centerline_with_footprint_validation"
-    assert layout["footprint_optimization_scope"] == "validation_only"
-    assert work_lines[0][0] == pytest.approx((2.0, 9.0))
-    assert work_lines[0][-1] == pytest.approx((12.0, 9.0))
+    assert layout["optimization_fallback_reason"] == "formal_footprint_metric_degraded"
+    assert layout["formal_comparison"]["degraded_metrics"] == ["track_core_overlap_pct"]
+
+
+def test_work_line_formal_comparison_uses_final_validation_masks(monkeypatch):
+    """DECISION-011: selection and final validation use identical mask evidence."""
+    import path_planner
+
+    processed = np.ones((20, 30), dtype=np.uint8) * 255
+    detected = np.zeros_like(processed)
+    detected[2:18, 2:28] = 255
+    planned = np.zeros_like(processed)
+    planned[6:14, 3:27] = 255
+    wide_bands = [{"id": 1, "centerline": [(2.0, 9.0), (12.0, 9.0)]}]
+
+    class State:
+        mask_raw = processed
+        harvester_params = {
+            "cutter_width_m": 2.0, "cutter_forward_offset_m": 1.0,
+            "track_width_m": 0.4, "track_gauge_m": 1.0,
+            "wheelbase_m": 1.8, "track_length_m": 1.7,
+            "turn_radius_m": 0.9,
+        }
+
+    class Geo:
+        def is_ready(self): return True
+        def meters_per_pixel(self, _x, _y): return 1.0
+
+    monkeypatch.setattr(path_planner, "generate_work_lines", lambda *_a, **_k: (
+        [[(2.0, 8.5), (12.0, 8.5)]], {
+            "optimization_complete": True,
+            "line_optimization": [
+                {"line_index": 0, "optimized": True},
+            ],
+        },
+    ))
+    calls = []
+
+    def fake_validate(*_args, **kwargs):
+        calls.append(kwargs)
+        core = 10.0 if len(calls) == 1 else 9.0
+        return {
+            "track_core_overlap_pct": core,
+            "planned_target_geometric_coverage_pct": 95.0,
+            "track_outside_field_pct": 0.0,
+            "track_outside_support_pct": 0.0,
+            "track_uncertain_overlap_pct": 0.0,
+            "track_forbidden_overlap_pct": 0.0,
+        }
+
+    monkeypatch.setattr(path_planner, "validate_footprints", fake_validate)
+
+    path_planner._prepare_work_line_layout(
+        wide_bands, processed, 0.0, geo=Geo(), state=State(),
+        config={"work_line_mode": "footprint_optimized"},
+        detected_mask=detected, planned_mask=planned,
+    )
+
+    assert len(calls) == 2
+    assert all(call["detected_mask"] is detected for call in calls)
+    assert all(call["planned_mask"] is planned for call in calls)
+
+
+def test_incomplete_footprint_optimization_falls_back_truthfully(monkeypatch):
+    import path_planner
+
+
+
+    processed = np.ones((20, 30), dtype=np.uint8) * 255
+    wide_bands = [{
+        "id": 1,
+        "centerline": [(2.0, 9.0), (12.0, 9.0)],
+    }]
+
+    class State:
+        mask_raw = processed
+        harvester_params = {
+            "cutter_width_m": 2.0,
+            "cutter_forward_offset_m": 1.0,
+            "track_width_m": 0.4,
+            "track_gauge_m": 1.0,
+        }
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 1.0
+
+    monkeypatch.setattr(
+        path_planner,
+        "generate_work_lines",
+        lambda *_args, **_kwargs: ([], {
+            "optimization_complete": False,
+            "reason": "no_safe_lateral_candidate",
+        }),
+    )
+
+    work_lines, layout = path_planner._prepare_work_line_layout(
+        wide_bands,
+        processed,
+        0.0,
+        geo=Geo(),
+        state=State(),
+        config={"work_line_mode": "footprint_optimized"},
+    )
+
+    assert work_lines
+    assert layout["work_line_mode"] == "band_centerline_with_footprint_validation"
+    assert layout["optimization_complete"] is False
+    assert layout["optimization_fallback_reason"] == "no_safe_lateral_candidate"
+
+
+def test_crossing_optimized_centerlines_fall_back_before_formal_comparison(monkeypatch):
+    """DECISION-011: independent lateral shifts may not cross or reorder passes."""
+    import path_planner
+
+    processed = np.ones((24, 30), dtype=np.uint8) * 255
+    wide_bands = [
+        {"id": 1, "centerline": [(2.0, 8.0), (12.0, 8.0)]},
+        {"id": 2, "centerline": [(2.0, 14.0), (12.0, 14.0)]},
+    ]
+
+    class State:
+        mask_raw = processed
+        harvester_params = {
+            "cutter_width_m": 2.0, "cutter_forward_offset_m": 1.0,
+            "track_width_m": 0.4, "track_gauge_m": 1.0,
+            "wheelbase_m": 1.8, "track_length_m": 1.7,
+            "turn_radius_m": 0.9,
+        }
+
+    class Geo:
+        def is_ready(self): return True
+        def meters_per_pixel(self, _x, _y): return 1.0
+
+    monkeypatch.setattr(path_planner, "generate_work_lines", lambda *_a, **_k: (
+        [
+            [(2.0, 7.0), (12.0, 15.0)],
+            [(2.0, 15.0), (12.0, 7.0)],
+        ],
+        {"optimization_complete": True},
+    ))
+    monkeypatch.setattr(
+        path_planner,
+        "validate_footprints",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("crossing work lines must fail before formal comparison")
+        ),
+    )
+
+    lines, layout = path_planner._prepare_work_line_layout(
+        wide_bands, processed, 0.0, geo=Geo(), state=State(),
+        config={"work_line_mode": "footprint_optimized"},
+    )
+
+    assert len(lines) == 2
+    assert layout["work_line_mode"] == "band_centerline_with_footprint_validation"
+    assert layout["optimization_complete"] is False
+    assert layout["optimization_fallback_reason"] == "optimized_centerline_topology_violation"

@@ -4,6 +4,7 @@ workers.py — PySide6 后台工作线程
 处理推理、路径规划等耗时操作，不阻塞 UI。
 """
 from typing import Optional, Dict, List, Tuple, Callable
+from types import SimpleNamespace
 import traceback
 import os
 import time
@@ -209,6 +210,97 @@ def require_metric_scale(geo, state, shape) -> float:
             )
         value = float(np.median(means))
     return value
+
+
+def path_planning_config_snapshot(runtime_config=None):
+    """DECISION-013: freeze one default-plus-runtime planner configuration."""
+    from config import Config
+
+    config = Config().section("path_planning")
+    config.update(dict(runtime_config or {}))
+    config.setdefault("headland_damage_weight", 1.0)
+    return config
+
+
+def planning_config_with_mask_evidence(config_snapshot, mask_result, state, shape):
+    """DECISION-009/013: inject the same semantic evidence into every planner path."""
+    config = dict(config_snapshot or {})
+    mask_result = dict(mask_result or {})
+    config["headland_mask"] = mask_result.get("headland_mask")
+    config["planning_support_mask"] = mask_result.get("planning_support_mask")
+    config["neutral_support_mask"] = mask_result.get("neutral_support_mask")
+    config["uncertain_mask"] = mask_result.get("uncertain_residual_mask")
+
+    from footprint_planner import rasterize_forbidden_regions
+
+    forbidden_confirmed = (
+        getattr(state, "forbidden_regions_confirmed", False) is True
+    )
+    forbidden_mask = rasterize_forbidden_regions(shape, state)
+    if forbidden_confirmed and forbidden_mask is None:
+        forbidden_mask = np.zeros(shape[:2], dtype=np.uint8)
+    config["forbidden_mask"] = forbidden_mask
+    config["forbidden_mask_confirmed"] = forbidden_confirmed
+    return config
+
+
+def semantic_mask_fingerprints(executed_config):
+    """DECISION-001/002/009: bind every planner semantic mask by content."""
+    from provenance import artifact_sha256
+
+    evidence = dict(executed_config or {})
+    return {
+        key: artifact_sha256(evidence.get(key))
+        for key in (
+            "headland_mask",
+            "planning_support_mask",
+            "neutral_support_mask",
+            "uncertain_mask",
+            "forbidden_mask",
+        )
+    }
+
+
+def attach_path_provenance(path_result, mask_result, state, executed_config):
+    """DECISION-001/013: bind a completed path to its exact scalar inputs."""
+    from path_planner import PATH_PLANNING_VERSION
+    from provenance import make_stage_record
+
+    excluded = {
+        "headland_mask", "planning_support_mask", "uncertain_residual_mask",
+        "uncertain_mask", "forbidden_mask", "neutral_support_mask",
+    }
+    path_config = {
+        key: value for key, value in dict(executed_config or {}).items()
+        if not str(key).startswith("_") and key not in excluded
+    }
+    path_inputs = {
+        "mask_fingerprint": str(
+            (dict(mask_result or {}).get("provenance", {}) or {}).get(
+                "fingerprint", ""
+            )
+        ),
+        "path_config": path_config,
+        "harvester": dict(getattr(state, "harvester_params", {}) or {}),
+        "turn_strategy": str(getattr(state, "turn_strategy", "auto")),
+        "entry_point": getattr(state, "entry_point", None),
+        "exit_point": getattr(state, "exit_point", None),
+        "unload_points": list(getattr(state, "unload_points", []) or []),
+        "forbidden_regions": list(getattr(state, "forbidden_regions", []) or []),
+        "forbidden_regions_confirmed": bool(
+            getattr(state, "forbidden_regions_confirmed", False)
+        ),
+        "semantic_mask_fingerprints": semantic_mask_fingerprints(executed_config),
+    }
+    path_artifact = {
+        "full_path": path_result.get("full_path", []),
+        "segment_types": path_result.get("segment_types", []),
+        "layout": path_result.get("layout", {}),
+    }
+    path_result["provenance"] = make_stage_record(
+        "path", PATH_PLANNING_VERSION, path_inputs, path_artifact
+    )
+    return path_result
 
 
 class TifLoadWorker(QObject):
@@ -448,7 +540,24 @@ class CacheRestoreWorker(QObject):
                 current_path_config.update({
                     "min_turn_radius_m": float(harvester.get("turn_radius_m", cfg.MIN_TURN_RADIUS_M)),
                     "turn_strategy": str(saved.get("turn_strategy", "auto")),
+                    "forbidden_mask_confirmed": bool(
+                        saved.get("forbidden_regions_confirmed", False)
+                    ),
                 })
+                restored_mask_result = dict(processed_layers)
+                restored_mask_result["processed_mask"] = processed_mask
+                restored_state = SimpleNamespace(
+                    forbidden_regions=list(saved.get("forbidden_regions") or []),
+                    forbidden_regions_confirmed=bool(
+                        saved.get("forbidden_regions_confirmed", False)
+                    ),
+                )
+                restored_config = planning_config_with_mask_evidence(
+                    current_path_config,
+                    restored_mask_result,
+                    restored_state,
+                    processed_mask.shape,
+                )
                 path_inputs.update({
                     "path_config": current_path_config,
                     "harvester": harvester,
@@ -456,10 +565,18 @@ class CacheRestoreWorker(QObject):
                     "entry_point": saved.get("entry_point"),
                     "exit_point": saved.get("exit_point"),
                     "unload_points": list(saved.get("unload_points") or []),
+                    "forbidden_regions": list(saved.get("forbidden_regions") or []),
+                    "forbidden_regions_confirmed": bool(
+                        saved.get("forbidden_regions_confirmed", False)
+                    ),
+                    "semantic_mask_fingerprints": semantic_mask_fingerprints(
+                        restored_config
+                    ),
                 })
                 path_artifact = {
                     "full_path": [item.get("points", []) for item in saved.get("auto_path", [])],
                     "segment_types": [item.get("segment_type", "work") for item in saved.get("auto_path", [])],
+                    "layout": dict(saved.get("path_artifact") or {}).get("layout", {}),
                 }
                 if str(path_record.get("algorithm_version", "")) != PATH_PLANNING_VERSION:
                     raise ProvenanceError("path algorithm version changed")
@@ -514,7 +631,10 @@ class PipelineWorker(QObject):
         self.geo = geo
         self.model_engine = model_engine
         self.image = image
-        self.params = params
+        self.params = dict(params or {})
+        self.path_config = path_planning_config_snapshot(
+            self.params.get("path_config") or {}
+        )
         self._cancelled = False
 
     def cancel(self):
@@ -599,20 +719,28 @@ class PipelineWorker(QObject):
             if not np.any(planning_mask):
                 planning_mask = processed_mask
 
-            path_config = {
-                "min_turn_radius_m": self.params.get("turn_radius", 2.5),
-                "turn_strategy": self.params.get("turn_strategy", "auto"),
-                "headland_mask": processed.get("headland_mask"),
-                "planning_support_mask": processed.get("planning_support_mask"),
-            }
+            path_config = dict(self.path_config)
+            path_config.setdefault(
+                "min_turn_radius_m", self.params.get("turn_radius", 2.5)
+            )
+            path_config.setdefault(
+                "turn_strategy", self.params.get("turn_strategy", "auto")
+            )
+            path_config = planning_config_with_mask_evidence(
+                path_config, processed, self.state, processed_mask.shape
+            )
             path_result = plan_path(
                 planning_bands, processed_mask, main_angle,
                 geo=self.geo,
                 state=self.state,
                 config=path_config,
                 progress_callback=self._emit_plan_progress,
-                detected_mask=self.state.inference_original_mask if hasattr(self.state, 'inference_original_mask') else None,
+                detected_mask=raw_mask,
                 planned_mask=planning_mask,
+                all_bands=processed.get("all_bands", []),
+            )
+            attach_path_provenance(
+                path_result, processed, self.state, path_config
             )
             result["path"] = path_result
 
@@ -772,16 +900,12 @@ class PlanWorker(QObject):
 
     def __init__(self, mask_result: dict, geo, state, config: dict, detected_mask=None, token=None, parent=None):
         super().__init__(parent)
-        from config import Config
-
         self.mask_result = dict(mask_result or {})
         self.geo = geo
         self.state = state
         # DECISION-013: the executed planner configuration must match the configuration
         # recorded in path provenance. Per-run values override persisted ones.
-        self.config = Config().section("path_planning")
-        self.config.update(dict(config or {}))
-        self.config.setdefault("headland_damage_weight", 1.0)
+        self.config = path_planning_config_snapshot(config)
         self.detected_mask = detected_mask
         self.token = token
         self._cancelled = False
@@ -831,24 +955,8 @@ class PlanWorker(QObject):
                 self._finish("cancelled")
                 return
             self.progress.emit(35, "正在计算作业线与转弯段...")
-            config = dict(self.config)
-            config.setdefault("headland_mask", self.mask_result.get("headland_mask"))
-            config.setdefault("planning_support_mask", self.mask_result.get("planning_support_mask"))
-            config.setdefault("uncertain_mask", self.mask_result.get("uncertain_residual_mask"))
-            from footprint_planner import rasterize_forbidden_regions
-            forbidden_confirmed = bool(
-                getattr(self.state, "forbidden_regions_confirmed", False)
-            )
-            forbidden_mask = rasterize_forbidden_regions(processed_mask.shape, self.state)
-            if forbidden_confirmed and forbidden_mask is None:
-                forbidden_mask = np.zeros(processed_mask.shape[:2], dtype=np.uint8)
-            config.setdefault(
-                "forbidden_mask",
-                forbidden_mask,
-            )
-            config.setdefault(
-                "forbidden_mask_confirmed",
-                forbidden_confirmed,
+            config = planning_config_with_mask_evidence(
+                self.config, self.mask_result, self.state, processed_mask.shape
             )
             config["_cancel_callback"] = self._is_cancelled
             path_result = plan_path(
@@ -859,43 +967,13 @@ class PlanWorker(QObject):
                 progress_callback=self._emit_plan_progress,
                 detected_mask=self.detected_mask,
                 planned_mask=planning_mask,
+                all_bands=self.mask_result.get("all_bands", []),
             )
             if self._is_cancelled():
                 self._finish("cancelled")
                 return
-            from config import Config
-            from path_planner import PATH_PLANNING_VERSION
-            from provenance import make_stage_record
-            path_config = Config().section("path_planning")
-            path_config.update({
-                key: value for key, value in self.config.items()
-                if not str(key).startswith("_") and key not in {
-                    "headland_mask", "planning_support_mask", "uncertain_residual_mask",
-                    "uncertain_mask", "forbidden_mask",
-                    "neutral_support_mask",
-                }
-            })
-            path_inputs = {
-                "mask_fingerprint": str(
-                    (self.mask_result.get("provenance", {}) or {}).get("fingerprint", "")
-                ),
-                "path_config": path_config,
-                "harvester": dict(getattr(self.state, "harvester_params", {}) or {}),
-                "turn_strategy": str(getattr(self.state, "turn_strategy", "auto")),
-                "entry_point": getattr(self.state, "entry_point", None),
-                "exit_point": getattr(self.state, "exit_point", None),
-                "unload_points": list(getattr(self.state, "unload_points", []) or []),
-                "forbidden_regions": list(getattr(self.state, "forbidden_regions", []) or []),
-                "forbidden_regions_confirmed": bool(
-                    getattr(self.state, "forbidden_regions_confirmed", False)
-                ),
-            }
-            path_artifact = {
-                "full_path": path_result.get("full_path", []),
-                "segment_types": path_result.get("segment_types", []),
-            }
-            path_result["provenance"] = make_stage_record(
-                "path", PATH_PLANNING_VERSION, path_inputs, path_artifact
+            attach_path_provenance(
+                path_result, self.mask_result, self.state, config
             )
             path_result["runtime"] = {
                 "stage": "path_planning",
@@ -914,4 +992,3 @@ class PlanWorker(QObject):
             })
         except Exception as e:
             self._finish("failed", error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
-

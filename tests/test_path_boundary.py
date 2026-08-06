@@ -88,7 +88,7 @@ def test_reverse_turns_do_not_bypass_field_boundary_constraint():
     assert diagnostics["boundary_constraints"]["turns_adjusted"] >= 1
 
 
-@pytest.mark.parametrize("strategy", ["bow", "pear", "semicircle", "alpha", "fishtail", "auto"])
+@pytest.mark.parametrize("strategy", ["bow", "pear", "semicircle", "alpha", "fishtail", "contour", "auto"])
 def test_all_turn_strategies_keep_non_work_segments_inside_field_boundary(strategy):
     from path_planner import _connect_work_lines
     from state import AppState

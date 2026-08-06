@@ -214,6 +214,8 @@ class ImageViewer(QGraphicsView):
         self._draw_press_pos = None    # 绘制模式按下时的屏幕坐标
         self._draw_press_scene = None  # 绘制模式按下时的场景坐标
         self._draw_dragged = False     # 是否已拖动超过阈值
+        self._direct_drag_hit_test = None
+        self._direct_drag_active = False
         self.setMinimumSize(200, 150)
         self.setMouseTracking(True)
         self.setCursor(Qt.ArrowCursor)
@@ -295,6 +297,30 @@ class ImageViewer(QGraphicsView):
         self._update_scene_rect_padding()
         self.view_scale_changed.emit(self.get_view_scale())
 
+    def capture_view_state(self):
+        """Capture the current image-space viewport for lossless image swaps."""
+        center = self.mapToScene(self.viewport().rect().center())
+        return {
+            "transform": QTransform(self.transform()),
+            "center": QPointF(float(center.x()), float(center.y())),
+            "rotation_deg": float(self._rotation_deg),
+        }
+
+    def restore_view_state(self, state):
+        """Restore zoom, rotation and image-space centre after an image swap."""
+        if not state or self._pixmap is None:
+            return
+        transform = state.get("transform")
+        center = state.get("center")
+        if isinstance(transform, QTransform):
+            self.setTransform(QTransform(transform))
+        self._rotation_deg = float(state.get("rotation_deg", self._rotation_deg)) % 360
+        self._clamp_zoom()
+        self._update_scene_rect_padding()
+        if isinstance(center, QPointF):
+            self.centerOn(center)
+        self.view_scale_changed.emit(self.get_view_scale())
+
     def zoom_out(self):
         self.scale(0.8, 0.8)
         self._update_scene_rect_padding()
@@ -330,6 +356,10 @@ class ImageViewer(QGraphicsView):
 
     # ── 鼠标事件 ──
 
+    def set_direct_drag_hit_test(self, callback):
+        """Register a scene-coordinate hit test that captures left-drag before panning."""
+        self._direct_drag_hit_test = callback if callable(callback) else None
+
     def wheelEvent(self, e):
         f = 1.15 if e.angleDelta().y() > 0 else 0.87
         self.scale(f, f)
@@ -345,6 +375,19 @@ class ImageViewer(QGraphicsView):
     def mousePressEvent(self, e):
         pos = self.mapToScene(e.pos())
         btn = {Qt.LeftButton: 1, Qt.RightButton: 2, Qt.MiddleButton: 3}.get(e.button(), 0)
+        if e.button() == Qt.LeftButton and self._direct_drag_hit_test is not None:
+            try:
+                capture = bool(
+                    self._direct_drag_hit_test(int(pos.x()), int(pos.y()))
+                )
+            except Exception:
+                capture = False
+            if capture:
+                self._direct_drag_active = True
+                self.setCursor(Qt.ClosedHandCursor)
+                self.mouse_pressed.emit(int(pos.x()), int(pos.y()), 1)
+                e.accept()
+                return
         # 中键 → 始终平移
         if e.button() == Qt.MiddleButton:
             self._pan_origin = e.pos()
@@ -374,6 +417,12 @@ class ImageViewer(QGraphicsView):
     def mouseReleaseEvent(self, e):
         pos = self.mapToScene(e.pos())
         btn = {Qt.LeftButton: 1, Qt.RightButton: 2, Qt.MiddleButton: 3}.get(e.button(), 0)
+        if e.button() == Qt.LeftButton and self._direct_drag_active:
+            self._direct_drag_active = False
+            self.setCursor(Qt.CrossCursor if self.drawing_mode else Qt.ArrowCursor)
+            self.mouse_released.emit(int(pos.x()), int(pos.y()), 1)
+            e.accept()
+            return
         # 绘制模式左键释放
         if e.button() == Qt.LeftButton and self.drawing_mode:
             was_dragged = self._draw_dragged
@@ -404,6 +453,11 @@ class ImageViewer(QGraphicsView):
         btns = (1 if e.buttons() & Qt.LeftButton else 0) \
              | (2 if e.buttons() & Qt.RightButton else 0) \
              | (4 if e.buttons() & Qt.MiddleButton else 0)
+        if self._direct_drag_active and (e.buttons() & Qt.LeftButton):
+            self.mouse_moved.emit(int(pos.x()), int(pos.y()), btns)
+            self.mouse_dragged.emit(int(pos.x()), int(pos.y()), btns)
+            e.accept()
+            return
         # 绘制模式左键拖拽检测
         if self.drawing_mode and self._draw_press_pos is not None and (e.buttons() & Qt.LeftButton):
             dist = (e.pos() - self._draw_press_pos).manhattanLength()
@@ -456,6 +510,14 @@ class ImageViewer(QGraphicsView):
             self._scene.removeItem(i)
         self._overlay_group.clear()
 
+    def remove_overlays(self, items):
+        """Remove a caller-owned overlay subset without disturbing other layers."""
+        for item in list(items or []):
+            if item in self._overlay_group:
+                self._overlay_group.remove(item)
+            if item is not None and item.scene() is self._scene:
+                self._scene.removeItem(item)
+
     def draw_line(self, x1, y1, x2, y2, color=(0, 200, 80), width=2, style=Qt.SolidLine):
         pen = QPen(QColor(*reversed(color) if len(color) == 3 else color), width, style)
         pen.setCosmetic(True)
@@ -464,10 +526,10 @@ class ImageViewer(QGraphicsView):
         self._overlay_group.append(line)
         return line
 
-    def draw_polyline(self, pts, color=(0, 200, 80), width=2):
+    def draw_polyline(self, pts, color=(0, 200, 80), width=2, style=Qt.SolidLine):
         if len(pts) < 2:
             return
-        pen = QPen(QColor(*reversed(color)), width, Qt.SolidLine)
+        pen = QPen(QColor(*reversed(color)), width, style)
         pen.setCosmetic(True)
         for i in range(len(pts) - 1):
             x1, y1 = pts[i]
@@ -803,7 +865,7 @@ class ImageViewerGroup(QWidget):
         btn_compare = QPushButton("对比")
         btn_compare.setFixedWidth(42)
         btn_compare.setStyleSheet(style)
-        btn_compare.setToolTip("切换掩膜处理前后效果")
+        btn_compare.setToolTip("切换原始影像与当前正在操作的结果")
         btn_compare.clicked.connect(self.mask_compare_requested.emit)
         tbar.addWidget(btn_compare); self._tb_buttons.append(btn_compare)
 

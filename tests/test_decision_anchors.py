@@ -62,8 +62,12 @@ DECISION_ANCHORS = {
     ),
     "DECISION-011": (
         "docs/DECISIONS.md",
+        "path_planner.py",
         "footprint_planner.py",
+        "machine_route_validator.py",
         "tests/test_planar_footprint.py",
+        "tests/test_cross_module_math.py",
+        "tests/test_machine_readiness.py",
     ),
     "DECISION-012": (
         "docs/DECISIONS.md",
@@ -93,6 +97,19 @@ DECISION_ANCHORS = {
         "tests/test_headland_turn.py",
         "tests/test_headland_turn_contract.py",
         "tests/test_headland_turn_integration.py",
+    ),
+    "DECISION-016": (
+        "docs/DECISIONS.md",
+        "docs/DATA_CONTRACTS.md",
+        "path_planner.py",
+        "pyside6_app/panels.py",
+        "tests/test_contour_strategy.py",
+    ),
+    "DECISION-017": (
+        "docs/DECISIONS.md",
+        "docs/DATA_CONTRACTS.md",
+        "path_planner.py",
+        "tests/test_mixed_region_strategy.py",
     ),
 }
 

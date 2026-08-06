@@ -60,9 +60,90 @@ def _field_support(mask: np.ndarray, state=None) -> np.ndarray:
 
 
 def _interval_mean(cumulative: np.ndarray, start: int, end: int) -> float:
-    start = max(0, min(int(start), cumulative.size - 1))
-    end = max(start + 1, min(int(end), cumulative.size - 1))
-    return float(cumulative[end] - cumulative[start]) / max(end - start, 1)
+    """Mean over an interval, treating samples outside the raster as zero."""
+    profile_size = max(0, int(cumulative.size) - 1)
+    start, end = int(start), int(end)
+    requested_width = end - start
+    if requested_width <= 0 or profile_size <= 0:
+        return 0.0
+    clipped_start = max(0, min(start, profile_size))
+    clipped_end = max(0, min(end, profile_size))
+    if clipped_end <= clipped_start:
+        return 0.0
+    return float(cumulative[clipped_end] - cumulative[clipped_start]) / requested_width
+
+
+def summarize_work_line_footprint(footprint: Dict) -> Dict:
+    keys = (
+        "track_core_overlap_pct",
+        "planned_target_geometric_coverage_pct",
+        "track_outside_field_pct",
+        "track_outside_support_pct",
+        "track_uncertain_overlap_pct",
+        "track_forbidden_overlap_pct",
+        "rolling_canopy_pct",
+        "track_swept_area_m2",
+        "footprint_resolution_m",
+    )
+    return {key: footprint.get(key) for key in keys}
+
+
+def compare_work_line_footprints(
+    baseline: Dict,
+    optimized: Dict,
+    *,
+    tolerance: float = 1e-6,
+) -> Dict:
+    """Accept optimized work lines only when formal footprint metrics improve safely."""
+    lower_is_better = (
+        "track_core_overlap_pct",
+        "track_outside_field_pct",
+        "track_outside_support_pct",
+        "track_uncertain_overlap_pct",
+        "track_forbidden_overlap_pct",
+    )
+    higher_is_better = ("planned_target_geometric_coverage_pct",)
+    required = {
+        "track_core_overlap_pct",
+        "planned_target_geometric_coverage_pct",
+        "track_outside_field_pct",
+    }
+    degraded, improved, invalid = [], [], []
+
+    for name in (*lower_is_better, *higher_is_better):
+        before = baseline.get(name)
+        after = optimized.get(name)
+        if before is None and after is None:
+            if name in required:
+                invalid.append(name)
+            continue
+        try:
+            before_value = float(before)
+            after_value = float(after)
+        except (TypeError, ValueError):
+            invalid.append(name)
+            continue
+        if not math.isfinite(before_value) or not math.isfinite(after_value):
+            invalid.append(name)
+            continue
+        delta = after_value - before_value
+        if name in lower_is_better:
+            if delta > tolerance:
+                degraded.append(name)
+            elif delta < -tolerance:
+                improved.append(name)
+        else:
+            if delta < -tolerance:
+                degraded.append(name)
+            elif delta > tolerance:
+                improved.append(name)
+
+    return {
+        "accepted": not invalid and not degraded and bool(improved),
+        "degraded_metrics": degraded,
+        "improved_metrics": improved,
+        "invalid_metrics": invalid,
+    }
 
 
 def _choose_layout(
@@ -274,6 +355,203 @@ def _optimize_line(
     return np.column_stack([x_values.astype(np.float64), baseline_y + offsets])
 
 
+def _optimize_baseline_line(
+    baseline: np.ndarray,
+    crop: np.ndarray,
+    core: np.ndarray,
+    support: np.ndarray,
+    forbidden: Optional[np.ndarray],
+    uncertain: Optional[np.ndarray],
+    work_mpp: float,
+    cutter_width_m: float,
+    track_width_m: float,
+    track_gauge_m: float,
+    config: Dict,
+) -> Tuple[Optional[np.ndarray], Dict]:
+    """Optimize one row-band centerline only within its lateral search corridor."""
+    values = np.asarray(baseline, dtype=np.float64)
+    reference_shape = np.asarray(crop).shape[:2]
+    for layer_name, layer in (
+        ("core", core),
+        ("support", support),
+        ("forbidden", forbidden),
+        ("uncertain", uncertain),
+    ):
+        if layer is not None and np.asarray(layer).shape[:2] != reference_shape:
+            return None, {"reason": f"{layer_name}_shape_mismatch"}
+    if values.ndim != 2 or values.shape[0] < 2:
+        return None, {"reason": "invalid_baseline"}
+    order = np.argsort(values[:, 0])
+    values = values[order]
+    keep = np.concatenate(([True], np.diff(values[:, 0]) > 1e-6))
+    values = values[keep]
+    if values.shape[0] < 2:
+        return None, {"reason": "degenerate_baseline"}
+
+    start_x, end_x = float(values[0, 0]), float(values[-1, 0])
+    station_m = float(config.get("station_interval_m", 0.25))
+    station_px = max(1.0, station_m / max(work_mpp, 1e-9))
+    sample_count = max(2, int(math.ceil((end_x - start_x) / station_px)) + 1)
+    x_values = np.linspace(start_x, end_x, sample_count)
+    baseline_y = np.interp(x_values, values[:, 0], values[:, 1])
+
+    search_m = float(config.get("lateral_search_m", 0.25))
+    lateral_step_m = float(config.get("lateral_step_m", 0.025))
+    if not math.isfinite(search_m) or search_m < 0.0:
+        return None, {"reason": "invalid_lateral_search"}
+    if not math.isfinite(lateral_step_m) or lateral_step_m <= 0.0:
+        return None, {"reason": "invalid_lateral_step"}
+    offset_values = np.arange(
+        -search_m,
+        search_m + lateral_step_m * 0.5,
+        lateral_step_m,
+        dtype=np.float64,
+    ) / max(work_mpp, 1e-9)
+    if offset_values.size == 0:
+        return None, {"reason": "empty_lateral_search"}
+
+    cutter_px = cutter_width_m / work_mpp
+    track_px = track_width_m / work_mpp
+    gauge_px = track_gauge_m / work_mpp
+    window_half = max(
+        1,
+        int(round(float(config.get("station_window_m", 0.16)) / work_mpp / 2.0)),
+    )
+    data_cost = np.full((sample_count, offset_values.size), np.inf, dtype=np.float64)
+    forbidden_mask = None if forbidden is None else np.asarray(forbidden) > 0
+    uncertain_mask = None if uncertain is None else np.asarray(uncertain) > 0
+    uncertain_penalty = float(config.get("lateral_uncertain_penalty", 40.0))
+
+    for x_index, x_value in enumerate(x_values):
+        x0 = max(0, int(round(x_value)) - window_half)
+        x1 = min(crop.shape[1], int(round(x_value)) + window_half + 1)
+        if x1 <= x0:
+            continue
+        crop_profile = np.mean(crop[:, x0:x1] > 0, axis=1).astype(np.float64)
+        core_profile = np.mean(core[:, x0:x1] > 0, axis=1).astype(np.float64)
+        support_profile = np.mean(support[:, x0:x1] > 0, axis=1).astype(np.float64)
+        forbidden_profile = (
+            np.mean(forbidden_mask[:, x0:x1], axis=1).astype(np.float64)
+            if forbidden_mask is not None
+            else np.zeros(crop.shape[0], dtype=np.float64)
+        )
+        uncertain_profile = (
+            np.mean(uncertain_mask[:, x0:x1], axis=1).astype(np.float64)
+            if uncertain_mask is not None
+            else np.zeros(crop.shape[0], dtype=np.float64)
+        )
+        crop_cumulative = np.concatenate(([0.0], np.cumsum(crop_profile)))
+        core_cumulative = np.concatenate(([0.0], np.cumsum(core_profile)))
+        support_cumulative = np.concatenate(([0.0], np.cumsum(support_profile)))
+        forbidden_cumulative = np.concatenate(([0.0], np.cumsum(forbidden_profile)))
+        uncertain_cumulative = np.concatenate(([0.0], np.cumsum(uncertain_profile)))
+
+        for offset_index, offset in enumerate(offset_values):
+            center = float(baseline_y[x_index] + offset)
+            if center < 0.0 or center >= crop.shape[0]:
+                continue
+            core_overlap = canopy_overlap = track_support = 0.0
+            forbidden_overlap = uncertain_overlap = 0.0
+            for track_center in (center - gauge_px / 2.0, center + gauge_px / 2.0):
+                start = int(round(track_center - track_px / 2.0))
+                end = int(round(track_center + track_px / 2.0)) + 1
+                core_overlap += _interval_mean(core_cumulative, start, end)
+                canopy_overlap += _interval_mean(crop_cumulative, start, end)
+                track_support += _interval_mean(support_cumulative, start, end)
+                forbidden_overlap += _interval_mean(forbidden_cumulative, start, end)
+                uncertain_overlap += _interval_mean(uncertain_cumulative, start, end)
+            core_overlap *= 0.5
+            canopy_overlap *= 0.5
+            track_support *= 0.5
+            forbidden_overlap *= 0.5
+            uncertain_overlap *= 0.5
+
+            cutter_start = int(round(center - cutter_px / 2.0))
+            cutter_end = int(round(center + cutter_px / 2.0)) + 1
+            cutter_crop = _interval_mean(crop_cumulative, cutter_start, cutter_end)
+            cutter_support = _interval_mean(support_cumulative, cutter_start, cutter_end)
+            outside = 1.0 - min(track_support, cutter_support)
+            normalized_offset = offset * work_mpp / max(search_m, lateral_step_m)
+            if forbidden_overlap > 0.0:
+                continue
+            data_cost[x_index, offset_index] = (
+                80.0 * core_overlap
+                + 5.0 * canopy_overlap
+                + 20.0 * outside
+                + uncertain_penalty * uncertain_overlap
+                - 1.0 * cutter_crop
+                + 0.8 * normalized_offset * normalized_offset
+            )
+
+    if not np.all(np.any(np.isfinite(data_cost), axis=1)):
+        return None, {"reason": "no_finite_lateral_candidate"}
+    smooth_penalty = float(config.get("lateral_smooth_penalty", 0.12))
+    dp = np.full_like(data_cost, np.inf)
+    previous = np.zeros(data_cost.shape, dtype=np.int32)
+    dp[0] = data_cost[0]
+    indices = np.arange(offset_values.size)
+    for station in range(1, sample_count):
+        for current in range(offset_values.size):
+            if not math.isfinite(float(data_cost[station, current])):
+                continue
+            transition = dp[station - 1] + smooth_penalty * (indices - current) ** 2
+            best_previous = int(np.argmin(transition))
+            previous[station, current] = best_previous
+            dp[station, current] = data_cost[station, current] + transition[best_previous]
+    if not np.any(np.isfinite(dp[-1])):
+        return None, {"reason": "no_continuous_lateral_candidate"}
+
+    chosen = np.zeros(sample_count, dtype=np.int32)
+    chosen[-1] = int(np.argmin(dp[-1]))
+    for station in range(sample_count - 1, 0, -1):
+        chosen[station - 1] = previous[station, chosen[station]]
+    offsets = offset_values[chosen]
+    zero_index = int(np.argmin(np.abs(offset_values)))
+    baseline_costs = data_cost[:, zero_index]
+    offsets = smooth_1d(
+        offsets,
+        float(config.get("path_smooth_m", 0.75)) / max(station_m, 1e-6),
+    )
+    limit_px = search_m / max(work_mpp, 1e-9)
+    offsets = np.clip(offsets, -limit_px, limit_px)
+    final_indices = np.argmin(
+        np.abs(offsets[:, None] - offset_values[None, :]),
+        axis=1,
+    )
+    selected_costs = data_cost[np.arange(sample_count), final_indices]
+    if not np.all(np.isfinite(selected_costs)):
+        return None, {"reason": "smoothed_path_enters_invalid_candidate"}
+    optimized_objective = float(np.mean(selected_costs))
+    baseline_objective = (
+        float(np.mean(baseline_costs))
+        if np.all(np.isfinite(baseline_costs))
+        else None
+    )
+    if (
+        baseline_objective is not None
+        and optimized_objective > baseline_objective + 1e-9
+    ):
+        return None, {
+            "reason": "smoothed_path_worse_than_baseline",
+            "baseline_objective": baseline_objective,
+            "optimized_objective": optimized_objective,
+        }
+    optimized = np.column_stack([x_values, baseline_y + offsets])
+    shift_m = np.abs(offsets) * work_mpp
+    return optimized, {
+        "mean_abs_lateral_shift_m": float(np.mean(shift_m)),
+        "max_abs_lateral_shift_m": float(np.max(shift_m)),
+        "station_count": int(sample_count),
+        "baseline_objective": baseline_objective,
+        "optimized_objective": optimized_objective,
+        "objective_improvement": (
+            float(baseline_objective - optimized_objective)
+            if baseline_objective is not None
+            else None
+        ),
+    }
+
+
 def generate_work_lines(
     processed_mask: np.ndarray,
     main_angle: float,
@@ -282,8 +560,9 @@ def generate_work_lines(
     harvester: Optional[Dict] = None,
     config: Optional[Dict] = None,
     progress_callback=None,
+    baseline_lines: Optional[List[List[Point]]] = None,
 ) -> Tuple[List[List[Point]], Dict]:
-    """Generate coverage passes whose two track footprints avoid crop cores."""
+    """Generate footprint-aware passes, optionally anchored to row-band centerlines."""
     cfg = config or {}
     specs = dict(harvester or {})
     required = ("cutter_width_m", "track_width_m", "track_gauge_m")
@@ -314,11 +593,43 @@ def generate_work_lines(
         interpolation=cv2.INTER_AREA,
     )
     work = (work >= 96).astype(np.uint8) * 255
-    support_full = _field_support(raw, state)
+    configured_support = cfg.get("planning_support_mask")
+    if (
+        isinstance(configured_support, np.ndarray)
+        and configured_support.shape[:2] == raw.shape[:2]
+    ):
+        support_full = (
+            np.asarray(configured_support, dtype=np.uint8) > 0
+        ).astype(np.uint8) * 255
+    else:
+        support_full = _field_support(raw, state)
     support_work = cv2.resize(
         support_full,
         (work.shape[1], work.shape[0]),
         interpolation=cv2.INTER_NEAREST,
+    )
+    forbidden_full = rasterize_forbidden_regions(raw.shape, state)
+    forbidden_work = (
+        cv2.resize(
+            forbidden_full,
+            (work.shape[1], work.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        if forbidden_full is not None
+        else None
+    )
+    configured_uncertain = cfg.get("uncertain_mask")
+    uncertain_work = (
+        cv2.resize(
+            (np.asarray(configured_uncertain, dtype=np.uint8) > 0).astype(np.uint8) * 255,
+            (work.shape[1], work.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        if (
+            isinstance(configured_uncertain, np.ndarray)
+            and configured_uncertain.shape[:2] == raw.shape[:2]
+        )
+        else None
     )
     work_mpp = mpp / scale
 
@@ -331,6 +642,30 @@ def generate_work_lines(
         flags=cv2.INTER_NEAREST,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
+    )
+    forbidden_rotated = (
+        cv2.warpAffine(
+            forbidden_work,
+            matrix,
+            (crop_rotated.shape[1], crop_rotated.shape[0]),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        if forbidden_work is not None
+        else None
+    )
+    uncertain_rotated = (
+        cv2.warpAffine(
+            uncertain_work,
+            matrix,
+            (crop_rotated.shape[1], crop_rotated.shape[0]),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        if uncertain_work is not None
+        else None
     )
     inverse = cv2.invertAffineTransform(matrix)
     if np.count_nonzero(support_rotated) == 0:
@@ -356,6 +691,89 @@ def generate_work_lines(
         ),
         iterations=1,
     )
+
+    if baseline_lines is not None:
+        report(0.18, "以四行带中心线为基准建立横向搜索走廊")
+        optimized_lines: List[List[Point]] = []
+        line_diagnostics = []
+        for index, baseline in enumerate(baseline_lines):
+            values = np.asarray(baseline, dtype=np.float64)
+            if values.ndim != 2 or values.shape[0] < 2:
+                line_diagnostics.append({
+                    "line_index": int(index),
+                    "optimized": False,
+                    "reason": "invalid_baseline",
+                })
+                continue
+            baseline_work = values * scale
+            baseline_rotated = cv2.transform(
+                baseline_work.reshape(-1, 1, 2),
+                matrix,
+            ).reshape(-1, 2)
+            line_rotated, diagnostics = _optimize_baseline_line(
+                baseline_rotated,
+                crop_rotated,
+                core,
+                support_rotated,
+                forbidden_rotated,
+                uncertain_rotated,
+                work_mpp,
+                cutter_width_m,
+                track_width_m,
+                track_gauge_m,
+                cfg,
+            )
+            item = {"line_index": int(index), **dict(diagnostics or {})}
+            if line_rotated is None or len(line_rotated) < 2:
+                item["optimized"] = False
+                line_diagnostics.append(item)
+                continue
+            line_work = cv2.transform(
+                line_rotated.reshape(-1, 1, 2).astype(np.float64),
+                inverse,
+            ).reshape(-1, 2)
+            line_full = line_work / scale
+            optimized_lines.append([
+                (float(x), float(y)) for x, y in line_full
+            ])
+            item["optimized"] = True
+            line_diagnostics.append(item)
+            report(
+                0.18 + 0.72 * (index + 1) / max(len(baseline_lines), 1),
+                f"四行带作业线横向优化 {index + 1}/{len(baseline_lines)}",
+            )
+
+        complete = len(optimized_lines) == len(baseline_lines)
+        max_shift = max(
+            (
+                float(item.get("max_abs_lateral_shift_m", 0.0))
+                for item in line_diagnostics
+                if item.get("optimized")
+            ),
+            default=0.0,
+        )
+        layout = {
+            "source": "four_row_band_centerlines_lateral_optimization",
+            "footprint_optimization_scope": "centerline_anchored_lateral_search",
+            "optimization_complete": bool(complete),
+            "baseline_pass_count": len(baseline_lines),
+            "optimized_pass_count": len(optimized_lines),
+            "generated_pass_count": len(optimized_lines),
+            "lateral_search_m": float(cfg.get("lateral_search_m", 0.25)),
+            "lateral_step_m": float(cfg.get("lateral_step_m", 0.025)),
+            "max_abs_lateral_shift_m": max_shift,
+            "line_optimization": line_diagnostics,
+            "meters_per_pixel": float(mpp),
+            "planning_scale": float(scale),
+            "planning_resolution_m": float(work_mpp),
+            "crop_core_erosion_m": erosion_m,
+        }
+        if not complete:
+            layout["reason"] = "incomplete_centerline_optimization"
+            return [], layout
+        report(0.90, "四行带作业线横向优化完成")
+        return optimized_lines, layout
+
     support_counts = np.sum(support_rotated > 0, axis=1).astype(np.float64)
     crop_profile = np.divide(
         np.sum(crop_rotated > 0, axis=1),

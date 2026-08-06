@@ -12,7 +12,7 @@ def test_builtin_test_image_resolves_to_existing_geotiff():
     assert builtin_assets_status() == "available"
 
 
-def test_builtin_test_models_are_exactly_three_trained_best_weights():
+def test_builtin_test_models_include_all_registered_trained_best_weights():
     from builtin_test_assets import builtin_test_models
 
     models = builtin_test_models()
@@ -20,8 +20,9 @@ def test_builtin_test_models_are_exactly_three_trained_best_weights():
         "YOLO11m-seg（内置对比）",
         "YOLO11s-seg（内置对比）",
         "YOLOv8s-seg（内置对比）",
+        "YOLO11s-seg（分蘖期12m）",
     ]
-    assert len(models) == 3
+    assert len(models) == 4
     assert all(model["path"].endswith(".pt") for model in models)
     assert all(os.path.isfile(model["path"]) for model in models)
     assert all(len(model["sha256"]) == 64 for model in models)
@@ -49,7 +50,7 @@ def test_main_window_merges_trusted_builtin_comparison_models(monkeypatch):
     monkeypatch.setattr(window, "_model_registry", lambda model_dir=None: {})
 
     models = window._builtin_model_list()
-    assert len(models) == 3
+    assert len(models) == 4
     assert all(model.get("trusted_builtin") for model in models)
     assert all(os.path.isfile(model["path"]) for model in models)
     assert window._is_trusted_builtin_model_path(models[0]["path"])

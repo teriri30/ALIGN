@@ -3,10 +3,64 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from trial_package import export_visual_artifacts, write_package_index
 from pyside6_app.main_window import MainWindow
+
+
+def _machine_ready():
+    return {
+        "schema": "reui.machine-readiness.v1",
+        "controlled_trial_ready": True,
+        "controlled_trial_blockers": [],
+        "eligible_for_machine_export": True,
+        "current_route_classification": "machine_export_candidate",
+        "blockers": [],
+        "manual_review_required": False,
+        "terminal_protocol_validated": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "readiness",
+    [
+        {},
+        {
+            **_machine_ready(),
+            "eligible_for_machine_export": False,
+            "blockers": ["terminal_adapter_not_validated"],
+        },
+        {**_machine_ready(), "terminal_protocol_validated": False},
+        _machine_ready(),
+    ],
+)
+def test_candidate_path_export_fails_before_writing_without_machine_evidence(
+    tmp_path, readiness
+):
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    output = tmp_path / "blocked.path"
+    path_result = {"machine_readiness": readiness}
+    points = [{
+        "lat": 30.0,
+        "lon": 116.0,
+        "pixel_x": 1.0,
+        "pixel_y": 1.0,
+        "segment_index": 0,
+        "point_index": 0,
+        "segment_type": "work",
+        "status": 1,
+    }]
+
+    with pytest.raises(ValueError, match="机器|终端协议"):
+        window._export_candidate_path(
+            str(output), path_result=path_result, geo_points=points
+        )
+
+    assert not output.exists()
+    window.close()
 
 
 def test_complete_trial_visual_artifacts_include_masks_path_and_diagnostics(tmp_path):
@@ -97,6 +151,7 @@ def test_complete_package_keeps_candidate_path_and_required_manifest_together(tm
         "tracks": [{"points": [(1, 1), (10, 10)]}],
         "turns": [],
         "validation": {"valid": True},
+        "machine_readiness": _machine_ready(),
     }
     geo_points = [
         {
@@ -111,6 +166,10 @@ def test_complete_package_keeps_candidate_path_and_required_manifest_together(tm
         }
     ]
     monkeypatch.setattr(window, "_geo_export_payload", lambda: (path_result, geo_points))
+    monkeypatch.setattr(
+        "machine_route_validator.assess_machine_readiness",
+        lambda *_args, **_kwargs: _machine_ready(),
+    )
     def fake_visual_artifacts(output_dir, **_kwargs):
         preview = Path(output_dir) / "preview.png"
         preview.write_bytes(b"png")

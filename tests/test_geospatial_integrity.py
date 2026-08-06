@@ -31,6 +31,10 @@ def _window_with_path():
     from inference import INFERENCE_PIPELINE_VERSION
     from path_planner import PATH_PLANNING_VERSION
     from provenance import file_sha256, make_stage_record
+    from pyside6_app.workers import (
+        planning_config_with_mask_evidence,
+        semantic_mask_fingerprints,
+    )
     from row_geometry import MASK_REGULARIZATION_VERSION
 
     QApplication.instance() or QApplication([])
@@ -42,6 +46,11 @@ def _window_with_path():
     model_sha256 = file_sha256(model_path)
     raw_mask = np.ones((40, 40), dtype=np.uint8)
     processed_mask = raw_mask.copy()
+    headland_mask = np.zeros_like(processed_mask)
+    headland_mask[:4, :] = 255
+    planning_support_mask = processed_mask.copy()
+    neutral_support_mask = np.zeros_like(processed_mask)
+    uncertain_residual_mask = np.zeros_like(processed_mask)
     inference_inputs = {
         "source_sha256": "test-source-sha256",
         "model_sha256": model_sha256,
@@ -66,6 +75,7 @@ def _window_with_path():
         "mask", MASK_REGULARIZATION_VERSION, mask_inputs, processed_mask
     )
     path_geometry = [[(10.25, 20.75), (15.5, 25.125)]]
+    path_layout = {}
     harvester = window._effective_harvester_params(window.state.harvester_params)
     path_config = window.cfg.section("path_planning")
     path_config.update({
@@ -84,11 +94,30 @@ def _window_with_path():
         "forbidden_regions": [],
         "forbidden_regions_confirmed": False,
     }
+    semantic_config = planning_config_with_mask_evidence(
+        path_config,
+        {
+            "processed_mask": processed_mask,
+            "headland_mask": headland_mask,
+            "planning_support_mask": planning_support_mask,
+            "neutral_support_mask": neutral_support_mask,
+            "uncertain_residual_mask": uncertain_residual_mask,
+        },
+        window.state,
+        processed_mask.shape,
+    )
+    path_inputs["semantic_mask_fingerprints"] = semantic_mask_fingerprints(
+        semantic_config
+    )
     path_record = make_stage_record(
         "path",
         PATH_PLANNING_VERSION,
         path_inputs,
-        {"full_path": path_geometry, "segment_types": ["work"]},
+        {
+            "full_path": path_geometry,
+            "segment_types": ["work"],
+            "layout": path_layout,
+        },
     )
     window.state.safe_update(
         source_sha256="test-source-sha256",
@@ -96,13 +125,21 @@ def _window_with_path():
         model_sha256=model_sha256,
         mask_raw=raw_mask,
         inference_provenance=inference_record,
-        mask_result={"processed_mask": processed_mask, "provenance": mask_record},
+        mask_result={
+            "processed_mask": processed_mask,
+            "headland_mask": headland_mask,
+            "planning_support_mask": planning_support_mask,
+            "neutral_support_mask": neutral_support_mask,
+            "uncertain_residual_mask": uncertain_residual_mask,
+            "provenance": mask_record,
+        },
         mask_provenance=mask_record,
         path_provenance=path_record,
     )
     window._store_path_result({
         "full_path": path_geometry,
         "segment_types": ["work"],
+        "layout": path_layout,
         "geo_points": [
             {
                 "lon": 1.0,
@@ -375,6 +412,15 @@ def test_export_rejects_forbidden_region_change_after_planning():
     window = _window_with_path()
     window.state.forbidden_regions = [[(1, 1), (3, 1), (3, 3), (1, 3)]]
     window.state.forbidden_regions_confirmed = True
+
+    with pytest.raises(ValueError, match="input fingerprint"):
+        window._geo_export_payload()
+
+
+def test_export_rejects_semantic_mask_change_after_path_planning():
+    """DECISION-001/002: formal output requires current semantic mask evidence."""
+    window = _window_with_path()
+    window.state.mask_result["planning_support_mask"][0, 0] = 0
 
     with pytest.raises(ValueError, match="input fingerprint"):
         window._geo_export_payload()

@@ -8,8 +8,10 @@ startup.py — 环境自检 + 一键安装模块
 import importlib
 from importlib import metadata
 import os
+import site
 import subprocess
 import sys
+import sysconfig
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -17,6 +19,74 @@ from pathlib import Path
 from runtime_env import configure_geospatial_environment
 
 
+def _path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(str(path or "")))
+
+
+def _prioritize_active_environment_paths() -> None:
+    """Isolate this interpreter from packages injected by a parent process.
+
+    Hermes and some IDE launchers export their own ``PYTHONPATH``. Reordering
+    those entries is insufficient: if this environment lacks a package, Python
+    will still import a binary extension built for another Python ABI. Keep the
+    project directory, then the active/user package directories, and discard
+    inherited path entries from the application process.
+    """
+    if not sys.path:
+        return
+    project_dir = str(Path(__file__).resolve().parent)
+    inherited = {
+        _path_key(path)
+        for path in str(os.environ.get("PYTHONPATH", "")).split(os.pathsep)
+        if path
+    }
+    inherited.discard(_path_key(project_dir))
+    if inherited:
+        sys.path[:] = [
+            path for path in sys.path
+            if _path_key(path) not in inherited
+        ]
+    os.environ.pop("PYTHONPATH", None)
+
+    # 用户 site-packages 优先于解释器自身的 site-packages，与 Python 默认
+    # 的 sys.path 语义一致。此前把 purelib/platlib 排在 user_site 前面，
+    # 导致 game 环境（conda，不可写）中 BLAS 动态库损坏的 numpy 覆盖了
+    # user-site 里自带的正常 numpy，任何矩阵乘法（@ / np.linalg）都会在
+    # 原生层崩溃（0xC06D007F）。
+    active_paths = []
+    try:
+        user_site = site.getusersitepackages()
+    except (AttributeError, OSError):
+        user_site = ""
+    if isinstance(user_site, str) and user_site:
+        active_paths.append(user_site)
+    for scheme in ("purelib", "platlib"):
+        try:
+            candidate = sysconfig.get_path(scheme)
+        except (KeyError, TypeError):
+            candidate = ""
+        if candidate:
+            active_paths.append(candidate)
+
+    active_keys = {_path_key(path) for path in active_paths}
+    if not active_keys:
+        return
+    first = sys.path[0]
+    remaining = list(sys.path[1:])
+    by_key = {_path_key(path): path for path in remaining if path}
+    prioritized = []
+    seen = set()
+    for path in active_paths:
+        key = _path_key(path)
+        if key in by_key and key not in seen:
+            prioritized.append(by_key[key])
+            seen.add(key)
+    sys.path[:] = [first] + prioritized + [
+        path for path in remaining if _path_key(path) not in seen
+    ]
+
+
+_prioritize_active_environment_paths()
 configure_geospatial_environment()
 
 PIP_INSTALL_TIMEOUT_SECONDS = int(os.environ.get("REUI_PIP_TIMEOUT_SECONDS", "1800"))
@@ -52,8 +122,35 @@ def _core_requirements():
 
 
 DEPENDENCIES = _core_requirements() + [
+    ("PyTorch", "torch", "torch==2.9.1+cu128", None),
+    ("TorchVision", "torchvision", "torchvision==0.24.1+cu128", None),
     ("Ultralytics", "ultralytics", "ultralytics==8.3.163", None),
 ]
+
+PYTORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+
+
+def _site_directory_is_writable(path: str) -> bool:
+    """Probe effective directory write permission instead of trusting os.access()."""
+    directory = str(path or "")
+    if not directory or not os.path.isdir(directory):
+        return False
+    probe = os.path.join(
+        directory,
+        f".reui_write_probe_{os.getpid()}_{threading.get_ident()}",
+    )
+    try:
+        with open(probe, "x", encoding="ascii"):
+            pass
+        os.remove(probe)
+        return True
+    except (OSError, UnicodeError):
+        try:
+            if os.path.exists(probe):
+                os.remove(probe)
+        except OSError:
+            pass
+        return False
 
 
 def check_missing() -> list:
@@ -82,6 +179,18 @@ def get_pip_python() -> str:
 def get_pip_command(packages: list[str]) -> list[str]:
     """构造 pip install 命令。"""
     cmd = [get_pip_python(), "-m", "pip", "install"]
+    site_paths = []
+    for scheme in ("purelib", "platlib"):
+        try:
+            path = sysconfig.get_path(scheme)
+        except (KeyError, TypeError):
+            path = ""
+        if path and path not in site_paths:
+            site_paths.append(path)
+    if site_paths and not any(_site_directory_is_writable(path) for path in site_paths):
+        cmd.append("--user")
+    if any(str(package).lower().startswith(("torch", "torchvision")) for package in packages):
+        cmd.extend(["--extra-index-url", PYTORCH_INDEX_URL])
     # 如果检测到清华镜像源环境变量或系统位于中国大陆，可添加镜像
     # 但不自动添加，由用户自行决定
     cmd.extend(packages)

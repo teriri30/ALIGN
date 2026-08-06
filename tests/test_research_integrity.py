@@ -286,6 +286,27 @@ def test_builtin_model_registry_matches_present_weight_files():
             assert file_sha256(weight) == item["sha256"]
 
 
+def test_tillering_12m_model_is_registered_with_requested_display_name():
+    """DECISION-006: the imported model is content-pinned and clearly named."""
+    import json
+    from pathlib import Path
+
+    model_dir = Path(__file__).resolve().parents[1] / "data" / "models"
+    registry = json.loads(
+        (model_dir / "model_registry.json").read_text(encoding="utf-8")
+    )
+    item = next(
+        model for model in registry["models"]
+        if model["name"] == "yolo11s_seg_tiller12m_best.pt"
+    )
+
+    assert item["display_name"] == "YOLO11s-seg（分蘖期12m）"
+    assert item["sha256"] == (
+        "5f31cc3950fe803e0768b2763f0ee9dd2a3a01395aa67a362ee734d41f4d3969"
+    )
+    assert item["metadata_status"] == "incomplete"
+
+
 def test_provenance_canonical_json_normalises_nonfinite_metadata():
     """DECISION-005: preprocessing provenance has stable canonical serialization."""
     from provenance import canonical_json_bytes

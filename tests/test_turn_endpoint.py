@@ -56,13 +56,19 @@ def test_single_short_line_uses_separate_headland_approach_before_turn():
     )
 
     first_turn = path[segment_types.index("turn")]
-    approach_index = segment_types.index("turn_approach")
-    approach = path[approach_index]
     assert first_turn[0][0] == pytest.approx(100.0)
     assert first_turn[-1][0] == pytest.approx(100.0)
-    assert approach[0] == pytest.approx((100.0, 40.0))
-    assert approach[-1] == pytest.approx((70.0, 40.0))
+    # DECISION-010 v2: 锚点延长沿主方向合并进作业线本身（不再产生独立
+    # turn_approach 段）——短线直接延伸到田头锚点，转弯保持短小。
+    assert "turn_approach" not in segment_types
+    work_indices = [i for i, t in enumerate(segment_types) if t == "work"]
+    short_line = path[work_indices[1]]
+    assert short_line[0] == pytest.approx((100.0, 40.0))
+    assert short_line[-1] == pytest.approx((10.0, 40.0))
     assert diagnostics["endpoint_alignment"]["corrected_endpoint_count"] == 1
+    assert diagnostics["endpoint_alignment"].get(
+        "long_anchor_extensions_merged_into_work_lines"
+    )
     decision = diagnostics["turn_decisions"][0]
     assert decision["requested_strategy"] == "pear"
     assert decision["candidate_strategy"] == "pear"

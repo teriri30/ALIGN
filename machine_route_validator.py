@@ -4,13 +4,95 @@ import math
 from typing import Dict, Optional
 
 from harvester_geometry import FOOTPRINT_MODEL, FOOTPRINT_REFERENCE_POINT
+from footprint_planner import compare_work_line_footprints
 
 
 MACHINE_READINESS_SCHEMA = "reui.machine-readiness.v1"
 
 
 def _verified_report(report: object) -> bool:
-    return isinstance(report, dict) and bool(report.get("verified"))
+    return isinstance(report, dict) and report.get("verified") is True
+
+
+def _finite_real(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _verified_optimization_identity(layout: Dict, pass_count: int) -> bool:
+    band_ids = layout.get("ordered_band_ids")
+    diagnostics = layout.get("line_optimization")
+    if (
+        not isinstance(band_ids, list)
+        or not isinstance(diagnostics, list)
+        or len(band_ids) != pass_count
+        or len(diagnostics) != pass_count
+        or any(
+            band_id == earlier
+            for index, band_id in enumerate(band_ids)
+            for earlier in band_ids[:index]
+        )
+    ):
+        return False
+    for index, (band_id, item) in enumerate(zip(band_ids, diagnostics)):
+        if not isinstance(item, dict):
+            return False
+        line_index = item.get("line_index")
+        if (
+            not isinstance(line_index, int)
+            or isinstance(line_index, bool)
+            or line_index != index
+            or item.get("band_id") != band_id
+            or item.get("optimized") is not True
+        ):
+            return False
+    return True
+
+
+def _accepted_footprint_comparison(layout: Dict, validation: Dict) -> bool:
+    comparison = layout.get("formal_comparison")
+    baseline = layout.get("baseline_footprint_metrics")
+    optimized = layout.get("optimized_footprint_metrics")
+    if not all(isinstance(value, dict) for value in (comparison, baseline, optimized)):
+        return False
+    if (
+        comparison.get("accepted") is not True
+        or comparison.get("degraded_metrics") != []
+        or comparison.get("invalid_metrics") != []
+        or not comparison.get("improved_metrics")
+    ):
+        return False
+    recomputed = compare_work_line_footprints(baseline, optimized)
+    if (
+        recomputed.get("accepted") is not True
+        or comparison.get("degraded_metrics")
+        != recomputed.get("degraded_metrics")
+        or comparison.get("improved_metrics")
+        != recomputed.get("improved_metrics")
+        or comparison.get("invalid_metrics")
+        != recomputed.get("invalid_metrics")
+    ):
+        return False
+    required_metrics = [
+        "track_core_overlap_pct",
+        "planned_target_geometric_coverage_pct",
+        "track_outside_field_pct",
+    ]
+    for presence_key, metric in (
+        ("semantic_support_present", "track_outside_support_pct"),
+        ("uncertain_mask_present", "track_uncertain_overlap_pct"),
+        ("forbidden_mask_present", "track_forbidden_overlap_pct"),
+    ):
+        if validation.get(presence_key) is True:
+            required_metrics.append(metric)
+    return all(
+        _finite_real(summary.get(name))
+        for summary in (baseline, optimized)
+        for name in required_metrics
+    )
 
 
 def assess_machine_readiness(
@@ -29,17 +111,46 @@ def assess_machine_readiness(
     turning = dict(result.get("turn_assessment") or {})
     controlled_trial_blockers = []
 
-    if not bool(result.get("is_valid", validation.get("valid", False))):
+    if result.get("is_valid", validation.get("valid", False)) is not True:
         controlled_trial_blockers.append("path_validation_failed")
     if turning.get("hard_reasons"):
         controlled_trial_blockers.append("turn_hard_errors_present")
-    if layout.get("work_line_mode") != "footprint_optimized":
+    # DECISION-011: a label alone is insufficient; readiness requires the
+    # complete centerline-anchored optimization contract and matching counts.
+    optimization_scope = layout.get("footprint_optimization_scope")
+    if (
+        layout.get("work_line_mode") != "footprint_optimized"
+        or optimization_scope != "centerline_anchored_lateral_search"
+    ):
         controlled_trial_blockers.append("footprint_optimized_work_lines_not_used")
+    else:
+        baseline_count = layout.get("baseline_pass_count")
+        optimized_count = layout.get("optimized_pass_count")
+        complete_counts = (
+            isinstance(baseline_count, int)
+            and not isinstance(baseline_count, bool)
+            and baseline_count > 0
+            and isinstance(optimized_count, int)
+            and not isinstance(optimized_count, bool)
+            and optimized_count == baseline_count
+        )
+        if layout.get("optimization_complete") is not True or not complete_counts:
+            controlled_trial_blockers.append("footprint_optimization_incomplete")
+        if complete_counts and not _verified_optimization_identity(
+            layout, baseline_count
+        ):
+            controlled_trial_blockers.append(
+                "footprint_optimization_identity_unverified"
+            )
+        if not _accepted_footprint_comparison(layout, validation):
+            controlled_trial_blockers.append(
+                "formal_footprint_comparison_not_accepted"
+            )
     if validation.get("validation_profile") not in {"field_trial", "machine_candidate"}:
         controlled_trial_blockers.append("field_trial_validation_profile_not_used")
-    if not bool(validation.get("field_boundary_present")):
+    if validation.get("field_boundary_present") is not True:
         controlled_trial_blockers.append("confirmed_field_boundary_missing")
-    if not bool(validation.get("semantic_support_present")):
+    if validation.get("semantic_support_present") is not True:
         controlled_trial_blockers.append("semantic_support_missing")
     if (
         validation.get("footprint_model") != FOOTPRINT_MODEL
@@ -47,14 +158,28 @@ def assess_machine_readiness(
     ):
         controlled_trial_blockers.append("footprint_contract_mismatch")
     if not (
-        bool(validation.get("forbidden_mask_present"))
-        and bool(cfg.get("forbidden_mask_confirmed"))
+        validation.get("forbidden_mask_present") is True
+        and cfg.get("forbidden_mask_confirmed") is True
     ):
         controlled_trial_blockers.append("confirmed_forbidden_map_missing")
     resolution = validation.get("footprint_resolution_m")
     harvester = dict((result.get("planning_factors") or {}).get("harvester") or {})
     track_width = harvester.get("track_width_m")
-    if isinstance(resolution, (int, float)) and isinstance(track_width, (int, float)):
+    resolution_valid = (
+        isinstance(resolution, (int, float))
+        and not isinstance(resolution, bool)
+        and math.isfinite(float(resolution))
+        and float(resolution) > 0.0
+    )
+    track_width_valid = (
+        isinstance(track_width, (int, float))
+        and not isinstance(track_width, bool)
+        and math.isfinite(float(track_width))
+        and float(track_width) > 0.0
+    )
+    if not resolution_valid or not track_width_valid:
+        controlled_trial_blockers.append("planning_resolution_missing_or_invalid")
+    else:
         resolution_limit = min(0.10, float(track_width) / 4.0)
         if float(resolution) > resolution_limit:
             controlled_trial_blockers.append("planning_resolution_too_coarse")
@@ -66,7 +191,7 @@ def assess_machine_readiness(
         max_machine_outside = limits.get("machine_outside_field")
         max_machine_forbidden = limits.get("machine_forbidden_overlap")
         if not all(
-            isinstance(value, (int, float)) and math.isfinite(float(value))
+            _finite_real(value)
             for value in (
                 machine_outside,
                 machine_forbidden,
@@ -90,9 +215,8 @@ def assess_machine_readiness(
     geo_rmse = geo_report.get("rmse_m") if isinstance(geo_report, dict) else None
     if not (
         _verified_report(geo_report)
-        and isinstance(geo_rmse, (int, float))
-        and math.isfinite(float(geo_rmse))
-        and bool(geo_report.get("within_tolerance"))
+        and _finite_real(geo_rmse)
+        and geo_report.get("within_tolerance") is True
     ):
         blockers.append("external_geo_accuracy_not_verified")
 
@@ -101,27 +225,32 @@ def assess_machine_readiness(
     if not reference_point or not (
         isinstance(gnss_offset, (list, tuple))
         and len(gnss_offset) == 3
-        and all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in gnss_offset)
+        and all(_finite_real(value) for value in gnss_offset)
     ):
         blockers.append("vehicle_reference_geometry_incomplete")
-    if not bool(cfg.get("kinematic_model_validated")):
+    if cfg.get("kinematic_model_validated") is not True:
         blockers.append("full_vehicle_kinematics_not_validated")
     if not (
         str(cfg.get("terminal_adapter", "")).strip()
-        and bool(cfg.get("terminal_adapter_validated"))
+        and cfg.get("terminal_adapter_validated") is True
     ):
         blockers.append("terminal_adapter_not_validated")
     if not _verified_report(cfg.get("field_tracking_report")):
         blockers.append("field_tracking_validation_missing")
-    if not bool(cfg.get("manual_review_signed")):
+    if cfg.get("manual_review_signed") is not True:
         blockers.append("manual_review_not_signed")
 
     blockers = list(dict.fromkeys(blockers))
+    terminal_protocol_validated = bool(
+        cfg.get("terminal_adapter_validated") is True
+        and str(cfg.get("terminal_adapter", "")).strip()
+    )
     return {
         "schema": MACHINE_READINESS_SCHEMA,
         "controlled_trial_ready": not controlled_trial_blockers,
         "controlled_trial_blockers": controlled_trial_blockers,
         "eligible_for_machine_export": not blockers,
+        "terminal_protocol_validated": terminal_protocol_validated,
         "current_route_classification": (
             "machine_export_candidate" if not blockers else "research_manual_review"
         ),
