@@ -881,12 +881,12 @@ def _sample_planar_poses(
 
 
 def _accumulate_pose_track_visit(
-    track_visit_count: np.ndarray,
+    track_pose_occupancy_count: np.ndarray,
     left_pixels: np.ndarray,
     right_pixels: np.ndarray,
 ) -> Tuple[int, int]:
     """Accumulate one pose using only the tracks' clipped local bounding box."""
-    height, width = track_visit_count.shape[:2]
+    height, width = track_pose_occupancy_count.shape[:2]
     points = np.vstack((left_pixels, right_pixels)).astype(np.int32, copy=False)
     x0 = max(0, int(np.min(points[:, 0])))
     y0 = max(0, int(np.min(points[:, 1])))
@@ -898,8 +898,30 @@ def _accumulate_pose_track_visit(
     offset = np.asarray([x0, y0], dtype=np.int32)
     cv2.fillPoly(local, [left_pixels - offset], 1)
     cv2.fillPoly(local, [right_pixels - offset], 1)
-    track_visit_count[y0:y1 + 1, x0:x1 + 1] += local.astype(np.uint32)
+    track_pose_occupancy_count[y0:y1 + 1, x0:x1 + 1] += local.astype(np.uint32)
     return local.shape
+
+
+def _accumulate_logical_segment_pass(
+    track_pass_count: np.ndarray,
+    segment_track_sweep: np.ndarray,
+) -> None:
+    """Count one logical segment once for every pixel in its union sweep.
+
+    Pose occupancy is intentionally separate from logical passage count.  A
+    segment may contain hundreds of overlapping poses, but it is still only
+    one logical pass for the formal repeated-rolling metrics.  Saturating at
+    the uint32 limit keeps the diagnostic map auditable even if a caller
+    supplies an unusually large number of logical segments.
+    """
+    active = np.asarray(segment_track_sweep) > 0
+    if not np.any(active):
+        return
+    max_count = np.iinfo(np.uint32).max
+    current = np.asarray(track_pass_count[active], dtype=np.uint64)
+    track_pass_count[active] = np.minimum(
+        current + np.uint64(1), np.uint64(max_count)
+    ).astype(np.uint32)
 
 
 def _rasterize_planar_sweeps(
@@ -909,9 +931,13 @@ def _rasterize_planar_sweeps(
     geometry: Dict,
     work_mpp: float,
     config: Dict,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[np.ndarray], float, float, int]:
+) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    List[np.ndarray], float, float, int,
+]:
     track_swept = np.zeros(shape, dtype=np.uint8)
-    track_visit_count = np.zeros(shape, dtype=np.uint32)
+    track_pose_occupancy_count = np.zeros(shape, dtype=np.uint32)
+    track_pass_count = np.zeros(shape, dtype=np.uint32)
     cutter_swept = np.zeros(shape, dtype=np.uint8)
     machine_swept = np.zeros(shape, dtype=np.uint8)
     segment_track_sweeps = [np.zeros(shape, dtype=np.uint8) for _ in full_path]
@@ -972,7 +998,7 @@ def _rasterize_planar_sweeps(
             cv2.fillPoly(track_swept, [left_pixels], 255)
             cv2.fillPoly(track_swept, [right_pixels], 255)
             _accumulate_pose_track_visit(
-                track_visit_count,
+                track_pose_occupancy_count,
                 left_pixels,
                 right_pixels,
             )
@@ -1004,8 +1030,10 @@ def _rasterize_planar_sweeps(
                     )
                     cv2.fillPoly(cutter_swept, [swept_quad], 255)
                 previous_cutter = cutter_pixels
+        _accumulate_logical_segment_pass(track_pass_count, segment_track)
     return (
-        track_swept, track_visit_count, cutter_swept, machine_swept,
+        track_swept, track_pose_occupancy_count, track_pass_count,
+        cutter_swept, machine_swept,
         segment_track_sweeps,
         pose_step_m, pose_heading_window_m, pose_count,
     )
@@ -1162,7 +1190,8 @@ def validate_footprints(
     ]
     (
         track_swept,
-        track_visit_count,
+        track_pose_occupancy_count,
+        track_pass_count,
         cutter_swept,
         machine_swept,
         segment_track_sweeps,
@@ -1174,8 +1203,6 @@ def validate_footprints(
     )
 
     track_area = max(int(np.count_nonzero(track_swept)), 1)
-    track_once = int(np.count_nonzero(track_visit_count == 1))
-    track_repeat = int(np.count_nonzero(track_visit_count >= 2))
     body_area_raw = int(np.count_nonzero(body))
     headland_area_raw = int(np.count_nonzero(headland))
     canopy_area_raw = int(np.count_nonzero(canopy))
@@ -1222,8 +1249,8 @@ def validate_footprints(
     if not np.isfinite(headland_weight) or not 0.0 < headland_weight <= 1.0:
         raise ValueError("headland_damage_weight must be within (0, 1]")
     pixel_area_m2 = work_mpp * work_mpp
-    track_rolling_visit_once_area_m2 = float(np.count_nonzero(track_visit_count == 1) * pixel_area_m2)
-    track_rolling_visit_twice_or_more_area_m2 = float(np.count_nonzero(track_visit_count >= 2) * pixel_area_m2)
+    track_rolling_visit_once_area_m2 = float(np.count_nonzero(track_pass_count == 1) * pixel_area_m2)
+    track_rolling_visit_twice_or_more_area_m2 = float(np.count_nonzero(track_pass_count >= 2) * pixel_area_m2)
     segment_metrics = []
     prior_track = np.zeros_like(track_swept)
     turn_union_exclusive = np.zeros_like(track_swept)
@@ -1267,7 +1294,7 @@ def validate_footprints(
     turn_forbidden = int(np.count_nonzero(turn_exclusive_bool & (forbidden > 0))) if forbidden is not None else None
     turn_outside = int(np.count_nonzero(turn_exclusive_bool & (field_support == 0)))
     turn_area = max(int(np.count_nonzero(turn_exclusive_bool)), 1)
-    turn_repeat = int(np.count_nonzero(turn_raw_bool & (track_visit_count >= 2)))
+    turn_repeat = int(np.count_nonzero(turn_raw_bool & (track_pass_count >= 2)))
     turn_metrics = {
         "turn_segment_metrics": [item for item in segment_metrics if item["segment_type"].startswith("turn")],
         "headland_turn_track_overlap_area_m2": float(turn_headland * pixel_area_m2),
@@ -1305,9 +1332,11 @@ def validate_footprints(
         "segment_metrics": segment_metrics,
         "turn_segment_metrics": turn_metrics["turn_segment_metrics"],
         "turn_metrics_attribution_rule": "exclusive_first_segment",
+        "footprint_repeat_count_basis": "logical_path_segment_union",
         "track_rolling_visit_once_area_m2": track_rolling_visit_once_area_m2,
         "track_rolling_visit_twice_or_more_area_m2": track_rolling_visit_twice_or_more_area_m2,
-        "track_access_count_dtype": str(track_visit_count.dtype),
+        "track_pass_count_dtype": str(track_pass_count.dtype),
+        "track_pose_occupancy_count_dtype": str(track_pose_occupancy_count.dtype),
         "headland_turn_track_overlap_area_m2": turn_metrics["headland_turn_track_overlap_area_m2"],
         "headland_turn_rolling_pct": turn_metrics["headland_turn_rolling_pct"],
         "turn_body_overlap_area_m2": turn_metrics["turn_body_overlap_area_m2"],
@@ -1383,7 +1412,8 @@ def validate_footprints(
         "footprint_resolution_m": float(work_mpp),
         "crop_core_erosion_m": erosion_m,
     }
-    # DECISION-015: uint32 access counts support auditable segment attribution.
+    # DECISION-015: logical segment-union pass counts, not pose occupancy,
+    # support the auditable once/repeated rolling metrics.
     formal = assess_footprint_hard_constraints(
         result,
         cfg,

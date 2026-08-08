@@ -128,11 +128,14 @@ def test_prepare_layout_keeps_classified_region_work_lines_separate():
         return_regions=True,
     )
 
-    assert len(lines) == 8
+    assert len(lines) == 9
     assert [item["kind"] for item in regions] == [
         "wide_narrow_rows", "uniform_block"
     ]
-    assert [item["line_count"] for item in regions] == [1, 7]
+    assert [item["line_count"] for item in regions] == [1, 8]
+    assert [item["line_source"] for item in regions] == [
+        "four_row_band_centerlines", "cutter_width_uniform_swaths"
+    ]
     regular_line = regions[0]["work_lines"][0]
     assert regular_line[0] == pytest.approx(regular["centerline"][0])
     assert regular_line[-1] == pytest.approx(regular["centerline"][-1])
@@ -240,11 +243,140 @@ def test_compact_uniform_zone_uses_centerline_and_mask_without_dense_contour():
         return_regions=True,
     )
 
-    assert len(lines) == 8
-    assert [region["line_count"] for region in regions] == [1, 7]
+    assert len(lines) == 9
+    assert [region["line_count"] for region in regions] == [1, 8]
     assert layout["uniform_zones"][0]["reference_geometry_source"] == (
         "compact_centerline_and_mask"
     )
+
+
+def test_uniform_zone_expands_narrow_planning_contour_from_profile_width():
+    """DECISION-009/017: measured block width must not be clipped by a narrow contour."""
+    from path_planner import _prepare_work_line_layout
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.01
+
+    class State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+        mask_raw = None
+
+    uniform = {
+        "id": 1,
+        "profile_width_m": 12.45,
+        "width_m": 3.89,
+        "centerline": [(100.0, 622.5), (1900.0, 622.5)],
+        # This reproduces the cache contract: the planning contour is only
+        # the narrow semantic support stripe, while profile_width_m covers
+        # the complete equal-distance block.
+        "contour": [
+            (0.0, 428.0), (2000.0, 428.0),
+            (2000.0, 817.0), (0.0, 817.0),
+        ],
+    }
+    regular = {
+        "id": 2,
+        "profile_width_m": 1.04,
+        "width_m": 1.00,
+        "centerline": [(100.0, 1800.0), (1900.0, 1800.0)],
+        "contour": [
+            (0.0, 1750.0), (2000.0, 1750.0),
+            (2000.0, 1850.0), (0.0, 1850.0),
+        ],
+    }
+    mask = np.full((2000, 2000), 255, dtype=np.uint8)
+
+    lines, layout, regions = _prepare_work_line_layout(
+        [uniform, regular],
+        mask,
+        0.0,
+        geo=Geo(),
+        state=State(),
+        config={
+            "work_line_mode": "band_centerline",
+            "uniform_zone_line_spacing_m": 1.75,
+        },
+        return_regions=True,
+    )
+
+    assert [region["line_count"] for region in regions] == [1, 8]
+    assert len(lines) == 9
+    assert layout["uniform_zones"][0]["effective_geometry_source"] == (
+        "contour_expanded_from_profile_width"
+    )
+    # The measured profile expands the equal-distance block, but the nearest
+    # regular centreline still owns the shared boundary swath.  The guard is
+    # therefore retained to prevent a cross-region duplicate pass.
+    assert layout["uniform_zones"][0]["inner_limit_applied"] is True
+    assert layout["uniform_zones"][0]["effective_transverse_width_m"] == pytest.approx(
+        12.45
+    )
+
+
+def test_uniform_zone_does_not_duplicate_adjacent_regular_boundary_line():
+    """DECISION-017: 相邻区域共享边界作业带，不得重复生成等距线。"""
+    from path_planner import _prepare_work_line_layout
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.01
+
+    class State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+        mask_raw = None
+
+    uniform = {
+        "id": 1,
+        "profile_width_m": 12.45,
+        "width_m": 3.89,
+        "centerline": [(100.0, 622.5), (1900.0, 622.5)],
+        "contour": [
+            (0.0, 428.0), (2000.0, 428.0),
+            (2000.0, 817.0), (0.0, 817.0),
+        ],
+    }
+    regular = {
+        "id": 2,
+        "profile_width_m": 1.04,
+        "width_m": 1.00,
+        "centerline": [(100.0, 1000.0), (1900.0, 1000.0)],
+        "contour": [
+            (0.0, 950.0), (2000.0, 950.0),
+            (2000.0, 1050.0), (0.0, 1050.0),
+        ],
+    }
+    lines, _layout, regions = _prepare_work_line_layout(
+        [uniform, regular],
+        np.full((2000, 2000), 255, dtype=np.uint8),
+        0.0,
+        geo=Geo(),
+        state=State(),
+        config={
+            "work_line_mode": "band_centerline",
+            "uniform_zone_line_spacing_m": 1.75,
+        },
+        return_regions=True,
+    )
+
+    uniform_lines = regions[1]["work_lines"]
+    regular_y = 1000.0
+    uniform_ys = [float(np.mean([point[1] for point in line])) for line in uniform_lines]
+    assert uniform_lines
+    assert max(uniform_ys) <= regular_y - 100.0 + 1e-6
+    assert len(lines) == len(uniform_lines) + 1
 
 
 def test_ambiguous_classification_is_a_plan_path_hard_reason():
@@ -359,6 +491,120 @@ def test_mixed_regions_are_contoured_independently_with_one_transfer():
     assert assessment["region_transfers"][0]["segment_type"] == "turn_aux"
     assert assessment["region_transfers"][0]["machine_executable"] is True
     assert assessment["machine_executable"] is True
+
+
+def test_mixed_region_transition_starts_from_far_side_when_boundary_passes_are_adjacent():
+    """DECISION-016/017: region handoff must not become an adjacent-row U-turn."""
+    from path_planner import _connect_work_regions
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.1
+
+    class State:
+        mask_raw = np.zeros((220, 220), dtype=np.uint8)
+        mask_offset_x = 0
+        mask_offset_y = 0
+        field_boundary = [
+            (0.0, 0.0), (220.0, 0.0), (220.0, 220.0), (0.0, 220.0)
+        ]
+        entry_point = None
+        exit_point = None
+        unload_points = []
+
+    regular_lines = [
+        [(20.0, float(row)), (200.0, float(row))]
+        for row in range(10, 90, 10)
+    ]
+    uniform_lines = [
+        [(20.0, float(row)), (200.0, float(row))]
+        for row in range(90, 170, 10)
+    ]
+    regions = [
+        {
+            "region_id": "wide_narrow_rows_1",
+            "kind": "wide_narrow_rows",
+            "normal_position": 45.0,
+            "line_count": len(regular_lines),
+            "work_lines": regular_lines,
+        },
+        {
+            "region_id": "uniform_block_1",
+            "kind": "uniform_block",
+            "normal_position": 125.0,
+            "line_count": len(uniform_lines),
+            "work_lines": uniform_lines,
+        },
+    ]
+
+    path, segment_types, assessment, _ordered = _connect_work_regions(
+        regions,
+        geo=Geo(),
+        state=State(),
+        min_turn_radius_m=0.5,
+        turn_strategy="contour",
+        config={"contour_max_endpoint_extension_m": 0.0},
+        global_main_angle=0.0,
+        processed_mask=State.mask_raw,
+    )
+
+    transition = assessment["contour_ordering"][
+        "cross_region_transition_records"
+    ][0]
+    assert transition["default_spacing_m"] == pytest.approx(1.0)
+    assert transition["reversed"] is True
+    assert transition["selected_spacing_m"] >= 2.6 - 1e-9
+    assert assessment["region_transfers"][0]["transverse_spacing_m"] >= 2.6
+    target = assessment["region_routes"][1]["assessment"]["contour_ordering"]
+    assert target["normal_order_reversed"] is True
+    assert target["adjacent_transition_count"] == 0
+    assert segment_types.count("turn_aux") == 1
+    assert len(path) == len(segment_types)
+
+
+def test_contour_region_transfer_never_falls_back_to_a_pear_bulb():
+    """窄交界仍使用套圈弓形转场，不生成灯泡/梨形回退。"""
+    from path_planner import _build_inter_region_transfer
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.1
+
+    class State:
+        mask_raw = np.zeros((100, 100), dtype=np.uint8)
+        mask_offset_x = 0
+        mask_offset_y = 0
+        field_boundary = [
+            (0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)
+        ]
+
+    transfer, report = _build_inter_region_transfer(
+        [[(20.0, 10.0), (80.0, 10.0)]],
+        ["work"],
+        [[(80.0, 15.0), (20.0, 15.0)]],
+        ["work"],
+        geo=Geo(),
+        state=State(),
+        min_turn_radius_m=1.0,
+        requested_strategy="contour",
+        config={"turn_outward_clearance_m": 0.1},
+    )
+
+    assert report["strategy"] == "bow"
+    assert report["requested_strategy"] == "contour"
+    assert report["radius_capped_for_contour_pairing"] is True
+    assert report["valid"] is True
+    assert len(transfer) > 2
 
 
 def test_region_nearest_entry_runs_first_and_uses_nearest_outer_line():
@@ -636,6 +882,7 @@ def test_gap_recovery_interpolates_four_row_lattice_and_ignores_narrow_band():
         0.0,
         geo=Geo(),
         state=State(),
+        config={"validation_profile": "research", "recover_missing_work_bands": True},
     )
 
     assert report["recovered_band_ids"] == [-1]
@@ -682,6 +929,7 @@ def test_gap_recovery_rejects_lattice_line_without_processed_body_support():
         0.0,
         geo=Geo(),
         state=State(),
+        config={"validation_profile": "research", "recover_missing_work_bands": True},
     )
 
     assert [item["id"] for item in recovered] == [2, 4, 6, 8]
@@ -727,6 +975,7 @@ def test_gap_recovery_uses_stable_four_row_phase_instead_of_gap_midpoint():
         0.0,
         geo=Geo(),
         state=State(),
+        config={"validation_profile": "research", "recover_missing_work_bands": True},
     )
 
     promoted = next(item for item in recovered if item.get("planning_recovered"))
@@ -777,6 +1026,7 @@ def test_gap_recovery_accepts_bilateral_crop_evidence_around_machine_center():
         0.0,
         geo=Geo(),
         state=State(),
+        config={"validation_profile": "research", "recover_missing_work_bands": True},
     )
 
     assert report["recovered_band_ids"] == [-1]
@@ -838,7 +1088,10 @@ def test_opposite_headland_exit_is_split_into_reverse_and_short_exit():
         state=State(),
         min_turn_radius_m=0.5,
         turn_strategy="bow",
-        config={"service_headland_axial_tolerance_m": 3.0},
+        config={
+            "service_headland_axial_tolerance_m": 3.0,
+            "service_point_mode": "connect",
+        },
         return_diagnostics=True,
         global_main_angle=0.0,
         processed_mask=State.mask_raw,
@@ -848,3 +1101,47 @@ def test_opposite_headland_exit_is_split_into_reverse_and_short_exit():
     assert path[-2] == [(90.0, 40.0), (50.0, 40.0), (10.0, 40.0)]
     assert path[-1] == [(10.0, 40.0), (10.0, 50.0)]
     assert diagnostics["service_points"]["exit_route"]["retrace_last_work"] is True
+
+
+def test_exit_near_current_work_end_does_not_add_redundant_reverse_segment():
+    """A freely placed exit point must not force a last-line retrace."""
+    from path_planner import _connect_work_lines
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.1
+
+    class State:
+        mask_raw = np.zeros((100, 100), dtype=np.uint8)
+        mask_offset_x = 0
+        mask_offset_y = 0
+        field_boundary = [
+            (0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)
+        ]
+        entry_point = None
+        exit_point = (90.0, 45.0)
+        unload_points = []
+
+    path, segment_types, diagnostics = _connect_work_lines(
+        [[(10.0, 40.0), (50.0, 40.0), (90.0, 40.0)]],
+        geo=Geo(),
+        state=State(),
+        min_turn_radius_m=0.5,
+        turn_strategy="bow",
+        config={
+            "service_headland_axial_tolerance_m": 3.0,
+            "service_point_mode": "connect",
+        },
+        return_diagnostics=True,
+        global_main_angle=0.0,
+        processed_mask=State.mask_raw,
+    )
+
+    assert segment_types == ["work", "exit"]
+    assert path[-1] == [(90.0, 40.0), (90.0, 45.0)]
+    assert diagnostics["service_points"]["exit_route"]["retrace_last_work"] is False

@@ -1217,6 +1217,7 @@ def test_connect_work_lines_uses_global_service_points_with_local_work_lines():
         geo=_FixedMetricGeo(),
         min_turn_radius_m=1.0,
         turn_strategy="auto",
+        config={"service_point_mode": "connect"},
     )
 
     assert segment_types[0] == "entry"
@@ -1224,6 +1225,93 @@ def test_connect_work_lines_uses_global_service_points_with_local_work_lines():
     assert full_path[0][-1] == full_path[1][0]
     assert segment_types[-1] == "exit"
     assert full_path[-1][-1] == (50.0, 60.0)
+
+
+def test_service_points_default_to_reference_only_without_forced_connectors():
+    from path_planner import _connect_work_lines
+    from state import AppState
+
+    state = AppState()
+    state.mask_offset_x = 100
+    state.mask_offset_y = 200
+    state.mask_raw = np.zeros((100, 100), dtype=np.uint8)
+    state.entry_point = (130.0, 250.0)
+    state.exit_point = (190.0, 280.0)
+
+    full_path, segment_types, diagnostics = _connect_work_lines(
+        [[(10, 20), (10, 60)], [(20, 60), (20, 20)]],
+        state=state,
+        geo=_FixedMetricGeo(),
+        min_turn_radius_m=1.0,
+        turn_strategy="auto",
+        return_diagnostics=True,
+    )
+
+    assert segment_types[0] == "work"
+    assert "entry" not in segment_types
+    assert "exit" not in segment_types
+    assert "turn_reverse" not in segment_types
+    assert diagnostics["service_points"]["mode"] == "reference_only"
+    assert diagnostics["service_points"]["entry_reference_used"] is True
+    assert diagnostics["service_points"]["exit_reference_used"] is True
+    assert diagnostics["service_points"]["entry_connector_emitted"] is False
+    assert diagnostics["service_points"]["exit_connector_emitted"] is False
+    assert full_path[0][0] != (30.0, 50.0)
+
+
+def test_service_point_references_select_route_start_and_end_direction():
+    """起终点都应参与首尾参考，而不是只使用起点。"""
+    from path_planner import _connect_work_lines
+    from state import AppState
+
+    def plan(exit_point):
+        state = AppState()
+        state.mask_offset_x = 0
+        state.mask_offset_y = 0
+        state.mask_raw = np.zeros((200, 200), dtype=np.uint8)
+        state.entry_point = (10.0, 10.0)
+        state.exit_point = exit_point
+        return _connect_work_lines(
+            [
+                [(0.0, 10.0), (100.0, 10.0)],
+                [(0.0, 20.0), (100.0, 20.0)],
+                [(0.0, 30.0), (100.0, 30.0)],
+                [(0.0, 40.0), (100.0, 40.0)],
+            ],
+            state=state,
+            geo=_FixedMetricGeo(),
+            min_turn_radius_m=1.0,
+            turn_strategy="contour",
+            return_diagnostics=True,
+            global_main_angle=0.0,
+            processed_mask=state.mask_raw,
+        )
+
+    first_path, first_types, first_diagnostics = plan((90.0, 40.0))
+    second_path, second_types, second_diagnostics = plan((10.0, 10.0))
+    first_work = [
+        segment for segment, kind in zip(first_path, first_types)
+        if kind == "work"
+    ]
+    second_work = [
+        segment for segment, kind in zip(second_path, second_types)
+        if kind == "work"
+    ]
+
+    assert first_diagnostics["reference_ordering"]["exit_reference_used"] is True
+    assert second_diagnostics["reference_ordering"]["exit_reference_used"] is True
+    assert first_work != second_work
+    assert first_diagnostics["reference_ordering"]["selected_exit_distance_m"] <= 10.0
+    actual_exit_distance_m = float(
+        np.hypot(
+            first_work[-1][-1][0] - 90.0,
+            first_work[-1][-1][1] - 40.0,
+        ) * 0.01
+    )
+    assert first_diagnostics["reference_ordering"]["selected_exit_distance_m"] == pytest.approx(
+        actual_exit_distance_m
+    )
+
 
 
 def test_manual_bow_falls_back_when_spacing_is_less_than_two_radius():
@@ -1304,6 +1392,7 @@ def test_unload_point_is_explicit_service_segment_before_exit():
         geo=_FixedMetricGeo(),
         min_turn_radius_m=1.0,
         turn_strategy="auto",
+        config={"service_point_mode": "connect"},
         return_diagnostics=True,
     )
 

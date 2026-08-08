@@ -156,6 +156,7 @@ class AppState:
         self.forbidden_regions_confirmed: bool = False
 
         self.harvester_params: Dict[str, float] = {}
+        self.harvester_param_sources: Dict[str, str] = {}
         self.harvester_params_confirmed: bool = False
 
         # 进场/离场点
@@ -287,7 +288,7 @@ class AppState:
             "mask_raw", "inference_original_mask", "mask_offset_x", "mask_offset_y",
             "inference_done", "mask_processed", "mask_result",
             "smooth_original_mask", "smoothed_result", "_show_original",
-            "band_list", "corridors", "harvester_params", "turn_strategy",
+            "band_list", "corridors", "harvester_params", "harvester_param_sources", "turn_strategy",
             "harvester_params_confirmed",
             "entry_point", "exit_point", "unload_points", "unload_point",
             "entry_point_locked", "exit_point_locked", "unload_point_locked",

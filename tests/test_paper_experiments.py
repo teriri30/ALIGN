@@ -244,8 +244,8 @@ def test_experiment_worker_emits_token_bound_export_result(tmp_path):
     }]
 
 
-def test_decision_014_experiment_menu_exists_and_uses_isolated_runner(monkeypatch):
-    """DECISION-014: the experiment entry remains explicit and isolated."""
+def test_decision_014_experiment_menu_is_removed_from_desktop():
+    """DECISION-014: offline experiments have no desktop execution entry."""
     import os
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import QApplication
@@ -256,10 +256,9 @@ def test_decision_014_experiment_menu_exists_and_uses_isolated_runner(monkeypatc
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     menus = [action.text() for action in window.menuBar().actions()]
-    assert "实验" in menus
-    assert any(
-        action.text() == "论文消融实验中心..."
-        for action in window.findChildren(QAction)
+    assert "实验" not in menus
+    assert not any(
+        "消融实验" in action.text() for action in window.findChildren(QAction)
     )
     window.close()
 

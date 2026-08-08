@@ -26,6 +26,20 @@ def test_row_angle_estimation_does_not_depend_on_numpy_covariance(monkeypatch):
     assert abs(angle - np.arctan(0.35)) < np.deg2rad(3.0)
 
 
+def test_profile_gate_edges_isolate_band_next_to_broad_uniform_block():
+    """宽等距块旁的四行带不能被宽块尾部拉偏中心线门控。"""
+    from row_geometry import _profile_run_gates
+
+    runs = [(1556, 2435), (2450, 2521), (2535, 2575)]
+    gates = _profile_run_gates(runs, height=3600)
+
+    # The middle run is the target four-row band.  Its gate must start after
+    # the broad block and end before the next narrow run.
+    assert gates[1] == (2442, 2528)
+    assert gates[1][0] > runs[0][1]
+    assert gates[1][1] < runs[2][0]
+
+
 def test_regularize_output_preserves_raw_parallel_residual_in_processed_mask(monkeypatch):
     import row_geometry
 

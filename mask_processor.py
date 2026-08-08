@@ -35,7 +35,7 @@ def detect_main_direction_refined(mask: np.ndarray,
 
     Stage 1: PCA 粗估计田块主方向（field-level orientation）
     Stage 2: 若有源图像，使用 FFT 频谱分析精化种植行方向
-             (参考: _estimate_row_angle in coverage.py)
+             (参考: _estimate_row_angle in legacy_route_coverage.py)
 
     Args:
         mask: 二值掩膜

@@ -105,6 +105,30 @@ def test_task_panel_simulate_action_pauses_instead_of_exiting_active_animation()
     window.close()
 
 
+def test_simulation_render_failure_does_not_roll_back_or_leave_animation_active():
+    from pyside6_app.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._pipeline_result = {
+        "path": {
+            "full_path": [[(0.0, 0.0), (10.0, 0.0)]],
+            "segment_types": ["work"],
+        }
+    }
+
+    def fail_render():
+        raise RuntimeError("pose render probe")
+
+    window._render_anim_frame = fail_render
+    window._on_toggle_animation()
+
+    assert window.state.anim_active is False
+    assert window._anim_timer is None
+    assert window._pipeline_result["path"]["full_path"] == [[(0.0, 0.0), (10.0, 0.0)]]
+    window.close()
+
+
 def test_animation_and_footprint_validation_share_corner_pose_heading():
     from footprint_planner import _sample_planar_poses
 

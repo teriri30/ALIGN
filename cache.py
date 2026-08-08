@@ -270,6 +270,9 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "mask_result": _mask_result_summary(getattr(state, "mask_result", None)),
         "mask_provenance": _jsonable(getattr(state, "mask_provenance", {}) or {}),
         "harvester_params": _jsonable(getattr(state, "harvester_params", {})),
+        "harvester_param_sources": _jsonable(
+            getattr(state, "harvester_param_sources", {})
+        ),
         "harvester_params_confirmed": bool(
             getattr(state, "harvester_params_confirmed", False)
         ),

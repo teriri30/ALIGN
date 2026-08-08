@@ -2,17 +2,19 @@
 
 本文件记录不能被随意删除、绕过或以“简化”为理由弱化的系统级决策。修改决策相关代码时，必须同步核对代码锚点和不变量测试。
 
-## DECISION-001：正式路径导出必须失败关闭
+## DECISION-001：路径导出必须保持数据一致性，安全指标不作为研究输出硬门禁
 
-**结论**：GeoJSON、CSV、KML、JSON 和 `$PATH` 必须先经过 `_geo_export_payload()`；输出成功后必须生成 manifest。
+**结论**：GeoJSON、CSV、KML、JSON 和 `$PATH` 必须先经过 `_geo_export_payload()`；输出成功后必须生成 manifest。研究作品默认允许导出，理论履带重叠率、覆盖率、碾压率和机器就绪证据只作为结果字段保存，不再阻止研究输出。`fail_closed` 仅用于严格 CI 或明确的受控试验流程。
 
 **原因**：路径可能进入受控田间试验。可用性不能优先于坐标、参数和路径安全。
 
+**兼容测试文件边界**：`machine_harvester_straight_turn_v1` 是给目标终端做格式和几何试跑的文本投影。它仍必须经过 `_geo_export_payload(formal=False)` 的地理配准、当前路径、provenance、有限坐标、点序和压缩后线段格式检查；研究指标、参数来源、机器就绪、恢复状态和终端协议不再弹窗或阻断。manifest 必须保留 `preview_only=true`、`machine_executable=false` 和 `COMPATIBILITY_TEST_ONLY_MANUAL_REVIEW`，不能被误称为田间试验就绪证据。
+
 **不变量**：
 
-- 无有效地理配准、路径未验证或 provenance 不一致时禁止导出。
-- 农机参数、调头策略与规划时不一致时禁止导出。
-- 路径点超出影像范围时禁止仿射外推。
+- 无有效地理配准、源影像已变化、provenance 无法重算、坐标非有限或点序/状态码不一致时禁止导出。
+- 农机参数、调头策略与规划时不一致时保留在 manifest；严格 `fail_closed` 模式下才禁止导出。
+- 路径点超出影像范围时禁止仿射外推；研究模式不以理论履带指标替代坐标一致性检查。
 - manifest 写入失败时不得保留正式路径文件。
 - 旧 `ExportEngine` 不得成为旁路。
 
@@ -32,7 +34,7 @@
 - 不按图像尺寸跨源复用缓存。
 - 推理失效必须使掩膜和路径失效；掩膜失效必须使路径失效。
 - 旧模式缓存失败关闭，不猜测兼容。
-- 恢复的路径几何和指标只能作为历史快照展示；在当前输入与当前验证规则下重新执行完整路径验证前，`auto_path_valid` 必须为 `False`，且禁止正式导出。
+- 恢复的路径几何和指标必须标记为历史快照；在当前输入与当前验证规则下重新执行完整路径验证前，`auto_path_valid` 必须为 `False`。默认研究导出保留该状态并写入 manifest，不弹窗、不阻断；只有显式 `fail_closed` 模式才拒绝导出。
 
 **代码锚点**：`CacheRestoreWorker`、`cache.load_project_state`、`provenance.verify_stage_record`。
 
@@ -119,14 +121,14 @@
 
 - 失效顺序固定为 inference -> mask -> path -> simulation/export。
 - 重新推理不保留旧掩膜作为成功结果。
-- 手工编辑路线后路径状态必须为未验证，禁止正式导出。
+- 手工编辑路线后路径状态必须为未验证。默认研究导出保留该状态并写入 manifest，不弹窗、不阻断；只有显式 `fail_closed` 模式才拒绝导出。
 - 智能推荐的起点、终点和卸粮点必须支持在影像上直接拖动；拖动受已确认田界约束，一次按下—移动—释放只形成一个撤销事务，并在释放时使旧路径及其验证/导出证据失效。
-- 起点和终点拖动期间使用主航线轴与田界投影实时限制在最近田头深度内，并显示与最近作业线端点相接的正交青色预览；该预览不写入 canonical 路径、不参与验证或导出。释放后旧路径立即失效；任务条件完整时短延迟自动启动正式路径规划和完整足迹验证。
+- 起点和终点拖动期间只受已确认田界约束，两个坐标轴均跟随鼠标，不得使用主航线轴、田头深度或田头走廊把点吸附到一条线；与最近作业线端点相接的正交青色线仅为预览，不写入 canonical 路径、不参与验证或导出。释放后旧路径立即失效；任务条件完整时短延迟自动启动正式路径规划和完整足迹验证。
 - 释放后的短延迟期间允许保留一份显式标记为“待重新规划预览（不可导出）”的旧路线，仅供连续交互观察；canonical `auto_path`、验证、仿真和导出状态仍为空/失效，新规划提交后预览必须被清除。
 
 **代码锚点**：`ImageViewer.set_direct_drag_hit_test`、`MainWindow._invalidate_analysis_from`、`_on_params_dialog`、`_on_turn_strategy_changed`、`_place_entry_exit_point`、`_begin_service_point_drag`、`_constrain_service_point`、`_draw_service_point_drag_preview`、`_finish_service_point_drag`。
 
-**测试锚点**：`test_input_changes_invalidate_stale_downstream_results`、`test_export_blocks_when_harvester_parameters_changed_after_planning`、`test_export_rejects_service_point_change_after_path_planning`、`test_recommended_service_point_can_be_dragged_directly_and_invalidates_path`、`test_service_point_drag_corrects_live_to_headland_and_schedules_replan`、`test_viewer_captures_service_point_drag_before_left_button_pan`。
+**测试锚点**：`test_input_changes_invalidate_stale_downstream_results`、`test_export_blocks_when_harvester_parameters_changed_after_planning`、`test_export_rejects_service_point_change_after_path_planning`、`test_recommended_service_point_can_be_dragged_directly_and_invalidates_path`、`test_service_point_drag_preserves_free_2d_position_and_schedules_replan`、`test_viewer_captures_service_point_drag_before_left_button_pan`。
 
 ## DECISION-008：科研适用范围与指标表述
 
@@ -159,12 +161,14 @@
 - 田头与纵向主体粘连、导致残差方向失真时，只允许在规则化纵向行带的轴向端部，用跨越足够多行的高占用横向连续带补充田头种子；不得使用已合并残差后的外包络作为端部参照，也不得把稀疏纵向行尾提升为田头。
 - 已确认的端部田头走廊必须沿规则化纵向主体的逐列端点墙平滑展开，并与原始作物支持逐像素相交；不得用矩形外包络填平真实弯曲边缘或凭空补出无作物区域。
 - 端点墙只能由轴向跨度达到全田参考跨度显式比例的横截行建立；区域分界、断行或孤立短作业片段不得贡献端点，缺失横截行只在可信长跨度端点之间插值。诊断必须记录参考跨度、可信行数和被拒短行数。
+- 横向剖面相邻行带的局部占用门控必须按相邻 profile run 的边界中点划分，并记录 `profile_gate_basis=run_edge_midpoints`；不得用相邻中心点中点为宽等距块旁的四行带建立门控，否则宽块尾部会把真实四行中心线中位数拉偏。
+- 上述门控修正自掩膜规则化算法版本 14 生效；版本 13 及更早的处理缓存不得恢复为当前掩膜证据，必须从同一原始推理掩膜重新执行掩膜处理后再规划。
 - 田头分类必须先对规则化主体做连通区域分区，再按区域的轴向跨度、端部邻接和跨行支持率分类；只有被可信端部区域接受的残差种子才能进入 `headland_mask`。被拒的内部区域种子不得因“曾经是方向残差”而继续显示为黄色田头。
 - 处理后主体、田头和不确定层作为同一个原子缓存产物保存，JSON 不得承载大掩膜数组。
 
-**代码锚点**：`row_geometry.residual_mask_layers`、`row_geometry.close_band_support_gaps`、`row_geometry.resolve_terminal_headland_overlap`、`footprint_planner.validate_footprints`、处理后掩膜缓存。
+**代码锚点**：`row_geometry.regularize_crop_mask`、`row_geometry._profile_run_gates`、`row_geometry.residual_mask_layers`、`row_geometry.close_band_support_gaps`、`row_geometry.resolve_terminal_headland_overlap`、`footprint_planner.validate_footprints`、处理后掩膜缓存。
 
-**测试锚点**：`test_detached_parallel_fragment_inside_body_extent_becomes_uncertain`、`test_terminal_band_gap_uses_stricter_threshold_than_internal_gap`、`test_headland_corridor_recovers_dense_second_terminal_without_angle_seed`、`test_headland_dense_seed_does_not_relabel_parallel_row_tails`、`test_terminal_headland_follows_curved_crop_support_not_rectangle`、`test_terminal_headland_wall_ignores_short_internal_work_fragment`、`test_terminal_headland_classifies_regions_before_exposing_seed`、`test_validate_footprints_uses_neutral_support_without_counting_it_as_crop`、`test_semantic_mask_layers_roundtrip_without_entering_json_summary`。
+**测试锚点**：`test_profile_gate_edges_isolate_band_next_to_broad_uniform_block`、`test_detached_parallel_fragment_inside_body_extent_becomes_uncertain`、`test_terminal_band_gap_uses_stricter_threshold_than_internal_gap`、`test_headland_corridor_recovers_dense_second_terminal_without_angle_seed`、`test_headland_dense_seed_does_not_relabel_parallel_row_tails`、`test_terminal_headland_follows_curved_crop_support_not_rectangle`、`test_terminal_headland_wall_ignores_short_internal_work_fragment`、`test_terminal_headland_classifies_regions_before_exposing_seed`、`test_validate_footprints_uses_neutral_support_without_counting_it_as_crop`、`test_semantic_mask_layers_roundtrip_without_entering_json_summary`。
 
 **允许的变更方式**：可通过真实标注样本调整米制邻近阈值和端部阈值，但必须同时报告主体误增面积、主体漏保留面积、田头误分类面积和运行时间。
 
@@ -202,6 +206,8 @@
 - 禁行区必须来自用户确认多边形，并进入项目缓存、路径 provenance、足迹验证和导出 manifest；任何修改必须使旧路径失效。
 - GeoJSON、CSV、KML、JSON 和 `$PATH` 均记录坐标基准、车辆参考点和规划参数，便于与目标终端格式进行核对。
 - 机器执行就绪评估基于外部定位精度、车辆参考几何、运动学、终端适配和实车跟踪等记录项计算；记录不完整时，界面应明确显示待补充项。
+- 农机几何参数必须逐字段携带来源元数据；`default`、`recommended`、`user_entered` 和历史未记录来源不得静默写成实测值。`field_trial`/`machine_candidate` 缺少完整的显式 `user_measured` 来源时，路径结果必须为 `machine_executable=false`，但研究导出仍可保留原始来源信息。
+- 兼容测试可以在上述参数来源、机器就绪和终端协议记录不完整时生成 `$PATH` 文本；它不得提升 `machine_executable`，但不再通过警告或理论指标阻断研究作品导出。
 - 足迹验证必须记录 `planar_rigid_footprint_v2` 和参考点 `track_contact_center`。演示与验证共用左右履带、机身和割刀线；履带碾压使用有限接地长度的有向矩形扫掠，作物掩膜几何覆盖使用具有实测前置距离的有效割幅线段扫掠。
 - 二维刚体模型用于计算平面包络、履带扫掠和割幅覆盖；轴距影响机身与割台前后位置，履带接地长度独立决定履带接地矩形，避免重复计量。车辆动力学、土壤压实和 CAD 外廓可作为后续扩展模型。
 - 进入候选软排序前，正式足迹验证必须显式给出 `valid=True`、空 `issues` 和完整硬门禁指标；缺少有效性证据、必需指标、对应语义层指标或任一门限失败均须 fail-closed，并进入候选拒绝诊断。
@@ -263,7 +269,7 @@
   4. IoU、Dice、Precision、Recall 仅在提供同尺寸人工真值掩膜时生成；没有真值时保持缺失，不得用原始模型输出充当真值。
   5. 单个实验组失败必须保留失败原因并继续其余组；输出必须包含输入摘要、组参数、长表、宽表、逐组结果和效果图。
   6. 当前入口不具备隔离原始 GeoTIFF 多模型推理时，不得把同一原始掩膜复制并标记为不同模型结果。
-- 代码锚点：`paper_experiments.py`、`pyside6_app/workers.py`、`pyside6_app/main_window.py`。
+- 代码锚点：`paper_experiments.py`、`pyside6_app/workers.py`；桌面主界面不再提供消融实验入口，离线实验模块仅保留给可复现实验脚本和测试使用。
 - 测试锚点：`tests/test_paper_experiments.py`。
 - 允许变更方式：可增加新的真实中间层、模型隔离推理和统计图，但必须保持固定输入、人工真值门槛和失败记录，并同步更新实验 schema 与测试。
 
@@ -282,29 +288,33 @@
 - 结论：路径验证以同一 `plan_pose` 和 `planar_rigid_footprint_v2` 产生整型履带访问计数图，并对 `work`、`turn_approach`、`turn`、`turn_reverse`、`turn_aux`、`entry`、`exit` 等实际段分别记录长度和足迹归因。
 - 原因：整条路径单一统计无法审计田头转弯代价，也不能把二值并集误称为重复碾压。
 - 不变量：
-  1. `segment_metrics` 使用 `exclusive_first_segment` 规则；分段独占履带并集和为全路径 `track_swept_area_m2`，重复访问另由 `uint32` 访问计数图统计。
+    1. `segment_metrics` 使用 `exclusive_first_segment` 规则；分段独占履带并集和为全路径 `track_swept_area_m2`，重复访问另由 `uint32` 逻辑通过计数图统计。一个逻辑路径段内部的相邻姿态先取二值并集，只能计为一次通过；姿态覆盖次数不得进入正式指标。
   2. 转弯层单独报告 `headland_turn_track_overlap_area_m2`、`headland_turn_rolling_pct`、主体/不确定区/禁行区重叠、田界越界和 `turn_cost_m2`；田头仍是软代价，不是硬障碍。
   3. 候选搜索只在端点保持、策略和最小半径不变的有限走廊内进行；田界、禁行区、运动学不可行、无有效米制尺度和退化直线均 fail-closed。没有安全改进候选时保留原候选并记录 `fallback_reason`。
   4. 一次与两次及以上履带访问面积是二维几何模型指标，不等于土壤压实、产量损失、实机可执行结果或田间验证结果。
   5. 候选必须通过与正式路径一致的足迹硬门禁：始终要求核心区重叠、规划目标覆盖和田界越界指标，并在提供支撑区、不确定区或禁行区时要求对应指标；`valid`、`issues` 或指标缺失不得默认放行。
-- 代码锚点：`footprint_planner.validate_footprints`、`path_planner._connect_work_lines`、`headland_turn_optimizer.select_turn_candidate`。
-- 测试锚点：`tests/test_headland_turn.py`、`tests/test_headland_turn_contract.py`、`tests/test_headland_turn_integration.py`。
+- 代码锚点：`footprint_planner._accumulate_logical_segment_pass`、`footprint_planner.validate_footprints`、`path_planner._connect_work_lines`、`headland_turn_optimizer.select_turn_candidate`。
+- 测试锚点：`tests/test_track_pass_count.py`、`tests/test_headland_turn.py`、`tests/test_headland_turn_contract.py`、`tests/test_headland_turn_integration.py`。
 - 允许变更方式：可增加有实测依据的足迹模型或标定代价，但必须保留整路径/分段核对、访问计数类型、硬约束诊断和实验输入冻结。
 
-## DECISION-016：套圈按外侧作业线配对并共享田头转弯线
+## DECISION-016：套圈按两半交错作业线并共享田头转弯线
 
-- 结论：`contour`（套圈收割）保留现有作物证据支持的平行作业线，按田块法向轴从两侧向中心配对访问：`左1、右1、左2、右2……`。相邻访问段在对应短边田头连接；同一端的各圈共用同一条轴向田头墙，横向转弯距离逐圈减小。它不生成脱离作物证据的闭合偏置轮廓，也不绕过运动学和正式足迹验证。
+- **当前 v7（2026-08-08）覆盖旧版顺序定义**：法向排序后的 `n` 条线取 `split=ceil(n/2)`，输出 `0, split, 1, split+1, ...`；8 条为 `0,4,1,5,2,6,3,7`，9 条为 `0,5,1,6,2,7,3,8,4`。4 条线使用 `1,3,0,2` 避免中心相邻转弯；2–3 条线无法完全避免相邻转弯，必须如实记录。起点/终点默认作为首尾作业线和方向参考；混合区域在有起终点时只允许反转完整区域顺序，不改变区域内部套圈；`service_point_mode=reference_only` 不生成跨田块入口、出口或倒车接驳线，界面保留用户拖动坐标；只有显式 `connect` 才输出服务段。等距区外侧若仅存在短于主体跨度的掩膜碎片，必须在套圈排序前记录并排除该边缘碎片，不能把它连接成跨田长斜线；内部短段不得用同一规则静默删除。
+
+- 结论：`contour`（套圈收割）保留现有作物证据支持的平行作业线，先按田块法向轴排序，再按两半交错访问；相邻访问段在对应短边田头连接，同一端的转弯共用同一条轴向田头墙。它不生成脱离作物证据的闭合偏置轮廓，也不绕过运动学和正式足迹验证。
 - **v3（2026-08-05 修订）**：替代 v2 的单侧连续扫掠。v2 虽能保证相邻法向位置连续，却仍是蛇形行走，不符合外侧两行组成第 1 圈、次外侧两行组成第 2 圈的回字形语义。v3 同时规定：
   1. 作业线顺序沿主航线法向取 `low, high, low+1, high-1, ...`；入口点只允许交换每一层的左右次序，不得把整个序列反转为从中心向外。
   2. 所有作业线先统一主航线方向再交替反向；同一田头的端点投影到同一轴向墙。宽间距采用两段最小半径四分之一圆弧加横向切线的弓形转弯，使同一端的横向切线重叠；中心间距小于 `2R` 时仍按 DECISION-010 选择半径安全的替代几何。
   3. 横向田头跨度代表田块宽度，不设旧的 `4 m` 短连接上限；只限制沿主航线的端点补偿，并要求邻近/群体证据和田界内线段。无法建立共享田头墙时失败关闭，不把普通蛇形路线标成套圈成功。
   4. 奇数作业线允许中心单行收尾；不得因未配对中心线拒绝整条套圈路线。
   5. 等距种植区细分线使用相对质心的局部主向坐标扫描，禁止把绝对投影再次叠加质心而只生成半段主航线。
+  6. 等距区未给出显式间距时，细分线间距取 `track_gauge_m`，使相邻两趟的右履带/左履带中心线重合；掩膜缝隙补偿只能选择整块统一相位，不得逐条移动作业线；诊断必须记录 `actual_spacing_m`、`phase_offset_m` 和 `spacing_is_uniform=true`。显式 `uniform_zone_line_spacing_m` 必须在诊断中标记为研究对照。
+  7. 兼容农机控制折线中每条主作业线只保留两个端点，套圈非作业段只保留一条直线弦；canonical 稠密路径仍单独用于科研足迹验证。
 - **v4（2026-08-06 修订）**：同一侧田头的全部转弯先按田界逐段审计安全余量，再采用该侧最严格的共同余量；混合种植田块还必须跨全部已分类区域共同审计。接近 `2R`、且半径短缺不超过显式米制几何容差时，用向外平移的小半圆保持最小半径切线位置；超过容差仍失败关闭或使用原有安全回退，不得产生单独梨形环。
-- 原因：仅更改排序无法消除端点主向错位造成的长斜向转弯；仅连接相邻法向作业线又会退化为蛇形。外侧配对顺序、共享田头墙和弓形横向切线共同表达用户确认的套圈拓扑，同时仍以作物中心线、田界和农机曲率作为安全证据。
+- 原因：仅连接相邻法向作业线会把最后两条相邻作业线硬接在一起并产生过大的转弯角；两半交错顺序、共享田头墙和弓形横向切线共同表达用户确认的套圈拓扑，同时仍以作物中心线、田界和农机曲率作为安全证据。
 - 不变量：
   1. `contour` 不改变作业线数量和法向层级；只允许已有端点群体/邻线证据支持、位于田界内的主向端点校正，不允许横向移动作业线或伪造闭合轮廓。
-  2. 诊断必须记录原始索引、法向位置、两条田头墙投影、逐次横向转弯距离和奇数中心收尾状态；`turn_distances_m` 必须由外向内单调不增。
+  2. 诊断必须记录原始索引、分半索引、低/高半原始索引、交错原始索引、对应作业线对、两条田头墙投影、逐次横向转弯距离和奇数中心收尾状态；`adjacent_transition_count` 对 4 条及以上的有效交错集合应为 0，`turn_distances_m` 按实际交错顺序记录，不再强行要求单调不增。
   3. 同一田头的转弯锚点必须具有相同主向投影；宽间距套圈转弯的横向切线不得被逐转弯优化器移离共享田头线。
   3a. 同一田头侧的 `shared_turn_clearance_m_by_side` 必须在全田已分类区域中一致，诊断记录 `shared_turn_clearance_scope=all_classified_regions`；局部凹边界只允许整体内移该侧共同切线，不得只改变一个转弯的曲率。
   4. 套圈连接继续标记为 `turn`/`turn_reverse`/`turn_aux` 等正式转弯段，必须进入 DECISION-015 的长度、足迹和重复访问归因；不得新增绕过统计与协议的 `connector` 段类型。
@@ -326,11 +336,12 @@
   2. 阈值保护带内或同一实测队列中缺失宽度证据的候选必须标为 `ambiguous` 并失败关闭，不得猜测路径策略。仅在旧调用完全没有宽度字段时，允许按“四行带输入契约”兼容为宽窄行并如实记录理由。
   3. `wide_narrow_rows` 作业线必须继续锚定对应四行中心线；`uniform_block` 作业线必须按收割机割幅和该区掩膜/轮廓生成，不得拿大片区域的一条中心线代替全覆盖。
   4. 混合田块不得跨区域配圈。有起点时先完成与起点端点距离最近的区域；区域内部第 1 圈也从当前参考点较近的外侧线进入。没有起点证据时才使用稳定的类型/法向顺序。各区域虽然独立套圈，但必须共享全田同一对田头轴向墙和同一主航线方向，不能因分区产生互相倾斜或错开的调头线。执行顺序、距离、每区行数、来源带、共享田头墙和独立套圈诊断必须进入 `layout` 和路径阶段指纹。
-  5. 相邻区域之间只允许一个显式 `turn_aux` 转场。转场必须具备非退化曲线、留在选定田界内，并与全路线一起进入 DECISION-015 的足迹、长度、禁行区、曲率和导出门禁；直线退化只能用于诊断，不得标记为机器可执行。
+  5. 相邻区域之间只允许一个显式 `turn_aux` 转场。转场必须具备非退化曲线、留在选定田界内，并与全路线一起进入 DECISION-015 的足迹、长度、禁行区、曲率和导出门禁；套圈请求在区域边界继续使用有限弓形配对，不得回退成梨形灯泡；直线退化只能用于诊断，不得标记为机器可执行。
   6. 单一种植类型仍使用同一分类协议和原有规划/验证链路，不得因为没有混合区域而绕过证据记录。
   7. UI/缓存可删除稠密带轮廓，但必须保留至多 256 点的 `planning_contour`；历史紧凑缓存缺少该字段时，等距区必须能以中心线确定主向范围、以原始/处理掩膜确定真实横向范围，不得因此生成 0 条作业线。
   8. 两行窄带中心不得提升为四行作业线。宽窄行相邻正式四行中心线间距成为孤立异常大值、且约等于两个正常四行间距时，允许恢复一个规划期四行晶格中心：两侧稳定晶格相位支持不对称时必须从较长队列外推，不得机械取缺口中点；相位证据相当时才允许中点。支持校验必须沿候选四行带宽度做横截面占用并检查轴向连续性，不得要求机器中心线本身落在作物像素上。间隙中的 `all_bands` 窄带只能作为“已检查但忽略”的负证据。原分类、相位方法、队列证据、中心线/横截面支持、轴向长度和补线理由必须同时保留；连续多条缺失或证据不足时失败关闭。
   9. 收割结束后到终点的 `exit` 不得以长斜线跨越田块。终点位于最后作业线另一侧田头时，先用显式 `turn_reverse` 沿最后一条已收割作业线返回对应田头，再用 `exit` 在田头横向接驳；诊断必须记录直达轴向距离、选择模式和田界检查。
+  10. 漏线恢复算法保留用于 `research` 模式的显式手动复现；`field_trial` 和 `machine_candidate` 仍强制关闭自动恢复。缓存中存在 `planning_recovered=true` 的作业带时，结果必须保留该标记；严格 `fail_closed` 模式拒绝导出，研究导出不再弹窗或阻断。
 - 代码锚点：`MainWindow._compact_mask_result_for_ui`、`row_geometry.resolve_terminal_headland_overlap`、`path_planner.build_band_mask`、`path_planner._uniform_zone_reference_geometry`、`path_planner._classify_planting_regions`、`path_planner._recover_lattice_supported_work_bands`、`path_planner._prepare_work_line_layout`、`path_planner._connect_work_regions`、`path_planner._build_inter_region_transfer`、`path_planner._build_exit_service_route`、`path_planner.plan_path`。
 - 测试锚点：`tests/test_mixed_region_strategy.py`、`tests/test_contour_strategy.py`、`test_compact_mask_result_keeps_small_planning_contour`。
 - 允许的变更方式：可用人工标注的宽窄行/等距区样本重新标定宽度阈值、模糊带、异常间距或区域次序，但必须版本化分类器与补线器、保存逐带证据、维持不按左右硬编码、跨区不配圈和不确定时失败关闭。

@@ -103,6 +103,9 @@ def reset_project_state(state, *, preserve_model=True, preserve_machine=True) ->
     if preserve_machine:
         preserved.update(
             harvester_params=deepcopy(getattr(state, "harvester_params", {}) or {}),
+            harvester_param_sources=deepcopy(
+                getattr(state, "harvester_param_sources", {}) or {}
+            ),
             turn_strategy=str(getattr(state, "turn_strategy", "auto") or "auto"),
         )
     if preserve_model:

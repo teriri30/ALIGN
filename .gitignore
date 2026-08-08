@@ -29,6 +29,12 @@ data/models/*.onnx
 !data/models/yolo11s_seg_best.pt
 !data/models/yolov8s_seg_best.pt
 !data/models/yolo11s_seg_tiller12m_best.pt
+!data/models/yolo11s_seg_transplant_12m_best.pt
+!data/models/yolo11s_seg_greenup_12m_best.pt
+!data/models/yolo11s_seg_greenup_30m_best.pt
+!data/models/yolo11s_seg_greenup_50m_best.pt
+!data/models/yolo11s_seg_tiller_12m_best.pt
+!data/models/yolo11s_seg_tiller_30m_best.pt
 data/tif/
 *.tif
 *.tiff

@@ -68,7 +68,10 @@ def _valid_path_result(mode="footprint_optimized"):
                 "track_forbidden_overlap_pct": 0.0,
             },
         },
-        "planning_factors": {"harvester": {"track_width_m": 0.4}},
+        "planning_factors": {
+            "harvester": {"track_width_m": 0.4},
+            "harvester_param_sources": {"track_width_m": "user_measured"},
+        },
         "turn_assessment": {"hard_reasons": []},
     }
 

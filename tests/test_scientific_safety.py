@@ -346,7 +346,10 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
     }]
     path_result = {
         "validation": {"valid": True, "issues": []},
-        "planning_factors": {"harvester": {"track_width_m": 0.45}},
+        "planning_factors": {
+            "harvester": {"track_width_m": 0.45},
+            "harvester_param_sources": {"track_width_m": "user_measured"},
+        },
         "layout": {
             "work_line_mode": "band_centerline_with_footprint_validation",
             "formal_comparison": {"accepted": False},
@@ -443,7 +446,10 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
             },
         },
         "turn_assessment": {"hard_reasons": []},
-        "planning_factors": {"harvester": {"track_width_m": 0.45}},
+        "planning_factors": {
+            "harvester": {"track_width_m": 0.45},
+            "harvester_param_sources": {"track_width_m": "user_measured"},
+        },
     })
     path_result["machine_readiness"] = assess_machine_readiness(
         path_result,

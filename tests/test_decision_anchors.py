@@ -68,6 +68,7 @@ DECISION_ANCHORS = {
         "tests/test_planar_footprint.py",
         "tests/test_cross_module_math.py",
         "tests/test_machine_readiness.py",
+        "tests/test_parameter_provenance.py",
     ),
     "DECISION-012": (
         "docs/DECISIONS.md",
@@ -94,6 +95,7 @@ DECISION_ANCHORS = {
         "footprint_planner.py",
         "path_planner.py",
         "headland_turn_optimizer.py",
+        "tests/test_track_pass_count.py",
         "tests/test_headland_turn.py",
         "tests/test_headland_turn_contract.py",
         "tests/test_headland_turn_integration.py",

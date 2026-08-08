@@ -13,7 +13,13 @@ from typing import List, Tuple, Optional, Dict
 import numpy as np
 import cv2
 from shapely.geometry import LineString, Point, Polygon
-from config import Config, AppLogger
+from config import (
+    Config,
+    AppLogger,
+    DEFAULT_HARVESTER_PARAMS,
+    HARVESTER_FORMAL_MEASURED_SOURCES,
+    HARVESTER_PARAM_SOURCE_LABELS,
+)
 from footprint_planner import (
     assess_footprint_hard_constraints,
     compare_work_line_footprints,
@@ -34,17 +40,20 @@ def _contour_order_work_lines(
     field_polygon: Optional[np.ndarray],
     main_angle: Optional[float] = None,
 ) -> Tuple[List[List[Tuple[float, float]]], Dict]:
-    """DECISION-016: order crop-supported four-row lines outside-in.
+    """DECISION-016: order parallel work lines by half-split interleaving.
 
     This is the *order* part of a contour/spiral baseline. It does not invent
     a closed boundary contour: every returned pass remains an existing
-    crop-supported work line. The normal-axis records are visited from the two
-    outside edges toward the middle (low, high, low+1, high-1, ...), which is
-    the order needed before building progressively shorter headland crossings.
+    crop-supported work line. The normal-axis records are split into two
+    contiguous blocks and interleaved (low-half[0], high-half[0], ...). This
+    keeps each turn between corresponding, well-separated rows instead of
+    forcing the final transition between the two central rows.
     """
     diagnostics = {
-        "ordering": "contour_outside_in_nested",
-        "algorithm_version": "contour-order-v3",
+        "ordering": "contour_half_split_interleaved",
+        "algorithm_version": "contour-order-v5",
+        "ordering_basis": "parallel_line_half_split_interleave",
+        "normal_order_reversed": False,
         "field_boundary_required": False,
         "fallback_reason": "",
     }
@@ -93,20 +102,60 @@ def _contour_order_work_lines(
         records.append({"index": index, "line": list(line), "pos": pos})
     records.sort(key=lambda item: (round(item["pos"], 6), item["index"]))
 
-    nested = []
-    left, right = 0, len(records) - 1
-    while left <= right:
-        nested.append(records[left])
-        left += 1
-        if left <= right:
-            nested.append(records[right])
-            right -= 1
-    diagnostics["ordered_original_indices"] = [item["index"] for item in nested]
-    diagnostics["normal_positions"] = [item["pos"] for item in nested]
+    # Split the normal-axis sequence into two blocks and interleave them. For
+    # n=8 this is 0,4,1,5,2,6,3,7; for n=9 it is 0,5,1,6,2,7,3,8,4.
+    # Four lines are the only useful small case where the simple split would
+    # still leave a central adjacent transition; use the parity order there.
+    split_index = (len(records) + 1) // 2
+    low_block = records[:split_index]
+    high_block = records[split_index:]
+    if len(records) == 4:
+        ordered_records = [records[index] for index in (1, 3, 0, 2)]
+        ordering_variant = "parity_avoid_adjacent_centre"
+    else:
+        ordered_records = []
+        for index in range(max(len(low_block), len(high_block))):
+            if index < len(low_block):
+                ordered_records.append(low_block[index])
+            if index < len(high_block):
+                ordered_records.append(high_block[index])
+        ordering_variant = "half_split_interleave"
+
+    pairs = []
+    for index in range(0, len(ordered_records), 2):
+        pair = ordered_records[index:index + 2]
+        pairs.append(pair)
+    ordered_positions = [item["pos"] for item in ordered_records]
+    diagnostics["split_index"] = int(split_index)
+    diagnostics["low_block_original_indices"] = [item["index"] for item in low_block]
+    diagnostics["high_block_original_indices"] = [item["index"] for item in high_block]
+    diagnostics["ordering_variant"] = ordering_variant
+    diagnostics["ordered_original_indices"] = [item["index"] for item in ordered_records]
+    diagnostics["normal_positions"] = ordered_positions
     diagnostics["sorted_normal_positions"] = [item["pos"] for item in records]
+    diagnostics["pair_count"] = len(pairs)
+    normal_rank = {
+        item["index"]: rank for rank, item in enumerate(records)
+    }
+    normal_index_gaps = [
+        abs(normal_rank[right["index"]] - normal_rank[left["index"]])
+        for left, right in zip(ordered_records, ordered_records[1:])
+    ]
+    diagnostics["adjacent_transition_count"] = sum(
+        gap == 1 for gap in normal_index_gaps
+    )
+    diagnostics["minimum_normal_index_gap"] = min(normal_index_gaps, default=0)
+    diagnostics["corresponding_pairs"] = [
+        {
+            "pair_index": pair_index,
+            "original_indices": [item["index"] for item in pair],
+            "normal_positions": [float(item["pos"]) for item in pair],
+        }
+        for pair_index, pair in enumerate(pairs)
+    ]
     diagnostics["main_angle_rad"] = float(angle)
     diagnostics["fallback_reason"] = None
-    return [item["line"] for item in nested], diagnostics
+    return [item["line"] for item in ordered_records], diagnostics
 
 
 def _build_contour_connector_anchors(
@@ -118,11 +167,12 @@ def _build_contour_connector_anchors(
 ) -> Tuple[List[Dict[str, Tuple[float, float]]], Dict]:
     """DECISION-016: build the two shared headland walls for nested loops.
 
-    Work lines are already ordered ``left-1, right-1, left-2, right-2, ...``
-    and oriented alternately.  Every endpoint on the same physical field end
-    is projected to one common axial wall.  The following bow turns therefore
+    Work lines are already ordered by the contour half-split interleave and
+    oriented alternately. Every endpoint on the same physical field end is
+    projected to one common axial wall. The following bow turns therefore
     place their transverse tangent on the same headland line; their lateral
-    spans shrink monotonically as the route moves inward.
+    spans are retained in the actual interleaved order and need not shrink
+    monotonically.
 
     The transverse span is intentionally *not* capped at a few metres: the
     first loop crosses from the left outer pass to the right outer pass.  Only
@@ -201,6 +251,18 @@ def _build_contour_connector_anchors(
         "low": float(min(low_projections)),
         "high": float(max(high_projections)),
     }
+    try:
+        endpoint_extension_m = float(
+            cfg.get("work_line_endpoint_extension_m", 0.0)
+        )
+    except (TypeError, ValueError):
+        endpoint_extension_m = 0.0
+    if not math.isfinite(endpoint_extension_m) or endpoint_extension_m < 0.0:
+        diagnostics["fallback_reason"] = "invalid_work_line_endpoint_extension"
+        return [], diagnostics
+    diagnostics["configured_work_line_endpoint_extension_m"] = (
+        endpoint_extension_m
+    )
     forced_walls = cfg.get("_contour_forced_wall_projections")
     if isinstance(forced_walls, dict):
         forced_low = _finite_float(forced_walls.get("low"))
@@ -216,6 +278,13 @@ def _build_contour_connector_anchors(
             diagnostics["shared_headland_scope"] = "current_region"
     else:
         diagnostics["shared_headland_scope"] = "current_region"
+    # A small, explicit outward extension gives the machine a usable straight
+    # headland approach.  It is applied after any field-wide forced walls so
+    # every classified region receives the same extension.  Boundary checking
+    # below keeps this from becoming a hidden excursion outside the field.
+    endpoint_extension_px = endpoint_extension_m / max(float(mpp), 1e-9)
+    wall_projection["low"] -= endpoint_extension_px
+    wall_projection["high"] += endpoint_extension_px
     anchors = [
         {
             "start": (float(line[0][0]), float(line[0][1])),
@@ -278,13 +347,10 @@ def _build_contour_connector_anchors(
         transition_walls.append(side)
         diagnostics["connector_count"] += 1
 
-    if any(
+    turn_distances_nonincreasing = not any(
         later > earlier + 1e-6
         for earlier, later in zip(turn_distances_m, turn_distances_m[1:])
-    ):
-        diagnostics["fallback_reason"] = "turn_distance_does_not_shrink_inward"
-        diagnostics["turn_distances_m"] = turn_distances_m
-        return [], diagnostics
+    )
 
     diagnostics.update({
         "fallback_reason": None,
@@ -292,7 +358,7 @@ def _build_contour_connector_anchors(
         "headland_wall_projections_px": wall_projection,
         "transition_walls": transition_walls,
         "turn_distances_m": turn_distances_m,
-        "turn_distances_nonincreasing": True,
+        "turn_distances_nonincreasing": turn_distances_nonincreasing,
         "max_endpoint_extension_m": max(endpoint_adjustments, default=0.0),
         "configured_max_endpoint_extension_m": max_extension_m,
     })
@@ -1204,7 +1270,7 @@ TURN_STRATEGY_LABELS = {
     "pear": "梨形转弯",
     "fishtail": "鱼尾折返",
     "alpha": "紧凑α折返",
-    "contour": "套圈收割（外圈向内）",
+    "contour": "套圈收割",
     "auto": "按行距自适应组合",
 }
 
@@ -1435,10 +1501,13 @@ def assess_turn_strategy(
     """
     selected = normalize_turn_strategy(strategy)
     ordering_strategy = selected
-    if selected == "contour":
+    contour_requested = selected == "contour"
+    if contour_requested:
         # The nested contour needs a shared transverse tangent.  Bow geometry
-        # supplies it for omega >= 2R; DECISION-010 still replaces an
-        # impossible central bow with a radius-safe alternative.
+        # supplies the finite paired transition.  Unlike an ordinary bow
+        # request, contour ordering must not silently become a pear/bulb at a
+        # narrow region boundary: the machine-facing topology is still the
+        # same two-sided contour pass.
         selected = "bow"
     spacings = [
         float(value)
@@ -1466,10 +1535,18 @@ def assess_turn_strategy(
 
         if selected == "bow":
             if below:
-                hard_reasons.append(
+                message = (
                     f"{len(below)}处行距ω小于2R（最小{minimum:.2f}m，"
-                    f"2R={two_radius:.2f}m），弓形转弯的两段R圆弧无法相切连接"
+                    f"2R={two_radius:.2f}m）"
                 )
+                if contour_requested:
+                    warnings.append(
+                        message + "，套圈转场保留有限弓形连接，不回退为梨形灯泡"
+                    )
+                else:
+                    hard_reasons.append(
+                        message + "，弓形转弯的两段R圆弧无法相切连接"
+                    )
         elif selected == "semicircle":
             if below:
                 hard_reasons.append(
@@ -1958,8 +2035,18 @@ def _connect_work_lines(
     def to_local(point):
         return (float(point[0]) - ox, float(point[1]) - oy) if point else None
 
-    include_entry_service = bool(cfg.get("_include_entry_service", True))
-    include_exit_service = bool(cfg.get("_include_exit_service", True))
+    service_point_mode = str(
+        cfg.get("service_point_mode", "reference_only")
+    ).strip().lower()
+    if service_point_mode not in {"reference_only", "connect"}:
+        service_point_mode = "reference_only"
+    connect_service_points = service_point_mode == "connect"
+    include_entry_service = bool(
+        connect_service_points and cfg.get("_include_entry_service", True)
+    )
+    include_exit_service = bool(
+        connect_service_points and cfg.get("_include_exit_service", True)
+    )
     entry_point = to_local(entry_global)
     if "_route_start_reference_local" in cfg:
         reference = cfg.get("_route_start_reference_local")
@@ -1969,6 +2056,17 @@ def _connect_work_lines(
             else None
         )
     exit_point = to_local(exit_global)
+    # A classified-region route receives the user's exit reference only on
+    # its final region.  Intermediate regions still use the previous region's
+    # endpoint as their entry reference and must not be reordered toward the
+    # global exit point.
+    if "_route_end_reference_local" in cfg:
+        reference = cfg.get("_route_end_reference_local")
+        exit_point = (
+            (float(reference[0]), float(reference[1]))
+            if reference is not None
+            else None
+        )
     unload_points = [to_local(point) for point in unload_globals if point]
     ordered_lines = [list(line) for line in work_lines]
     contour_ordering = {
@@ -1989,19 +2087,66 @@ def _connect_work_lines(
                 else None
             ),
         )
+        if bool(cfg.get("_contour_reverse_normal_order", False)):
+            # DECISION-017: a region may have to be entered from its far side
+            # when the previous region ends on the shared boundary.  Reversing
+            # the complete interleaved sequence preserves the pair spacing
+            # (for example 0,4,1,5 becomes 7,3,6,2,...) while moving the
+            # cross-region handoff away from an adjacent row.
+            ordered_lines.reverse()
+            ordered_indices = list(
+                reversed(contour_ordering.get("ordered_original_indices") or [])
+            )
+            normal_positions = list(
+                reversed(contour_ordering.get("normal_positions") or [])
+            )
+            contour_ordering["ordered_original_indices"] = ordered_indices
+            contour_ordering["normal_positions"] = normal_positions
+            contour_ordering["corresponding_pairs"] = [
+                {
+                    "pair_index": pair_index,
+                    "original_indices": ordered_indices[index:index + 2],
+                    "normal_positions": normal_positions[index:index + 2],
+                }
+                for pair_index, index in enumerate(
+                    range(0, len(ordered_indices), 2)
+                )
+            ]
+            contour_ordering["ordering_variant"] = (
+                "half_split_interleave_reversed_normal"
+            )
+            contour_ordering["normal_order_reversed"] = True
         # Wide nested-loop transitions use the two-quarter-arc bow geometry so
-        # their transverse tangents overlap on one headland line.  The central
-        # transition still goes through DECISION-010 fallback when omega < 2R.
-        turn_request_strategy = "bow"
+        # their transverse tangents overlap on one headland line.  Keep the
+        # contour request visible to the selector: a narrow contour transition
+        # must not be replaced by the pear/bulb fallback used by ordinary bow
+        # requests.
+        turn_request_strategy = "contour"
+        # The contour candidate is also the machine-facing straight-line
+        # topology: retain only the crop-supported endpoints of each already
+        # generated parallel pass.  This makes the route's work segments agree
+        # with the two-point control/export contract; the other candidate
+        # strategies continue to retain their dense canonical geometry.
+        ordered_lines = [
+            [
+                (float(line[0][0]), float(line[0][1])),
+                (float(line[-1][0]), float(line[-1][1])),
+            ]
+            for line in ordered_lines
+            if len(line) >= 2
+        ]
+        contour_ordering["work_line_geometry"] = "straight_endpoint_chord"
+        contour_ordering["work_line_point_counts"] = [
+            len(line) for line in ordered_lines
+        ]
     if entry_point and len(ordered_lines) >= 2:
         first_distance = min(
             math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
             for point in (ordered_lines[0][0], ordered_lines[0][-1])
         )
         if requested_strategy == "contour":
-            # The first two lines are the two outside edges.  Select the nearer
-            # edge without reversing the whole nested sequence (which would
-            # incorrectly start at the centre and work outward).
+            # The first two lines are the first low/high pair. Select the
+            # nearer side without reversing the whole interleaved sequence.
             other_distance = min(
                 math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
                 for point in (ordered_lines[1][0], ordered_lines[1][-1])
@@ -2020,6 +2165,19 @@ def _connect_work_lines(
                             values[pair_index],
                         )
                     contour_ordering[key] = values
+                pairs = []
+                pair_indices = contour_ordering.get("corresponding_pairs") or []
+                for pair in pair_indices:
+                    item = dict(pair)
+                    for key in ("original_indices", "normal_positions"):
+                        pair_values = list(item.get(key) or [])
+                        if len(pair_values) >= 2:
+                            pair_values[0], pair_values[1] = (
+                                pair_values[1], pair_values[0]
+                            )
+                        item[key] = pair_values
+                    pairs.append(item)
+                contour_ordering["corresponding_pairs"] = pairs
                 contour_ordering["outside_side_reversed_for_entry"] = True
             else:
                 contour_ordering["outside_side_reversed_for_entry"] = False
@@ -2055,37 +2213,216 @@ def _connect_work_lines(
             alignment_angle = 0.5 * math.atan2(weighted_sin, weighted_cos)
             alignment_direction_source = "all_work_lines_axial_mean"
 
-    start_reversed = False
-    if entry_point and ordered_lines and len(ordered_lines[0]) >= 2:
-        first = ordered_lines[0]
-        distance_start = math.hypot(
-            first[0][0] - entry_point[0],
-            first[0][1] - entry_point[1],
-        )
-        distance_end = math.hypot(
-            first[-1][0] - entry_point[0],
-            first[-1][1] - entry_point[1],
-        )
-        start_reversed = distance_end < distance_start
+    has_internal_handoff_reference = "_route_start_reference_local" in cfg
+    allow_reference_ordering_with_handoff = bool(
+        cfg.get("_allow_reference_ordering_with_handoff", False)
+    )
+    reference_ordering = {
+        # ``_route_start_reference_local`` is an internal handoff from a
+        # preceding classified region, not a second user choice.  Region
+        # reversal is handled by _connect_work_regions so that its adjacent
+        # transition check remains authoritative.
+        "enabled": bool(
+            (entry_point is not None or exit_point is not None)
+            and (
+                not has_internal_handoff_reference
+                or (
+                    allow_reference_ordering_with_handoff
+                    and exit_point is not None
+                )
+            )
+        ),
+        "candidate_count": 1,
+        "selected_variant": "current",
+        "entry_reference_used": bool(entry_point is not None),
+        "exit_reference_used": bool(exit_point is not None),
+    }
 
-    oriented = []
-    for index, line in enumerate(ordered_lines):
-        points = list(line)
-        if requested_strategy == "contour" and len(points) >= 2:
-            direction = (
-                math.cos(float(alignment_angle)),
-                math.sin(float(alignment_angle)),
+    def _contour_pair_swap(lines, indices, positions):
+        swapped_lines = [list(line) for line in lines]
+        swapped_indices = list(indices)
+        swapped_positions = list(positions)
+        for pair_index in range(0, len(swapped_lines) - 1, 2):
+            swapped_lines[pair_index], swapped_lines[pair_index + 1] = (
+                swapped_lines[pair_index + 1],
+                swapped_lines[pair_index],
             )
-            axial_delta = (
-                (float(points[-1][0]) - float(points[0][0])) * direction[0]
-                + (float(points[-1][1]) - float(points[0][1])) * direction[1]
+            if pair_index < len(swapped_indices) - 1:
+                swapped_indices[pair_index], swapped_indices[pair_index + 1] = (
+                    swapped_indices[pair_index + 1],
+                    swapped_indices[pair_index],
+                )
+            if pair_index < len(swapped_positions) - 1:
+                swapped_positions[pair_index], swapped_positions[pair_index + 1] = (
+                    swapped_positions[pair_index + 1],
+                    swapped_positions[pair_index],
+                )
+        return swapped_lines, swapped_indices, swapped_positions
+
+    def _preview_oriented(lines):
+        preview = []
+        start_reverse = False
+        if entry_point and lines and len(lines[0]) >= 2:
+            first = lines[0]
+            distance_start = math.hypot(
+                first[0][0] - entry_point[0],
+                first[0][1] - entry_point[1],
             )
-            if axial_delta < 0.0:
+            distance_end = math.hypot(
+                first[-1][0] - entry_point[0],
+                first[-1][1] - entry_point[1],
+            )
+            start_reverse = distance_end < distance_start
+        for index, line in enumerate(lines):
+            points = list(line)
+            if requested_strategy == "contour" and len(points) >= 2:
+                direction = (
+                    math.cos(float(alignment_angle)),
+                    math.sin(float(alignment_angle)),
+                )
+                axial_delta = (
+                    (float(points[-1][0]) - float(points[0][0])) * direction[0]
+                    + (float(points[-1][1]) - float(points[0][1])) * direction[1]
+                )
+                if axial_delta < 0.0:
+                    points.reverse()
+            if bool(index % 2) ^ start_reverse:
                 points.reverse()
-        if bool(index % 2) ^ start_reversed:
-            points.reverse()
-        if len(points) >= 2:
-            oriented.append(points)
+            if len(points) >= 2:
+                preview.append(points)
+        return preview
+
+    selected_preview = None
+    if reference_ordering["enabled"] and len(ordered_lines) >= 2:
+        candidate_specs = []
+        current_indices = list(
+            contour_ordering.get("ordered_original_indices") or []
+        )
+        current_positions = list(contour_ordering.get("normal_positions") or [])
+        if len(current_indices) != len(ordered_lines):
+            current_indices = list(range(len(ordered_lines)))
+        if len(current_positions) != len(ordered_lines):
+            current_positions = [None] * len(ordered_lines)
+        candidate_specs.append((
+            "current", [list(line) for line in ordered_lines],
+            current_indices, current_positions,
+        ))
+        if requested_strategy == "contour":
+            pair_lines, pair_indices, pair_positions = _contour_pair_swap(
+                ordered_lines, current_indices, current_positions
+            )
+            candidate_specs.append((
+                "pair_side_swapped", pair_lines, pair_indices, pair_positions
+            ))
+        base_specs = list(candidate_specs)
+        for name, lines, indices, positions in base_specs:
+            candidate_specs.append((
+                f"{name}_reversed", list(reversed(lines)),
+                list(reversed(indices)), list(reversed(positions)),
+            ))
+
+        scored = []
+        for candidate_index, (name, lines, indices, positions) in enumerate(
+            candidate_specs
+        ):
+            preview = _preview_oriented(lines)
+            if not preview:
+                continue
+            score = 0.0
+            entry_distance = None
+            exit_distance = None
+            if entry_point is not None:
+                # The route enters at the first point of the first oriented
+                # line.  Taking the minimum endpoint distance here can score
+                # a candidate whose *unvisited* endpoint is close while the
+                # actual route start is far away.
+                entry_distance = math.hypot(
+                    preview[0][0][0] - entry_point[0],
+                    preview[0][0][1] - entry_point[1],
+                )
+                score += entry_distance
+            if exit_point is not None:
+                # Likewise the route leaves at the final point of the final
+                # oriented line.  This is important when entry and exit are
+                # on the same field side.
+                exit_distance = math.hypot(
+                    preview[-1][-1][0] - exit_point[0],
+                    preview[-1][-1][1] - exit_point[1],
+                )
+                score += exit_distance
+            scored.append((score, candidate_index, name, lines, indices, positions,
+                           entry_distance, exit_distance, preview))
+        if scored:
+            selected = min(scored, key=lambda item: (item[0], item[1]))
+            (
+                score, candidate_index, name, selected_lines, selected_indices,
+                selected_positions, entry_distance, exit_distance,
+                selected_preview,
+            ) = selected
+            ordered_lines = selected_lines
+            reference_ordering.update({
+                "candidate_count": len(candidate_specs),
+                "selected_variant": name,
+                "selected_score_px": float(score),
+                "selected_entry_distance_m": (
+                    None if entry_distance is None else float(entry_distance * mpp)
+                ),
+                "selected_exit_distance_m": (
+                    None if exit_distance is None else float(exit_distance * mpp)
+                ),
+            })
+            if requested_strategy == "contour":
+                contour_ordering["ordered_original_indices"] = selected_indices
+                contour_ordering["normal_positions"] = selected_positions
+                contour_ordering["corresponding_pairs"] = [
+                    {
+                        "pair_index": pair_index,
+                        "original_indices": selected_indices[index:index + 2],
+                        "normal_positions": selected_positions[index:index + 2],
+                    }
+                    for pair_index, index in enumerate(
+                        range(0, len(selected_indices), 2)
+                    )
+                ]
+                contour_ordering["reference_order_variant"] = name
+
+    if selected_preview is not None:
+        # Candidate scoring already produced the exact oriented route.  Do
+        # not orient it a second time using only the entry point: that used to
+        # undo the exit-side choice for same-side start/end markers.
+        oriented = [list(line) for line in selected_preview]
+    else:
+        start_reversed = False
+        if entry_point and ordered_lines and len(ordered_lines[0]) >= 2:
+            first = ordered_lines[0]
+            distance_start = math.hypot(
+                first[0][0] - entry_point[0],
+                first[0][1] - entry_point[1],
+            )
+            distance_end = math.hypot(
+                first[-1][0] - entry_point[0],
+                first[-1][1] - entry_point[1],
+            )
+            start_reversed = distance_end < distance_start
+
+        oriented = []
+        for index, line in enumerate(ordered_lines):
+            points = list(line)
+            if requested_strategy == "contour" and len(points) >= 2:
+                direction = (
+                    math.cos(float(alignment_angle)),
+                    math.sin(float(alignment_angle)),
+                )
+                axial_delta = (
+                    (float(points[-1][0]) - float(points[0][0])) * direction[0]
+                    + (float(points[-1][1]) - float(points[0][1])) * direction[1]
+                )
+                if axial_delta < 0.0:
+                    points.reverse()
+            if bool(index % 2) ^ start_reversed:
+                points.reverse()
+            if len(points) >= 2:
+                oriented.append(points)
 
     full_path = []
     segment_types = []
@@ -2226,26 +2563,32 @@ def _connect_work_lines(
             if gap_m <= 1e-9:
                 gap_m = float(np.linalg.norm(lateral) * mpp)
             decision = _select_turn_strategy(
-                "bow",
+                "contour",
                 gap_m,
                 min_turn_radius_m,
                 geometry_tolerance_m=turn_radius_geometry_tolerance_m,
             )
-            strategy = str(decision["strategy"])
+            strategy = (
+                "bow" if str(decision["strategy"]) == "contour"
+                else str(decision["strategy"])
+            )
             function = TURN_STRATEGIES.get(strategy, _turn_bow)
+            geometry_radius_m = min(
+                float(min_turn_radius_m), max(1e-6, gap_m * 0.5)
+            ) if str(decision["strategy"]) == "contour" else float(min_turn_radius_m)
             selected_clearance = 0.0
             for candidate_clearance in clearance_candidates:
                 if strategy == "semicircle":
                     candidate = function(
                         start, end, work_direction, 1.0, mpp,
-                        min_turn_radius_m, candidate_clearance,
+                        geometry_radius_m, candidate_clearance,
                         radius_tolerance_m=turn_radius_geometry_tolerance_m,
                         tangent_radius_m=min_turn_radius_m,
                     )
                 else:
                     candidate = function(
                         start, end, work_direction, 1.0, mpp,
-                        min_turn_radius_m, candidate_clearance,
+                        geometry_radius_m, candidate_clearance,
                     )
                 if _segment_inside_field_boundary(candidate, field_polygon):
                     selected_clearance = candidate_clearance
@@ -2256,6 +2599,7 @@ def _connect_work_lines(
                 "headland_side": side,
                 "individually_safe_clearance_m": float(selected_clearance),
                 "strategy": strategy,
+                "geometry_radius_m": float(geometry_radius_m),
             })
         for side in ("low", "high"):
             if safe_by_side[side]:
@@ -2356,15 +2700,28 @@ def _connect_work_lines(
             headland_limited=headland_limited,
             geometry_tolerance_m=turn_radius_geometry_tolerance_m,
         )
-        selected_strategy = decision["strategy"]
+        selected_strategy = (
+            "bow" if str(decision["strategy"]) == "contour"
+            else decision["strategy"]
+        )
+        geometry_radius_m = (
+            min(float(min_turn_radius_m), max(1e-6, gap_m * 0.5))
+            if requested_strategy == "contour"
+            else float(min_turn_radius_m)
+        )
         turn_decisions.append({
             "transition_index": index,
             "requested_strategy": decision.get("requested_strategy"),
             "candidate_strategy": decision.get("candidate_strategy"),
-            "effective_strategy": decision.get("effective_strategy", selected_strategy),
+            "effective_strategy": selected_strategy,
             "strategy": selected_strategy,
             "pass_spacing_m": float(gap_m),
             "turn_radius_m": float(min_turn_radius_m),
+            "geometry_radius_m": float(geometry_radius_m),
+            "radius_capped_for_contour_pairing": bool(
+                requested_strategy == "contour"
+                and geometry_radius_m < float(min_turn_radius_m) - 1e-9
+            ),
             "geometry_tolerance_m": float(
                 decision.get("geometry_tolerance_m", 0.0)
             ),
@@ -2383,7 +2740,7 @@ def _connect_work_lines(
         })
         if requested_strategy == "contour":
             turn_decisions[-1]["ordering_strategy"] = "contour"
-            turn_decisions[-1]["turn_request_strategy"] = "bow"
+            turn_decisions[-1]["turn_request_strategy"] = "contour"
         if decision.get("fallback_reason"):
             fallback_reasons.append(decision["fallback_reason"])
         used_strategies.append(selected_strategy)
@@ -2469,7 +2826,7 @@ def _connect_work_lines(
                 work_direction,
                 turn_sign,
                 mpp,
-                min_turn_radius_m,
+                geometry_radius_m,
                 selected_strategy,
                 turn_clearance_m,
                 field_polygon,
@@ -2625,11 +2982,21 @@ def _connect_work_lines(
         "pass_spacings_m": pass_spacings_m,
         "turn_decisions": turn_decisions,
         "endpoint_alignment": endpoint_alignment,
+        "reference_ordering": reference_ordering,
         "contour_connector": contour_connector_diagnostics,
         "contour_route_mode": contour_route_mode,
         "service_points": {
-            "entry_present": bool(include_entry_service and entry_point is not None),
-            "exit_present": bool(include_exit_service and exit_point is not None),
+            "mode": service_point_mode,
+            "entry_present": bool(entry_point is not None),
+            "exit_present": bool(exit_point is not None),
+            "entry_reference_used": bool(entry_point is not None and oriented),
+            "exit_reference_used": bool(exit_point is not None and oriented),
+            "entry_connector_emitted": bool(
+                include_entry_service and entry_point is not None and oriented
+            ),
+            "exit_connector_emitted": bool(
+                include_exit_service and exit_point is not None and oriented
+            ),
             "unload_count": len(unload_points) if include_exit_service else 0,
             "unload_visit_count": sum(1 for item in segment_types if item == "unload"),
             "route_start_reference_present": entry_point is not None,
@@ -3264,6 +3631,465 @@ def export_path_format(geo_points: List[Dict], output_path: str):
         f.write(f"{cfg.INFM_LINE}\n")
 
 
+MACHINE_COMPATIBILITY_PROTOCOL = "machine_harvester_straight_turn_v1"
+MACHINE_COMPATIBILITY_DEDUP_DISTANCE_M = 0.02
+MACHINE_COMPATIBILITY_MAX_POINTS_PER_FILE = 50
+
+
+def _machine_compatibility_output_paths(
+    output_path: str,
+    chunk_count: int,
+) -> List[str]:
+    """Choose non-overwriting numbered files for a split machine export.
+
+    A legacy file path is kept for a one-file programmatic export so existing
+    integrations remain compatible.  A directory, or any export that needs
+    more than one file, uses the terminal-facing ``001.txt`` convention and
+    starts after the highest numeric TXT file already present in that folder.
+    """
+    requested = os.path.abspath(os.fspath(output_path))
+    requested_suffix = os.path.splitext(requested)[1]
+    numbered = os.path.isdir(requested) or not requested_suffix or chunk_count > 1
+    if not numbered:
+        return [requested]
+
+    directory = requested if os.path.isdir(requested) or not requested_suffix else os.path.dirname(requested)
+    os.makedirs(directory, exist_ok=True)
+    highest = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        names = []
+    for name in names:
+        stem, suffix = os.path.splitext(name)
+        if suffix.lower() != ".txt" or not stem.isdigit():
+            continue
+        try:
+            highest = max(highest, int(stem))
+        except ValueError:
+            continue
+
+    paths = []
+    next_index = highest + 1
+    for _ in range(chunk_count):
+        while True:
+            candidate = os.path.join(directory, f"{next_index:03d}.txt")
+            next_index += 1
+            if not os.path.exists(candidate) and candidate not in paths:
+                paths.append(candidate)
+                break
+    return paths
+
+
+def _write_machine_compatibility_file(
+    output_path: str,
+    points: List[Dict],
+    cfg: Config,
+) -> None:
+    """Write one independently indexed <=50-point terminal PATH file."""
+    with _atomic_text_writer(output_path, encoding="utf-8") as handle:
+        total = len(points)
+        for index, point in enumerate(points):
+            # A split file is imported as an independent route. Its final
+            # record has no outgoing edge, so it must terminate as non-work
+            # even when the canonical point would continue in the next file.
+            status = 0 if index == total - 1 else int(point["status"])
+            handle.write(
+                f"$PATH,0,{index},{total},"
+                f"{float(point['lat']):.8f},{float(point['lon']):.8f},"
+                f"{cfg.OFFSET_X},{cfg.OFFSET_Y},{status}*\n"
+            )
+        handle.write(f"{cfg.INFM_LINE}\n")
+
+
+def _machine_compatibility_distance_m(first: Dict, second: Dict) -> float:
+    """Return an equirectangular WGS84 distance for nearby route points."""
+    lat1 = math.radians(float(first["lat"]))
+    lat2 = math.radians(float(second["lat"]))
+    mean_lat = (lat1 + lat2) / 2.0
+    dlat = math.radians(float(second["lat"]) - float(first["lat"]))
+    dlon = math.radians(float(second["lon"]) - float(first["lon"]))
+    earth_radius_m = 6371008.8
+    return earth_radius_m * math.hypot(dlat, dlon * math.cos(mean_lat))
+
+
+def _machine_compatibility_segment_type(point: Dict) -> str:
+    segment_type = str(point.get("segment_type") or "").strip().lower()
+    if segment_type:
+        return segment_type
+    try:
+        status = int(point.get("status", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("农机兼容导出点缺少有效段类型和状态") from exc
+    return "work" if status == 1 else "turn"
+
+
+def _machine_compatibility_segment_groups(
+    geo_points: List[Dict],
+) -> List[Dict]:
+    """Group flattened geographic points back into ordered logical segments."""
+    groups = []
+    for order, point in enumerate(geo_points):
+        segment_type = _machine_compatibility_segment_type(point)
+        raw_index = point.get("segment_index")
+        if raw_index is None:
+            # Legacy point lists without segment indices can still be consumed,
+            # but a type change starts a new logical segment.
+            group_key = ("legacy", segment_type)
+        else:
+            try:
+                group_key = ("explicit", int(raw_index))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"第 {order + 1} 个农机兼容点的 segment_index 无效"
+                ) from exc
+        if groups and groups[-1]["key"] == group_key:
+            groups[-1]["points"].append(point)
+            continue
+        groups.append({
+            "key": group_key,
+            "segment_type": segment_type,
+            "points": [point],
+        })
+    return groups
+
+
+def _machine_compatibility_copy_point(
+    point: Dict,
+    *,
+    status: int,
+    compatibility_segment_type: str,
+) -> Dict:
+    copied = dict(point)
+    copied["status"] = int(status)
+    copied["segment_type"] = str(compatibility_segment_type)
+    copied["compatibility_segment_type"] = str(compatibility_segment_type)
+    copied["source_segment_type"] = str(point.get("segment_type") or "")
+    return copied
+
+
+def _machine_compatibility_edges(groups: List[Dict]) -> List[Tuple[Dict, Dict, int, str]]:
+    """Build work edges and one straight chord for every non-work run.
+
+    The target terminal protocol does not receive the research turn geometry
+    or its internal motion labels.  ``turn_reverse`` is therefore treated the
+    same as every other non-work segment here: it becomes one status-0 chord
+    between adjacent work-line endpoints.  This projection does not mutate
+    the canonical research route or claim that the terminal performs reverse.
+    """
+    if not groups:
+        raise ValueError("没有有效路径段，不能生成农机兼容文件")
+
+    work_indices = [
+        index
+        for index, group in enumerate(groups)
+        if str(group["segment_type"]) == "work"
+    ]
+    if not work_indices:
+        raise ValueError("农机兼容导出至少需要一条 work 作业线")
+
+    edges = []
+    first_work_index = work_indices[0]
+    if first_work_index > 0:
+        entry_start = groups[0]["points"][0]
+        first_work_start = groups[first_work_index]["points"][0]
+        edges.append((entry_start, first_work_start, 0, "turn"))
+
+    for position, work_index in enumerate(work_indices):
+        work_points = groups[work_index]["points"]
+        if len(work_points) < 2:
+            raise ValueError(
+                f"第 {work_index + 1} 条 work 作业线少于两个点，不能生成兼容路径"
+            )
+        # The target controller consumes one straight work edge per logical
+        # work line.  Intermediate research poses are deliberately discarded
+        # here; otherwise the visible two-point route and the exported file
+        # would diverge again for curved/dense canonical segments.
+        edges.append((
+            work_points[0],
+            work_points[-1],
+            1,
+            "work",
+        ))
+
+        if position + 1 < len(work_indices):
+            next_work = groups[work_indices[position + 1]]
+            # The controller receives only this chord for the whole non-work
+            # run.  It is deliberately not used for scientific validation.
+            edges.append((
+                work_points[-1],
+                next_work["points"][0],
+                0,
+                "turn",
+            ))
+        elif work_index < len(groups) - 1:
+            exit_end = groups[-1]["points"][-1]
+            edges.append((work_points[-1], exit_end, 0, "turn"))
+
+    return edges
+
+
+def _deduplicate_machine_compatibility_points(
+    points: List[Dict],
+    threshold_m: float,
+) -> Tuple[List[Dict], int]:
+    if not math.isfinite(float(threshold_m)) or float(threshold_m) <= 0.0:
+        raise ValueError("农机兼容重复点阈值必须是正数")
+    deduplicated = []
+    removed = 0
+    for point in points:
+        if deduplicated and _machine_compatibility_distance_m(
+            deduplicated[-1], point
+        ) < float(threshold_m):
+            # The later record represents the outgoing state of the next
+            # logical edge, so it wins when a boundary has nearly identical
+            # coordinates.
+            deduplicated[-1] = point
+            removed += 1
+        else:
+            deduplicated.append(point)
+    if len(deduplicated) < 2:
+        raise ValueError("清理重复点后有效兼容路径少于两个点")
+    for index, point in enumerate(deduplicated):
+        point["compatibility_index"] = int(index)
+    return deduplicated, removed
+
+
+def prepare_machine_compatibility_points(
+    geo_points: List[Dict],
+    *,
+    duplicate_distance_m: Optional[float] = None,
+) -> Tuple[List[Dict], Dict]:
+    """Project the research route to the harvest-machine compatibility format.
+
+    The research route keeps its physical turn curves.  This projection
+    collapses each contiguous non-work run between two work lines to one
+    straight chord and assigns the status to the outgoing edge, matching the
+    supplied terminal sample (1=work, 0=turn).
+    """
+    geo_points = validate_geo_points(geo_points)
+    cfg = Config()
+    compatibility_config = cfg.section("export").get("machine_compatibility", {})
+    try:
+        configured_route_id = int(compatibility_config.get("route_id", 0))
+        configured_work_status = int(
+            compatibility_config.get("work_status", 1)
+        )
+        configured_non_work_status = int(
+            compatibility_config.get("non_work_status", 0)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("农机兼容协议配置中的固定字段无效") from exc
+    configured_protocol = str(
+        compatibility_config.get("protocol", MACHINE_COMPATIBILITY_PROTOCOL)
+    )
+    configured_turn_geometry = str(
+        compatibility_config.get("turn_geometry", "straight_chord")
+    )
+    if (
+        configured_protocol != MACHINE_COMPATIBILITY_PROTOCOL
+        or configured_route_id != 0
+        or configured_work_status != 1
+        or configured_non_work_status != 0
+        or configured_turn_geometry != "straight_chord"
+    ):
+        raise ValueError(
+            "农机兼容协议配置必须固定为 straight_turn_v1、route_id=0、"
+            "work=1、non_work=0、turn_geometry=straight_chord"
+        )
+    threshold = (
+        compatibility_config.get(
+            "deduplicate_distance_m",
+            MACHINE_COMPATIBILITY_DEDUP_DISTANCE_M,
+        )
+        if duplicate_distance_m is None
+        else duplicate_distance_m
+    )
+    threshold = float(threshold)
+    groups = _machine_compatibility_segment_groups(geo_points)
+    edges = _machine_compatibility_edges(groups)
+
+    raw_points = []
+    for edge_index, (start, end, status, segment_type) in enumerate(edges):
+        next_status = (
+            int(edges[edge_index + 1][2])
+            if edge_index + 1 < len(edges)
+            else 0
+        )
+        next_segment_type = (
+            str(edges[edge_index + 1][3])
+            if edge_index + 1 < len(edges)
+            else "turn"
+        )
+        start_point = _machine_compatibility_copy_point(
+            start,
+            status=int(status),
+            compatibility_segment_type=str(segment_type),
+        )
+        end_point = _machine_compatibility_copy_point(
+            end,
+            status=next_status,
+            compatibility_segment_type=next_segment_type,
+        )
+        if raw_points and _machine_compatibility_distance_m(
+            raw_points[-1], start_point
+        ) <= 1e-9:
+            # Segment endpoints are intentionally shared.  Do not count this
+            # serialization boundary as an input duplicate.
+            raw_points[-1] = start_point
+        else:
+            raw_points.append(start_point)
+        if raw_points and _machine_compatibility_distance_m(
+            raw_points[-1], end_point
+        ) <= 1e-9:
+            raw_points[-1] = end_point
+        else:
+            raw_points.append(end_point)
+
+    compat_points, removed_count = _deduplicate_machine_compatibility_points(
+        raw_points,
+        threshold,
+    )
+    for point in compat_points:
+        status = int(point.get("status", 0))
+        if status not in (0, 1):
+            raise ValueError(
+                f"农机兼容导出产生非法状态码: {status}，只允许 0 或 1"
+            )
+    diagnostics = {
+        "protocol": MACHINE_COMPATIBILITY_PROTOCOL,
+        "turn_geometry": "straight_chord",
+        "status_semantics": "outgoing_edge",
+        "source_point_count": int(len(geo_points)),
+        "output_point_count": int(len(compat_points)),
+        "source_segment_count": int(len(groups)),
+        "turn_run_count": int(
+            sum(
+                1
+                for index, group in enumerate(groups)
+                if str(group["segment_type"]) != "work"
+                and (
+                    index == 0
+                    or str(groups[index - 1]["segment_type"]) == "work"
+                )
+            )
+        ),
+        "removed_near_duplicate_count": int(removed_count),
+        "work_line_geometry": "straight_endpoint_chord",
+        "work_line_point_compression": True,
+        "deduplicate_distance_m": float(threshold),
+        "route_id": 0,
+        "status_codes": {"turn_or_other": 0, "work": 1},
+        "infoline": str(cfg.INFM_LINE),
+    }
+    return compat_points, diagnostics
+
+
+def validate_machine_compatibility_geometry(
+    compat_points: List[Dict],
+    *,
+    field_polygon: Optional[np.ndarray] = None,
+    forbidden_regions: Optional[List[List[Tuple[float, float]]]] = None,
+) -> Dict:
+    """Validate the actual straight segments sent to the terminal."""
+    if len(compat_points) < 2:
+        raise ValueError("农机兼容路径少于两个点，不能进行几何校验")
+    forbidden_polygons = []
+    for region_index, region in enumerate(forbidden_regions or []):
+        try:
+            region_points = [
+                (float(point[0]), float(point[1]))
+                for point in np.asarray(region, dtype=np.float64)
+            ]
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError(
+                f"禁行区 {region_index + 1} 几何无效，不能生成兼容文件"
+            ) from exc
+        if len(region_points) < 3:
+            raise ValueError(
+                f"禁行区 {region_index + 1} 几何无效，不能生成兼容文件"
+            )
+        polygon = Polygon(region_points)
+        if polygon.is_empty or not polygon.is_valid:
+            raise ValueError(
+                f"禁行区 {region_index + 1} 几何无效，不能生成兼容文件"
+            )
+        forbidden_polygons.append(polygon)
+
+    for index in range(1, len(compat_points)):
+        previous = compat_points[index - 1]
+        current = compat_points[index]
+        segment = [
+            (float(previous["pixel_x"]), float(previous["pixel_y"])),
+            (float(current["pixel_x"]), float(current["pixel_y"])),
+        ]
+        if not segment_within_field_boundary(segment, field_polygon):
+            raise ValueError(
+                "农机兼容转弯直线越出田块边界："
+                f"point={index - 1}->{index}"
+            )
+        geometry = LineString(segment)
+        for region_index, polygon in enumerate(forbidden_polygons):
+            if polygon.intersects(geometry):
+                raise ValueError(
+                    "农机兼容路径直线进入禁行区："
+                    f"point={index - 1}->{index}, region={region_index + 1}"
+                )
+    return {
+        "field_boundary_checked": field_polygon is not None,
+        "forbidden_regions_checked": len(forbidden_polygons),
+        "valid": True,
+    }
+
+
+def export_machine_compatibility_path(
+    geo_points: List[Dict],
+    output_path: str,
+    *,
+    duplicate_distance_m: Optional[float] = None,
+    field_polygon: Optional[np.ndarray] = None,
+    forbidden_regions: Optional[List[List[Tuple[float, float]]]] = None,
+) -> Tuple[List[Dict], Dict]:
+    """Export straight-turn, 0/1-only PATH files, max 50 points each.
+
+    When one file is enough, a caller-supplied file path is preserved.  When
+    the route is split, or when a directory is supplied, numbered files are
+    created without overwriting existing ``NNN.txt`` files.  Point indices
+    and the declared total restart in each file because the terminal imports
+    each file as an independent PATH object.
+    """
+    compat_points, diagnostics = prepare_machine_compatibility_points(
+        geo_points,
+        duplicate_distance_m=duplicate_distance_m,
+    )
+    geometry_diagnostics = validate_machine_compatibility_geometry(
+        compat_points,
+        field_polygon=field_polygon,
+        forbidden_regions=forbidden_regions,
+    )
+    diagnostics["geometry"] = geometry_diagnostics
+    cfg = Config()
+    max_points = MACHINE_COMPATIBILITY_MAX_POINTS_PER_FILE
+    chunks = [
+        compat_points[index:index + max_points]
+        for index in range(0, len(compat_points), max_points)
+    ]
+    if not chunks:
+        raise ValueError("鍐滄満鍏煎璺緞娌℃湁鍙鍑虹偣")
+    output_paths = _machine_compatibility_output_paths(output_path, len(chunks))
+    for path, chunk in zip(output_paths, chunks):
+        _write_machine_compatibility_file(path, chunk, cfg)
+    diagnostics.update({
+        "max_points_per_file": int(max_points),
+        "file_count": int(len(output_paths)),
+        "output_files": list(output_paths),
+        "points_per_file": [int(len(chunk)) for chunk in chunks],
+        "point_index_scope": "per_file",
+        "file_boundary_point_overlap": False,
+    })
+    return compat_points, diagnostics
+
+
 def _candidate_strategies_for_request(requested_strategy: str) -> List[str]:
     """Return executable strategies to evaluate for a user request.
 
@@ -3448,6 +4274,20 @@ def _build_planning_factor_report(
     layout = layout or {}
     turn_assessment = turn_assessment or {}
     validation = validation or {}
+    raw_sources = (
+        getattr(state, "harvester_param_sources", {}) or {}
+        if state is not None
+        else {}
+    )
+    harvester_param_sources = {
+        key: str(raw_sources.get(key, "legacy_unverified"))
+        for key in specs
+    }
+    unverified_harvester_params = [
+        key
+        for key, source in harvester_param_sources.items()
+        if source not in HARVESTER_FORMAL_MEASURED_SOURCES
+    ]
     return {
         "decision_chain": [
             "processed_mask_and_field_support",
@@ -3461,6 +4301,13 @@ def _build_planning_factor_report(
             key: float(value)
             for key, value in specs.items()
         },
+        "harvester_param_sources": harvester_param_sources,
+        "harvester_param_source_labels": {
+            key: HARVESTER_PARAM_SOURCE_LABELS.get(source, source)
+            for key, source in harvester_param_sources.items()
+        },
+        "harvester_param_source_complete": not unverified_harvester_params,
+        "unverified_harvester_params": unverified_harvester_params,
         "mask": {
             "shape_hw": list(mask.shape[:2]) if mask is not None else None,
             "offset_xy": [ox, oy],
@@ -3618,11 +4465,13 @@ def _generate_uniform_zone_lines(
     state=None,
     mask: Optional[np.ndarray] = None,
     inner_limit_offset: Optional[float] = None,
+    diagnostics: Optional[Dict] = None,
+    config: Optional[Dict] = None,
 ) -> List[List[Tuple[float, float]]]:
     """在等距种植大片区域内按固定间距生成平行作业线（常规全覆盖）。
 
-    大片等距区（剖面宽 >> 割幅）无法用一条中心线覆盖，按割幅间距沿
-    法向逐条生成与主方向平行的作业线。宽度与线段必须基于真实掩膜：
+    大片等距区（剖面宽 >> 割幅）无法用一条中心线覆盖，按解析后的固定
+    作业间距（默认轨距）沿法向生成与主方向平行的作业线。宽度与线段必须基于真实掩膜：
     contour 只是边界跟踪的骨架（可能远窄于实际种植区），掩膜才是
     实际可作业范围。
     """
@@ -3630,6 +4479,13 @@ def _generate_uniform_zone_lines(
         zone_band,
         main_angle,
     )
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update({
+            "reference_geometry_source": _geometry_source,
+            "effective_geometry_source": _geometry_source,
+            "profile_width_m": zone_band.get("profile_width_m"),
+        })
     if points is None or centroid is None:
         return []
     mpp = meters_per_pixel(
@@ -3671,13 +4527,73 @@ def _generate_uniform_zone_lines(
             return False
         return bool(zone_mask[y, x] > 100)
 
-    # 法向范围：从质心沿法向扫掩膜（真实宽度，contour 骨架可能偏窄）
-    n_lo = 0
-    while n_lo > -4000 and white_at(n_lo, 0.0):
-        n_lo -= 2
-    n_hi = 0
-    while n_hi < 4000 and white_at(n_hi, 0.0):
-        n_hi += 2
+    # 法向范围：优先使用等距区自身的几何边界，再用掩膜确认每条线的
+    # 轴向支撑。只在 t=0 这一条剖面上找边界，会在该位置恰好落到
+    # 非掩膜宽行/断点时把整个等距区误判成半宽，进而漏掉交界处的一趟。
+    # 对完整 contour 使用几何范围；只有紧凑 centerline 记录才退回单剖面扫掩膜。
+    normal_projection = (points - centroid) @ normal
+    geometry_bounds = None
+    if len(points) >= 3 and np.all(np.isfinite(normal_projection)):
+        geometry_bounds = (
+            float(normal_projection.min()),
+            float(normal_projection.max()),
+        )
+    # A regularized equal-distance block can retain a narrow tracking contour
+    # while its measured profile spans the complete block.  Using that contour
+    # as the only transverse limit silently clips the block (the real 12.47 m
+    # block in the field cache was reduced to 3.91 m here).  DECISION-009/017:
+    # use the measured profile width as the planning envelope when it provides
+    # materially stronger evidence than the contour; keep the mask as the
+    # axial support check and do not let a derived neighbour guard remove the
+    # measured boundary swath.
+    effective_geometry_source = _geometry_source
+    profile_width_m = _finite_float(zone_band.get("profile_width_m"))
+    profile_width_px = None
+    geometry_width_px = None
+    if profile_width_m is not None and profile_width_m > 0.0:
+        profile_width_px = profile_width_m / max(mpp, 1e-9)
+    if geometry_bounds is not None:
+        geometry_width_px = max(0.0, geometry_bounds[1] - geometry_bounds[0])
+    expansion_gap_px = max(8.0, spacing_px * 0.5)
+    if (
+        geometry_bounds is not None
+        and profile_width_px is not None
+        and profile_width_px > geometry_width_px + expansion_gap_px
+        and profile_width_px > geometry_width_px * 1.5
+    ):
+        geometry_bounds = (-0.5 * profile_width_px, 0.5 * profile_width_px)
+        effective_geometry_source = (
+            f"{_geometry_source}_expanded_from_profile_width"
+        )
+    inner_limit_applied = inner_limit_offset is not None
+    # The expanded profile is evidence for the complete equal-distance block,
+    # but it can extend across the neighbouring classified row region. Keep
+    # the inner boundary guard in that case: the nearest regular centreline
+    # owns the boundary swath, so an equal-distance line must not be generated
+    # on top of it. The processed-mask support check below remains a hard
+    # condition for every generated line.
+    if diagnostics is not None:
+        diagnostics.update({
+            "effective_geometry_source": effective_geometry_source,
+            "profile_width_px": profile_width_px,
+            "reference_geometry_width_px": geometry_width_px,
+            "effective_transverse_width_m": (
+                None
+                if geometry_bounds is None
+                else (geometry_bounds[1] - geometry_bounds[0]) * mpp
+            ),
+            "inner_limit_applied": inner_limit_applied,
+        })
+    scan_lo = 0
+    while scan_lo > -4000 and white_at(scan_lo, 0.0):
+        scan_lo -= 2
+    scan_hi = 0
+    while scan_hi < 4000 and white_at(scan_hi, 0.0):
+        scan_hi += 2
+    if geometry_bounds is not None:
+        n_lo, n_hi = geometry_bounds
+    else:
+        n_lo, n_hi = float(scan_lo), float(scan_hi)
     # 内侧限制：等距区与相邻带在掩膜上可能相连（无间隙），细分线不得
     # 越过相邻带中心线 -1m 安全带（避免作业线落到相邻 4 行带上）。
     if inner_limit_offset is not None:
@@ -3688,35 +4604,165 @@ def _generate_uniform_zone_lines(
     if n_hi - n_lo < spacing_px * 0.5:
         return []
 
-    lines = []
-    position = n_lo + spacing_px * 0.5
-    while position < n_hi:
-        # 该法向位置沿主向扫描白色 run；合并小间隙（≤60px≈0.8m，断行）
-        # 后取最长段作为作业线，横贯整个等距种植区
-        t_start = int(t_lo) - 30
-        t_end = int(t_hi) + 30
+    t_start = int(t_lo) - 30
+    t_end = int(t_hi) + 30
+
+    def longest_supported_run(n_off: float):
+        """Return the longest mask-supported axial run at one normal offset."""
         white_positions = [
             t_off for t_off in range(t_start, t_end)
-            if white_at(position, float(t_off))
+            if white_at(n_off, float(t_off))
         ]
-        if white_positions:
-            segments = []
-            seg_start = white_positions[0]
-            prev = white_positions[0]
-            for value in white_positions[1:]:
-                if value - prev > 60:
-                    segments.append((seg_start, prev))
-                    seg_start = value
-                prev = value
-            segments.append((seg_start, prev))
-            longest = max(segments, key=lambda seg: seg[1] - seg[0])
-            if longest[1] - longest[0] >= 4:
-                p1 = (cx + normal[0] * position + direction[0] * longest[0],
-                      cy + normal[1] * position + direction[1] * longest[0])
-                p2 = (cx + normal[0] * position + direction[0] * longest[1],
-                      cy + normal[1] * position + direction[1] * longest[1])
-                lines.append([p1, p2])
-        position += spacing_px
+        if not white_positions:
+            return None
+        segments = []
+        seg_start = white_positions[0]
+        prev = white_positions[0]
+        for value in white_positions[1:]:
+            if value - prev > 60:
+                segments.append((seg_start, prev))
+                seg_start = value
+            prev = value
+        segments.append((seg_start, prev))
+        longest = max(segments, key=lambda seg: seg[1] - seg[0])
+        return longest if longest[1] - longest[0] >= 4 else None
+
+    # ``track_gauge`` is the machine-compatible pass spacing: the right track
+    # of one pass and the left track of the next pass must share a centreline.
+    # Do not redistribute the residual width into ``(n_hi-n_lo)/pass_count``;
+    # that made every equal-distance pass use a different spacing.  Center the
+    # residual edge margin while keeping every adjacent pass exactly
+    # ``spacing_px`` apart.
+    pass_count = max(1, int(math.ceil((n_hi - n_lo) / spacing_px - 1e-9)))
+    if pass_count == 1:
+        nominal_positions = [0.5 * (n_lo + n_hi)]
+    else:
+        residual_px = max(0.0, (n_hi - n_lo) - (pass_count - 1) * spacing_px)
+        first_position = n_lo + 0.5 * residual_px
+        nominal_positions = [
+            first_position + spacing_px * pass_index
+            for pass_index in range(pass_count)
+        ]
+
+    # A single global phase may be selected to bridge a narrow mask seam, but
+    # it is applied to the whole equal-distance block.  Per-line phase search
+    # silently turns a regular grid into irregular lanes.
+    phase_candidates = [0.0]
+    for fraction in (0.15, 0.30, 0.45):
+        delta = spacing_px * fraction
+        phase_candidates.extend((-delta, delta))
+    phase_evaluations = []
+    for phase in phase_candidates:
+        positions = [position + phase for position in nominal_positions]
+        if positions and (
+            min(positions) < n_lo - 1e-6 or max(positions) > n_hi + 1e-6
+        ):
+            continue
+        runs = [longest_supported_run(position) for position in positions]
+        supported_count = sum(run is not None for run in runs)
+        supported_length = sum(
+            (run[1] - run[0]) for run in runs if run is not None
+        )
+        phase_evaluations.append((
+            supported_count,
+            supported_length,
+            -abs(phase),
+            float(phase),
+            positions,
+            runs,
+        ))
+    if not phase_evaluations:
+        return []
+    nominal_evaluation = next(
+        (item for item in phase_evaluations if abs(item[3]) <= 1e-9),
+        None,
+    )
+    # Preserve the centred phase whenever it already supports every planned
+    # pass.  A mask-supported phase shift is only justified when the nominal
+    # phase actually loses a pass at a local seam.
+    selected_evaluation = (
+        nominal_evaluation
+        if nominal_evaluation is not None
+        and nominal_evaluation[0] == pass_count
+        else max(phase_evaluations, key=lambda item: item[:4])
+    )
+    (
+        _supported_count,
+        _supported_length,
+        _negative_phase_abs,
+        phase_offset_px,
+        selected_positions,
+        selected_runs,
+    ) = selected_evaluation
+    if diagnostics is not None:
+        diagnostics.update({
+            "pass_count": pass_count,
+            "nominal_spacing_m": float(spacing_m),
+            "actual_spacing_m": float(spacing_m),
+            "phase_offset_m": float(phase_offset_px * mpp),
+            "spacing_is_uniform": True,
+            "supported_pass_count": int(_supported_count),
+        })
+
+    cfg = dict(config or {})
+    try:
+        min_line_length_ratio = float(
+            cfg.get("uniform_zone_min_line_length_ratio", 0.65)
+        )
+    except (TypeError, ValueError):
+        min_line_length_ratio = 0.65
+    min_line_length_ratio = float(np.clip(min_line_length_ratio, 0.5, 1.0))
+
+    # A terminal mask fragment can be much shorter than the common crop span.
+    # Feeding that fragment into contour ordering creates an artificial long
+    # diagonal to the next full pass (the 003.txt failure was 18.9 m followed
+    # by 55.9 m).  Only discard a short *outer* run: an interior gap remains
+    # explicit evidence and is never silently filled by this filter.
+    run_lengths_m = [
+        (float(run[1] - run[0]) * mpp) if run is not None else None
+        for run in selected_runs
+    ]
+    finite_lengths = [value for value in run_lengths_m if value is not None]
+    median_length_m = float(np.median(finite_lengths)) if finite_lengths else 0.0
+    short_edge_indices = []
+    if median_length_m > 1e-9:
+        threshold_m = median_length_m * min_line_length_ratio
+        for index, length_m in enumerate(run_lengths_m):
+            if (
+                length_m is not None
+                and length_m < threshold_m
+                and index in {0, len(run_lengths_m) - 1}
+            ):
+                short_edge_indices.append(index)
+    accepted_indices = {
+        index for index, run in enumerate(selected_runs)
+        if run is not None and index not in short_edge_indices
+    }
+    if diagnostics is not None:
+        diagnostics.update({
+            "line_lengths_m": run_lengths_m,
+            "median_supported_line_length_m": median_length_m,
+            "min_line_length_ratio": min_line_length_ratio,
+            "short_edge_line_indices": [int(index) for index in short_edge_indices],
+            "short_edge_line_filter_applied": bool(short_edge_indices),
+            "accepted_pass_indices": sorted(int(index) for index in accepted_indices),
+        })
+
+    lines = []
+    for index, (position, longest) in enumerate(
+        zip(selected_positions, selected_runs)
+    ):
+        if index not in accepted_indices:
+            continue
+        p1 = (
+            cx + normal[0] * position + direction[0] * longest[0],
+            cy + normal[1] * position + direction[1] * longest[0],
+        )
+        p2 = (
+            cx + normal[0] * position + direction[0] * longest[1],
+            cy + normal[1] * position + direction[1] * longest[1],
+        )
+        lines.append([p1, p2])
     return lines
 
 
@@ -3726,12 +4772,13 @@ def _uniform_zone_inner_limit(
     main_angle: float,
     geo=None,
     state=None,
+    clearance_m: Optional[float] = None,
 ) -> Optional[float]:
     """等距区的内侧法向限制（质心坐标系）。
 
     等距区与相邻种植带在掩膜上可能相连（无间隙），细分作业线若按掩膜
     白色范围延伸会落到相邻带上。取相邻带（法向最近的 4 行带）中心线
-    位置并回退 1m 安全带作为内限。
+    位置并回退一个等距作业间隔作为内限，避免共享边界出现近重复线。
     """
     _points, centroid, _geometry_source = _uniform_zone_reference_geometry(
         zone_band,
@@ -3762,7 +4809,20 @@ def _uniform_zone_inner_limit(
         geo,
         state,
     )
-    safety_px = max(1.0, 1.0 / max(mpp, 1e-9))
+    if clearance_m is None:
+        values = getattr(state, "harvester_params", {}) or {}
+        candidate = values.get("track_gauge_m") if isinstance(values, dict) else None
+        if _finite_float(candidate) is None:
+            try:
+                candidate = Config().section("harvester").get("track_gauge_m")
+            except Exception:
+                candidate = None
+        clearance_m = (
+            float(candidate)
+            if _finite_float(candidate) is not None and float(candidate) > 0.0
+            else float(DEFAULT_HARVESTER_PARAMS["track_gauge_m"])
+        )
+    safety_px = max(1.0, float(clearance_m) / max(mpp, 1e-9))
     direction_sign = 1.0 if neighbor_n > zone_n else -1.0
     inner_n = neighbor_n - direction_sign * safety_px
     return float(inner_n - zone_n)
@@ -3930,6 +4990,50 @@ def _classify_planting_regions(
     return groups, diagnostics
 
 
+def _uniform_zone_spacing(
+    config: Optional[Dict] = None,
+    state=None,
+) -> Tuple[float, str, Dict]:
+    """Resolve equal-distance-zone spacing from the track-overlap contract.
+
+    Adjacent machine paths are separated by the track gauge: the right-track
+    centreline of one pass and the left-track centreline of the next pass then
+    coincide.  A caller may still provide an explicit spacing for a controlled
+    research comparison; the basis is reported so that it cannot be mistaken
+    for the default machine-compatible layout.
+    """
+    cfg = dict(config or {})
+    raw_explicit = cfg.get("uniform_zone_line_spacing_m")
+    explicit = _finite_float(raw_explicit)
+    if explicit is not None and explicit > 0.0:
+        return float(explicit), "explicit_config", {
+            "track_gauge_m": None,
+            "adjacent_track_centerline_offset_m": None,
+        }
+
+    candidates = []
+    state_values = getattr(state, "harvester_params", {}) or {}
+    if isinstance(state_values, dict):
+        candidates.append(state_values.get("track_gauge_m"))
+    try:
+        candidates.append(Config().section("harvester").get("track_gauge_m"))
+    except Exception:
+        pass
+    candidates.append(DEFAULT_HARVESTER_PARAMS.get("track_gauge_m"))
+    gauge = next(
+        (
+            float(value)
+            for value in candidates
+            if _finite_float(value) is not None and float(value) > 0.0
+        ),
+        float(DEFAULT_HARVESTER_PARAMS["track_gauge_m"]),
+    )
+    return gauge, "track_gauge_overlap", {
+        "track_gauge_m": gauge,
+        "adjacent_track_centerline_offset_m": 0.0,
+    }
+
+
 def _prepare_work_line_layout(
     wide_bands: List[Dict],
     processed_mask: np.ndarray,
@@ -3948,8 +5052,8 @@ def _prepare_work_line_layout(
         cfg.get("work_line_mode", "band_centerline_with_footprint_validation")
     ).strip().lower()
     # 等距区分离：剖面宽度远大于正常作物带（正常约 1m）的带是整片等距
-    # 种植区（如右侧 12.45m 宽的大片区域），一趟割幅收不完，必须按割幅
-    # 细分多条平行作业线（常规全覆盖），而不是过滤掉或只提一条中心线。
+    # 种植区（如右侧 12.45m 宽的大片区域），一趟固定作业间距收不完，
+    # 必须细分多条平行作业线（常规全覆盖），而不是过滤掉或只提一条中心线。
     region_groups, region_classification = _classify_planting_regions(
         wide_bands,
         main_angle,
@@ -4195,34 +5299,33 @@ def _prepare_work_line_layout(
         raise ValueError(f"unsupported work_line_mode: {mode}")
     layout = dict(layout or {})
     regular_work_lines = list(work_lines)
-    # 等距区（大片等距种植区）按割幅细分平行作业线，与宽窄行中心线统筹
+    # 等距区（大片等距种植区）按固定作业间距细分平行作业线，与宽窄行中心线统筹
     uniform_zone_lines = []
     uniform_region_lines = []
     if uniform_zones:
-        try:
-            spacing_m = float(cfg.get("uniform_zone_line_spacing_m") or 0.0)
-        except (TypeError, ValueError):
-            spacing_m = 0.0
-        if spacing_m <= 0.0:
-            try:
-                spacing_m = float(
-                    _harvester_specs(state).get("cutter_width_m")
-                    or 1.75
-                )
-            except (TypeError, ValueError, AttributeError):
-                spacing_m = 1.75
+        spacing_m, spacing_basis, spacing_diagnostics = _uniform_zone_spacing(
+            cfg, state
+        )
         uniform_zone_report = []
         for zone in uniform_zones:
             _zone_points, _zone_centroid, zone_geometry_source = (
                 _uniform_zone_reference_geometry(zone, main_angle)
             )
             inner_limit_offset = _uniform_zone_inner_limit(
-                zone, workable_bands, main_angle, geo, state
+                zone,
+                workable_bands,
+                main_angle,
+                geo,
+                state,
+                clearance_m=spacing_m,
             )
+            zone_diagnostics = {}
             zone_lines = _generate_uniform_zone_lines(
                 zone, main_angle, spacing_m, geo=geo, state=state,
                 mask=processed_mask,
                 inner_limit_offset=inner_limit_offset,
+                diagnostics=zone_diagnostics,
+                config=cfg,
             )
             uniform_zone_lines.extend(zone_lines)
             uniform_region_lines.append(list(zone_lines))
@@ -4230,8 +5333,54 @@ def _prepare_work_line_layout(
                 "id": zone.get("id"),
                 "profile_width_m": zone.get("profile_width_m"),
                 "line_spacing_m": spacing_m,
+                "line_spacing_basis": spacing_basis,
+                **spacing_diagnostics,
+                "shared_boundary_clearance_m": spacing_m,
                 "line_count": len(zone_lines),
                 "reference_geometry_source": zone_geometry_source,
+                "effective_geometry_source": zone_diagnostics.get(
+                    "effective_geometry_source", zone_geometry_source
+                ),
+                "profile_width_px": zone_diagnostics.get("profile_width_px"),
+                "reference_geometry_width_px": zone_diagnostics.get(
+                    "reference_geometry_width_px"
+                ),
+                "effective_transverse_width_m": zone_diagnostics.get(
+                    "effective_transverse_width_m"
+                ),
+                "pass_count": zone_diagnostics.get("pass_count"),
+                "nominal_spacing_m": zone_diagnostics.get("nominal_spacing_m"),
+                "actual_spacing_m": zone_diagnostics.get("actual_spacing_m"),
+                "phase_offset_m": zone_diagnostics.get("phase_offset_m"),
+                "spacing_is_uniform": zone_diagnostics.get(
+                    "spacing_is_uniform", False
+                ),
+                "supported_pass_count": zone_diagnostics.get(
+                    "supported_pass_count"
+                ),
+                # Keep the edge-fragment decision in the persisted layout
+                # report.  A route reviewer must be able to distinguish a
+                # deliberately omitted unsupported terminal fragment from a
+                # missing equal-distance pass or a mask-processing failure.
+                "line_lengths_m": zone_diagnostics.get("line_lengths_m"),
+                "median_supported_line_length_m": zone_diagnostics.get(
+                    "median_supported_line_length_m"
+                ),
+                "min_line_length_ratio": zone_diagnostics.get(
+                    "min_line_length_ratio"
+                ),
+                "short_edge_line_indices": zone_diagnostics.get(
+                    "short_edge_line_indices", []
+                ),
+                "short_edge_line_filter_applied": zone_diagnostics.get(
+                    "short_edge_line_filter_applied", False
+                ),
+                "accepted_pass_indices": zone_diagnostics.get(
+                    "accepted_pass_indices", []
+                ),
+                "inner_limit_applied": zone_diagnostics.get(
+                    "inner_limit_applied"
+                ),
             })
         layout["uniform_zones"] = uniform_zone_report
         layout["uniform_zone_line_count"] = len(uniform_zone_lines)
@@ -4303,9 +5452,14 @@ def _recover_lattice_supported_work_bands(
     """
     cfg = dict(config or {})
     original = [dict(item) for item in (wide_bands or [])]
+    validation_profile = str(cfg.get("validation_profile", "field_trial"))
+    recovery_enabled = bool(cfg.get("recover_missing_work_bands", False))
+    if validation_profile in {"field_trial", "machine_candidate"}:
+        recovery_enabled = False
     report = {
         "algorithm_version": "four-row-lattice-recovery-v2",
-        "enabled": bool(cfg.get("recover_missing_work_bands", True)),
+        "enabled": recovery_enabled,
+        "validation_profile": validation_profile,
         "candidate_source": "regular_four_row_lattice_plus_processed_body_support",
         "recovered_band_ids": [],
         "records": [],
@@ -4718,6 +5872,109 @@ def _region_route_endpoint(
     return None
 
 
+def _contour_region_transition_gap_m(
+    previous_path: List[List[Tuple[float, float]]],
+    previous_types: List[str],
+    next_path: List[List[Tuple[float, float]]],
+    next_types: List[str],
+    *,
+    main_angle: Optional[float],
+    geo=None,
+    state=None,
+) -> Optional[float]:
+    """Return the normal-axis gap at a classified-region handoff.
+
+    A region transfer is made at the headland, so the endpoint-to-endpoint
+    distance alone is not enough to detect the failure mode seen in the real
+    field: two neighbouring region passes can have endpoints only a metre
+    apart while both still look like separate paths.  Compare the final and
+    initial work-line centres in the common normal frame instead.
+    """
+    if main_angle is None or not math.isfinite(float(main_angle)):
+        return None
+    previous_work = next(
+        (
+            segment
+            for segment, segment_type in reversed(
+                list(zip(previous_path or [], previous_types or []))
+            )
+            if segment_type == "work" and len(segment) >= 2
+        ),
+        None,
+    )
+    next_work = next(
+        (
+            segment
+            for segment, segment_type in zip(
+                next_path or [], next_types or []
+            )
+            if segment_type == "work" and len(segment) >= 2
+        ),
+        None,
+    )
+    if previous_work is None or next_work is None:
+        return None
+    normal = np.asarray(
+        (-math.sin(float(main_angle)), math.cos(float(main_angle))),
+        dtype=np.float64,
+    )
+    previous_midpoint = (
+        np.asarray(previous_work[0], dtype=np.float64)
+        + np.asarray(previous_work[-1], dtype=np.float64)
+    ) * 0.5
+    next_midpoint = (
+        np.asarray(next_work[0], dtype=np.float64)
+        + np.asarray(next_work[-1], dtype=np.float64)
+    ) * 0.5
+    try:
+        mpp = meters_per_pixel(
+            getattr(state, "mask_raw", None)
+            if state is not None and getattr(state, "mask_raw", None) is not None
+            else np.zeros((2, 2), dtype=np.uint8),
+            geo,
+            state,
+        )
+    except (TypeError, ValueError):
+        return None
+    return float(abs(float((next_midpoint - previous_midpoint) @ normal)) * mpp)
+
+
+def _minimum_contour_region_transition_gap_m(
+    config: Optional[Dict] = None,
+    state=None,
+) -> float:
+    """Resolve the minimum normal separation for a cross-region contour turn.
+
+    The explicit setting is an escape hatch for a measured machine.  The
+    default is derived from the already configured machine geometry: two
+    track-gauge intervals (or 1.25 cutter widths) keeps the next region from
+    being entered on the immediately neighbouring pass.  This only controls
+    the region handoff; the regular within-region 0,4,1,5 contour pairing is
+    unchanged.
+    """
+    cfg = dict(config or {})
+    try:
+        explicit = float(cfg.get("contour_min_region_transition_spacing_m"))
+    except (TypeError, ValueError):
+        explicit = float("nan")
+    if math.isfinite(explicit) and explicit > 0.0:
+        return float(explicit)
+    values = getattr(state, "harvester_params", {}) or {}
+    try:
+        track_gauge = float(
+            values.get("track_gauge_m", DEFAULT_HARVESTER_PARAMS["track_gauge_m"])
+        )
+    except (TypeError, ValueError):
+        track_gauge = float(DEFAULT_HARVESTER_PARAMS["track_gauge_m"])
+    try:
+        cutter_width = float(
+            values.get("cutter_width_m", DEFAULT_HARVESTER_PARAMS["cutter_width_m"])
+        )
+    except (TypeError, ValueError):
+        cutter_width = float(DEFAULT_HARVESTER_PARAMS["cutter_width_m"])
+    return max(2.0 * max(track_gauge, 0.0), 1.25 * max(cutter_width, 0.0))
+
+
 def _build_inter_region_transfer(
     previous_path: List[List[Tuple[float, float]]],
     previous_types: List[str],
@@ -4727,6 +5984,7 @@ def _build_inter_region_transfer(
     geo=None,
     state=None,
     min_turn_radius_m: float,
+    requested_strategy: str = "bow",
     config: Optional[Dict] = None,
 ) -> Tuple[List[Tuple[float, float]], Dict]:
     """DECISION-017: build one formal, boundary-checked region transfer."""
@@ -4787,8 +6045,12 @@ def _build_inter_region_transfer(
         required_depth_px=(2.0 * min_turn_radius_m + clearance_m)
         / max(mpp, 1e-9),
     )
+    normalized_request = normalize_turn_strategy(requested_strategy)
+    selector_request = (
+        "contour" if normalized_request == "contour" else "bow"
+    )
     decision = _select_turn_strategy(
-        "bow",
+        selector_request,
         spacing_m,
         min_turn_radius_m,
         headland_limited=headland_limited,
@@ -4796,14 +6058,22 @@ def _build_inter_region_transfer(
             0.0, float(cfg.get("turn_radius_geometry_tolerance_m", 0.05))
         ),
     )
-    selected_strategy = str(decision["strategy"])
+    selected_strategy = (
+        "bow" if str(decision["strategy"]) == "contour"
+        else str(decision["strategy"])
+    )
+    geometry_radius_m = (
+        min(float(min_turn_radius_m), max(1e-6, spacing_m * 0.5))
+        if normalized_request == "contour"
+        else float(min_turn_radius_m)
+    )
     transfer, _, boundary_reason = _adjust_turn_to_field_boundary(
         start,
         end,
         work_direction,
         turn_sign,
         mpp,
-        min_turn_radius_m,
+        geometry_radius_m,
         selected_strategy,
         clearance_m,
         field_polygon,
@@ -4847,7 +6117,13 @@ def _build_inter_region_transfer(
     end_alignment = tangent_alignment(end_tangent, next_direction)
     diagnostics.update({
         "strategy": selected_strategy,
-        "requested_strategy": "bow",
+        "requested_strategy": normalized_request,
+        "ordering_strategy": normalized_request,
+        "geometry_radius_m": float(geometry_radius_m),
+        "radius_capped_for_contour_pairing": bool(
+            normalized_request == "contour"
+            and geometry_radius_m < float(min_turn_radius_m) - 1e-9
+        ),
         "decision": decision,
         "distance_m": float(sum(
             math.hypot(b[0] - a[0], b[1] - a[1])
@@ -4899,6 +6175,7 @@ def _connect_work_regions(
     """DECISION-017: finish each classified region before entering the next."""
     cfg = dict(config or {})
     entry_global = getattr(state, "entry_point", None) if state is not None else None
+    exit_global = getattr(state, "exit_point", None) if state is not None else None
     if entry_global is not None:
         ox = float(getattr(state, "mask_offset_x", 0) or 0)
         oy = float(getattr(state, "mask_offset_y", 0) or 0)
@@ -4909,6 +6186,23 @@ def _connect_work_regions(
     else:
         entry_reference = None
 
+    if "_route_end_reference_local" in cfg:
+        end_reference_value = cfg.get("_route_end_reference_local")
+        exit_reference = (
+            (float(end_reference_value[0]), float(end_reference_value[1]))
+            if end_reference_value is not None
+            else None
+        )
+    elif exit_global is not None:
+        ox = float(getattr(state, "mask_offset_x", 0) or 0)
+        oy = float(getattr(state, "mask_offset_y", 0) or 0)
+        exit_reference = (
+            float(exit_global[0]) - ox,
+            float(exit_global[1]) - oy,
+        )
+    else:
+        exit_reference = None
+
     def region_reference_distance(item):
         if entry_reference is None:
             return float("inf")
@@ -4916,6 +6210,20 @@ def _connect_work_regions(
             math.hypot(
                 float(point[0]) - entry_reference[0],
                 float(point[1]) - entry_reference[1],
+            )
+            for line in (item.get("work_lines") or [])
+            if len(line) >= 2
+            for point in (line[0], line[-1])
+        ]
+        return min(distances) if distances else float("inf")
+
+    def region_end_distance(item):
+        if exit_reference is None:
+            return float("inf")
+        distances = [
+            math.hypot(
+                float(point[0]) - exit_reference[0],
+                float(point[1]) - exit_reference[1],
             )
             for line in (item.get("work_lines") or [])
             if len(line) >= 2
@@ -4947,6 +6255,38 @@ def _connect_work_regions(
             ),
         )
         region_order_rule = "stable_kind_order_without_entry_reference"
+
+    # A free exit point is a real route-order reference, not merely metadata.
+    # Reversing the classified-region sequence is the only alternative that
+    # preserves each region's internal contour and shared-wall semantics.
+    region_reference_ordering = {
+        "enabled": bool(entry_reference is not None or exit_reference is not None),
+        "selected_variant": "current",
+        "candidate_count": 1,
+    }
+    if exit_reference is not None and len(ordered_regions) >= 2:
+        current_score = (
+            region_reference_distance(ordered_regions[0])
+            + region_end_distance(ordered_regions[-1])
+            if entry_reference is not None
+            else region_end_distance(ordered_regions[-1])
+        )
+        reversed_regions = list(reversed(ordered_regions))
+        reversed_score = (
+            region_reference_distance(reversed_regions[0])
+            + region_end_distance(reversed_regions[-1])
+            if entry_reference is not None
+            else region_end_distance(reversed_regions[-1])
+        )
+        region_reference_ordering.update({
+            "candidate_count": 2,
+            "current_score_px": float(current_score),
+            "reversed_score_px": float(reversed_score),
+        })
+        if reversed_score + 1e-6 < current_score:
+            ordered_regions = reversed_regions
+            region_order_rule = "entry_exit_reference_order"
+            region_reference_ordering["selected_variant"] = "reversed"
     if len(ordered_regions) <= 1:
         region = ordered_regions[0] if ordered_regions else {"work_lines": []}
         path, types, assessment = _connect_work_lines(
@@ -5013,6 +6353,12 @@ def _connect_work_regions(
             audit_cfg["_include_exit_service"] = (
                 region_index == len(ordered_regions) - 1
             )
+            audit_cfg["_route_end_reference_local"] = (
+                None if region_index < len(ordered_regions) - 1 else exit_reference
+            )
+            audit_cfg["_allow_reference_ordering_with_handoff"] = (
+                region_index == len(ordered_regions) - 1
+            )
             audit_cfg["_contour_forced_wall_projections"] = (
                 shared_contour_walls
             )
@@ -5052,10 +6398,17 @@ def _connect_work_regions(
     previous_path = []
     previous_types = []
     previous_endpoint = None
+    cross_region_transition_records = []
     for region_index, region in enumerate(ordered_regions):
         region_cfg = dict(cfg)
         region_cfg["_include_entry_service"] = region_index == 0
         region_cfg["_include_exit_service"] = region_index == len(ordered_regions) - 1
+        region_cfg["_route_end_reference_local"] = (
+            None if region_index < len(ordered_regions) - 1 else exit_reference
+        )
+        region_cfg["_allow_reference_ordering_with_handoff"] = (
+            region_index == len(ordered_regions) - 1
+        )
         if shared_contour_walls is not None:
             region_cfg["_contour_forced_wall_projections"] = shared_contour_walls
         if shared_contour_clearances:
@@ -5075,6 +6428,91 @@ def _connect_work_regions(
             global_main_angle=global_main_angle,
             processed_mask=processed_mask,
         )
+        if (
+            region_index > 0
+            and normalize_turn_strategy(turn_strategy) == "contour"
+            and previous_path
+            and global_main_angle is not None
+            and math.isfinite(float(global_main_angle))
+        ):
+            default_gap = _contour_region_transition_gap_m(
+                previous_path,
+                previous_types,
+                region_path,
+                region_types,
+                main_angle=float(global_main_angle),
+                geo=geo,
+                state=state,
+            )
+            minimum_gap = _minimum_contour_region_transition_gap_m(
+                cfg,
+                state,
+            )
+            selected_gap = default_gap
+            reversed_for_transition = False
+            reverse_attempted = False
+            if default_gap is not None and default_gap < minimum_gap:
+                reverse_attempted = True
+                reverse_cfg = dict(region_cfg)
+                reverse_cfg["_contour_reverse_normal_order"] = True
+                reversed_path, reversed_types, reversed_assessment = (
+                    _connect_work_lines(
+                        region.get("work_lines") or [],
+                        geo=geo,
+                        state=state,
+                        min_turn_radius_m=min_turn_radius_m,
+                        turn_strategy=turn_strategy,
+                        config=reverse_cfg,
+                        return_diagnostics=True,
+                        global_main_angle=global_main_angle,
+                        processed_mask=processed_mask,
+                    )
+                )
+                reverse_gap = _contour_region_transition_gap_m(
+                    previous_path,
+                    previous_types,
+                    reversed_path,
+                    reversed_types,
+                    main_angle=float(global_main_angle),
+                    geo=geo,
+                    state=state,
+                )
+                if (
+                    reverse_gap is not None
+                    and (default_gap is None or reverse_gap > default_gap + 1e-6)
+                ):
+                    region_path = reversed_path
+                    region_types = reversed_types
+                    region_assessment = reversed_assessment
+                    selected_gap = reverse_gap
+                    reversed_for_transition = True
+            if selected_gap is not None and selected_gap < minimum_gap:
+                region_assessment.setdefault("hard_reasons", []).append(
+                    "cross-region contour transition remains too close to the "
+                    f"previous work line ({selected_gap:.2f}m < {minimum_gap:.2f}m)"
+                )
+                region_assessment["feasible"] = False
+                region_assessment["needs_confirmation"] = True
+            contour_ordering = region_assessment.setdefault(
+                "contour_ordering", {}
+            )
+            contour_ordering.update({
+                "cross_region_transition_spacing_m": selected_gap,
+                "cross_region_transition_min_spacing_m": minimum_gap,
+                "cross_region_transition_reverse_attempted": reverse_attempted,
+                "cross_region_transition_reversed": reversed_for_transition,
+            })
+            cross_region_transition_records.append({
+                "from_region_id": ordered_regions[region_index - 1].get(
+                    "region_id"
+                ),
+                "to_region_id": region.get("region_id"),
+                "default_spacing_m": default_gap,
+                "selected_spacing_m": selected_gap,
+                "minimum_spacing_m": minimum_gap,
+                "reverse_attempted": reverse_attempted,
+                "reversed": reversed_for_transition,
+            })
         if region_index > 0:
             transfer, transfer_report = _build_inter_region_transfer(
                 previous_path,
@@ -5084,6 +6522,7 @@ def _connect_work_regions(
                 geo=geo,
                 state=state,
                 min_turn_radius_m=min_turn_radius_m,
+                requested_strategy=turn_strategy,
                 config=cfg,
             )
             transfer_report.update({
@@ -5176,9 +6615,17 @@ def _connect_work_regions(
                 str(item.get("region_id")): float(region_reference_distance(item))
                 for item in ordered_regions
             } if entry_reference is not None else {},
+            "exit_reference_local": list(exit_reference)
+            if exit_reference is not None else None,
+            "exit_region_distances_px": {
+                str(item.get("region_id")): float(region_end_distance(item))
+                for item in ordered_regions
+            } if exit_reference is not None else {},
+            "reference_ordering": region_reference_ordering,
             "no_cross_region_pairing": True,
             "shared_headland_wall_projections_px": shared_contour_walls,
             "shared_turn_clearance_m_by_side": shared_contour_clearances,
+            "cross_region_transition_records": cross_region_transition_records,
         },
         "used_strategies": used_strategies,
         "fallback_reasons": fallback_reasons,
@@ -5285,6 +6732,11 @@ def plan_path(wide_bands: List[Dict],
     cfg_obj = Config()
     cfg = cfg_obj.section("path_planning")
     cfg.update(config or {})
+    validation_profile = str(cfg.get("validation_profile", "field_trial"))
+    if validation_profile in {"field_trial", "machine_candidate"}:
+        # P0: automatic band invention is preview-only for the two formal
+        # profiles.  Research users may opt in explicitly in their config.
+        cfg["recover_missing_work_bands"] = False
     cancel_callback = cfg.get("_cancel_callback")
 
     def abort_if_cancelled():
@@ -5347,6 +6799,9 @@ def plan_path(wide_bands: List[Dict],
         return_regions=True,
     )
     layout["coverage_gap_recovery"] = coverage_gap_recovery
+    layout["planning_recovered"] = bool(
+        coverage_gap_recovery.get("recovered_band_ids")
+    )
     # 等距区细分线不参与田头端点校正（已在掩膜边界正确截断）
     abort_if_cancelled()
     if not work_lines:
@@ -5369,6 +6824,7 @@ def plan_path(wide_bands: List[Dict],
             "is_valid": False,
             "description": "未生成有效作业线",
             "layout": layout,
+            "machine_executable": False,
             "requested_strategy": turn_strategy,
             "turn_assessment": {
                 "strategy": turn_strategy,
@@ -5636,6 +7092,9 @@ def plan_path(wide_bands: List[Dict],
     result["machine_readiness"] = assess_machine_readiness(
         result,
         execution_config=cfg,
+    )
+    result["machine_executable"] = bool(
+        result["machine_readiness"].get("machine_executable") is True
     )
     return result
 

@@ -3,6 +3,7 @@
 import math
 from typing import Dict, Optional
 
+from config import HARVESTER_FORMAL_MEASURED_SOURCES
 from harvester_geometry import FOOTPRINT_MODEL, FOOTPRINT_REFERENCE_POINT
 from footprint_planner import compare_work_line_footprints
 
@@ -109,7 +110,28 @@ def assess_machine_readiness(
     validation = dict(result.get("validation") or {})
     layout = dict(result.get("layout") or {})
     turning = dict(result.get("turn_assessment") or {})
+    planning_factors = dict(result.get("planning_factors") or {})
     controlled_trial_blockers = []
+
+    harvester = dict(planning_factors.get("harvester") or {})
+    raw_sources = dict(planning_factors.get("harvester_param_sources") or {})
+    unverified_harvester_params = [
+        key
+        for key in harvester
+        if raw_sources.get(key) not in HARVESTER_FORMAL_MEASURED_SOURCES
+    ]
+    parameter_source_status = {
+        "required": list(harvester),
+        "sources": {key: raw_sources.get(key, "missing") for key in harvester},
+        "unverified": unverified_harvester_params,
+        "formal_measured_sources": sorted(HARVESTER_FORMAL_MEASURED_SOURCES),
+    }
+    recovery_report = dict(layout.get("coverage_gap_recovery") or {})
+    planning_recovered = bool(
+        layout.get("planning_recovered") is True
+        or recovery_report.get("planning_recovered") is True
+        or recovery_report.get("recovered_band_ids")
+    )
 
     if result.get("is_valid", validation.get("valid", False)) is not True:
         controlled_trial_blockers.append("path_validation_failed")
@@ -148,6 +170,12 @@ def assess_machine_readiness(
             )
     if validation.get("validation_profile") not in {"field_trial", "machine_candidate"}:
         controlled_trial_blockers.append("field_trial_validation_profile_not_used")
+    profile = str(validation.get("validation_profile", "research"))
+    if profile in {"field_trial", "machine_candidate"}:
+        if unverified_harvester_params:
+            controlled_trial_blockers.append("harvester_parameter_source_unverified")
+        if planning_recovered:
+            controlled_trial_blockers.append("planning_recovered_work_bands")
     if validation.get("field_boundary_present") is not True:
         controlled_trial_blockers.append("confirmed_field_boundary_missing")
     if validation.get("semantic_support_present") is not True:
@@ -163,7 +191,6 @@ def assess_machine_readiness(
     ):
         controlled_trial_blockers.append("confirmed_forbidden_map_missing")
     resolution = validation.get("footprint_resolution_m")
-    harvester = dict((result.get("planning_factors") or {}).get("harvester") or {})
     track_width = harvester.get("track_width_m")
     resolution_valid = (
         isinstance(resolution, (int, float))
@@ -256,4 +283,7 @@ def assess_machine_readiness(
         ),
         "blockers": blockers,
         "manual_review_required": bool(blockers),
+        "machine_executable": bool(not controlled_trial_blockers and not blockers),
+        "harvester_parameter_source_status": parameter_source_status,
+        "planning_recovered": planning_recovered,
     }

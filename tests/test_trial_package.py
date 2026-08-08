@@ -63,6 +63,219 @@ def test_candidate_path_export_fails_before_writing_without_machine_evidence(
     window.close()
 
 
+def test_machine_compatibility_preview_exports_without_formal_machine_evidence(
+    tmp_path, monkeypatch
+):
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    output = tmp_path / "compatibility-preview.path"
+    path_result = {
+        "machine_readiness": {},
+        "validation": {"valid": True},
+        "is_valid": True,
+    }
+    points = [
+        {
+            "lat": 30.0,
+            "lon": 116.0,
+            "pixel_x": 1.0,
+            "pixel_y": 1.0,
+            "segment_index": 0,
+            "point_index": 0,
+            "segment_type": "work",
+            "status": 1,
+        },
+        {
+            "lat": 30.001,
+            "lon": 116.0,
+            "pixel_x": 1.0,
+            "pixel_y": 10.0,
+            "segment_index": 0,
+            "point_index": 1,
+            "segment_type": "work",
+            "status": 1,
+        },
+    ]
+    captured = {}
+
+    def fake_manifest(
+        path,
+        output_format,
+        captured_result,
+        captured_points,
+        protocol_metadata=None,
+    ):
+        captured.update({
+            "output_format": output_format,
+            "path_result": captured_result,
+            "points": captured_points,
+            "protocol": protocol_metadata,
+        })
+        return str(path) + ".manifest.json"
+
+    monkeypatch.setattr(window, "_write_export_manifest", fake_manifest)
+    window._export_candidate_path(
+        str(output),
+        path_result=path_result,
+        geo_points=points,
+        machine_compatibility=True,
+        preview_only=True,
+    )
+
+    assert output.exists()
+    assert captured["output_format"] == "$PATH_MACHINE_COMPAT"
+    assert captured["protocol"]["preview_only"] is True
+    assert captured["protocol"]["machine_executable"] is False
+    rows = [
+        line
+        for line in output.read_text(encoding="utf-8").splitlines()
+        if line.startswith("$PATH")
+    ]
+    assert len(rows) == 2
+    assert all(row.rstrip("*").split(",")[-1] in {"0", "1"} for row in rows)
+    window.close()
+
+
+def test_machine_compatibility_export_matches_visible_compact_control_points(
+    tmp_path, monkeypatch
+):
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    output = tmp_path / "compact-control-preview.path"
+    window._tif_rgb = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    class Geo:
+        def is_ready(self):
+            return True
+
+        def pixel_to_lonlat(self, x, y):
+            return 116.0 + float(x) * 0.001, 30.0 + float(y) * 0.001
+
+        def pixel_distance_m(self, first, second):
+            return float(
+                ((float(second[0]) - float(first[0])) ** 2
+                 + (float(second[1]) - float(first[1])) ** 2) ** 0.5
+            )
+
+    window.geo = Geo()
+    window.state.path_points = [
+        (1.0, 1.0),
+        (10.0, 1.0),
+        (10.0, 10.0),
+        (1.0, 10.0),
+    ]
+    window.state.path_status = [1, 0, 1]
+    dense_points = [
+        {
+            "lat": 30.0 + index * 0.0001,
+            "lon": 116.0,
+            "pixel_x": float(index),
+            "pixel_y": 1.0,
+            "segment_index": 0,
+            "point_index": index,
+            "segment_type": "work",
+            "status": 1,
+        }
+        for index in range(10)
+    ]
+    path_result = {
+        "machine_readiness": {},
+        "validation": {"valid": True},
+        "is_valid": True,
+    }
+    captured = {}
+
+    def fake_manifest(
+        path,
+        output_format,
+        captured_result,
+        captured_points,
+        protocol_metadata=None,
+    ):
+        captured.update({
+            "output_format": output_format,
+            "points": captured_points,
+            "protocol": protocol_metadata,
+        })
+        return str(path) + ".manifest.json"
+
+    monkeypatch.setattr(window, "_write_export_manifest", fake_manifest)
+    window._export_candidate_path(
+        str(output),
+        path_result=path_result,
+        geo_points=dense_points,
+        machine_compatibility=True,
+        preview_only=True,
+    )
+
+    rows = [
+        line
+        for line in output.read_text(encoding="utf-8").splitlines()
+        if line.startswith("$PATH")
+    ]
+    assert len(rows) == len(window.state.path_points)
+    assert [row.rstrip("*").split(",")[-1] for row in rows] == [
+        "1", "0", "1", "0"
+    ]
+    assert captured["protocol"]["route_source"] == (
+        "shared_route_control_polyline"
+    )
+    assert captured["protocol"]["control_route_point_count"] == 4
+    assert captured["protocol"]["canonical_route_point_count"] == 10
+    window.close()
+
+
+def test_compatibility_payload_skips_only_formal_parameter_source_gate(monkeypatch):
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)
+
+    class Geo:
+        def is_ready(self):
+            return True
+
+        def pixel_to_lonlat(self, x, y):
+            return 116.0 + float(x) * 0.001, 30.0 + float(y) * 0.001
+
+    planned_cutter_width = float(
+        window._effective_harvester_params(
+            getattr(window.state, "harvester_params", {}) or {}
+        )["cutter_width_m"]
+    )
+    path_result = {
+        "full_path": [[(1.0, 1.0), (10.0, 1.0)]],
+        "segment_types": ["work"],
+        "ordered_segments": [{
+            "points": [(1.0, 1.0), (10.0, 1.0)],
+            "type": "work",
+        }],
+        "validation": {
+            "valid": True,
+            "current_validation_complete": True,
+            "validation_profile": "field_trial",
+        },
+        "is_valid": True,
+        "planning_factors": {
+            "harvester": {"cutter_width_m": planned_cutter_width},
+            "harvester_parameter_source_status": {
+                "required": ["cutter_width_m"],
+                "sources": {"cutter_width_m": "default"},
+            },
+        },
+        "layout": {},
+    }
+    window.geo = Geo()
+    monkeypatch.setattr(window, "_path_result_from_state", lambda: path_result)
+    monkeypatch.setattr(window, "_verify_scientific_provenance", lambda _: None)
+
+    _result, points = window._geo_export_payload(formal=False)
+    assert len(points) == 2
+
+    with pytest.raises(ValueError, match="参数来源"):
+        window._geo_export_payload(formal=True)
+    window.close()
+
+
 def test_complete_trial_visual_artifacts_include_masks_path_and_diagnostics(tmp_path):
     base = np.full((80, 120, 3), 80, dtype=np.uint8)
     raw = np.zeros((50, 70), dtype=np.uint8)

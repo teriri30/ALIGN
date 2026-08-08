@@ -39,7 +39,7 @@
 - `raster_preprocessing.py`
 - `mask_processor.py`
 - `row_geometry.py`
-- `coverage.py`
+- `legacy_route_coverage.py`
 - `path_planner.py`
 - `pyside6_app/main_window.py`
 - `pyside6_app/workers.py`

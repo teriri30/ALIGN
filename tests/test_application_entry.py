@@ -20,7 +20,7 @@ def test_core_modules_use_short_role_names():
     required_modules = {
         "cache.py",
         "config.py",
-        "coverage.py",
+        "legacy_route_coverage.py",
         "export_guard.py",
         "geo.py",
         "inference.py",

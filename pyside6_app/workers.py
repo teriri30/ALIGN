@@ -282,6 +282,9 @@ def attach_path_provenance(path_result, mask_result, state, executed_config):
         ),
         "path_config": path_config,
         "harvester": dict(getattr(state, "harvester_params", {}) or {}),
+        "harvester_param_sources": dict(
+            getattr(state, "harvester_param_sources", {}) or {}
+        ),
         "turn_strategy": str(getattr(state, "turn_strategy", "auto")),
         "entry_point": getattr(state, "entry_point", None),
         "exit_point": getattr(state, "exit_point", None),
@@ -561,6 +564,9 @@ class CacheRestoreWorker(QObject):
                 path_inputs.update({
                     "path_config": current_path_config,
                     "harvester": harvester,
+                    "harvester_param_sources": dict(
+                        saved.get("harvester_param_sources") or {}
+                    ),
                     "turn_strategy": str(saved.get("turn_strategy", "auto")),
                     "entry_point": saved.get("entry_point"),
                     "exit_point": saved.get("exit_point"),

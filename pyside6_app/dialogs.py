@@ -105,11 +105,12 @@ class PaperExperimentDialog(QDialog):
 
 
 class HarvesterParamsDialog(QDialog):
-    def __init__(self, params=None, parent=None):
+    def __init__(self, params=None, parent=None, source="user_entered"):
         super().__init__(parent)
         self.setWindowTitle("农机参数设置")
-        self.setFixedSize(420, 360)
+        self.setFixedSize(460, 420)
         self._params = params or {}
+        self._source = str(source or "user_entered")
         self._build_ui()
 
     def _spin(self, value, minimum, maximum, step):
@@ -129,7 +130,10 @@ class HarvesterParamsDialog(QDialog):
     def _build_ui(self):
         lo = QVBoxLayout(self)
         lo.setSpacing(12)
-        lbl = QLabel("请设置收割机的物理参数，用于路径规划计算。")
+        lbl = QLabel(
+            "请设置收割机的物理参数，用于等距区域路径和理论履带碾压计算。"
+            "宽窄行中心线仍以掩膜/行带几何为准。"
+        )
         lbl.setWordWrap(True)
         lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
         lo.addWidget(lbl)
@@ -152,10 +156,8 @@ class HarvesterParamsDialog(QDialog):
         fm.addRow(QLabel("割刀前置距离:"), self.spin_cutter_offset)
         self.spin_track = self._spin(self._params.get("track_width_m", 0.35), 0.1, 1.0, 0.05)
         fm.addRow(QLabel("履带宽度:"), self.spin_track)
-        self.spin_gauge = self._spin(self._params.get("track_gauge_m", 1.7), 0.5, 3.0, 0.1)
+        self.spin_gauge = self._spin(self._params.get("track_gauge_m", 1.3), 0.5, 3.0, 0.1)
         fm.addRow(QLabel("履带中心距:"), self.spin_gauge)
-        self.spin_wheelbase = self._spin(self._params.get("wheelbase_m", 2.5), 1.0, 6.0, 0.1)
-        fm.addRow(QLabel("轴距:"), self.spin_wheelbase)
         self.spin_track_length = self._spin(self._params.get("track_length_m", 1.7), 0.5, 6.0, 0.1)
         fm.addRow(QLabel("履带接地长度:"), self.spin_track_length)
         self.spin_turn = self._spin(self._params.get("turn_radius_m", 2.0), 0.5, 6.0, 0.1)
@@ -182,7 +184,6 @@ class HarvesterParamsDialog(QDialog):
             ),
             "track_width_m": self.spin_track.value(),
             "track_gauge_m": self.spin_gauge.value(),
-            "wheelbase_m": self.spin_wheelbase.value(),
             "turn_radius_m": self.spin_turn.value(),
             "track_length_m": self.spin_track_length.value(),
             "work_speed_mps": self.spin_work_speed.value(),
@@ -195,7 +196,7 @@ class HarvesterParamsDialog(QDialog):
                 self,
                 "缺少实测参数",
                 "请填写履带接地区域几何中心到割刀切割线的水平前向距离。\n"
-                "系统不会根据轴距或机身尺寸推算该值。",
+                "系统不会根据机身尺寸推算该值。",
             )
             self.spin_cutter_offset.setFocus()
             return

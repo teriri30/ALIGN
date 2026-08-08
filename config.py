@@ -10,9 +10,9 @@ class ConfigValidationError(ValueError):
 
 
 DEFAULT_HARVESTER_PARAMS = {
-    "cutter_width_m": 2.15,
-    "track_width_m": 0.40,
-    "track_gauge_m": 1.60,
+    "cutter_width_m": 2.00,
+    "track_width_m": 0.35,
+    "track_gauge_m": 1.30,
     "wheelbase_m": 1.80,
     "track_length_m": 1.70,
     "turn_radius_m": 0.90,
@@ -20,6 +20,21 @@ DEFAULT_HARVESTER_PARAMS = {
     "turn_speed_mps": 0.60,
     "entry_speed_mps": 0.80,
 }
+
+# Parameter provenance is deliberately orthogonal to the numerical defaults.
+# A value copied from config or a heuristic recommendation remains unverified
+# until an operator explicitly records a measured source.
+HARVESTER_PARAM_KEYS = tuple(DEFAULT_HARVESTER_PARAMS) + (
+    "cutter_forward_offset_m",
+)
+HARVESTER_PARAM_SOURCE_LABELS = {
+    "default": "系统默认值",
+    "recommended": "智能推荐值",
+    "user_entered": "用户填写（未提供实测证据）",
+    "user_measured": "用户实测记录",
+    "legacy_unverified": "历史缓存（来源未记录）",
+}
+HARVESTER_FORMAL_MEASURED_SOURCES = frozenset({"user_measured"})
 
 
 def _validated_number(section: dict, key: str, *, minimum=None, maximum=None, strict_min=False):
@@ -101,12 +116,31 @@ def validate_config(raw: dict) -> dict:
         raise ConfigValidationError(
             "validation_profile must be research, field_trial, or machine_candidate"
         )
+    if "service_point_mode" in planning and str(
+        planning["service_point_mode"]
+    ) not in {"reference_only", "connect"}:
+        raise ConfigValidationError(
+            "service_point_mode must be reference_only or connect"
+        )
     _validated_number(planning, "min_turn_radius_m", minimum=0.0, strict_min=True)
     _validated_number(planning, "planning_max_dim", minimum=256)
     _validated_number(planning, "validation_max_dim", minimum=256)
     _validated_number(planning, "endpoint_short_line_ratio", minimum=0.5, maximum=1.0)
     _validated_number(planning, "endpoint_shortfall_min_m", minimum=0.0)
     _validated_number(planning, "endpoint_extension_max_m", minimum=0.0)
+    _validated_number(planning, "work_line_endpoint_extension_m", minimum=0.0)
+    _validated_number(
+        planning, "uniform_zone_min_line_length_ratio",
+        minimum=0.5, maximum=1.0,
+    )
+    if planning.get("uniform_zone_line_spacing_m") is not None:
+        _validated_number(planning, "uniform_zone_line_spacing_m", minimum=0.0, strict_min=True)
+    if "uniform_zone_spacing_basis" in planning and str(
+        planning["uniform_zone_spacing_basis"]
+    ) not in {"track_gauge_overlap", "explicit"}:
+        raise ConfigValidationError(
+            "uniform_zone_spacing_basis must be track_gauge_overlap or explicit"
+        )
     _validated_number(planning, "endpoint_outlier_mad_scale", minimum=0.0)
     _validated_number(planning, "footprint_pose_step_m", minimum=0.01, maximum=0.20)
     _validated_number(planning, "pose_heading_window_m", minimum=0.01, maximum=2.0)

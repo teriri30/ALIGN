@@ -77,6 +77,9 @@ def _window_with_path():
     path_geometry = [[(10.25, 20.75), (15.5, 25.125)]]
     path_layout = {}
     harvester = window._effective_harvester_params(window.state.harvester_params)
+    window.state.harvester_param_sources = {
+        key: "user_measured" for key in harvester
+    }
     path_config = window.cfg.section("path_planning")
     path_config.update({
         "min_turn_radius_m": float(harvester["turn_radius_m"]),
@@ -87,6 +90,7 @@ def _window_with_path():
         "mask_fingerprint": mask_record["fingerprint"],
         "path_config": path_config,
         "harvester": harvester,
+        "harvester_param_sources": dict(window.state.harvester_param_sources),
         "turn_strategy": str(window.state.turn_strategy),
         "entry_point": window.state.entry_point,
         "exit_point": window.state.exit_point,

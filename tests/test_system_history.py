@@ -120,8 +120,8 @@ def test_recommended_service_point_can_be_dragged_directly_and_invalidates_path(
     assert window.state.path_provenance == {"fingerprint": "old-path"}
 
 
-def test_service_point_drag_corrects_live_to_headland_and_schedules_replan():
-    """DECISION-007: dragging previews correction before formal replanning."""
+def test_service_point_drag_preserves_free_2d_position_and_schedules_replan():
+    """DECISION-007: drag previews the connector without snapping the point."""
     from state import AutoPathSegment, PathPoint
 
     class Geo:
@@ -158,15 +158,16 @@ def test_service_point_drag_corrects_live_to_headland_and_schedules_replan():
     window._service_points_visible = True
 
     assert window._begin_service_point_drag(10, 30)
-    window._move_service_point_drag(50, 30)
+    window._move_service_point_drag(50, 45)
 
-    # With a 4 m terminal depth and 5 px/m scale, the interior request is
-    # corrected to the low terminal-zone boundary while the mouse is moving.
-    assert window.state.entry_point == (20.0, 30.0)
-    assert window._service_point_drag_last_correction["terminal_corrected"] is True
+    # The point follows the cursor in both axes.  Only the confirmed field
+    # boundary is a hard constraint; terminal/headland projection is preview
+    # geometry, not a coordinate snap.
+    assert window.state.entry_point == (50.0, 45.0)
+    assert window._service_point_drag_last_correction["terminal_corrected"] is False
     assert window._service_point_drag_preview_items
 
-    window._finish_service_point_drag(50, 30)
+    window._finish_service_point_drag(50, 45)
     assert window.state.auto_path_planned is False
     assert window._stale_path_preview is not None
     assert window._stale_path_preview.get("stale_preview") is True
@@ -175,8 +176,8 @@ def test_service_point_drag_corrects_live_to_headland_and_schedules_replan():
     window._service_point_replan_timer.stop()
 
 
-def test_service_point_drag_prefers_detected_headland_corridor_bounds():
-    """DECISION-007/009: live correction follows the accepted headland layer."""
+def test_service_point_drag_does_not_snap_to_headland_corridor():
+    """DECISION-007/009: a detected corridor must not lock the point to one axis."""
     class Geo:
         @staticmethod
         def is_ready():
@@ -201,13 +202,70 @@ def test_service_point_drag_prefers_detected_headland_corridor_bounds():
     }
 
     point, correction = window._constrain_service_point(
-        ("entry", 0), (40.0, 30.0)
+        ("entry", 0), (40.0, 45.0)
     )
 
-    assert 0.0 <= point[0] <= 11.0
-    assert point[1] == 30.0
-    assert correction["terminal_corrected"] is True
-    assert correction["terminal_source"] == "headland_corridor_mask"
+    assert point == (40.0, 45.0)
+    assert correction["terminal_corrected"] is False
+    assert correction["terminal_source"] is None
+
+
+def test_service_markers_keep_user_positions_after_planning_without_mutating_inputs():
+    """规划后起终点标记、面板和动画共享路线首尾点。"""
+    window = _window()
+    window.state.entry_point = (10.0, 20.0)
+    window.state.exit_point = (90.0, 60.0)
+    window._pipeline_result = {
+        "path": {
+            "full_path": [
+                [(25.0, 30.0), (75.0, 30.0)],
+                [(75.0, 30.0), (75.0, 70.0)],
+            ],
+        }
+    }
+    window._service_points_visible = True
+
+    assert window._route_service_anchor("entry") == (25.0, 30.0)
+    assert window._route_service_anchor("exit") == (75.0, 70.0)
+    # Reference-only service points remain editable user coordinates after a
+    # route exists; only the diagnostic helper exposes route anchors.
+    assert window._service_point_value(("entry", 0)) == (10.0, 20.0)
+    assert window._service_point_value(("exit", 0)) == (90.0, 60.0)
+    assert window.state.entry_point == (10.0, 20.0)
+    assert window.state.exit_point == (90.0, 60.0)
+
+
+def test_measurement_tools_replace_previous_result_and_confirm_on_right_click():
+    window = _window()
+
+    window._on_measure_tool_changed("point")
+    window._handle_measure_click(10, 10, 1)
+    first_count = len(window._measure_overlay_items)
+    window._handle_measure_click(20, 20, 1)
+    assert window._measure_points == [(20, 20)]
+    assert window._measure_complete is True
+    assert len(window._measure_overlay_items) == first_count
+
+    window._on_measure_tool_changed("line")
+    window._handle_measure_click(10, 10, 1)
+    window._handle_measure_click(30, 10, 1)
+    assert window._measure_points == [(10, 10), (30, 10)]
+    assert window._measure_complete is False
+    window._handle_measure_click(30, 10, 2)
+    assert window._measure_complete is True
+    window._handle_measure_click(40, 20, 1)
+    assert window._measure_points == [(40, 20)]
+    assert window._measure_complete is False
+
+    window._on_measure_tool_changed("area")
+    for point in ((10, 10), (30, 10), (30, 30)):
+        window._handle_measure_click(*point, 1)
+    window._handle_measure_click(30, 30, 2)
+    assert window._measure_complete is True
+    window._handle_measure_click(50, 50, 1)
+    assert window._measure_points == [(50, 50)]
+    window._on_measure_tool_changed("")
+    assert window._measure_overlay_items == []
 
 
 def test_viewer_captures_service_point_drag_before_left_button_pan():

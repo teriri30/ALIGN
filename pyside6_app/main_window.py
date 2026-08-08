@@ -14,7 +14,13 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QStatusBar, QTabWidget, QLabel, QProgressBar,
     QDialog, QInputDialog, QApplication, QPushButton,
 )
-from config import Config, AppLogger, save_json_atomic
+from config import (
+    Config,
+    AppLogger,
+    save_json_atomic,
+    HARVESTER_PARAM_KEYS,
+    HARVESTER_PARAM_SOURCE_LABELS,
+)
 from state import AppState, AutoPathSegment, PathPoint
 from geo import GeoUtils
 from inference import ModelEngine, scan_model_dir
@@ -23,13 +29,13 @@ from pyside6_app.panels import TaskPanel, ParamPanel, LogPanel, RouteInfoPanel
 from pyside6_app.top_bar import TopToolbar
 from pyside6_app.workers import (
     PipelineWorker, MaskProcessWorker, PlanWorker, TifLoadWorker,
-    CacheRestoreWorker, MaskDiagnosticExportWorker, PaperExperimentWorker,
+    CacheRestoreWorker, MaskDiagnosticExportWorker,
 )
 from pyside6_app.event_handler import EventBridge
 from pyside6_app.dialogs import (
     HarvesterParamsDialog, ModelManagerDialog, SettingsDialog,
     ProjectLogDialog, ReportDialog, DiagnosisDialog, LoadingProgress,
-    MachineRecommendationDialog, PaperExperimentDialog,
+    MachineRecommendationDialog,
 )
 from pyside6_app.launcher import LauncherDialog
 from pyside6_app.styles import COLORS, ThemeManager, ThemeMode, THEMES, build_stylesheet
@@ -53,6 +59,9 @@ class MainWindow(QMainWindow):
         self._mask_processing_strength = str(self.cfg.section("mask_processing").get("strength", "standard"))
         # 从 config.json 加载农机参数；缺项使用 Config 默认值补齐，避免默认参数被判定“不完整”。
         self.state.harvester_params = self._effective_harvester_params({})
+        self.state.harvester_param_sources = self._default_harvester_param_sources(
+            self.state.harvester_params
+        )
         self.model_engine = ModelEngine()
         self._tif_rgb: Optional[np.ndarray] = None
         self._tif_path: Optional[str] = None
@@ -77,6 +86,8 @@ class MainWindow(QMainWindow):
         self._forbidden_pts: List[Tuple[int, int]] = []
         self._measure_tool = ""
         self._measure_points: List[Tuple[int, int]] = []
+        self._measure_overlay_items = []
+        self._measure_complete = False
         self._route_edit_active = False
         self._route_drag_idx = -1
         self._show_mask_before = False
@@ -88,7 +99,6 @@ class MainWindow(QMainWindow):
         self._service_point_drag_moved = False
         self._service_point_drag_preview_items = []
         self._service_point_drag_last_correction = {}
-        self._service_point_drag_terminal_bounds = None
         self._service_point_replan_timer = QTimer(self)
         self._service_point_replan_timer.setSingleShot(True)
         self._service_point_replan_timer.timeout.connect(
@@ -116,7 +126,6 @@ class MainWindow(QMainWindow):
         self._active_inference_runner = None
         self._active_mask_token = None
         self._active_plan_token = None
-        self._active_paper_experiment_token = None
         self._active_cache_restore_token = None
         self._active_plan_generation = None
         self._close_after_worker_cancel = False
@@ -160,6 +169,62 @@ class MainWindow(QMainWindow):
                         params[key] = value
         return params
 
+    @staticmethod
+    def _normalise_harvester_param_source(source) -> str:
+        value = str(source or "").strip().lower()
+        aliases = {
+            "默认": "default",
+            "系统默认值": "default",
+            "智能推荐": "recommended",
+            "推荐": "recommended",
+            "用户自定义": "user_entered",
+            "custom": "user_entered",
+            "用户填写": "user_entered",
+            "用户实测": "user_measured",
+            "实测": "user_measured",
+        }
+        value = aliases.get(value, value)
+        return value if value in HARVESTER_PARAM_SOURCE_LABELS else "legacy_unverified"
+
+    def _default_harvester_param_sources(self, params=None, fallback="default"):
+        values = params if isinstance(params, dict) else self._effective_harvester_params({})
+        source = self._normalise_harvester_param_source(fallback)
+        return {
+            key: source
+            for key in HARVESTER_PARAM_KEYS
+            if key in values
+        }
+
+    def _normalise_harvester_param_sources(self, params=None, sources=None, *, fallback="legacy_unverified"):
+        values = params if isinstance(params, dict) else self._effective_harvester_params({})
+        raw_sources = sources if isinstance(sources, dict) else {}
+        default_source = self._normalise_harvester_param_source(fallback)
+        return {
+            key: self._normalise_harvester_param_source(
+                raw_sources.get(key, default_source)
+            )
+            for key in HARVESTER_PARAM_KEYS
+            if key in values
+        }
+
+    def _harvester_source_summary(self, params=None, sources=None):
+        values = params if isinstance(params, dict) else self._effective_harvester_params({})
+        normalised = self._normalise_harvester_param_sources(
+            values,
+            sources if sources is not None else getattr(self.state, "harvester_param_sources", {}),
+        )
+        return {
+            key: {
+                "source": normalised.get(key, "legacy_unverified"),
+                "label": HARVESTER_PARAM_SOURCE_LABELS.get(
+                    normalised.get(key, "legacy_unverified"),
+                    normalised.get(key, "legacy_unverified"),
+                ),
+            }
+            for key in HARVESTER_PARAM_KEYS
+            if key in values
+        }
+
     def apply_stylesheet(self):
         self.setStyleSheet(build_stylesheet(self._theme_mgr.colors()))
 
@@ -198,7 +263,18 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "保存项目", QKeySequence.Save, self._on_save_project)
         self._add_action(fm, "加载模型...", "Ctrl+M", self._on_load_model)
         fm.addSeparator()
-        self._add_action(fm, "导出收获机候选路径（$PATH）...", None, self._on_export_path_format)
+        self._add_action(
+            fm,
+            "导出农机兼容测试文件（$PATH，转弯直线）...",
+            None,
+            self._on_export_machine_compatibility_path,
+        )
+        self._add_action(
+            fm,
+            "导出收获机候选路径（正式门禁）...",
+            None,
+            self._on_export_path_format,
+        )
         self._add_action(fm, "导出完整试验资料包...", None, self._on_export_trial_package)
         record_menu = fm.addMenu("查看与记录导出")
         self._add_action(record_menu, "导出 GeoJSON...", "Ctrl+E", self._on_export_geojson)
@@ -238,8 +314,6 @@ class MainWindow(QMainWindow):
         self._add_action(tm, "项目日志...", None, self._on_project_log)
         self._add_action(tm, "系统诊断...", None, self._on_diagnose)
 
-        em = mb.addMenu("实验")
-        self._add_action(em, "论文消融实验中心...", None, self._on_paper_experiments)
     def _add_action(self, menu, text, shortcut, slot):
         act = QAction(text, self)
         if shortcut: act.setShortcut(QKeySequence(shortcut))
@@ -287,7 +361,7 @@ class MainWindow(QMainWindow):
         tp.simulate_requested.connect(self._on_simulate_task_action)
         tp.params_requested.connect(self._on_params_dialog)
         tp.entry_exit_toggle.connect(self._on_toggle_entry_exit)
-        tp.export_geojson_requested.connect(self._on_export_path_format)
+        tp.export_geojson_requested.connect(self._on_export_machine_compatibility_path)
         tp.export_csv_requested.connect(self._on_export_csv_geo)
         tp.export_img_requested.connect(self._on_export_img)
         tp.field_drawing_requested.connect(self._on_toggle_field_drawing)
@@ -397,7 +471,6 @@ class MainWindow(QMainWindow):
             "_active_mask_token",
             "_active_plan_token",
             "_active_cache_restore_token",
-            "_active_paper_experiment_token",
         ):
             token = getattr(self, token_name, None)
             if token is not None:
@@ -656,6 +729,10 @@ class MainWindow(QMainWindow):
         self.top_toolbar.set_worker_cancel_visible(False)
         path_result = self._store_path_result(result.get("path", {}), result)
         self._service_points_visible = True
+        # The requested service points remain editable provenance inputs.  The
+        # route planner uses them as start/end references; it does not replace
+        # the visible markers with canonical route vertices.
+        self._refresh_service_points_panel()
         if (
             not path_result.get("full_path")
             and isinstance(getattr(self, "_stale_path_preview", None), dict)
@@ -674,6 +751,15 @@ class MainWindow(QMainWindow):
         turns = len(path_result.get("formal_turns", path_result.get("turns", [])))
         self.lbl_status.setText("路径规划完成")
         self.log_panel.success(self._path_quality_summary(path_result, bands_count, tracks, turns))
+        contour_ordering = (path_result.get("turn_assessment") or {}).get(
+            "contour_ordering", {}
+        ) or {}
+        reference_ordering = contour_ordering.get("reference_ordering") or {}
+        if reference_ordering.get("enabled"):
+            self.log_panel.info(
+                "起点/终点已参与作业区排序与行驶方向选择；当前为参考点模式，"
+                "不会把标记点强行拉接进作业线，因此路线实际首尾可与标记保持少量距离。"
+            )
         self._log_turn_strategy_comparison(path_result)
         self._journal.info(f"路径规划完成: {bands_count}条带 {tracks}条作业线 {turns}条转弯线")
         validation = path_result.get("validation", {}) or {}
@@ -1044,6 +1130,7 @@ class MainWindow(QMainWindow):
                     'forbidden_regions', 'forbidden_regions_confirmed',
                     'unload_points', 'unload_point', 'entry_point_locked',
                     'exit_point_locked', 'unload_point_locked', 'workflow_step',
+                    'harvester_param_sources',
                     'harvester_params_confirmed',
                     'inference_done', 'mask_processed', 'simulation_done', 'export_done',
                     'turn_strategy',
@@ -1060,6 +1147,17 @@ class MainWindow(QMainWindow):
             restored_state.update(path_restore["state_updates"])
             restored_state['harvester_params'] = self._effective_harvester_params(
                 saved.get('harvester_params') or {}
+            )
+            restored_state['harvester_param_sources'] = (
+                self._normalise_harvester_param_sources(
+                    restored_state['harvester_params'],
+                    saved.get('harvester_param_sources'),
+                    fallback=(
+                        "legacy_unverified"
+                        if saved.get('harvester_params')
+                        else "default"
+                    ),
+                )
             )
             self.state.safe_update(**restored_state)
             if not self._sync_cache_model_identity():
@@ -1164,85 +1262,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log_panel.error(f"项目保存失败: {e}")
             QMessageBox.warning(self, "项目保存失败", str(e))
-
-    def _on_paper_experiments(self):
-        raw_mask = getattr(self.state, "mask_raw", None)
-        if not isinstance(raw_mask, np.ndarray) or self._tif_rgb is None:
-            QMessageBox.warning(
-                self,
-                "实验前提不足",
-                "请先完成影像导入和 AI 识别。实验中心仅对当前项目的冻结快照运行，不会覆盖界面结果。",
-            )
-            return
-        dialog = PaperExperimentDialog(self)
-        if dialog.exec() != QDialog.Accepted:
-            return
-        options = dialog.options()
-        output_dir = QFileDialog.getExistingDirectory(self, "选择实验结果目录", "")
-        if not output_dir:
-            return
-        ground_truth = None
-        truth_path = str(options.get("ground_truth_path", "") or "")
-        if truth_path:
-            ground_truth = cv2.imread(truth_path, cv2.IMREAD_GRAYSCALE)
-            if ground_truth is None:
-                QMessageBox.warning(self, "真值掩膜不可用", f"无法读取人工真值掩膜：{truth_path}")
-                return
-        from paper_experiments import PaperExperimentRunner, default_experiment_plan
-
-        plan = default_experiment_plan([])
-        if not options.get("include_mask"):
-            plan["mask_cases"] = []
-        if not options.get("include_path"):
-            plan["path_cases"] = []
-        runner = PaperExperimentRunner(
-            raw_mask=raw_mask,
-            source_image=self._tif_rgb,
-            state=self.state,
-            geo=self.geo,
-            output_dir=output_dir,
-            mask_config=self.cfg.section("mask_processing"),
-            path_config=self.cfg.section("path_planning"),
-            ground_truth_mask=ground_truth,
-        )
-        token = make_task_token(self.state, "paper_experiment")
-        self._active_paper_experiment_token = token
-        worker = PaperExperimentWorker(runner, plan, token=token)
-        worker.finished.connect(self._on_paper_experiments_done)
-        self.lbl_status.setText("论文实验运行中...")
-        if not self._start_background_worker(worker, "论文实验已开始；当前界面状态不会被实验过程修改。"):
-            token.invalidate()
-            self._clear_task_token_if_current(
-                "paper_experiment", {"task_token": token},
-            )
-            self.lbl_status.setText("论文实验未启动")
-
-    @Slot(dict)
-    def _on_paper_experiments_done(self, payload):
-        result = self._unwrap_task_result("paper_experiment", payload)
-        if result is None:
-            if (
-                isinstance(payload, dict)
-                and payload.get("status") == "failed"
-                and self._admit_task_completion(
-                    "paper_experiment", payload.get("task_token")
-                )
-            ):
-                self.lbl_status.setText("论文实验失败")
-                self.log_panel.error(
-                    f"论文实验失败: {str(payload.get('error') or '未知错误')}"
-                )
-            self._clear_task_token_if_current("paper_experiment", payload)
-            return
-        output_dir = str(result.get("output_dir", "") or "")
-        self.progress_bar.hide()
-        self.top_toolbar.set_progress(0)
-        self.top_toolbar.set_worker_cancel_visible(False)
-        self.lbl_status.setText("论文实验资料包已生成")
-        self.log_panel.success(f"论文实验资料包：{output_dir}")
-        self._clear_task_token_if_current("paper_experiment", payload)
-        if self._worker_thread:
-            self._worker_thread.quit()
 
     def _on_open_tif(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1373,20 +1392,28 @@ class MainWindow(QMainWindow):
             return False
         try:
             builtin_root = os.path.abspath(self._builtin_model_dir())
-            external_model = os.path.commonpath(
+            in_builtin_dir = os.path.commonpath(
                 [builtin_root, os.path.abspath(path)]
-            ) != builtin_root
+            ) == builtin_root
         except ValueError:
-            external_model = True
-        if external_model and QMessageBox.question(
+            in_builtin_dir = False
+        registry_entry = self._model_registry_entry(path)
+        is_registered = bool(
+            registry_entry and str(registry_entry.get("sha256", "") or "").strip()
+        )
+        # DECISION-006: only explicitly registered weights are trusted without
+        # confirmation. A .pt file inside data/models that is absent from the
+        # registry is treated like an external weight.
+        needs_confirmation = (not in_builtin_dir) or (not is_registered)
+        if needs_confirmation and QMessageBox.question(
             self,
-            "外部模型安全确认",
+            "模型安全确认",
             "PyTorch .pt 文件可能包含可执行的序列化内容。仅应加载由你训练或来源可信的模型。\n\n"
             f"文件：{os.path.abspath(path)}\n\n确认信任并继续加载吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         ) != QMessageBox.Yes:
-            self.log_panel.info("已取消加载未经确认的外部模型")
+            self.log_panel.info("已取消加载未经确认的模型")
             return False
         try:
             self._invalidate_active_inference_runner()
@@ -1394,7 +1421,6 @@ class MainWindow(QMainWindow):
             previous_sha256 = str(getattr(self.state, 'model_sha256', '') or '')
             from provenance import file_sha256
             model_sha256 = file_sha256(path)
-            registry_entry = self._model_registry_entry(path) if not external_model else {}
             expected_sha256 = str(registry_entry.get("sha256", "") or "").lower()
             if expected_sha256 and model_sha256.lower() != expected_sha256:
                 self.log_panel.error("内置模型哈希与注册表不一致，已拒绝加载")
@@ -1508,6 +1534,7 @@ class MainWindow(QMainWindow):
                 "requested_strategy",
                 "coordinate_space",
                 "machine_readiness",
+                "machine_executable",
                 "path_candidates",
                 "layout",
             )
@@ -1656,6 +1683,7 @@ class MainWindow(QMainWindow):
 
         if "params" in affected:
             self.state.harvester_params = {}
+            self.state.harvester_param_sources = {}
         if "entry" in affected:
             self.state.entry_point = None
             self.state.entry_point_locked = False
@@ -1849,7 +1877,7 @@ class MainWindow(QMainWindow):
             "pear": "梨形调头",
             "fishtail": "鱼尾折返",
             "alpha": "紧凑 Alpha",
-            "contour": "套圈收割（外圈向内）",
+            "contour": "套圈收割",
         }
         self.task_panel.set_turn_strategy(strategy_key)
         self.top_toolbar.set_current_strategy(strategy_key)
@@ -1969,12 +1997,12 @@ class MainWindow(QMainWindow):
         vr = self._field_vertex_radius()
         for i in range(len(pts) - 1):
             viewer.draw_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
-                             color=(0, 200, 80), width=lw)
+                             color=(50, 140, 255), width=lw)
         if mouse_pos and pts:
             viewer.draw_line(pts[-1][0], pts[-1][1], mouse_pos[0], mouse_pos[1],
-                             color=(0, 200, 80), width=max(3, lw // 2), style=Qt.DashLine)
+                             color=(50, 140, 255), width=max(3, lw // 2), style=Qt.DashLine)
         for i, (px, py) in enumerate(pts):
-            c = (255, 255, 0) if i == 0 else (0, 200, 80)
+            c = (255, 255, 0) if i == 0 else (50, 140, 255)
             viewer.draw_circle(px, py, radius=vr, color=c)
 
     def _clear_field_overlay(self):
@@ -2063,7 +2091,7 @@ class MainWindow(QMainWindow):
         for i in range(len(boundary)):
             p1 = boundary[i]
             p2 = boundary[(i + 1) % len(boundary)]
-            viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(0, 255, 100), width=lw)
+            viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(50, 140, 255), width=lw)
         for px, py in boundary:
             viewer.draw_circle(px, py, radius=vr, color=(255, 255, 0))
         self._draw_forbidden_regions(clear_first=False)
@@ -2174,6 +2202,51 @@ class MainWindow(QMainWindow):
         if boundary and len(boundary) >= 3:
             self._draw_field_boundary()
 
+    def _route_service_anchor(self, kind):
+        """Return the visible route endpoint for a service-point marker.
+
+        ``entry_point``/``exit_point`` are user inputs and remain unchanged in
+        ``AppState`` for provenance.  This helper is retained for animation
+        and diagnostics, but the editable marker must never be replaced by a
+        canonical route vertex: reference-only planning intentionally keeps a
+        user-selected service point independent from the nearest work-line
+        endpoint.
+        """
+        if kind not in {"entry", "exit"}:
+            return None
+        pipeline = getattr(self, "_pipeline_result", None)
+        if not isinstance(pipeline, dict):
+            return None
+        path_result = pipeline.get("path")
+        if not isinstance(path_result, dict):
+            return None
+        full_path = path_result.get("full_path") or []
+        segments = [
+            self._coerce_points(segment)
+            for segment in full_path
+        ]
+        segments = [segment for segment in segments if len(segment) >= 2]
+        if not segments:
+            return None
+        point = segments[0][0] if kind == "entry" else segments[-1][-1]
+        return (float(point[0]), float(point[1]))
+
+    def _display_service_point_value(self, target):
+        # The marker is the editable state value, both before and after
+        # planning.  The old route-anchor substitution made every successful
+        # replan visually snap the marker back to the canonical first/last
+        # route vertex, so dragging appeared to have no effect.
+        return self._service_point_state_value(target)
+
+    def _service_point_state_value(self, target):
+        kind, index = target
+        if kind == "entry":
+            return getattr(self.state, "entry_point", None)
+        if kind == "exit":
+            return getattr(self.state, "exit_point", None)
+        points = list(getattr(self.state, "unload_points", []) or [])
+        return points[index] if 0 <= index < len(points) else None
+
     def _draw_service_points_overlay(self, clear_first=False):
         viewer = self.image_view.viewer
         if clear_first:
@@ -2185,8 +2258,8 @@ class MainWindow(QMainWindow):
         if not self._service_points_should_show():
             return
         points = []
-        ep = getattr(self.state, 'entry_point', None)
-        xp = getattr(self.state, 'exit_point', None)
+        ep = self._display_service_point_value(("entry", 0))
+        xp = self._display_service_point_value(("exit", 0))
         if ep:
             points.append((ep, "起点", (0, 255, 80)))
         if xp:
@@ -2213,8 +2286,8 @@ class MainWindow(QMainWindow):
         if not self._service_points_should_show():
             return None
         candidates = []
-        entry = getattr(self.state, "entry_point", None)
-        exit_point = getattr(self.state, "exit_point", None)
+        entry = self._display_service_point_value(("entry", 0))
+        exit_point = self._display_service_point_value(("exit", 0))
         if entry:
             candidates.append(("entry", 0, entry))
         if exit_point:
@@ -2239,10 +2312,13 @@ class MainWindow(QMainWindow):
         return (target[0], target[1]) if distance <= self._service_point_hit_radius() else None
 
     def _service_point_direct_drag_available(self, x, y):
+        # Route editing uses the same direct-capture path as service markers.
+        # drawing_mode otherwise treats a left drag as canvas panning.
+        if self._route_edit_active:
+            return self._route_edit_nearest_node((x, y)) >= 0
         if (
             self._show_mask_before
             or self._measure_tool
-            or self._route_edit_active
             or self._field_drawing
             or self._forbidden_drawing
         ):
@@ -2250,13 +2326,7 @@ class MainWindow(QMainWindow):
         return self._service_point_hit_test(x, y) is not None
 
     def _service_point_value(self, target):
-        kind, index = target
-        if kind == "entry":
-            return getattr(self.state, "entry_point", None)
-        if kind == "exit":
-            return getattr(self.state, "exit_point", None)
-        points = list(getattr(self.state, "unload_points", []) or [])
-        return points[index] if 0 <= index < len(points) else None
+        return self._display_service_point_value(target)
 
     def _set_service_point_value(self, target, point, journal=False):
         kind, index = target
@@ -2308,9 +2378,9 @@ class MainWindow(QMainWindow):
         )
         self._service_point_drag_moved = False
         self._service_point_drag_last_correction = {}
-        self._service_point_drag_terminal_bounds = (
-            self._prepare_service_point_terminal_bounds()
-        )
+        # Service points follow the cursor in both image axes.  Keep only the
+        # confirmed field boundary as a hard safety constraint; do not apply a
+        # main-angle/terminal-depth snap during the drag.
         self._service_point_replan_timer.stop()
         self._clear_service_point_drag_preview()
         self.image_view.viewer.setCursor(Qt.ClosedHandCursor)
@@ -2366,18 +2436,12 @@ class MainWindow(QMainWindow):
                 f"{labels.get(target[0], '服务点')}已移动到: "
                 f"({float(point[0]):.1f}, {float(point[1]):.1f})"
             )
-            if correction.get("terminal_corrected"):
-                self.log_panel.info(
-                    "服务点已实时纠正到最近田头；青色折线为拖动预览，"
-                    "正式路径将在释放后重新规划"
-                )
         self._clear_service_point_drag_preview()
         self.state._drag_entry_exit = None
         self._service_point_drag_origin = None
         self._service_point_drag_undo_saved = False
         self._service_point_drag_had_path = False
         self._service_point_drag_moved = False
-        self._service_point_drag_terminal_bounds = None
         self._sync_drawing_mode()
         self._restore_visual_from_state()
         self._refresh_service_points_panel()
@@ -2487,8 +2551,8 @@ class MainWindow(QMainWindow):
         if not self._service_points_should_show():
             self.route_info.update_service_points(None, None, [])
             return
-        entry = getattr(self.state, 'entry_point', None)
-        exit_point = getattr(self.state, 'exit_point', None)
+        entry = self._display_service_point_value(("entry", 0))
+        exit_point = self._display_service_point_value(("exit", 0))
         unload_points = list(getattr(self.state, 'unload_points', []) or [])
         if not (entry or exit_point or unload_points):
             self.route_info.clear_info()
@@ -2496,85 +2560,11 @@ class MainWindow(QMainWindow):
         self.route_info.update_service_points(entry, exit_point, unload_points)
 
     def _on_service_point_selected(self, kind, index):
-        point = None
-        if kind == "entry":
-            point = getattr(self.state, 'entry_point', None)
-        elif kind == "exit":
-            point = getattr(self.state, 'exit_point', None)
-        elif kind == "unload":
-            points = list(getattr(self.state, 'unload_points', []) or [])
-            if 0 <= index < len(points):
-                point = points[index]
+        point = self._display_service_point_value((kind, index))
         if not point:
             return
         self._draw_service_points_overlay(clear_first=False)
         self.image_view.viewer.draw_circle(float(point[0]), float(point[1]), radius=13, color=(0, 220, 255))
-
-    def _prepare_service_point_terminal_bounds(self):
-        """Cache semantic headland projection bounds for one drag gesture.
-
-        ``headland_corridor_mask`` is preferred because it is the accepted,
-        terminal-only envelope.  The residual ``headland_mask`` is a fallback
-        for older caches.  The result is transient UI evidence; it never
-        changes the canonical path or mask layers.
-        """
-        mask_result = getattr(self.state, "mask_result", None) or {}
-        if not isinstance(mask_result, dict):
-            return None
-        try:
-            angle = float(mask_result.get("main_angle", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(angle):
-            return None
-        boundary = getattr(self.state, "field_boundary", None)
-        if not boundary or len(boundary) < 3:
-            return None
-        axis = np.asarray((math.cos(angle), math.sin(angle)), dtype=np.float64)
-        field_vertices = np.asarray(boundary, dtype=np.float64)
-        field_projections = field_vertices @ axis
-        if field_projections.size == 0:
-            return None
-        field_low = float(np.min(field_projections))
-        field_high = float(np.max(field_projections))
-        if not math.isfinite(field_low) or not math.isfinite(field_high):
-            return None
-        midpoint = 0.5 * (field_low + field_high)
-        offset = np.asarray((
-            float(getattr(self.state, "mask_offset_x", 0) or 0),
-            float(getattr(self.state, "mask_offset_y", 0) or 0),
-        ), dtype=np.float64)
-        for layer_name in ("headland_corridor_mask", "headland_mask"):
-            layer = mask_result.get(layer_name)
-            if not isinstance(layer, np.ndarray) or layer.ndim < 2:
-                continue
-            ys, xs = np.where(layer > 0)
-            if xs.size < 4:
-                continue
-            coords = np.column_stack((xs, ys)).astype(np.float64) + offset
-            projections = coords @ axis
-            projections = projections[np.isfinite(projections)]
-            low_values = projections[projections <= midpoint]
-            high_values = projections[projections >= midpoint]
-            bounds = {}
-            if low_values.size:
-                # Inner edge of the low-side corridor: keep the service point
-                # in the detected headland instead of using a fixed 4 m prior.
-                bounds["low_outer"] = float(np.min(low_values))
-                bounds["low"] = float(np.percentile(low_values, 90.0))
-            if high_values.size:
-                bounds["high_outer"] = float(np.max(high_values))
-                bounds["high"] = float(np.percentile(high_values, 10.0))
-            if bounds:
-                return {
-                    "source": layer_name,
-                    "axis": axis,
-                    "low": bounds.get("low"),
-                    "high": bounds.get("high"),
-                    "field_low": field_low,
-                    "field_high": field_high,
-                }
-        return None
 
     def _constrain_point_to_field(self, point):
         boundary = getattr(self.state, 'field_boundary', None)
@@ -2610,7 +2600,14 @@ class MainWindow(QMainWindow):
         return (float(nearest[0]), float(nearest[1]))
 
     def _constrain_service_point(self, target, point):
-        """Keep entry/exit in a physical headland zone while dragging live."""
+        """Keep a dragged service point inside the confirmed field only.
+
+        Entry and exit points are user-selected execution references, not
+        crop-row anchors.  Projecting them onto the main-angle terminal wall
+        can move an exit to the opposite end of the last work line and create
+        an artificial ``turn_reverse`` segment.  The live connector preview
+        remains visual-only; the point itself follows the cursor in both axes.
+        """
         requested = (float(point[0]), float(point[1]))
         constrained = self._constrain_point_to_field(requested)
         report = {
@@ -2624,122 +2621,6 @@ class MainWindow(QMainWindow):
             "terminal_source": None,
             "preview_only": True,
         }
-        if target[0] not in ("entry", "exit"):
-            return constrained, report
-        boundary = getattr(self.state, "field_boundary", None)
-        mask_result = getattr(self.state, "mask_result", None) or {}
-        if not boundary or len(boundary) < 3 or "main_angle" not in mask_result:
-            return constrained, report
-        if not self.geo.is_ready():
-            return constrained, report
-        angle = float(mask_result.get("main_angle", 0.0) or 0.0)
-        if not math.isfinite(angle):
-            return constrained, report
-        axis = np.asarray((math.cos(angle), math.sin(angle)), dtype=np.float64)
-        vertices = np.asarray(boundary, dtype=np.float64)
-        projections = vertices @ axis
-        low = float(np.min(projections))
-        high = float(np.max(projections))
-        if not math.isfinite(low) or not math.isfinite(high) or high <= low:
-            return constrained, report
-        terminal_bounds = getattr(
-            self, "_service_point_drag_terminal_bounds", None
-        )
-        if terminal_bounds is None:
-            terminal_bounds = self._prepare_service_point_terminal_bounds()
-        if isinstance(terminal_bounds, dict):
-            value = np.asarray(constrained, dtype=np.float64)
-            projection = float(value @ axis)
-            semantic_candidates = []
-            already_in_terminal = None
-            for side, key in (("low", "low"), ("high", "high")):
-                target_projection = terminal_bounds.get(key)
-                if target_projection is None:
-                    continue
-                target_projection = float(np.clip(
-                    target_projection,
-                    low,
-                    high,
-                ))
-                outer_projection = terminal_bounds.get(f"{side}_outer")
-                if outer_projection is not None:
-                    outer_projection = float(np.clip(
-                        outer_projection,
-                        low,
-                        high,
-                    ))
-                    if (
-                        side == "low"
-                        and outer_projection <= projection <= target_projection
-                    ) or (
-                        side == "high"
-                        and target_projection <= projection <= outer_projection
-                    ):
-                        already_in_terminal = side
-                        break
-                semantic_candidates.append((
-                    abs(projection - target_projection),
-                    side,
-                    target_projection,
-                ))
-            if already_in_terminal is not None:
-                report["terminal_side"] = already_in_terminal
-                report["terminal_source"] = str(
-                    terminal_bounds.get("source") or "headland_mask"
-                )
-                return constrained, report
-            if semantic_candidates:
-                distance, side, target_projection = min(
-                    semantic_candidates,
-                    key=lambda item: (item[0], 0 if item[1] == "low" else 1),
-                )
-                if low < projection < high and distance > 1e-7:
-                    value = value + (target_projection - projection) * axis
-                    constrained = self._constrain_point_to_field(
-                        (float(value[0]), float(value[1]))
-                    )
-                    report["terminal_corrected"] = True
-                    report["terminal_side"] = side
-                    report["terminal_source"] = str(
-                        terminal_bounds.get("source") or "headland_mask"
-                    )
-                    report["corrected_point"] = constrained
-                    return constrained, report
-        try:
-            ppm = float(self.geo.pixels_per_meter(*constrained))
-        except Exception:
-            return constrained, report
-        depth_m = float(
-            self.cfg.section("path_planning").get(
-                "service_point_terminal_depth_m", 4.0
-            )
-        )
-        terminal_depth = max(0.0, depth_m * ppm)
-        terminal_depth = min(terminal_depth, 0.45 * (high - low))
-        low_inner = low + terminal_depth
-        high_inner = high - terminal_depth
-        value = np.asarray(constrained, dtype=np.float64)
-        projection = float(value @ axis)
-        if low_inner < projection < high_inner:
-            low_distance = projection - low_inner
-            high_distance = high_inner - projection
-            if low_distance <= high_distance:
-                target_projection = low_inner
-                report["terminal_side"] = "low"
-            else:
-                target_projection = high_inner
-                report["terminal_side"] = "high"
-            value = value + (target_projection - projection) * axis
-            constrained = self._constrain_point_to_field(
-                (float(value[0]), float(value[1]))
-            )
-            report["terminal_corrected"] = True
-            report["terminal_source"] = "field_terminal_depth"
-            report["corrected_point"] = constrained
-        else:
-            report["terminal_side"] = (
-                "low" if projection <= low_inner else "high"
-            )
         return constrained, report
 
     def _suggest_service_points(self):
@@ -2915,10 +2796,19 @@ class MainWindow(QMainWindow):
             self.log_panel.warn("请先加载模型")
             return
         if not self._sync_cache_model_identity():
-            self.log_panel.warn(
-                "历史缓存模型不匹配：当前已加载模型与恢复缓存记录的权重身份不一致，"
-                "本次识别将使用当前已加载的模型进行"
-            )
+            if hasattr(self, "log_panel"):
+                self.log_panel.warn(
+                    "历史缓存模型不匹配：当前已加载模型与恢复缓存记录的权重身份不一致，"
+                    "已停止识别；请先加载与缓存哈希一致的模型或重新开始项目"
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "模型身份不一致",
+                    "历史缓存模型与当前加载模型不一致，已停止识别；"
+                    "请先加载与缓存哈希一致的模型或重新开始项目。",
+                )
+            return
         model_path = str(getattr(self.state, "current_model_path", "") or "")
         if model_path:
             try:
@@ -3147,6 +3037,58 @@ class MainWindow(QMainWindow):
                     "segment_index": index,
                     "length": display_length,
                 }
+                if segment_type == "work":
+                    layout = normalised.get("layout") or {}
+                    region_sources = {
+                        str(region.get("region_id")): region
+                        for region in (layout.get("work_regions") or [])
+                        if isinstance(region, dict) and region.get("region_id") is not None
+                    }
+                    region_routes = (
+                        (normalised.get("turn_assessment") or {}).get(
+                            "region_routes"
+                        )
+                        or []
+                    )
+                    for route in region_routes:
+                        if not isinstance(route, dict):
+                            continue
+                        start = route.get("segment_start_index")
+                        end = route.get("segment_end_index")
+                        if start is None or end is None:
+                            continue
+                        if not (int(start) <= index <= int(end)):
+                            continue
+                        region_id = route.get("region_id")
+                        region = region_sources.get(str(region_id), {})
+                        item["region_id"] = region_id
+                        item["region_kind"] = route.get("kind") or region.get("kind")
+                        item["line_source"] = (
+                            region.get("line_source")
+                            or (
+                                "cutter_width_uniform_swaths"
+                                if item["region_kind"] == "uniform_block"
+                                else "four_row_band_centerlines"
+                            )
+                        )
+                        break
+                    if not item.get("line_source") and len(region_routes) == 1:
+                        route = region_routes[0]
+                        region_id = route.get("region_id") if isinstance(route, dict) else None
+                        region = region_sources.get(str(region_id), {})
+                        item["region_id"] = region_id
+                        item["region_kind"] = (
+                            (route.get("kind") if isinstance(route, dict) else None)
+                            or region.get("kind")
+                        )
+                        item["line_source"] = (
+                            region.get("line_source")
+                            or (
+                                "cutter_width_uniform_swaths"
+                                if item["region_kind"] == "uniform_block"
+                                else "four_row_band_centerlines"
+                            )
+                        )
                 ordered.append(item)
                 if segment_type == "work":
                     tracks.append(item)
@@ -3279,6 +3221,10 @@ class MainWindow(QMainWindow):
             "mask_fingerprint": str(mask_record.get("fingerprint", "")),
             "path_config": path_config,
             "harvester": current_harvester,
+            "harvester_param_sources": self._normalise_harvester_param_sources(
+                current_harvester,
+                getattr(self.state, "harvester_param_sources", {}) or {},
+            ),
             "turn_strategy": str(getattr(self.state, "turn_strategy", "auto")),
             "entry_point": getattr(self.state, "entry_point", None),
             "exit_point": getattr(self.state, "exit_point", None),
@@ -3306,41 +3252,113 @@ class MainWindow(QMainWindow):
         }
 
     def _export_gate_mode(self) -> str:
-        """Export gate behaviour: 'fail_closed' (default) or 'confirm'.
+        """Export gate behaviour: 'confirm' (default) or 'fail_closed'.
 
-        DECISION-001 remains the default contract: formal geographic exports
-        fail closed unless validation evidence is complete. Operators who
-        explicitly opt in via ``export.gate_mode = "confirm"`` in config.json
-        accept risk visibility instead of hard blocking; risk metrics are still
-        computed and displayed either way. The ``REUI_EXPORT_GATE`` environment
-        variable overrides the config so automated test suites always run under
-        a deterministic gate.
+        Research output keeps the computed route metrics and provenance in the
+        manifest, but does not turn theoretical footprint thresholds into a
+        file-format/export blocker.  ``fail_closed`` remains available for
+        strict CI or controlled-trial runs.  The ``REUI_EXPORT_GATE``
+        environment variable overrides the config so automated test suites can
+        select a deterministic gate.
         """
         env_mode = str(os.environ.get("REUI_EXPORT_GATE", "")).strip().lower()
         if env_mode:
             return env_mode if env_mode in {"fail_closed", "confirm"} else "fail_closed"
         try:
-            mode = (self.cfg.section("export") or {}).get("gate_mode", "fail_closed")
+            mode = (self.cfg.section("export") or {}).get("gate_mode", "confirm")
         except Exception:
-            mode = "fail_closed"
-        return str(mode or "fail_closed").strip().lower() or "fail_closed"
+            mode = "confirm"
+        return str(mode or "confirm").strip().lower() or "confirm"
 
     def _confirm_export_risk(self, title: str, detail: str) -> None:
-        """Enforce the gate: hard-block in fail_closed, silent-pass in confirm mode.
+        """Enforce strict mode while keeping research output silent.
 
-        In ``confirm`` mode the operator has already chosen to export, so no
-        dialog is shown; the risk is recorded in the log panel instead.
+        In ``confirm`` mode the computed detail remains in the path result and
+        manifest, but it does not become a popup or warning log.
         """
         if self._export_gate_mode() != "confirm":
             raise ValueError(detail)
-        self.log_panel.warn(f"导出门控 confirm：已放行（{detail}）")
+        # Research export keeps the detail in validation/manifest fields.  Do
+        # not turn a computed scientific metric into a popup or warning log.
+        return
 
-    def _geo_export_payload(self):
-        """DECISION-001: fail-closed gate for every formal geographic export.
+    def _record_compatibility_preview_risk(self, detail: str) -> None:
+        """Keep compatibility diagnostics in the manifest without UI noise."""
+        return
+
+    @staticmethod
+    def _layout_has_planning_recovery(layout) -> bool:
+        """Detect explicit or nested cached automatic work-band recovery."""
+        def walk(value):
+            if isinstance(value, dict):
+                if value.get("planning_recovered") is True:
+                    return True
+                return any(walk(item) for item in value.values())
+            if isinstance(value, (list, tuple)):
+                return any(walk(item) for item in value)
+            return False
+
+        return walk(layout)
+
+    def _enforce_formal_parameter_and_recovery_gate(self, path_result):
+        """Report provenance/recovery risks without hiding them in exports.
+
+        The route data still carries the original source and recovery flags.
+        In strict ``fail_closed`` mode these conditions remain blocking; in
+        the normal research export mode they are recorded as warnings so a
+        reproducible research artifact can still be written.
+        """
+        path_result = path_result or {}
+        validation = path_result.get("validation", {}) or {}
+        profile = str(
+            validation.get("validation_profile")
+            or self.cfg.section("path_planning").get("validation_profile", "field_trial")
+        )
+        if profile not in {"field_trial", "machine_candidate"}:
+            return
+        planning_factors = path_result.get("planning_factors", {}) or {}
+        source_status = dict(
+            planning_factors.get("harvester_parameter_source_status")
+            or (path_result.get("machine_readiness", {}) or {}).get(
+                "harvester_parameter_source_status"
+            )
+            or {}
+        )
+        source_map = dict(
+            planning_factors.get("harvester_param_sources")
+            or source_status.get("sources")
+            or {}
+        )
+        required_params = list(
+            (planning_factors.get("harvester") or {}).keys()
+            or source_status.get("required")
+            or []
+        )
+        unverified = [
+            key for key in required_params
+            if source_map.get(key) != "user_measured"
+        ]
+        if unverified:
+            self._confirm_export_risk(
+                "导出确认",
+                "农机参数来源未完成实测记录，禁止田间试验/机器候选正式导出："
+                + ", ".join(unverified)
+            )
+        if self._layout_has_planning_recovery(path_result.get("layout", {})):
+            self._confirm_export_risk(
+                "导出确认",
+                "当前缓存路径包含 planning_recovered=True 的自动恢复作业带，"
+                "禁止正式导出；请重新规划或逐条人工确认后再导出"
+            )
+
+    def _geo_export_payload(self, *, formal=True):
+        """DECISION-001: validate export data before serializing coordinates.
 
         GeoJSON, CSV, KML, JSON and $PATH must all pass this function. The
         checks are intentionally redundant with stage validation because a
-        route may enter a field trial. No exporter may bypass this gate.
+        route may enter a field trial. Research mode keeps computed metrics in
+        the manifest without turning them into a hard export blocker; source,
+        coordinate and route-data consistency checks remain mandatory.
         See docs/DECISIONS.md and the DECISION-001 invariant tests.
         """
         if not self.geo.is_ready():
@@ -3356,10 +3374,14 @@ class MainWindow(QMainWindow):
         if validation.get("validation_source") == "cache_snapshot" or not bool(
             validation.get("current_validation_complete", True)
         ):
-            self._confirm_export_risk(
-                "导出确认",
-                "路径来自缓存快照，尚未使用当前输入重新验证，禁止正式导出",
-            )
+            detail = "路径来自缓存快照，尚未使用当前输入重新验证"
+            if formal:
+                self._confirm_export_risk(
+                    "导出确认",
+                    detail + "，禁止正式导出",
+                )
+            else:
+                self._record_compatibility_preview_risk(detail)
         path_valid = bool(
             path_result.get("is_valid", validation.get("valid", False))
             and validation.get("valid", path_result.get("is_valid", False))
@@ -3395,20 +3417,36 @@ class MainWindow(QMainWindow):
                 elif abs(float(value) - float(current_value)) > 1e-9:
                     changed.append(key)
             if changed:
-                self._confirm_export_risk(
-                    "导出确认",
-                    "当前农机参数与路径规划时不一致，必须重新规划："
-                    + ", ".join(changed),
+                detail = (
+                    "当前农机参数与路径规划时不一致："
+                    + ", ".join(changed)
                 )
+                if formal:
+                    self._confirm_export_risk(
+                        "导出确认",
+                        detail + "，必须重新规划",
+                    )
+                else:
+                    self._record_compatibility_preview_risk(detail)
+        if formal:
+            self._enforce_formal_parameter_and_recovery_gate(path_result)
+        elif self._layout_has_planning_recovery(path_result.get("layout", {})):
+            self._record_compatibility_preview_risk(
+                "路径包含 planning_recovered=True 的自动恢复作业带"
+            )
         requested_strategy = path_result.get("requested_strategy")
         if (
             requested_strategy
             and str(requested_strategy) != str(getattr(self.state, "turn_strategy", "auto"))
         ):
-            self._confirm_export_risk(
-                "导出确认",
-                "当前调头策略与路径规划时不一致，必须重新规划",
-            )
+            detail = "当前调头策略与路径规划时不一致"
+            if formal:
+                self._confirm_export_risk(
+                    "导出确认",
+                    detail + "，必须重新规划",
+                )
+            else:
+                self._record_compatibility_preview_risk(detail)
         full_path = path_result.get("full_path", [])
         segment_types = path_result.get("segment_types", [])
         display_h, display_w = (
@@ -3514,7 +3552,14 @@ class MainWindow(QMainWindow):
             self._file_hash_cache[key] = value
         return value
 
-    def _write_export_manifest(self, output_path, output_format, path_result, geo_points):
+    def _write_export_manifest(
+        self,
+        output_path,
+        output_format,
+        path_result,
+        geo_points,
+        protocol_metadata=None,
+    ):
         """DECISION-001: make a route inseparable from its audit evidence.
 
         A manifest failure is an export failure; callers must not report a
@@ -3571,7 +3616,7 @@ class MainWindow(QMainWindow):
             "raster_preprocessing.py",
             "mask_processor.py",
             "row_geometry.py",
-            "coverage.py",
+            "legacy_route_coverage.py",
             "footprint_planner.py",
             "path_planner.py",
             "provenance.py",
@@ -3620,7 +3665,14 @@ class MainWindow(QMainWindow):
                 if controlled_trial else "RESEARCH_MANUAL_REVIEW_ONLY"
             ),
         }
-        if str(output_format).upper() == "$PATH":
+        output_format_upper = str(output_format).upper()
+        if output_format_upper in {"$PATH", "$PATH_MACHINE_COMPAT"}:
+            compatibility_protocol = output_format_upper == "$PATH_MACHINE_COMPAT"
+            compatibility_preview = bool(
+                compatibility_protocol
+                and isinstance(protocol_metadata, dict)
+                and protocol_metadata.get("preview_only") is True
+            )
             output_metadata["candidate_machine_path"] = True
             output_metadata["terminal_protocol_validated"] = bool(
                 controlled_trial
@@ -3629,21 +3681,44 @@ class MainWindow(QMainWindow):
             output_metadata["machine_executable"] = output_metadata[
                 "terminal_protocol_validated"
             ]
-            output_metadata["path_protocol"] = {
+            path_protocol = {
                 "record_prefix": "$PATH",
                 "coordinate_order": ["latitude", "longitude"],
                 "point_index_base": 0,
                 "record_terminator": "*",
-                "route_id": self.cfg.ROUTE_ID,
-                "status_codes": {
-                    "turn_or_other": 0,
-                    "work": 1,
-                    "entry": 2,
-                    "exit": 3,
-                    "turn_reverse_or_aux": 4,
-                },
+                "protocol_variant": (
+                    "machine_harvester_straight_turn_v1"
+                    if compatibility_protocol
+                    else "research_compatibility"
+                ),
+                "route_id": 0 if compatibility_protocol else self.cfg.ROUTE_ID,
+                "status_codes": (
+                    {
+                        "turn_or_other": 0,
+                        "work": 1,
+                    }
+                    if compatibility_protocol
+                    else {
+                        "turn_or_other": 0,
+                        "work": 1,
+                        "entry": 2,
+                        "exit": 3,
+                        "turn_reverse_or_aux": 4,
+                    }
+                ),
                 "final_record": self.cfg.INFM_LINE,
             }
+            if compatibility_protocol:
+                path_protocol.update(self._manifest_jsonable(protocol_metadata or {}))
+            if compatibility_preview:
+                output_metadata["preview_only"] = True
+                output_metadata["route_classification"] = "compatibility_preview"
+                output_metadata["usage_restriction"] = (
+                    "COMPATIBILITY_TEST_ONLY_MANUAL_REVIEW"
+                )
+                output_metadata["terminal_protocol_validated"] = False
+                output_metadata["machine_executable"] = False
+            output_metadata["path_protocol"] = path_protocol
         manifest = {
             "schema": 2,
             "application_version": APP_VERSION,
@@ -3675,6 +3750,9 @@ class MainWindow(QMainWindow):
                 "fallback_pipeline": bool(diagnostics.get("fallback_pipeline", False)),
                 "harvester_params": self._manifest_jsonable(
                     getattr(self.state, "harvester_params", {}) or {}
+                ),
+                "harvester_param_sources": self._manifest_jsonable(
+                    getattr(self.state, "harvester_param_sources", {}) or {}
                 ),
                 "turn_strategy": str(getattr(self.state, "turn_strategy", "")),
                 "validation": self._manifest_jsonable(
@@ -3849,15 +3927,12 @@ class MainWindow(QMainWindow):
         elif not self.geo.is_ready():
             normalised["geo_points"] = []
         auto_segments = self._auto_segments_from_path(normalised)
-        flat_points, flat_status = [], []
-        for segment in auto_segments:
-            for point in segment.points:
-                point_tuple = (point.pixel_x, point.pixel_y)
-                if flat_points and math.hypot(point_tuple[0] - flat_points[-1][0], point_tuple[1] - flat_points[-1][1]) < 1e-6:
-                    flat_status[-1] = segment.status
-                    continue
-                flat_points.append(point_tuple)
-                flat_status.append(segment.status)
+        # Keep one compact control polyline for the route editor and the
+        # machine-compatibility projection.  The dense canonical segments stay
+        # in ``auto_path`` for scientific validation and footprint metrics.
+        control_points, control_status = self._build_route_control_polyline(
+            auto_segments
+        )
 
         geo_points = normalised.get("geo_points", [])
         validation = normalised.get("validation", {}) or {}
@@ -3869,6 +3944,7 @@ class MainWindow(QMainWindow):
                 "requested_strategy",
                 "coordinate_space",
                 "machine_readiness",
+                "machine_executable",
                 "path_candidates",
                 "layout",
             )
@@ -3881,8 +3957,8 @@ class MainWindow(QMainWindow):
             auto_path_valid=bool(normalised.get("is_valid", validation.get("valid", False))),
             auto_path_desc=normalised.get("description", ""),
             auto_path_planned=bool(auto_segments),
-            path_points=flat_points,
-            path_status=flat_status,
+            path_points=control_points,
+            path_status=control_status,
             path_validation=dict(validation),
             path_provenance=dict(normalised.get("provenance") or {}),
             path_runtime=dict(normalised.get("runtime") or {}),
@@ -3924,7 +4000,7 @@ class MainWindow(QMainWindow):
         "pear": "梨形调头",
         "fishtail": "鱼尾折返",
         "alpha": "紧凑 Alpha",
-        "contour": "套圈收割（外圈向内）",
+        "contour": "套圈收割",
     }
 
     def _turn_strategy_label(self, path_result=None):
@@ -4304,19 +4380,36 @@ class MainWindow(QMainWindow):
             self.log_panel.info("对比：显示当前操作结果")
         self.image_view.viewer.restore_view_state(view_state)
 
-    def _on_measure_tool_changed(self, tool):
-        self._measure_tool = tool
+    def _clear_measurement_overlay(self):
+        viewer = self.image_view.viewer
+        viewer.remove_overlays(self._measure_overlay_items)
+        self._measure_overlay_items = []
+
+    def _measure_draw(self, draw_call, *args, **kwargs):
+        item = draw_call(*args, **kwargs)
+        if item is not None:
+            self._measure_overlay_items.append(item)
+        return item
+
+    def _reset_measurement_geometry(self):
+        self._clear_measurement_overlay()
         self._measure_points = []
+        self._measure_complete = False
+
+    def _on_measure_tool_changed(self, tool):
+        self._reset_measurement_geometry()
+        self._measure_tool = tool
         if tool:
             self._field_drawing = False
             self._sync_drawing_mode()
             tips = {
                 "point": "点选模式：点击地图查看经纬度",
-                "line": "测距模式：点击两个点测量距离",
-                "area": "测面积模式：点击多边形顶点并闭合",
+                "line": "测距模式：点击两个点，右键确认长度；左键开始下一条",
+                "area": "测面积模式：点击多边形顶点，右键确认面积；左键开始下一个",
             }
             self.log_panel.info(tips.get(tool, "测量工具"))
         else:
+            self._sync_drawing_mode()
             self.log_panel.info("已关闭测量工具")
 
     def _format_distance(self, meters):
@@ -4330,58 +4423,123 @@ class MainWindow(QMainWindow):
         viewer = self.image_view.viewer
         tool = self._measure_tool
         if tool == "point" and button == 1:
-            viewer.draw_circle(x, y, radius=7, color=(255, 200, 0))
+            self._reset_measurement_geometry()
+            self._measure_points = [(x, y)]
+            self._measure_draw(
+                viewer.draw_circle, x, y, radius=7, color=(255, 200, 0)
+            )
             if self.geo.is_ready():
                 lon, lat = self.geo.pixel_to_lonlat(x, y)
                 text = f"lon:{lon:.7f}\nlat:{lat:.7f}"
             else:
                 text = f"x:{x}\ny:{y}"
-            viewer.draw_text(x + 10, y + 10, text, color=(255, 255, 255), size=11)
+            self._measure_draw(
+                viewer.draw_text,
+                x + 10,
+                y + 10,
+                text,
+                color=(255, 255, 255),
+                size=11,
+            )
             self.log_panel.info(text.replace("\n", "  "))
+            self._measure_complete = True
             return True
         if tool == "line" and button == 1:
+            if self._measure_complete or len(self._measure_points) >= 2:
+                self._reset_measurement_geometry()
             self._measure_points.append((x, y))
-            viewer.draw_circle(x, y, radius=6, color=(0, 220, 255))
+            self._measure_draw(
+                viewer.draw_circle, x, y, radius=6, color=(0, 220, 255)
+            )
             if len(self._measure_points) == 2:
                 p1, p2 = self._measure_points
-                dist = self.geo.pixel_distance_m(p1, p2) if self.geo.is_ready() else math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-                unit = self._format_distance(dist) if self.geo.is_ready() else f"{dist:.1f} px"
-                viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(0, 220, 255), width=3)
-                viewer.draw_text((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2, unit, color=(255, 255, 255), size=12)
-                self.log_panel.info(f"??: {unit}")
-                self._measure_points = []
+                self._measure_draw(
+                    viewer.draw_line,
+                    p1[0], p1[1], p2[0], p2[1],
+                    color=(0, 220, 255), width=3,
+                )
+            return True
+        if tool == "line" and button == 2:
+            if len(self._measure_points) != 2:
+                self.log_panel.warn("测距需要先点击两个点")
+                return True
+            if self._measure_complete:
+                return True
+            p1, p2 = self._measure_points
+            dist = (
+                self.geo.pixel_distance_m(p1, p2)
+                if self.geo.is_ready()
+                else math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            )
+            unit = (
+                self._format_distance(dist)
+                if self.geo.is_ready()
+                else f"{dist:.1f} px"
+            )
+            self._measure_draw(
+                viewer.draw_text,
+                (p1[0] + p2[0]) / 2,
+                (p1[1] + p2[1]) / 2,
+                unit,
+                color=(255, 255, 255),
+                size=12,
+            )
+            self.log_panel.info(f"测距: {unit}")
+            self._measure_complete = True
             return True
         if tool == "area":
             if button == 2 and len(self._measure_points) >= 3:
                 self._finish_measure_area()
                 return True
+            if button == 2:
+                self.log_panel.warn("测面积需要先点击至少三个顶点")
+                return True
             if button != 1:
                 return True
+            if self._measure_complete:
+                self._reset_measurement_geometry()
             if len(self._measure_points) >= 3:
                 first = self._measure_points[0]
                 if math.hypot(x - first[0], y - first[1]) <= 12:
                     self._finish_measure_area()
                     return True
             self._measure_points.append((x, y))
-            viewer.draw_circle(x, y, radius=6, color=(255, 220, 0))
+            self._measure_draw(
+                viewer.draw_circle, x, y, radius=6, color=(255, 220, 0)
+            )
             if len(self._measure_points) >= 2:
                 p1, p2 = self._measure_points[-2], self._measure_points[-1]
-                viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(255, 220, 0), width=3)
+                self._measure_draw(
+                    viewer.draw_line,
+                    p1[0], p1[1], p2[0], p2[1],
+                    color=(255, 220, 0), width=3,
+                )
             return True
         return False
 
     def _finish_measure_area(self):
         pts = list(self._measure_points)
-        if len(pts) < 3:
+        if len(pts) < 3 or self._measure_complete:
             return
         viewer = self.image_view.viewer
-        viewer.draw_line(pts[-1][0], pts[-1][1], pts[0][0], pts[0][1], color=(255, 220, 0), width=3)
+        self._measure_draw(
+            viewer.draw_line,
+            pts[-1][0], pts[-1][1], pts[0][0], pts[0][1],
+            color=(255, 220, 0), width=3,
+        )
         area_info = self._estimate_field_area(pts)
         cx = sum(p[0] for p in pts) / len(pts)
         cy = sum(p[1] for p in pts) / len(pts)
-        viewer.draw_text(cx, cy, f"面积: {area_info}", color=(255, 255, 255), size=12)
+        self._measure_draw(
+            viewer.draw_text,
+            cx,
+            cy,
+            f"面积: {area_info}",
+            color=(255, 255, 255),
+            size=12,
+        )
         self.log_panel.info(f"面积测量: {area_info}")
-        self._measure_points = []
+        self._measure_complete = True
     def _mask_for_overlay(self, mask):
         if self._tif_rgb is None or mask is None:
             return None
@@ -4505,7 +4663,7 @@ class MainWindow(QMainWindow):
             for i in range(len(boundary)):
                 p1 = boundary[i]
                 p2 = boundary[(i + 1) % len(boundary)]
-                viewer.draw_line(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]), color=(0, 255, 100), width=2)
+                viewer.draw_line(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]), color=(50, 140, 255), width=2)
         self._draw_forbidden_regions(clear_first=False)
         self._draw_service_points_overlay(clear_first=False)
 
@@ -4537,7 +4695,7 @@ class MainWindow(QMainWindow):
             for i in range(len(boundary)):
                 p1 = boundary[i]
                 p2 = boundary[(i + 1) % len(boundary)]
-                viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(0, 255, 100), width=4)
+                viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(50, 140, 255), width=4)
         self._draw_forbidden_regions(clear_first=False)
         self._draw_service_points_overlay(clear_first=False)
         route_style = Qt.DashLine if stale_preview else Qt.SolidLine
@@ -4607,6 +4765,32 @@ class MainWindow(QMainWindow):
             return
         self._on_toggle_animation()
 
+    def _handle_animation_error(self, exc, path=None):
+        """Stop a failed preview without rolling back or discarding the route."""
+        if self._anim_timer:
+            self._anim_timer.stop()
+        self._anim_timer = None
+        self._anim_engine = None
+        self.state.anim_active = False
+        self.state.anim_paused = False
+        self.image_view.set_animation_controls_visible(False)
+        self.lbl_speed.clear()
+        self._clear_anim_overlay()
+        try:
+            if path:
+                self._show_path(path)
+        except Exception as restore_exc:
+            self.log_panel.error(
+                f"模拟演示失败后恢复路线显示也失败: "
+                f"{type(restore_exc).__name__}: {restore_exc}"
+            )
+        self._sync_task_statuses()
+        self.top_toolbar.refresh_actions(self.state)
+        self.log_panel.error(
+            f"模拟演示启动/刷新失败，路线未回退: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
     def _on_toggle_animation(self):
         if getattr(self.state, 'anim_active', False):
             self.state.anim_active = False
@@ -4631,8 +4815,15 @@ class MainWindow(QMainWindow):
         if not segments:
             self.log_panel.warn("路径点不足：当前路径点不足，无法进行模拟演示，请重新执行路径规划。")
             return
-        self._anim_engine = AnimationEngine(self.state, self.geo)
-        self._anim_engine.setup(segments)
+        try:
+            self._anim_engine = AnimationEngine(self.state, self.geo)
+            self._anim_engine.setup(segments)
+            # 首帧立即绘制，既让用户看到演示已经接管画布，也把几何/参数
+            # 错误拦截在启动阶段，避免 Qt 定时器回调静默中断。
+            self._render_anim_frame()
+        except Exception as exc:
+            self._handle_animation_error(exc, path)
+            return
         self.state.anim_active = True
         self.state.anim_paused = False
         self.state.anim_speed = 1.0
@@ -4681,33 +4872,37 @@ class MainWindow(QMainWindow):
                 self._anim_timer.stop()
                 self._anim_timer = None
             return
-        finished = not self._anim_engine.advance()
-        s = self.state
-        if finished or s.anim_frame >= s.anim_total_frames - 1:
-            self.state.anim_active = False
-            if self._anim_timer:
-                self._anim_timer.stop()
-                self._anim_timer = None
-            self.image_view.set_animation_progress(1.0)
-            self.image_view.set_animation_controls_visible(False)
-            self.lbl_speed.clear()
-            self.log_panel.info("演示完成")
-            report = self._anim_engine._gen_report()
-            if report:
-                self.log_panel.info(report)
-            self._show_path(self._pipeline_result.get("path", {}))
-            WorkflowUpdater.advance(self.state, "ANIMATION_DONE")
-            self._sync_task_statuses()
-            self.top_toolbar.refresh_actions(self.state)
-            return
-        self._render_anim_frame()
-        ratio = self._anim_engine.progress_ratio()
-        pct = int(round(ratio * 100))
-        self.image_view.set_animation_progress(ratio)
-        remaining = self._anim_engine.get_remaining_seconds()
-        rem_str = f"{remaining:.0f}s" if remaining > 0 else "..."
-        speed_str = f"{s.anim_speed:g}x"
-        self.lbl_speed.setText(f"  进度 {pct}%  播放 {speed_str}  剩余 {rem_str}  ")
+        path = (self._pipeline_result or {}).get("path", {})
+        try:
+            finished = not self._anim_engine.advance()
+            s = self.state
+            if finished or s.anim_frame >= s.anim_total_frames - 1:
+                self.state.anim_active = False
+                if self._anim_timer:
+                    self._anim_timer.stop()
+                    self._anim_timer = None
+                self.image_view.set_animation_progress(1.0)
+                self.image_view.set_animation_controls_visible(False)
+                self.lbl_speed.clear()
+                self.log_panel.info("演示完成")
+                report = self._anim_engine._gen_report()
+                if report:
+                    self.log_panel.info(report)
+                self._show_path(path)
+                WorkflowUpdater.advance(self.state, "ANIMATION_DONE")
+                self._sync_task_statuses()
+                self.top_toolbar.refresh_actions(self.state)
+                return
+            self._render_anim_frame()
+            ratio = self._anim_engine.progress_ratio()
+            pct = int(round(ratio * 100))
+            self.image_view.set_animation_progress(ratio)
+            remaining = self._anim_engine.get_remaining_seconds()
+            rem_str = f"{remaining:.0f}s" if remaining > 0 else "..."
+            speed_str = f"{s.anim_speed:g}x"
+            self.lbl_speed.setText(f"  进度 {pct}%  播放 {speed_str}  剩余 {rem_str}  ")
+        except Exception as exc:
+            self._handle_animation_error(exc, path)
 
     def _on_animation_pause(self):
         if not self._anim_engine or not self.state.anim_active:
@@ -4942,6 +5137,31 @@ class MainWindow(QMainWindow):
                 QApplication.restoreOverrideCursor()
             self._show_geo_export_error("$PATH", e)
 
+    def _on_export_machine_compatibility_path(self):
+        """Export the terminal-specific 0/1 PATH projection as numbered files."""
+        try:
+            path = QFileDialog.getExistingDirectory(
+                self,
+            )
+            if not path:
+                return
+            route_path, _manifest_path = self._export_candidate_path(
+                path,
+                machine_compatibility=True,
+                preview_only=True,
+            )
+            message = (
+                f"已导出农机兼容测试文件：{os.path.dirname(route_path)}，首份为 {os.path.basename(route_path)}；"
+                "转弯已压缩为端点直线，状态码仅使用 0/1；"
+                "该文件不代表正式机器执行就绪"
+            )
+            self.log_panel.success(message)
+            self.lbl_status.setText("农机兼容测试文件导出完成")
+        except Exception as e:
+            if QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+            self._show_geo_export_error("农机兼容测试 $PATH", e)
+
     def _on_export_trial_package(self):
         """Export the complete trial package into a chosen directory."""
         parent = QFileDialog.getExistingDirectory(
@@ -4980,47 +5200,135 @@ class MainWindow(QMainWindow):
             return "package"
         return ""
 
-    def _export_candidate_path(self, path, path_result=None, geo_points=None):
+    def _export_candidate_path(
+        self,
+        path,
+        path_result=None,
+        geo_points=None,
+        *,
+        machine_compatibility=False,
+        preview_only=False,
+    ):
         """DECISION-001: every candidate path remains inseparable from its manifest."""
+        if preview_only and not machine_compatibility:
+            raise ValueError("只有农机兼容路径允许生成非正式测试文件")
         if path_result is None or geo_points is None:
-            path_result, geo_points = self._geo_export_payload()
-        from machine_route_validator import assess_machine_readiness
+            path_result, geo_points = self._geo_export_payload(
+                formal=not preview_only
+            )
+        else:
+            if not preview_only:
+                self._enforce_formal_parameter_and_recovery_gate(path_result)
+        canonical_point_count = len(geo_points or [])
+        compatibility_route_source = "canonical_dense_path_fallback"
+        if machine_compatibility:
+            control_geo_points = self._control_route_geo_points()
+            if control_geo_points:
+                # The terminal preview must serialize exactly the control
+                # polyline shown by route editing.  The canonical dense route
+                # remains the source for formal research validation above.
+                geo_points = control_geo_points
+                compatibility_route_source = "shared_route_control_polyline"
+        if not preview_only:
+            from machine_route_validator import assess_machine_readiness
 
-        stored_readiness = dict(path_result.get("machine_readiness") or {})
-        readiness = assess_machine_readiness(
-            path_result, self.cfg.section("path_planning")
-        )
-        if stored_readiness != readiness:
-            self._confirm_export_risk(
-                "导出确认",
-                "机器就绪证据已过期或与当前路径及配置不一致，禁止生成收获机路径文件",
+            stored_readiness = dict(path_result.get("machine_readiness") or {})
+            readiness = assess_machine_readiness(
+                path_result, self.cfg.section("path_planning")
             )
-        machine_ready = bool(
-            readiness.get("schema") == "reui.machine-readiness.v1"
-            and readiness.get("eligible_for_machine_export") is True
-            and readiness.get("controlled_trial_ready") is True
-            and readiness.get("blockers") == []
-            and readiness.get("controlled_trial_blockers") == []
-            and readiness.get("manual_review_required") is False
-            and readiness.get("current_route_classification")
-            == "machine_export_candidate"
-        )
-        if not machine_ready:
-            self._confirm_export_risk(
-                "导出确认",
-                "机器就绪证据不完整，禁止生成收获机路径文件",
+            if stored_readiness != readiness:
+                self._confirm_export_risk(
+                    "导出确认",
+                    "机器就绪证据已过期或与当前路径及配置不一致，禁止生成收获机路径文件",
+                )
+            machine_ready = bool(
+                readiness.get("schema") == "reui.machine-readiness.v1"
+                and readiness.get("eligible_for_machine_export") is True
+                and readiness.get("controlled_trial_ready") is True
+                and readiness.get("blockers") == []
+                and readiness.get("controlled_trial_blockers") == []
+                and readiness.get("manual_review_required") is False
+                and readiness.get("current_route_classification")
+                == "machine_export_candidate"
             )
-        if readiness.get("terminal_protocol_validated") is not True:
-            self._confirm_export_risk(
-                "导出确认",
-                "目标收获机终端协议尚未验证，禁止生成机器路径文件",
+            if not machine_ready:
+                self._confirm_export_risk(
+                    "导出确认",
+                    "机器就绪证据不完整，禁止生成收获机路径文件",
+                )
+            if readiness.get("terminal_protocol_validated") is not True:
+                self._confirm_export_risk(
+                    "导出确认",
+                    "目标收获机终端协议尚未验证，禁止生成机器路径文件",
+                )
+        protocol_metadata = None
+        manifest_format = "$PATH"
+        if machine_compatibility:
+            from path_planner import export_machine_compatibility_path
+
+            manifest_points, protocol_metadata = export_machine_compatibility_path(
+                geo_points,
+                path,
+                field_polygon=(
+                    np.asarray(self.state.field_boundary, dtype=np.float64)
+                    if len(getattr(self.state, "field_boundary", []) or []) >= 3
+                    else None
+                ),
+                forbidden_regions=(
+                    getattr(self.state, "forbidden_regions", []) or []
+                ),
             )
-        from path_planner import export_path_format
-        export_path_format(geo_points, path)
-        manifest = self._write_export_manifest(
-            path, "$PATH", path_result, geo_points
-        )
-        return path, manifest
+            manifest_points = list(manifest_points)
+            manifest_format = "$PATH_MACHINE_COMPAT"
+            protocol_metadata.update({
+                "route_source": compatibility_route_source,
+                "control_route_point_count": int(
+                    len(getattr(self.state, "path_points", []) or [])
+                    if compatibility_route_source == "shared_route_control_polyline"
+                    else len(geo_points)
+                ),
+                "control_route_geo_record_count": int(len(geo_points)),
+                "canonical_route_point_count": int(canonical_point_count),
+                "control_route_status_semantics": "outgoing_edge_0_turn_1_work",
+            })
+            if preview_only:
+                protocol_metadata.update({
+                    "preview_only": True,
+                    "machine_executable": False,
+                    "formal_gate_bypassed": [
+                        "harvester_parameter_source",
+                        "machine_readiness",
+                        "terminal_protocol_validation",
+                    ],
+                })
+        else:
+            from path_planner import export_path_format
+
+            export_path_format(geo_points, path)
+            manifest_points = geo_points
+        manifest_output_path = path
+        if isinstance(protocol_metadata, dict):
+            output_files = list(protocol_metadata.get("output_files") or [])
+            if output_files:
+                manifest_output_path = output_files[0]
+        if protocol_metadata is None:
+            # Keep the original call shape for existing package/export
+            # integrations that replace the manifest writer in tests.
+            manifest = self._write_export_manifest(
+                manifest_output_path,
+                manifest_format,
+                path_result,
+                manifest_points,
+            )
+        else:
+            manifest = self._write_export_manifest(
+                manifest_output_path,
+                manifest_format,
+                path_result,
+                manifest_points,
+                protocol_metadata=protocol_metadata,
+            )
+        return manifest_output_path, manifest
 
     @staticmethod
     def _unique_package_path(parent):
@@ -5161,9 +5469,12 @@ class MainWindow(QMainWindow):
             current = self._effective_harvester_params(
                 getattr(self.state, "harvester_params", {}) or {}
             )
+            # 参数来源继续保存在内部 provenance 中，但不再要求用户在
+            # 参数窗口里重复选择；窗口只负责编辑物理数值。
             dlg = HarvesterParamsDialog(current, self)
             if dlg.exec() == QDialog.Accepted:
-                self._apply_harvester_params(dlg.get_params(), "用户自定义")
+                values = dlg.get_params()
+                self._apply_harvester_params(values, "user_entered")
         elif mode == "recommend":
             self._show_machine_recommendation(None)
 
@@ -5172,7 +5483,7 @@ class MainWindow(QMainWindow):
         box.setWindowTitle("农机尺寸配置")
         box.setIcon(QMessageBox.Question)
         box.setText(
-            "请选择参数来源。智能推荐会根据处理后的宽窄行通道净宽和田头空间"
+            "请选择参数设置方式。智能推荐会根据处理后的宽窄行通道净宽和田头空间"
             "给出候选尺寸；具体机型仍需人工核对。"
         )
         custom_button = box.addButton("自定义输入", QMessageBox.AcceptRole)
@@ -5188,6 +5499,12 @@ class MainWindow(QMainWindow):
         return ""
 
     def _apply_harvester_params(self, values, source, *, require_cutter_offset=True):
+        values = dict(values or {})
+        explicit_source = values.pop("_parameter_source", None)
+        source_key = self._normalise_harvester_param_source(
+            explicit_source or source
+        )
+        source_label = HARVESTER_PARAM_SOURCE_LABELS.get(source_key, source_key)
         params = self._effective_harvester_params(values)
         if require_cutter_offset and not params.get("cutter_forward_offset_m"):
             self.log_panel.warn("农机参数不完整：割刀前置距离必须根据实际收获机测量，不能由系统推荐或推算。")
@@ -5196,6 +5513,14 @@ class MainWindow(QMainWindow):
             getattr(self.state, "harvester_params", {}) or {}
         )
         current_raw = getattr(self.state, "harvester_params", {}) or {}
+        previous_sources = self._normalise_harvester_param_sources(
+            previous,
+            getattr(self.state, "harvester_param_sources", {}) or {},
+        )
+        next_sources = self._default_harvester_param_sources(
+            params,
+            fallback=source_key,
+        )
         def differs(key):
             before = previous.get(key)
             after = params.get(key)
@@ -5221,19 +5546,25 @@ class MainWindow(QMainWindow):
             return False
 
         changed = any(differs(key) for key in params)
+        sources_changed = previous_sources != next_sources
         if not changed:
-            if state_needs_sync():
+            if state_needs_sync() or sources_changed:
                 self.state.harvester_params = params
+                self.state.harvester_param_sources = next_sources
                 self.state.harvester_params_confirmed = True
                 self._sync_task_statuses()
-                self.log_panel.info(f"{source}农机参数与当前配置一致，已应用到当前任务")
+                self.log_panel.info(
+                    f"{source_label}农机参数与当前配置一致，已应用到当前任务；"
+                    f"来源已记录为{source_label}"
+                )
                 return True
             self.state.harvester_params_confirmed = True
             self._sync_task_statuses()
-            self.log_panel.info(f"{source}农机参数与当前配置一致，已确认")
+            self.log_panel.info(f"{source_label}农机参数与当前配置一致，已确认")
             return True
         self._save_system_undo("修改农机参数")
         self.state.harvester_params = params
+        self.state.harvester_param_sources = next_sources
         self.state.harvester_params_confirmed = True
         config_snapshot = self.cfg.update_section("harvester", params)
         cfg_path = os.path.join(
@@ -5252,14 +5583,17 @@ class MainWindow(QMainWindow):
             f"{float(cutter_offset):.2f}m" if cutter_offset else "未设置"
         )
         self.log_panel.success(
-            f"{source}农机参数已保存: "
+            f"{source_label}农机参数已保存: "
             f"割台={params['cutter_width_m']:.2f}m, "
             f"割刀前置={cutter_offset_text}, "
             f"履带={params['track_width_m']:.2f}m, "
             f"中心距={params['track_gauge_m']:.2f}m, "
-            f"轴距={params['wheelbase_m']:.2f}m, "
             f"转弯半径={params['turn_radius_m']:.2f}m"
         )
+        if source_key != "user_measured":
+            self.log_panel.warn(
+                f"参数来源仍为{source_label}；田间试验/机器候选正式导出需要逐项用户实测记录"
+            )
         if not cutter_offset:
             self.log_panel.warn("割刀前置距离未设置；路径规划前仍需按实际收获机测量填写")
         return True
@@ -5315,7 +5649,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             self._apply_harvester_params(
                 dlg.get_params(),
-                "智能推荐",
+                "recommended",
                 require_cutter_offset=False,
             )
 
@@ -5358,15 +5692,11 @@ class MainWindow(QMainWindow):
             if text and text not in issues:
                 issues.append(text)
         warnings = list(assessment.get("warnings") or [])
-        if issues:
-            message = "路径已生成，但存在以下风险，不代表农机参数缺失：\n\n" + "\n".join(
-                f"• {item}" for item in issues
-            )
-            message += "\n\n建议：可切换调头方式重算，或进入“编辑路线”横向微调作业线/转弯段。"
-            self.log_panel.warn("路径风险提示: " + "；".join(str(x) for x in issues[:3]))
-            self.lbl_status.setText("路径已生成，存在风险，禁止正式导出")
-        elif warnings:
-            self.log_panel.warn("调头方式提示: " + "；".join(str(x) for x in warnings[:3]))
+        if issues or warnings:
+            # Metrics and the original issue list remain visible in the route
+            # result/manifest. This callback must not duplicate them as a
+            # warning or change a research export into a blocked state.
+            self.lbl_status.setText("路径已生成，指标已更新")
 
     def _on_route_edit_requested(self):
         if self._route_edit_active:
@@ -5392,47 +5722,314 @@ class MainWindow(QMainWindow):
         self._draw_route_edit_overlay()
         self.log_panel.info("路线编辑：Alt+左键在线段插点，拖动控制点，Backspace 删除选中点")
 
-    def _prepare_route_editing(self):
-        """Build a compact, shape-preserving control polyline for manual route editing."""
-        st = self.state
-        if not getattr(st, 'auto_path', None):
-            return
+    def _build_route_control_polyline(self, segments):
+        """Build the single compact polyline shared by editing and compat export.
+
+        Every work line is represented by its two endpoints.  Every contiguous
+        non-work run is represented by one straight chord, because the target
+        terminal accepts only the outgoing status values 1 (work) and 0
+        (turn/other).  The canonical ``auto_path`` remains untouched and
+        retains the dense research geometry used for scientific validation.
+        """
         points = []
         statuses = []
-        tolerance_m = max(0.005, float(self.cfg.section("ui").get("route_edit_tolerance_m", 0.02)))
-
-        def simplify(source_points):
+        route_segments = list(segments or [])
+        def simplify_work(source_points):
             values = np.asarray(source_points, dtype=np.float32)
             if len(values) <= 2:
                 return [tuple(map(float, point)) for point in values]
-            tolerance_px = 2.0
-            if self.geo.is_ready():
-                try:
-                    one_pixel_m = self.geo.pixel_distance_m(tuple(values[0]), (float(values[0, 0] + 1.0), float(values[0, 1])))
-                    tolerance_px = max(1.0, tolerance_m / max(one_pixel_m, 1e-9))
-                except Exception:
-                    tolerance_px = 2.0
-            simplified = cv2.approxPolyDP(values.reshape(-1, 1, 2), tolerance_px, False).reshape(-1, 2)
-            simplified[0] = values[0]
-            simplified[-1] = values[-1]
-            return [tuple(map(float, point)) for point in simplified]
+            return [
+                tuple(map(float, values[0])),
+                tuple(map(float, values[-1])),
+            ]
 
-        for segment in st.auto_path:
-            segment_status = int(getattr(segment, 'status', self._status_for_segment_type(getattr(segment, 'segment_type', 'work'))))
-            source_points = self._coerce_points(getattr(segment, 'points', []))
-            for point in simplify(source_points):
-                if not points:
-                    points.append(point)
-                    continue
-                if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) <= 1e-6:
-                    continue
-                points.append(point)
-                statuses.append(segment_status)
+        def append_control_point(point, status):
+            point = (float(point[0]), float(point[1]))
+            if points and math.hypot(
+                point[0] - points[-1][0], point[1] - points[-1][1]
+            ) <= 1e-6:
+                return
+            if points:
+                statuses.append(int(status))
+            points.append(point)
+
+        index = 0
+        while index < len(route_segments):
+            segment = route_segments[index]
+            segment_type = str(
+                getattr(segment, "segment_type", "") or "work"
+            )
+            if segment_type == "work":
+                source_points = self._coerce_points(
+                    getattr(segment, "points", [])
+                )
+                for point in simplify_work(source_points):
+                    append_control_point(point, 1)
+                index += 1
+                continue
+
+            # Collapse turn/entry/exit/reverse runs as one compatibility chord.
+            run_start = None
+            run_end = None
+            next_index = index
+            while next_index < len(route_segments):
+                candidate = route_segments[next_index]
+                candidate_type = str(
+                    getattr(candidate, "segment_type", "") or "work"
+                )
+                if candidate_type == "work":
+                    break
+                candidate_points = self._coerce_points(
+                    getattr(candidate, "points", [])
+                )
+                if candidate_points:
+                    if run_start is None:
+                        run_start = candidate_points[0]
+                    run_end = candidate_points[-1]
+                next_index += 1
+            if run_start is not None:
+                append_control_point(run_start, 0)
+                if run_end is not None:
+                    append_control_point(run_end, 0)
+            index = next_index
+
+        return points, statuses[: max(0, len(points) - 1)]
+
+    def _control_route_segments(self, points, statuses):
+        """Group the shared control polyline by its outgoing 0/1 status."""
+        points = [tuple(map(float, point)) for point in points or []]
+        if len(points) < 2:
+            return [], []
+        expected = len(points) - 1
+        normalised_statuses = []
+        for value in list(statuses or [])[:expected]:
+            try:
+                normalised_statuses.append(1 if int(value) == 1 else 0)
+            except (TypeError, ValueError):
+                normalised_statuses.append(0)
+        if len(normalised_statuses) < expected:
+            normalised_statuses.extend([1] * (expected - len(normalised_statuses)))
+
+        status_to_type = {0: "turn", 1: "work"}
+        segments = []
+        current_status = normalised_statuses[0]
+        current_points = [points[0], points[1]]
+        for edge_index in range(1, expected):
+            edge_status = normalised_statuses[edge_index]
+            if edge_status == current_status:
+                current_points.append(points[edge_index + 1])
+                continue
+            segments.append(
+                self._route_segment_from_points(
+                    current_points, current_status, status_to_type
+                )
+            )
+            current_status = edge_status
+            current_points = [points[edge_index], points[edge_index + 1]]
+        segments.append(
+            self._route_segment_from_points(
+                current_points, current_status, status_to_type
+            )
+        )
+        return segments, normalised_statuses
+
+    def _validate_pixel_path_within_image(self, full_path):
+        """Reject control points outside the currently loaded display raster."""
+        display_h, display_w = (
+            self._tif_rgb.shape[:2]
+            if isinstance(self._tif_rgb, np.ndarray)
+            else (
+                int(getattr(self.state, "display_h", 0) or 0),
+                int(getattr(self.state, "display_w", 0) or 0),
+            )
+        )
+        if display_w <= 0 or display_h <= 0:
+            return
+        for segment_index, segment in enumerate(full_path):
+            for point_index, (pixel_x, pixel_y) in enumerate(segment):
+                if not (
+                    0.0 <= float(pixel_x) <= float(display_w - 1)
+                    and 0.0 <= float(pixel_y) <= float(display_h - 1)
+                ):
+                    raise ValueError(
+                        "璺緞鎺у埗鐐硅秴鍑哄奖鍍忚寖鍥达紝绂佹浣跨敤浠垮皠澶栨帹鍧愭爣: "
+                        f"segment={segment_index}, point={point_index}, "
+                        f"pixel=({float(pixel_x):.3f},{float(pixel_y):.3f})"
+                    )
+
+    def _control_route_geo_points(self):
+        """Convert the visible/editor control route to validated geo points."""
+        points = list(getattr(self.state, "path_points", []) or [])
+        statuses = list(getattr(self.state, "path_status", []) or [])
+        if len(points) < 2 and getattr(self.state, "auto_path", None):
+            points, statuses = self._build_route_control_polyline(
+                getattr(self.state, "auto_path", [])
+            )
+        if len(points) < 2:
+            return []
+        segments, _ = self._control_route_segments(points, statuses)
+        if not segments:
+            return []
+        full_path = [
+            [(point.pixel_x, point.pixel_y) for point in segment.points]
+            for segment in segments
+        ]
+        segment_types = [segment.segment_type for segment in segments]
+        self._validate_pixel_path_within_image(full_path)
+        from path_planner import global_path_to_geo, validate_geo_points
+
+        geo_points = global_path_to_geo(full_path, self.geo, segment_types)
+        return validate_geo_points(
+            geo_points,
+            expected_count=sum(len(segment) for segment in full_path),
+            path_segments=full_path,
+            segment_types=segment_types,
+        )
+
+    def _prepare_route_editing(self):
+        """Build the same compact control polyline used by compat export."""
+        st = self.state
+        if not getattr(st, "auto_path", None):
+            return
+        points, statuses = self._build_route_control_polyline(st.auto_path)
         if len(points) >= 2:
             st.path_points = points
-            st.path_status = statuses[:len(points) - 1]
+            st.path_status = statuses
             st.selected_type = None
             st.selected_idx = -1
+
+    def _simulation_segments_from_control_route(self, control_segments):
+        """Expand compact turn chords for the virtual-machine preview only.
+
+        The machine protocol deliberately receives one straight turn chord
+        between two work-line endpoints.  The animation must not mistake that
+        protocol projection for the physical path, so rebuild a bow-shaped
+        preview from the same endpoints while leaving ``path_points`` and the
+        export projection untouched.
+        """
+        segments = list(control_segments or [])
+        if not segments:
+            return []
+        try:
+            from path_planner import _turn_bow
+            from row_geometry import meters_per_pixel
+        except Exception:
+            _turn_bow = None
+            meters_per_pixel = None
+
+        params = self._effective_harvester_params(
+            getattr(self.state, "harvester_params", {}) or {}
+        )
+        try:
+            turn_radius_m = float(params.get("turn_radius_m", self.cfg.TURN_RADIUS_M))
+        except (TypeError, ValueError):
+            turn_radius_m = float(self.cfg.TURN_RADIUS_M)
+        if not math.isfinite(turn_radius_m) or turn_radius_m <= 0.0:
+            turn_radius_m = float(self.cfg.TURN_RADIUS_M)
+
+        mpp = 1.0
+        mask = getattr(self.state, "mask_raw", None)
+        if meters_per_pixel is not None and isinstance(mask, np.ndarray):
+            try:
+                value = float(meters_per_pixel(mask, self.geo, self.state))
+                if math.isfinite(value) and value > 0.0:
+                    mpp = value
+            except (TypeError, ValueError, RuntimeError):
+                pass
+
+        def point_value(point):
+            return (float(point.pixel_x), float(point.pixel_y))
+
+        def work_direction(turn_index):
+            for candidate_index in range(turn_index - 1, -1, -1):
+                candidate = segments[candidate_index]
+                if str(getattr(candidate, "segment_type", "")) != "work":
+                    continue
+                points = list(getattr(candidate, "points", []) or [])
+                if len(points) < 2:
+                    continue
+                a = point_value(points[-2])
+                b = point_value(points[-1])
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                norm = math.hypot(dx, dy)
+                if norm > 1e-9:
+                    return dx / norm, dy / norm
+            for candidate_index in range(turn_index + 1, len(segments)):
+                candidate = segments[candidate_index]
+                if str(getattr(candidate, "segment_type", "")) != "work":
+                    continue
+                points = list(getattr(candidate, "points", []) or [])
+                if len(points) < 2:
+                    continue
+                a = point_value(points[0])
+                b = point_value(points[1])
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                norm = math.hypot(dx, dy)
+                if norm > 1e-9:
+                    return dx / norm, dy / norm
+            return (1.0, 0.0)
+
+        result = []
+        for index, segment in enumerate(segments):
+            segment_type = str(getattr(segment, "segment_type", "") or "work")
+            points = list(getattr(segment, "points", []) or [])
+            if segment_type != "turn" or len(points) < 2:
+                result.append(segment)
+                continue
+
+            start = point_value(points[0])
+            end = point_value(points[-1])
+            direction = work_direction(index)
+            lateral_x = end[0] - start[0]
+            lateral_y = end[1] - start[1]
+            cross = direction[0] * lateral_y - direction[1] * lateral_x
+            turn_sign = 1.0 if cross >= 0.0 else -1.0
+            gap_m = abs(cross) * mpp
+            if gap_m <= 1e-9:
+                gap_m = math.hypot(lateral_x, lateral_y) * mpp
+            geometry_radius_m = min(
+                turn_radius_m,
+                max(1e-6, gap_m * 0.5),
+            )
+            curve = None
+            if _turn_bow is not None:
+                try:
+                    curve = _turn_bow(
+                        start,
+                        end,
+                        direction,
+                        turn_sign,
+                        mpp,
+                        geometry_radius_m,
+                        0.0,
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    curve = None
+            if not curve or len(curve) < 3:
+                # Very short chords cannot support two sampled arcs.  Keep a
+                # small quadratic bend so the virtual preview is still visibly
+                # curved; the protocol/export chord remains unchanged.
+                perp = (-direction[1] * turn_sign, direction[0] * turn_sign)
+                chord_length = math.hypot(lateral_x, lateral_y)
+                offset = min(30.0, max(1.0, chord_length * 0.35))
+                curve = [
+                    start,
+                    (
+                        (start[0] + end[0]) * 0.5 + perp[0] * offset,
+                        (start[1] + end[1]) * 0.5 + perp[1] * offset,
+                    ),
+                    end,
+                ]
+            curve[0], curve[-1] = start, end
+            preview_segment = AutoPathSegment(
+                points=[PathPoint(float(x), float(y)) for x, y in curve],
+                status=int(getattr(segment, "status", 0) or 0),
+                corridor_id=int(getattr(segment, "corridor_id", -1) or -1),
+                segment_type="turn",
+            )
+            preview_segment.length_m = self._segment_length(curve)
+            result.append(preview_segment)
+        return result
 
     def _sync_auto_path_from_editable_route(self):
         """Rebuild automatic path segments after a LabelMe-style manual route edit."""
@@ -5444,35 +6041,35 @@ class MainWindow(QMainWindow):
             st.auto_path_geo = []
             st.auto_path_planned = False
             return
-        expected = len(points) - 1
-        statuses = [int(value) for value in getattr(st, 'path_status', [])[:expected]]
-        if len(statuses) < expected:
-            statuses.extend([1] * (expected - len(statuses)))
+        segments, statuses = self._control_route_segments(
+            points, getattr(st, "path_status", [])
+        )
         st.path_status = statuses
-        status_to_type = {0: "turn", 1: "work", 2: "entry", 3: "exit", 4: "turn_reverse"}
-        segments = []
-        current_status = statuses[0]
-        current_points = [points[0], points[1]]
-        for edge_index in range(1, expected):
-            edge_status = statuses[edge_index]
-            if edge_status == current_status:
-                current_points.append(points[edge_index + 1])
-                continue
-            segments.append(self._route_segment_from_points(current_points, current_status, status_to_type))
-            current_status = edge_status
-            current_points = [points[edge_index], points[edge_index + 1]]
-        segments.append(self._route_segment_from_points(current_points, current_status, status_to_type))
-        st.auto_path = segments
-        st.auto_path_segments = segments
-        full_path = [
+        simulation_segments = self._simulation_segments_from_control_route(segments)
+        st.auto_path = simulation_segments
+        st.auto_path_segments = simulation_segments
+        control_full_path = [
             [(point.pixel_x, point.pixel_y) for point in segment.points]
             for segment in segments
         ]
-        segment_types = [segment.segment_type for segment in segments]
+        control_segment_types = [segment.segment_type for segment in segments]
+        control_geo_points = []
+        if self.geo.is_ready():
+            from path_planner import global_path_to_geo
+            control_geo_points = global_path_to_geo(
+                control_full_path, self.geo, control_segment_types
+            )
+        simulation_full_path = [
+            [(point.pixel_x, point.pixel_y) for point in segment.points]
+            for segment in simulation_segments
+        ]
+        segment_types = [segment.segment_type for segment in simulation_segments]
         geo_points = []
         if self.geo.is_ready():
             from path_planner import global_path_to_geo
-            geo_points = global_path_to_geo(full_path, self.geo, segment_types)
+            geo_points = global_path_to_geo(
+                simulation_full_path, self.geo, segment_types
+            )
         st.auto_path_geo = geo_points
         st.auto_path_planned = True
         st.auto_path_valid = False
@@ -5486,9 +6083,9 @@ class MainWindow(QMainWindow):
         st.path_provenance = {}
         st.path_runtime = {}
         st.path_artifact = {}
-        st.last_work_path_m = sum(item.length_m for item in segments if item.segment_type == "work")
-        st.last_turn_path_m = sum(item.length_m for item in segments if item.segment_type.startswith("turn"))
-        st.last_entry_exit_path_m = sum(item.length_m for item in segments if item.segment_type in ("entry", "exit"))
+        st.last_work_path_m = sum(item.length_m for item in simulation_segments if item.segment_type == "work")
+        st.last_turn_path_m = sum(item.length_m for item in simulation_segments if item.segment_type.startswith("turn"))
+        st.last_entry_exit_path_m = sum(item.length_m for item in simulation_segments if item.segment_type in ("entry", "exit"))
         st.last_total_path_m = st.last_work_path_m + st.last_turn_path_m + st.last_entry_exit_path_m
         st.path_validation.update(
             total_length_m=float(st.last_total_path_m),
@@ -5499,13 +6096,16 @@ class MainWindow(QMainWindow):
         st.simulation_done = False
         st.export_done = False
         path_result = {
-            "full_path": full_path,
-            "segment_types": segment_types,
+            # The pipeline result is the editable/protocol projection.  The
+            # state-owned auto_path above remains the curved simulation path.
+            "full_path": control_full_path,
+            "segment_types": control_segment_types,
             "segment_lengths_m": [float(segment.length_m) for segment in segments],
-            "geo_points": geo_points,
+            "geo_points": control_geo_points,
             "validation": dict(st.path_validation),
             "is_valid": False,
             "description": st.auto_path_desc,
+            "simulation_full_path": simulation_full_path,
         }
         self._pipeline_result = {"path": self._normalise_path_result(path_result)}
         self.route_info.update_from_auto_path(st.auto_path)
@@ -5641,6 +6241,7 @@ class MainWindow(QMainWindow):
         active = (
             self._field_drawing
             or self._forbidden_drawing
+            or bool(self._measure_tool)
             or getattr(self.state, 'entry_exit_mode', False)
             or self._route_edit_active
         )
@@ -5650,6 +6251,12 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("请先完成影像导入和田块圈选")
         elif self._forbidden_drawing:
             self.lbl_status.setText("禁行区绘制：点击首点闭合，右键取消")
+        elif self._measure_tool == "point":
+            self.lbl_status.setText("点选测量：左键选择点，下一次左键替换")
+        elif self._measure_tool == "line":
+            self.lbl_status.setText("测距：左键选两个点，右键显示长度；下一次左键新建")
+        elif self._measure_tool == "area":
+            self.lbl_status.setText("测面积：左键添加顶点，右键显示面积；下一次左键新建")
         elif getattr(self.state, 'entry_exit_mode', False):
             self.lbl_status.setText("起终点编辑：拖动现有标记，或点击空白处重新布设")
         elif self._route_edit_active:

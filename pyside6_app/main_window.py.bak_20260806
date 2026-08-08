@@ -3550,7 +3550,7 @@ class MainWindow(QMainWindow):
             "raster_preprocessing.py",
             "mask_processor.py",
             "row_geometry.py",
-            "coverage.py",
+            "legacy_route_coverage.py",
             "footprint_planner.py",
             "path_planner.py",
             "provenance.py",

@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 
 
-def test_contour_order_is_outside_in_nested_sweep():
-    """DECISION-016 v3: contour visits the two outside sides inward."""
+def test_contour_order_avoids_adjacent_centre_transition_for_four_lines():
+    """DECISION-016: the small four-line case also avoids a centre pair."""
     from path_planner import _contour_order_work_lines
 
     lines = [
@@ -20,9 +20,12 @@ def test_contour_order_is_outside_in_nested_sweep():
     ordered, diagnostics = _contour_order_work_lines(lines, polygon, main_angle=0.0)
 
     assert diagnostics["fallback_reason"] is None
-    assert diagnostics["algorithm_version"] == "contour-order-v3"
-    assert diagnostics["ordered_original_indices"] == [0, 3, 1, 2]
-    assert ordered == [lines[index] for index in [0, 3, 1, 2]]
+    assert diagnostics["algorithm_version"] == "contour-order-v5"
+    assert diagnostics["pair_count"] == 2
+    assert [item["original_indices"] for item in diagnostics["corresponding_pairs"]] == [[1, 3], [0, 2]]
+    assert diagnostics["ordered_original_indices"] == [1, 3, 0, 2]
+    assert diagnostics["adjacent_transition_count"] == 0
+    assert ordered == [lines[index] for index in [1, 3, 0, 2]]
 
 
 def test_contour_order_works_without_field_boundary():
@@ -37,8 +40,8 @@ def test_contour_order_works_without_field_boundary():
     assert ordered == [lines[1], lines[0]]
 
 
-def test_contour_order_is_outside_in_nested_loop_sequence():
-    """DECISION-016: 套圈按外侧两边向内交替访问，形成回字形。"""
+def test_contour_order_is_half_split_interleaved():
+    """DECISION-016: 套圈按两半交错访问，避免最后两行相邻转弯。"""
     from path_planner import _contour_order_work_lines
 
     lines = [
@@ -53,10 +56,43 @@ def test_contour_order_is_outside_in_nested_loop_sequence():
     )
 
     assert diagnostics["fallback_reason"] is None
-    assert diagnostics["ordering"] == "contour_outside_in_nested"
-    assert diagnostics["algorithm_version"] == "contour-order-v3"
-    assert diagnostics["ordered_original_indices"] == [0, 3, 1, 2]
-    assert ordered == [lines[index] for index in [0, 3, 1, 2]]
+    assert diagnostics["ordering"] == "contour_half_split_interleaved"
+    assert diagnostics["algorithm_version"] == "contour-order-v5"
+    assert diagnostics["ordered_original_indices"] == [1, 3, 0, 2]
+    assert ordered == [lines[index] for index in [1, 3, 0, 2]]
+
+
+def test_contour_order_interleaves_even_and_odd_line_counts():
+    """偶数和奇数主作业线都按两半交错，不把中心两行硬接在一起。"""
+    from path_planner import _contour_order_work_lines
+
+    lines = [
+        [(0.0, float(index)), (100.0, float(index))]
+        for index in range(10)
+    ]
+
+    ordered, diagnostics = _contour_order_work_lines(
+        lines, None, main_angle=0.0
+    )
+
+    expected = [0, 5, 1, 6, 2, 7, 3, 8, 4, 9]
+    assert diagnostics["ordered_original_indices"] == expected
+    assert diagnostics["pair_count"] == 5
+    assert [
+        item["original_indices"]
+        for item in diagnostics["corresponding_pairs"]
+    ] == [[0, 5], [1, 6], [2, 7], [3, 8], [4, 9]]
+    assert ordered == [lines[index] for index in expected]
+
+    odd_lines = [
+        [(0.0, float(index)), (100.0, float(index))]
+        for index in range(9)
+    ]
+    _odd_ordered, odd_diagnostics = _contour_order_work_lines(
+        odd_lines, None, main_angle=0.0
+    )
+    assert odd_diagnostics["ordered_original_indices"] == [0, 5, 1, 6, 2, 7, 3, 8, 4]
+    assert odd_diagnostics["corresponding_pairs"][-1]["original_indices"] == [4]
 
 
 def test_contour_order_uses_normal_axis_for_skewed_lines():
@@ -123,6 +159,40 @@ def test_contour_connector_anchors_share_each_pair_end_wall():
     assert anchors[2]["start"][0] == pytest.approx(10.0)
     assert anchors[2]["end"][0] == pytest.approx(90.0)
     assert anchors[3]["start"][0] == pytest.approx(90.0)
+
+
+def test_contour_connector_can_extend_parallel_lines_into_headland_space():
+    """套圈的直线端点可按配置向两侧田头统一外延。"""
+    from path_planner import _build_contour_connector_anchors
+
+    lines = [
+        [(10.0, 10.0), (90.0, 10.0)],
+        [(90.0, 40.0), (10.0, 40.0)],
+        [(10.0, 20.0), (90.0, 20.0)],
+        [(90.0, 30.0), (10.0, 30.0)],
+    ]
+    polygon = np.asarray(
+        [[0.0, 0.0], [100.0, 0.0], [100.0, 50.0], [0.0, 50.0]],
+        dtype=np.float64,
+    )
+
+    anchors, diagnostics = _build_contour_connector_anchors(
+        lines,
+        main_angle=0.0,
+        field_polygon=polygon,
+        mpp=0.1,
+        config={
+            "contour_max_endpoint_extension_m": 4.0,
+            "work_line_endpoint_extension_m": 0.5,
+        },
+    )
+
+    assert diagnostics["fallback_reason"] is None
+    assert diagnostics["configured_work_line_endpoint_extension_m"] == pytest.approx(0.5)
+    assert anchors[0]["start"][0] == pytest.approx(5.0)
+    assert anchors[0]["end"][0] == pytest.approx(95.0)
+    assert anchors[1]["start"][0] == pytest.approx(95.0)
+    assert anchors[1]["end"][0] == pytest.approx(5.0)
 
 
 def test_contour_outer_loop_may_cross_more_than_four_metres():
@@ -271,10 +341,10 @@ def test_contour_route_reuses_headland_lines_and_keeps_center_single():
 
     work = [segment for segment, kind in zip(path, segment_types) if kind == "work"]
     turns = [segment for segment, kind in zip(path, segment_types) if kind == "turn"]
-    assert [segment[0][1] for segment in work] == [10.0, 90.0, 30.0, 70.0, 50.0]
+    assert [segment[0][1] for segment in work] == [10.0, 70.0, 30.0, 90.0, 50.0]
     assert segment_types == ["work", "turn", "work", "turn", "work", "turn", "work", "turn", "work"]
     assert diagnostics["contour_connector"]["turn_distances_m"] == pytest.approx(
-        [8.0, 6.0, 4.0, 2.0]
+        [6.0, 4.0, 6.0, 4.0]
     )
     assert diagnostics["contour_connector"]["center_single_finish"] is True
     assert diagnostics["contour_route_mode"] is True
@@ -293,6 +363,59 @@ def test_contour_route_reuses_headland_lines_and_keeps_center_single():
         min(point[0] for point in turns[3])
     )
     assert "connector" not in segment_types
+
+
+def test_contour_route_uses_two_endpoint_work_chords_after_pairing():
+    """套圈候选先配对，再将每条主作业带固定为起终点直线。"""
+    from path_planner import _connect_work_lines
+
+    class _Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.1
+
+    class _State:
+        mask_raw = np.zeros((120, 120), dtype=np.uint8)
+        mask_offset_x = 0
+        mask_offset_y = 0
+        field_boundary = [
+            (0.0, 0.0), (110.0, 0.0), (110.0, 110.0), (0.0, 110.0)
+        ]
+        entry_point = None
+        exit_point = None
+        unload_points = []
+
+    curved_lines = [
+        [(20.0, y), (50.0, y + 2.0), (80.0, y)]
+        for y in (10.0, 30.0, 50.0, 70.0, 90.0)
+    ]
+    path, segment_types, diagnostics = _connect_work_lines(
+        curved_lines,
+        geo=_Geo(),
+        state=_State(),
+        min_turn_radius_m=1.0,
+        turn_strategy="contour",
+        config={
+            "turn_outward_clearance_m": 0.1,
+            "turn_safety_margin_m": 0.1,
+            "contour_max_endpoint_extension_m": 0.0,
+        },
+        global_main_angle=0.0,
+        return_diagnostics=True,
+    )
+
+    work = [
+        segment for segment, kind in zip(path, segment_types)
+        if kind == "work"
+    ]
+    assert all(len(segment) == 2 for segment in work)
+    assert diagnostics["contour_ordering"]["work_line_geometry"] == (
+        "straight_endpoint_chord"
+    )
 
 
 def test_contour_near_radius_limit_uses_shared_tangent_without_pear_loop():
@@ -345,22 +468,19 @@ def test_contour_near_radius_limit_uses_shared_tangent_without_pear_loop():
         if kind == "turn"
     ]
     assert [item["strategy"] for item in diagnostics["turn_decisions"]] == [
-        "bow", "bow", "bow", "bow", "semicircle"
+        "bow", "bow", "bow", "bow", "bow"
     ]
-    centre_decision = diagnostics["turn_decisions"][-1]
-    assert centre_decision["radius_shortfall_m"] == pytest.approx(0.025)
-    assert "shared-tangent near-semicircle" in centre_decision["fallback_reason"]
-    # Right and left turns respectively touch one common straight headland
-    # tangent, including the final near-semicircle on the right.
+    # The half-split order keeps every transition away from the adjacent
+    # centre rows while preserving one common straight headland per side.
     assert [max(point[0] for point in turns[index]) for index in (0, 2, 4)] == (
         pytest.approx([90.0, 90.0, 90.0])
     )
     assert [min(point[0] for point in turns[index]) for index in (1, 3)] == (
-        pytest.approx([10.5, 10.5])
+        pytest.approx([10.0, 10.0])
     )
     assert diagnostics["contour_connector"][
         "shared_turn_clearance_m_by_side"
-    ] == pytest.approx({"low": 0.05, "high": 0.1})
+    ] == pytest.approx({"low": 0.1, "high": 0.1})
     assert all(len(turn) > 2 for turn in turns)
 
 
@@ -400,9 +520,9 @@ def test_contour_entry_may_swap_outer_sides_but_never_start_at_center():
     )
 
     work = [segment for segment, kind in zip(path, segment_types) if kind == "work"]
-    assert [segment[0][1] for segment in work] == [90.0, 10.0, 70.0, 30.0, 50.0]
+    assert [segment[0][1] for segment in work] == [70.0, 10.0, 90.0, 30.0, 50.0]
     assert diagnostics["contour_ordering"]["outside_side_reversed_for_entry"] is True
-    assert diagnostics["contour_ordering"]["ordered_original_indices"] == [4, 0, 3, 1, 2]
+    assert diagnostics["contour_ordering"]["ordered_original_indices"] == [3, 0, 4, 1, 2]
 
 
 def test_contour_is_a_valid_ordering_strategy_and_uses_bow_turn_geometry():
@@ -473,11 +593,11 @@ def test_uniform_zones_are_split_into_swath_lines():
         },
     )
 
-    # 等距区 12.45m / 1.75m ≈ 7 条 + 常规带 1 条
-    assert len(lines) == 8, f"期望 8 条作业线, 实际 {len(lines)}"
+    # 等距区必须按 ceil(12.45 / 1.75)=8 条覆盖线分配，再加常规带 1 条。
+    assert len(lines) == 9, f"期望 9 条作业线, 实际 {len(lines)}"
     zone_report = layout["uniform_zones"]
     assert zone_report[0]["id"] == 1
-    assert zone_report[0]["line_count"] == 7, zone_report
+    assert zone_report[0]["line_count"] == 8, zone_report
     assert zone_report[0]["line_spacing_m"] == 1.75
 
 
@@ -513,7 +633,134 @@ def test_generate_uniform_zone_lines_spacing():
         xs = [point[0] for point in line]
         assert min(xs) <= 5.0
         assert max(xs) >= 1994.0
-        assert max(xs) - min(xs) >= 1990.0
+    assert max(xs) - min(xs) >= 1990.0
+
+
+def test_uniform_zone_keeps_a_pass_when_nominal_lateral_sample_hits_a_gap():
+    """交界断点不能让一条本应存在的等距作业线整体消失。"""
+    from path_planner import _generate_uniform_zone_lines
+
+    class _Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.01
+
+    class _State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+
+    contour = [(0.0, 0.0), (2000.0, 0.0), (2000.0, 800.0), (0.0, 800.0)]
+    mask = np.full((800, 2000), 255, dtype=np.uint8)
+    # One nominal pass centre is deliberately non-mask; the local support
+    # search should move it a short distance while retaining the pass.
+    mask[396:405, :] = 0
+    lines = _generate_uniform_zone_lines(
+        {"id": 10, "profile_width_m": 8.0, "contour": contour},
+        0.0,
+        1.75,
+        geo=_Geo(),
+        state=_State(),
+        mask=mask,
+    )
+
+    assert len(lines) == 5
+
+
+def test_uniform_zone_drops_an_outer_short_mask_fragment_before_contour_ordering():
+    """边界短掩膜片不能制造跨田长转弯。"""
+    from path_planner import _generate_uniform_zone_lines
+
+    class _Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.01
+
+    class _State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+
+    contour = [(0.0, 0.0), (2000.0, 0.0), (2000.0, 800.0), (0.0, 800.0)]
+    mask = np.full((800, 2000), 255, dtype=np.uint8)
+    # The first outer pass has only a short supported axial run.  The other
+    # nominal passes retain the complete 20 m crop span.
+    mask[45:56, 200:] = 0
+    diagnostics = {}
+    lines = _generate_uniform_zone_lines(
+        {"id": 12, "profile_width_m": 8.0, "contour": contour},
+        0.0,
+        1.75,
+        geo=_Geo(),
+        state=_State(),
+        mask=mask,
+        diagnostics=diagnostics,
+    )
+
+    assert diagnostics["short_edge_line_filter_applied"] is True
+    assert diagnostics["short_edge_line_indices"] == [0]
+    assert len(lines) == 4
+    positions_m = [float(np.mean([point[1] for point in line])) * 0.01 for line in lines]
+    assert np.diff(positions_m) == pytest.approx([1.75] * 3)
+
+
+def test_uniform_zone_global_phase_keeps_track_gauge_spacing_after_mask_gap():
+    """掩膜补偿只能改变整块相位，不能逐条改变等距作业线间距。"""
+    from path_planner import _generate_uniform_zone_lines
+
+    class _Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.01
+
+    class _State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+
+    contour = [(0.0, 0.0), (2000.0, 0.0), (2000.0, 800.0), (0.0, 800.0)]
+    mask = np.full((800, 2000), 255, dtype=np.uint8)
+    mask[396:405, :] = 0
+    diagnostics = {}
+    lines = _generate_uniform_zone_lines(
+        {"id": 11, "profile_width_m": 8.0, "contour": contour},
+        0.0,
+        1.75,
+        geo=_Geo(),
+        state=_State(),
+        mask=mask,
+        diagnostics=diagnostics,
+    )
+
+    positions_m = [float(np.mean([point[1] for point in line])) * 0.01 for line in lines]
+    assert len(positions_m) == 5
+    assert np.diff(positions_m) == pytest.approx([1.75] * 4)
+    assert diagnostics["spacing_is_uniform"] is True
+    assert diagnostics["actual_spacing_m"] == pytest.approx(1.75)
+
+
+def test_uniform_zone_default_spacing_aligns_adjacent_track_centrelines():
+    """未指定等距间隔时，默认用轨距而非割幅，保证左右履带重合。"""
+    from path_planner import _uniform_zone_spacing
+
+    class _State:
+        harvester_params = {"track_gauge_m": 1.3}
+
+    spacing, basis, diagnostics = _uniform_zone_spacing({}, _State())
+
+    assert spacing == pytest.approx(1.3)
+    assert basis == "track_gauge_overlap"
+    assert diagnostics["track_gauge_m"] == pytest.approx(1.3)
+    assert diagnostics["adjacent_track_centerline_offset_m"] == pytest.approx(0.0)
 
 
 def test_turn_strategy_defaults_to_contour():

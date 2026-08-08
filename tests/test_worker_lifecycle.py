@@ -133,7 +133,7 @@ def test_path_risk_notification_is_non_modal_and_keeps_event_loop_responsive(mon
 
     assert modal_calls == []
     assert timer_fired == [True]
-    assert "存在风险" in window.lbl_status.text()
+    assert "指标已更新" in window.lbl_status.text()
     window.close()
 
 

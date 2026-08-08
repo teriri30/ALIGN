@@ -341,40 +341,6 @@ def test_cancelling_background_work_invalidates_active_inference_runner():
     assert quit_calls == []
 
 
-def test_cancelling_paper_experiment_invalidates_its_completion_token():
-    from pyside6_app.main_window import MainWindow
-    from task_lifecycle import make_task_token
-
-    state = SimpleNamespace(
-        project_generation=2,
-        source_sha256="source-a",
-        model_sha256="model-a",
-        inference_running=False,
-        mask_processing_running=False,
-        plan_running=False,
-    )
-    token = make_task_token(state, "paper_experiment")
-    cancelled = []
-    window = MainWindow.__new__(MainWindow)
-    window.state = state
-    window._active_inference_token = None
-    window._active_inference_runner = None
-    window._active_mask_token = None
-    window._active_plan_token = None
-    window._active_cache_restore_token = None
-    window._active_paper_experiment_token = token
-    window._worker = SimpleNamespace(cancel=lambda: cancelled.append(True))
-    window._has_background_worker = lambda: True
-    window.lbl_status = SimpleNamespace(setText=lambda _text: None)
-    window.log_panel = SimpleNamespace(info=lambda _text: None)
-    window.btn_cancel_task = SimpleNamespace(setEnabled=lambda _enabled: None)
-
-    window._cancel_background_worker()
-
-    assert token.invalidated is True
-    assert cancelled == [True]
-
-
 def test_project_or_model_switch_invalidates_the_active_inference_runner():
     from pyside6_app.main_window import MainWindow
     from task_lifecycle import make_task_token
@@ -418,6 +384,38 @@ def test_declining_external_model_trust_does_not_cancel_active_inference(monkeyp
     )
 
     assert window._on_load_model_at(str(model_path)) is False
+    assert token.invalidated is False
+    assert cancelled == []
+    assert window._active_inference_runner is not None
+
+
+def test_unregistered_weight_inside_builtin_dir_requires_confirmation(monkeypatch, tmp_path):
+    """DECISION-006: a .pt inside data/models without a registry entry is not trusted implicitly."""
+    from pyside6_app.main_window import MainWindow, QMessageBox
+    from task_lifecycle import make_task_token
+
+    builtin_dir = tmp_path / "builtin"
+    builtin_dir.mkdir()
+    model_path = builtin_dir / "unregistered.pt"
+    model_path.write_bytes(b"unregistered")
+    state = SimpleNamespace(project_generation=2, source_sha256="source-a", model_sha256="model-a")
+    token = make_task_token(state, "inference")
+    cancelled = []
+    window = MainWindow.__new__(MainWindow)
+    window.state = state
+    window._active_inference_token = token
+    window._active_inference_runner = SimpleNamespace(cancel=lambda: cancelled.append(True))
+    window._pending_segment_display = True
+    window._builtin_model_dir = lambda: str(builtin_dir)
+    window.log_panel = SimpleNamespace(info=lambda _message: None)
+    prompts = []
+    monkeypatch.setattr(
+        "pyside6_app.main_window.QMessageBox.question",
+        lambda *_args, **_kwargs: prompts.append(True) or QMessageBox.No,
+    )
+
+    assert window._on_load_model_at(str(model_path)) is False
+    assert prompts == [True]
     assert token.invalidated is False
     assert cancelled == []
     assert window._active_inference_runner is not None
@@ -832,4 +830,3 @@ def test_failed_plan_completion_clears_only_the_matching_running_state():
     assert "applied" not in errors
     assert any(item[0] == "task" and item[1][0] == "plan" and item[1][1] == "failed" for item in statuses)
     assert errors and errors[0].endswith(": plan exploded")
-

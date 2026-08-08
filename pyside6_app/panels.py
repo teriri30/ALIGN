@@ -11,6 +11,23 @@ from pyside6_app.task_state import TASK_ORDER
 
 UI_FONT = '"Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif'
 
+HARVESTER_PARAM_LABELS = {
+    "cutter_width_m": "割台有效割幅",
+    "cutter_forward_offset_m": "割刀前置距离",
+    "track_width_m": "履带宽度",
+    "track_gauge_m": "履带中心距",
+    "wheelbase_m": "轴距",
+    "track_length_m": "履带接地长度",
+    "turn_radius_m": "最小转弯半径",
+}
+HARVESTER_SOURCE_LABELS = {
+    "default": "默认值",
+    "recommended": "推荐值",
+    "user_entered": "用户填写但未实测",
+    "legacy_unverified": "历史来源未记录",
+    "user_measured": "用户实测",
+}
+
 
 TASK_DEFS = [
     {"id": "import_img", "label": "影像导入", "hint": "加载正射影像 GeoTIFF 文件。", "color": "#6FA37F", "action": "导入"},
@@ -18,8 +35,8 @@ TASK_DEFS = [
     {"id": "segment", "label": "AI识别", "hint": "使用模型分割作物行带。", "color": "#649C7E", "action": "运行"},
     {"id": "process", "label": "掩膜处理", "hint": "优化 AI 识别掩膜并提取作物行带。", "color": "#648C82", "action": "处理"},
     {"id": "params", "label": "农机参数", "hint": "设置农机参数。", "color": "#AC7E56", "action": "设置"},
-    {"id": "entry", "label": "起点", "hint": "布设、确认或直接拖动机具入田起点。", "color": "#589C94", "action": "布设"},
-    {"id": "exit", "label": "终点", "hint": "布设、确认或直接拖动机具离田终点。", "color": "#C76B6B", "action": "布设"},
+    {"id": "entry", "label": "起点", "hint": "可自由布设或拖动；用于选择首条作业线和行驶方向，默认不强行拉接长直线。", "color": "#589C94", "action": "布设"},
+    {"id": "exit", "label": "终点", "hint": "可自由布设或拖动；用于选择末条作业线和离田方向，默认不强行拉接长直线。", "color": "#C76B6B", "action": "布设"},
     {"id": "unload", "label": "卸粮点", "hint": "按需要添加一个或多个卸粮点，可为空。", "color": "#C9A64A", "action": "布设"},
     {"id": "plan", "label": "路径规划", "hint": "生成作业路线。", "color": "#589862", "action": "生成"},
     {"id": "simulate", "label": "模拟演示", "hint": "沿规划路径模拟农机运动。", "color": "#4C8C7C", "action": "演示"},
@@ -349,7 +366,7 @@ class TaskPanel(QWidget):
                     rows.append(sep)
                     self.recommend_service_points_btn = QPushButton("智能推荐起点 / 终点")
                     self.recommend_service_points_btn.setToolTip(
-                        "根据处理后的作物行带方向和作业顺序推荐入田起点与离田终点；推荐后可在影像上直接拖动标记"
+                        "推荐点仅作为路径排序与方向参考；可在影像上任意拖动或重新布设，默认不会把起终点强行连入作业线"
                     )
                     self.recommend_service_points_btn.setMinimumHeight(30)
                     self.recommend_service_points_btn.clicked.connect(
@@ -397,7 +414,7 @@ class TaskPanel(QWidget):
                     # DECISION-016: contour is an auditable pass-order strategy.
                     # 套圈收割为默认策略（置于首位）。
                     for label, key in [
-                        ("套圈收割（外圈向内）", "contour"), ("自动推荐", "auto"),
+                        ("套圈收割", "contour"), ("自动推荐", "auto"),
                         ("弓形调头", "bow"), ("半圆调头", "semicircle"),
                         ("梨形调头", "pear"), ("鱼尾折返", "fishtail"), ("紧凑 Alpha", "alpha"),
                     ]:
@@ -784,10 +801,27 @@ class RouteInfoPanel(QWidget):
             "confirmed_forbidden_map_missing": "禁行区尚未确认",
             "planning_resolution_too_coarse": "规划分辨率不足",
             "footprint_contract_mismatch": "足迹模型或路径参考点不一致",
+            "harvester_parameter_source_unverified": "农机参数来源未完成实测",
+            "planning_recovered_work_bands": "包含自动恢复作业带",
         }
         readable_blockers = [blocker_labels.get(value, value) for value in blockers]
         limits = validation.get("validation_limits_pct", {}) or {}
         details = [f"待补充: {'；'.join(readable_blockers)}" if blockers else "田间试验检查已通过"]
+        planning_factors = data.get("planning_factors", {}) or {}
+        source_map = dict(
+            planning_factors.get("harvester_param_sources")
+            or (readiness.get("harvester_parameter_source_status", {}) or {}).get(
+                "sources"
+            )
+            or {}
+        )
+        unverified_sources = [
+            f"{HARVESTER_PARAM_LABELS.get(key, key)}（{HARVESTER_SOURCE_LABELS.get(source, source)}）"
+            for key, source in source_map.items()
+            if source != "user_measured"
+        ]
+        if unverified_sources:
+            details.append("参数来源未完成实测：" + "、".join(unverified_sources))
         if limits:
             details.append(
                 "阈值(%): 田界<={track_outside_field:g}, 支撑<={track_outside_support:g}, "

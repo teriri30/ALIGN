@@ -144,6 +144,42 @@ def test_manual_route_edit_refreshes_path_but_blocks_unvalidated_export(monkeypa
         window._geo_export_payload()
 
 
+def test_confirm_gate_exports_metric_failure_without_warning_block(monkeypatch):
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)
+    window.geo = _GoodGeo()
+    path_result = {
+        "full_path": [[(1.0, 1.0), (10.0, 1.0)]],
+        "segment_types": ["work"],
+        "ordered_segments": [{
+            "points": [(1.0, 1.0), (10.0, 1.0)],
+            "type": "work",
+            "segment_index": 0,
+        }],
+        "validation": {
+            "valid": False,
+            "current_validation_complete": True,
+            "validation_profile": "field_trial",
+            "issues": ["theoretical footprint metric exceeds threshold"],
+        },
+        "is_valid": False,
+    }
+    monkeypatch.setenv("REUI_EXPORT_GATE", "confirm")
+    warnings = []
+    monkeypatch.setattr(window.log_panel, "warn", warnings.append)
+    monkeypatch.setattr(window, "_path_result_from_state", lambda: path_result)
+    monkeypatch.setattr(window, "_verify_scientific_provenance", lambda _: None)
+
+    _result, points = window._geo_export_payload()
+
+    assert len(points) == 2
+    assert points[0]["pixel_x"] == 1.0
+    assert points[1]["pixel_x"] == 10.0
+    assert warnings == []
+    window.close()
+
+
 def test_geo_export_rejects_cached_validation_snapshot(monkeypatch):
     QApplication.instance() or QApplication([])
     window = MainWindow()

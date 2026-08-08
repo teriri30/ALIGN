@@ -20,9 +20,14 @@ def test_builtin_test_models_include_all_registered_trained_best_weights():
         "YOLO11m-seg（内置对比）",
         "YOLO11s-seg（内置对比）",
         "YOLOv8s-seg（内置对比）",
+        "YOLO11s-seg（插秧期12m）",
+        "YOLO11s-seg（返青期12m）",
+        "YOLO11s-seg（返青期30m）",
+        "YOLO11s-seg（返青期50m）",
         "YOLO11s-seg（分蘖期12m）",
+        "YOLO11s-seg（分蘖期30m）",
     ]
-    assert len(models) == 4
+    assert len(models) == 9
     assert all(model["path"].endswith(".pt") for model in models)
     assert all(os.path.isfile(model["path"]) for model in models)
     assert all(len(model["sha256"]) == 64 for model in models)
@@ -50,7 +55,7 @@ def test_main_window_merges_trusted_builtin_comparison_models(monkeypatch):
     monkeypatch.setattr(window, "_model_registry", lambda model_dir=None: {})
 
     models = window._builtin_model_list()
-    assert len(models) == 4
+    assert len(models) == 9
     assert all(model.get("trusted_builtin") for model in models)
     assert all(os.path.isfile(model["path"]) for model in models)
     assert window._is_trusted_builtin_model_path(models[0]["path"])

@@ -201,6 +201,88 @@ def test_cache_restore_rejects_old_mask_when_model_file_changes(tmp_path, monkey
     assert any(item.startswith("AI ") for item in restored["cache_validation_messages"])
 
 
+def test_cache_restore_rejects_mask_before_run_edge_gate_version(tmp_path, monkeypatch):
+    """DECISION-009: v13 geometry cannot survive the run-edge gate change."""
+    import cache
+    from config import Config
+    from inference import INFERENCE_PIPELINE_VERSION
+    from provenance import file_sha256, make_stage_record
+    from pyside6_app.workers import CacheRestoreWorker
+    from row_geometry import MASK_REGULARIZATION_VERSION
+    from state import AppState
+
+    assert MASK_REGULARIZATION_VERSION == 14
+    monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
+    source = tmp_path / "field.tif"
+    source.write_bytes(b"geotiff-source")
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"model-a")
+    raw_mask = np.ones((6, 6), dtype=np.uint8)
+    processed_mask = raw_mask.copy()
+    cfg = Config()
+    inference_inputs = {
+        "source_sha256": file_sha256(source),
+        "model_sha256": file_sha256(model),
+        "field_boundary": [[0.0, 0.0], [5.0, 0.0], [5.0, 5.0]],
+        "inference_config": {
+            "capture_size": int(cfg.TILE_CAPTURE_SIZE),
+            "overlap": float(cfg.TILE_OVERLAP),
+            "conf": float(cfg.MODEL_CONF),
+            "iou": float(cfg.MODEL_IOU),
+            "batch_size": 4,
+        },
+        "preprocessing_config": cfg.section("raster_preprocessing"),
+    }
+    inference_record = make_stage_record(
+        "inference", INFERENCE_PIPELINE_VERSION, inference_inputs, raw_mask
+    )
+    mask_inputs = {
+        "inference_fingerprint": inference_record["fingerprint"],
+        "raw_mask_sha256": inference_record["artifact_sha256"],
+        "mask_config": cfg.section("mask_processing"),
+    }
+    legacy_mask_record = make_stage_record(
+        "mask", 13, mask_inputs, processed_mask
+    )
+    state = AppState()
+    state.safe_update(
+        tif_path=str(source),
+        source_sha256=file_sha256(source),
+        current_model_path=str(model),
+        current_model_name=model.name,
+        model_sha256=file_sha256(model),
+        field_boundary=inference_inputs["field_boundary"],
+        inference_done=True,
+        inference_provenance=inference_record,
+        mask_processed=True,
+        mask_result={"diagnostics": {"algorithm_version": 13}},
+        mask_provenance=legacy_mask_record,
+        auto_path_planned=True,
+        auto_path_valid=True,
+    )
+    cache.save_mask(str(source), raw_mask)
+    cache.save_mask(str(source), processed_mask, suffix="_processed")
+    cache.save_project_state(str(source), state, stage="path")
+
+    results = []
+    worker = CacheRestoreWorker(
+        str(source), expected_source_sha256=file_sha256(source)
+    )
+    worker.finished.connect(results.append)
+    worker.run()
+
+    assert results[0]["status"] == "completed"
+    restored = results[0]["result"]
+    assert restored["saved"]["inference_done"] is True
+    assert restored["saved"]["mask_processed"] is False
+    assert restored["saved"]["auto_path_planned"] is False
+    assert restored["processed_mask"] is None
+    assert any(
+        "mask algorithm version changed" in item
+        for item in restored["cache_validation_messages"]
+    )
+
+
 def test_cache_loader_never_reuses_same_shape_mask_from_another_source(tmp_path, monkeypatch):
     """DECISION-002: array shape alone never establishes cache identity."""
     import cache
@@ -286,8 +368,8 @@ def test_builtin_model_registry_matches_present_weight_files():
             assert file_sha256(weight) == item["sha256"]
 
 
-def test_tillering_12m_model_is_registered_with_requested_display_name():
-    """DECISION-006: the imported model is content-pinned and clearly named."""
+def test_stage_height_models_are_registered_with_complete_training_metadata():
+    """DECISION-006: stage-height models are content-pinned and traceable."""
     import json
     from pathlib import Path
 
@@ -295,16 +377,31 @@ def test_tillering_12m_model_is_registered_with_requested_display_name():
     registry = json.loads(
         (model_dir / "model_registry.json").read_text(encoding="utf-8")
     )
-    item = next(
-        model for model in registry["models"]
-        if model["name"] == "yolo11s_seg_tiller12m_best.pt"
-    )
+    expected = {
+        "yolo11s_seg_transplant_12m_best.pt": ("插秧期", 12),
+        "yolo11s_seg_greenup_12m_best.pt": ("返青期", 12),
+        "yolo11s_seg_greenup_30m_best.pt": ("返青期", 30),
+        "yolo11s_seg_greenup_50m_best.pt": ("返青期", 50),
+        "yolo11s_seg_tiller_12m_best.pt": ("分蘖期", 12),
+        "yolo11s_seg_tiller_30m_best.pt": ("分蘖期", 30),
+    }
+    items = {item["name"]: item for item in registry["models"]}
 
-    assert item["display_name"] == "YOLO11s-seg（分蘖期12m）"
-    assert item["sha256"] == (
-        "5f31cc3950fe803e0768b2763f0ee9dd2a3a01395aa67a362ee734d41f4d3969"
-    )
-    assert item["metadata_status"] == "incomplete"
+    for filename, (stage, height_m) in expected.items():
+        item = items[filename]
+        assert item["display_name"] == f"YOLO11s-seg（{stage}{height_m}m）"
+        assert len(item["sha256"]) == 64
+        assert item["metadata_status"] == "complete"
+        assert item["class_mapping"] == {"0": "rice"}
+        assert item["stage"] == stage
+        assert item["height_m"] == height_m
+        assert item["training_preprocessing"] == {
+            "slice_size": 640,
+            "imgsz": 640,
+            "overlap": 0.4,
+            "augmentation_scope": "train_only_online",
+        }
+        assert item["compatibility"]["requires_manual_confirmation"] is False
 
 
 def test_provenance_canonical_json_normalises_nonfinite_metadata():

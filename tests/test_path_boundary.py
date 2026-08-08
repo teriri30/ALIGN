@@ -152,7 +152,11 @@ def test_entry_exit_and_unload_segments_report_field_boundary_violations():
         geo=Geo(),
         min_turn_radius_m=1.0,
         turn_strategy="semicircle",
-        config={"turn_outward_clearance_m": 0.1, "turn_safety_margin_m": 0.1},
+        config={
+            "turn_outward_clearance_m": 0.1,
+            "turn_safety_margin_m": 0.1,
+            "service_point_mode": "connect",
+        },
         return_diagnostics=True,
     )
 

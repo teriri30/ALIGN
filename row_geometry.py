@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-MASK_REGULARIZATION_VERSION = 13
+MASK_REGULARIZATION_VERSION = 14
 
 
 def odd_size(value: float, minimum: int = 3) -> int:
@@ -1552,6 +1552,31 @@ def _merge_close_runs(
     return [tuple(item) for item in merged]
 
 
+def _profile_run_gates(
+    runs: List[Tuple[int, int]],
+    height: int,
+) -> List[Tuple[int, int]]:
+    """Build local occupancy gates from neighbouring profile-run edges."""
+    if not runs:
+        return []
+    gates = []
+    for index, (run_start, run_end) in enumerate(runs):
+        if index == 0:
+            lower = int(round(
+                run_start - max(1.0, (run_end - run_start) * 0.5)
+            ))
+        else:
+            lower = int(round((runs[index - 1][1] + run_start) * 0.5))
+        if index == len(runs) - 1:
+            upper = int(round(
+                run_end + max(1.0, (run_end - run_start) * 0.5)
+            ))
+        else:
+            upper = int(round((run_end + runs[index + 1][0]) * 0.5))
+        gates.append((max(0, lower), min(int(height), upper)))
+    return gates
+
+
 def _longest_true_run(values: np.ndarray) -> Optional[Tuple[int, int]]:
     runs = _runs(values)
     return max(runs, key=lambda item: item[1] - item[0]) if runs else None
@@ -2081,19 +2106,13 @@ def regularize_crop_mask(
             )
             body_diagnostics.update(refined_body_diagnostics)
 
-    centers = np.asarray([(start + end - 1) * 0.5 for start, end in runs])
-    center_spacing = float(np.median(np.diff(centers))) if len(centers) > 1 else 0.0
-    gates = []
-    for index in range(len(runs)):
-        if index == 0:
-            lower = int(round(centers[index] - center_spacing * 0.5))
-        else:
-            lower = int(round((centers[index - 1] + centers[index]) * 0.5))
-        if index == len(runs) - 1:
-            upper = int(round(centers[index] + center_spacing * 0.5))
-        else:
-            upper = int(round((centers[index] + centers[index + 1]) * 0.5))
-        gates.append((max(0, lower), min(rotated.shape[0], upper)))
+    # Gate each profile run by its *run edges*, not by the midpoint of the
+    # neighbouring centres.  A broad uniform block next to a normal four-row
+    # band can be hundreds of pixels wide; centre-based gates then include the
+    # broad block tail in the neighbouring local profile and pull its median
+    # away from the actual four-row centreline.  Edge midpoints keep each run's
+    # local occupancy isolated while preserving a small terminal halo.
+    gates = _profile_run_gates(runs, rotated.shape[0])
 
     profile_bands = [
         {
@@ -2515,6 +2534,7 @@ def regularize_crop_mask(
         "headland_corridor_dropped_band_ids": corridor_dropped_band_ids,
         "body_interval": body_diagnostics,
         "candidate_band_count": len(runs),
+        "profile_gate_basis": "run_edge_midpoints",
         "rebuilt_band_count": len(bands),
         "skipped_bands": skipped_bands,
         "wide_profile_width_m": class_widths.get("wide"),
