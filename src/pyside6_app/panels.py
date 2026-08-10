@@ -322,23 +322,17 @@ class TaskPanel(QWidget):
                 if tid == "process":
                     self._mask_strength_label = QLabel("处理强度")
                     self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
-                    self.mask_strength_combo = QComboBox()
-                    self.mask_strength_combo.setToolTip("根据作物断行、粘连和噪声情况调节掩膜几何重建强度")
-                    self.mask_strength_combo.setMinimumHeight(30)
-                    self.mask_strength_combo.setStyleSheet(
-                        f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                        f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
+                    self.mask_strength_value_label = QLabel("标准（固定）")
+                    self.mask_strength_value_label.setToolTip(
+                        "掩膜处理统一使用标准参数，保证不同任务的处理口径一致"
                     )
-                    for label, key in [
-                        ("速度优先", "light"),
-                        ("标准（推荐）", "standard"),
-                        ("漏检较多", "strong"),
-                        ("严重断行", "very_strong"),
-                    ]:
-                        self.mask_strength_combo.addItem(label, key)
-                    self.mask_strength_combo.currentIndexChanged.connect(self._on_mask_strength_changed)
+                    self.mask_strength_value_label.setStyleSheet(
+                        f"color:{COLORS['text']};font-size:12px;font-family:{UI_FONT};"
+                        f"padding:4px 8px;border:1px solid {COLORS['border']};"
+                        "border-radius:4px;"
+                    )
                     rows.append(self._mask_strength_label)
-                    rows.append(self.mask_strength_combo)
+                    rows.append(self.mask_strength_value_label)
                     self.mask_diagnostic_btn = QPushButton("导出诊断数据")
                     self.mask_diagnostic_btn.setToolTip("导出各处理阶段、连通区域指标和异常编号总览")
                     self.mask_diagnostic_btn.setMinimumHeight(30)
@@ -552,21 +546,13 @@ class TaskPanel(QWidget):
                 return
 
     def _on_mask_strength_changed(self, index):
-        if not hasattr(self, 'mask_strength_combo'):
-            return
-        key = self.mask_strength_combo.itemData(index) or "standard"
-        self.mask_strength_changed.emit(str(key))
+        # Kept as a compatibility hook for callers from older UI snapshots.
+        self.mask_strength_changed.emit("standard")
 
     def set_mask_strength(self, key):
-        if not hasattr(self, 'mask_strength_combo'):
+        if not hasattr(self, "mask_strength_value_label"):
             return
-        key = str(key or "standard")
-        for i in range(self.mask_strength_combo.count()):
-            if self.mask_strength_combo.itemData(i) == key:
-                self.mask_strength_combo.blockSignals(True)
-                self.mask_strength_combo.setCurrentIndex(i)
-                self.mask_strength_combo.blockSignals(False)
-                return
+        self.mask_strength_value_label.setText("标准（固定）")
 
     def set_forbidden_state(self, count, confirmed):
         if not hasattr(self, "forbidden_status_label"):
@@ -623,7 +609,7 @@ class TaskPanel(QWidget):
         )
         if hasattr(self, "_mask_strength_label"):
             self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
-        for combo_name in ("model_combo", "turn_combo", "mask_strength_combo"):
+        for combo_name in ("model_combo", "turn_combo"):
             combo = getattr(self, combo_name, None)
             if combo:
                 combo.setStyleSheet(combo_style)

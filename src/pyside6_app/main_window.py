@@ -20,6 +20,7 @@ from config import (
     save_json_atomic,
     HARVESTER_PARAM_KEYS,
     HARVESTER_PARAM_SOURCE_LABELS,
+    MASK_PROCESSING_STRENGTH,
 )
 from state import AppState, AutoPathSegment, PathPoint
 from geo import GeoUtils
@@ -44,6 +45,12 @@ from workflow import WorkflowUpdater, AnimationEngine
 from project_log import ProjectJournal
 from task_lifecycle import admit_task_result, make_task_token
 from pyside6_app.project_session import cached_path_restore_plan, reset_project_state
+from runtime_paths import builtin_model_dir
+
+
+# ``ImageViewerGroup`` accepts BGR tuples and reverses them before creating a
+# Qt colour.  Keep the field-selection boundary blue at every redraw site.
+FIELD_BOUNDARY_COLOR_BGR = (255, 140, 50)
 
 
 class MainWindow(QMainWindow):
@@ -56,7 +63,7 @@ class MainWindow(QMainWindow):
         self.apply_stylesheet()
         self.cfg = Config(); self.cfg.load()
         self.state = AppState(); self.geo = GeoUtils()
-        self._mask_processing_strength = str(self.cfg.section("mask_processing").get("strength", "standard"))
+        self._mask_processing_strength = MASK_PROCESSING_STRENGTH
         # 从 config.json 加载农机参数；缺项使用 Config 默认值补齐，避免默认参数被判定“不完整”。
         self.state.harvester_params = self._effective_harvester_params({})
         self.state.harvester_param_sources = self._default_harvester_param_sources(
@@ -789,8 +796,7 @@ class MainWindow(QMainWindow):
         )
         self._set_theme_mode(target)
     def _builtin_model_dir(self):
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(root, "data", "models")
+        return str(builtin_model_dir())
 
     def _model_registry(self, model_dir=None):
         registry_path = os.path.join(
@@ -857,9 +863,7 @@ class MainWindow(QMainWindow):
         return self._on_load_model_at(models[0]["path"])
 
     def _auto_start(self):
-        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        data_dir = os.path.join(script_dir, "data")
-        data_models = os.path.join(data_dir, "models")
+        data_models = self._builtin_model_dir()
 
         self._model_list = self._builtin_model_list(data_models)
         if self._model_list:
@@ -1311,8 +1315,7 @@ class MainWindow(QMainWindow):
             seen.add(path)
             custom.append({"name": model.get("name") or self._model_display_name(model), "path": path})
         config_snapshot = self.cfg.update_section("models", {"custom": custom})
-        cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-        save_json_atomic(cfg_path, config_snapshot)
+        save_json_atomic(self.cfg.config_path(), config_snapshot)
 
     def _on_model_combo_changed(self, model_path_or_name):
         if model_path_or_name == "__IMPORT_MODEL_FOLDER__" or model_path_or_name == "导入模型文件夹...":
@@ -1821,32 +1824,22 @@ class MainWindow(QMainWindow):
             self.log_panel.info(f"已使下游结果失效：{reason}")
 
     def _on_mask_strength_changed(self, strength_key):
-        strength_key = str(strength_key or "standard")
+        # Compatibility hook for older panels/cached UI state.  The current
+        # application has one fixed mask-processing profile.
+        strength_key = MASK_PROCESSING_STRENGTH
         if strength_key == self._mask_processing_strength:
             return
-        labels = {
-            "light": "轻量/快速",
-            "standard": "标准",
-            "strong": "增强",
-            "very_strong": "强力",
-        }
         self._mask_processing_strength = strength_key
-        if strength_key in {"strong", "very_strong"}:
-            self.log_panel.warn(
-                "增强/强力模式会补全较长的行内断裂，仅适合明显漏检场景；"
-                "处理后请重点检查田头、道路边缘和面积变化。"
-            )
         config_snapshot = self.cfg.update_section("mask_processing", {"strength": strength_key})
-        cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-        save_json_atomic(cfg_path, config_snapshot)
+        save_json_atomic(self.cfg.config_path(), config_snapshot)
         self.task_panel.set_mask_strength(strength_key)
         if getattr(self.state, 'mask_processed', False):
             self._invalidate_analysis_from(
                 "mask",
-                f"掩膜处理强度已切换为 {labels.get(strength_key, strength_key)}，必须重新处理",
+                "掩膜处理参数已变化，必须重新处理",
             )
         else:
-            self.log_panel.info(f"掩膜处理强度: {labels.get(strength_key, strength_key)}")
+            self.log_panel.info("掩膜处理强度固定为：标准")
 
     def _ensure_field_trial_planning_mode(self):
         current = self.cfg.section("path_planning")
@@ -1860,8 +1853,7 @@ class MainWindow(QMainWindow):
         ):
             return
         snapshot = self.cfg.update_section("path_planning", desired)
-        cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-        save_json_atomic(cfg_path, snapshot)
+        save_json_atomic(self.cfg.config_path(), snapshot)
 
     def _on_turn_strategy_changed(self, strategy_key):
         """DECISION-007: a new turn strategy invalidates the planned route."""
@@ -1997,12 +1989,12 @@ class MainWindow(QMainWindow):
         vr = self._field_vertex_radius()
         for i in range(len(pts) - 1):
             viewer.draw_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
-                             color=(50, 140, 255), width=lw)
+                             color=FIELD_BOUNDARY_COLOR_BGR, width=lw)
         if mouse_pos and pts:
             viewer.draw_line(pts[-1][0], pts[-1][1], mouse_pos[0], mouse_pos[1],
-                             color=(50, 140, 255), width=max(3, lw // 2), style=Qt.DashLine)
+                             color=FIELD_BOUNDARY_COLOR_BGR, width=max(3, lw // 2), style=Qt.DashLine)
         for i, (px, py) in enumerate(pts):
-            c = (255, 255, 0) if i == 0 else (50, 140, 255)
+            c = (255, 255, 0) if i == 0 else FIELD_BOUNDARY_COLOR_BGR
             viewer.draw_circle(px, py, radius=vr, color=c)
 
     def _clear_field_overlay(self):
@@ -2091,7 +2083,7 @@ class MainWindow(QMainWindow):
         for i in range(len(boundary)):
             p1 = boundary[i]
             p2 = boundary[(i + 1) % len(boundary)]
-            viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(50, 140, 255), width=lw)
+            viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=FIELD_BOUNDARY_COLOR_BGR, width=lw)
         for px, py in boundary:
             viewer.draw_circle(px, py, radius=vr, color=(255, 255, 0))
         self._draw_forbidden_regions(clear_first=False)
@@ -3567,7 +3559,9 @@ class MainWindow(QMainWindow):
         """
         from importlib import metadata
         from cache import source_identity
+        from build_info import SCIENTIFIC_CODE_PATHS, load_build_info
         from provenance import APP_VERSION, code_identity, git_is_dirty, git_revision
+        from runtime_paths import is_frozen, project_root as runtime_project_root
 
         package_names = (
             "numpy", "opencv-python", "PySide6", "pyproj",
@@ -3609,21 +3603,21 @@ class MainWindow(QMainWindow):
         if not source_sha256:
             raise ValueError("源影像完整 SHA-256 缺失，不能生成科研溯源清单")
 
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        scientific_code = code_identity(project_root, [
-            "geo.py",
-            "inference.py",
-            "raster_preprocessing.py",
-            "mask_processor.py",
-            "row_geometry.py",
-            "legacy_route_coverage.py",
-            "footprint_planner.py",
-            "path_planner.py",
-            "provenance.py",
-            "config.py",
-            "cache.py",
-            "pyside6_app/workers.py",
-        ])
+        build_info = load_build_info()
+        # ``main_window.py`` is under ``src/pyside6_app`` after source
+        # organization; resolve the project root through the shared runtime
+        # helper instead of assuming the old flat layout.
+        project_root = str(runtime_project_root())
+        if is_frozen():
+            scientific_code = dict(build_info.get("scientific_code") or {})
+            if not scientific_code.get("fingerprint"):
+                raise ValueError("冻结包缺少科学代码构建指纹，不能生成溯源清单")
+            build_revision = str(build_info.get("commit_sha") or "")
+            build_dirty = build_info.get("git_dirty")
+        else:
+            scientific_code = code_identity(project_root, SCIENTIFIC_CODE_PATHS)
+            build_revision = git_revision(project_root)
+            build_dirty = git_is_dirty(project_root)
         readiness = dict(path_result.get("machine_readiness") or {})
         # DECISION-001/011: manifest classification must verify the complete
         # readiness assessment; a caller-supplied boolean must never upgrade a
@@ -3721,9 +3715,10 @@ class MainWindow(QMainWindow):
             output_metadata["path_protocol"] = path_protocol
         manifest = {
             "schema": 2,
-            "application_version": APP_VERSION,
-            "git_revision": git_revision(project_root),
-            "git_dirty": git_is_dirty(project_root),
+            "application_version": str(build_info.get("version") or APP_VERSION),
+            "git_revision": build_revision,
+            "git_dirty": build_dirty,
+            "build_info": self._manifest_jsonable(build_info),
             "scientific_code": scientific_code,
             "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
             "output": output_metadata,
@@ -4663,7 +4658,7 @@ class MainWindow(QMainWindow):
             for i in range(len(boundary)):
                 p1 = boundary[i]
                 p2 = boundary[(i + 1) % len(boundary)]
-                viewer.draw_line(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]), color=(50, 140, 255), width=2)
+                viewer.draw_line(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]), color=FIELD_BOUNDARY_COLOR_BGR, width=2)
         self._draw_forbidden_regions(clear_first=False)
         self._draw_service_points_overlay(clear_first=False)
 
@@ -4695,7 +4690,7 @@ class MainWindow(QMainWindow):
             for i in range(len(boundary)):
                 p1 = boundary[i]
                 p2 = boundary[(i + 1) % len(boundary)]
-                viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(50, 140, 255), width=4)
+                viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=FIELD_BOUNDARY_COLOR_BGR, width=4)
         self._draw_forbidden_regions(clear_first=False)
         self._draw_service_points_overlay(clear_first=False)
         route_style = Qt.DashLine if stale_preview else Qt.SolidLine
@@ -5567,11 +5562,7 @@ class MainWindow(QMainWindow):
         self.state.harvester_param_sources = next_sources
         self.state.harvester_params_confirmed = True
         config_snapshot = self.cfg.update_section("harvester", params)
-        cfg_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "config.json",
-        )
-        save_json_atomic(cfg_path, config_snapshot)
+        save_json_atomic(self.cfg.config_path(), config_snapshot)
         if getattr(self.state, "auto_path_planned", False):
             self._invalidate_analysis_from(
                 "path",
@@ -5603,7 +5594,7 @@ class MainWindow(QMainWindow):
         if SettingsDialog(self.cfg.snapshot(), self).exec() == QDialog.Accepted:
             self.cfg.load()
             current = self.cfg.snapshot()
-            self._mask_processing_strength = str(self.cfg.section("mask_processing").get("strength", "standard"))
+            self._mask_processing_strength = MASK_PROCESSING_STRENGTH
             self.task_panel.set_mask_strength(self._mask_processing_strength)
             if previous.get("model", {}) != current.get("model", {}):
                 self._invalidate_analysis_from(

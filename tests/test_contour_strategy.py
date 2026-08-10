@@ -484,7 +484,7 @@ def test_contour_near_radius_limit_uses_shared_tangent_without_pear_loop():
     assert all(len(turn) > 2 for turn in turns)
 
 
-def test_contour_entry_may_swap_outer_sides_but_never_start_at_center():
+def test_contour_entry_starts_at_the_nearest_row_pair():
     """入口靠右时逐层交换左右，不能整体反转为中心向外。"""
     from path_planner import _connect_work_lines
 
@@ -520,9 +520,69 @@ def test_contour_entry_may_swap_outer_sides_but_never_start_at_center():
     )
 
     work = [segment for segment, kind in zip(path, segment_types) if kind == "work"]
-    assert [segment[0][1] for segment in work] == [70.0, 10.0, 90.0, 30.0, 50.0]
-    assert diagnostics["contour_ordering"]["outside_side_reversed_for_entry"] is True
-    assert diagnostics["contour_ordering"]["ordered_original_indices"] == [3, 0, 4, 1, 2]
+    assert work[0][0][1] == 90.0
+    assert diagnostics["contour_ordering"]["entry_priority_applied"] is True
+    assert diagnostics["contour_ordering"]["ordered_original_indices"][0] == 4
+
+
+def test_band_centerline_endpoint_repair_restores_internal_truncated_rows():
+    from path_planner import prepare_band_centerlines
+
+    class _Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.01
+
+    class _State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+        mask_raw = np.zeros((500, 1400), dtype=np.uint8)
+        field_boundary = [
+            (0.0, 0.0), (1400.0, 0.0),
+            (1400.0, 500.0), (0.0, 500.0),
+        ]
+
+    bands = [
+        {
+            "id": index,
+            "centerline": [(100.0, 80.0 + index * 80.0),
+                            (1100.0, 80.0 + index * 80.0)],
+            "longitudinal_extent_m": 10.0,
+            "observed_span_ratio": 1.0,
+        }
+        for index in range(3)
+    ]
+    bands.append({
+        "id": 9,
+        "centerline": [(500.0, 320.0), (700.0, 320.0)],
+        "longitudinal_extent_m": 10.0,
+        "observed_span_ratio": 0.2,
+    })
+
+    lines, diagnostics = prepare_band_centerlines(
+        bands,
+        0.0,
+        geo=_Geo(),
+        state=_State(),
+        config={
+            "centerline_interval_m": 1.0,
+            "centerline_endpoint_repair_enabled": True,
+            "centerline_endpoint_repair_completion_ratio": 0.85,
+            "centerline_endpoint_repair_min_cohort": 3,
+            "centerline_endpoint_repair_max_m": 20.0,
+            "centerline_min_span_ratio": 0.65,
+        },
+    )
+
+    assert diagnostics["endpoint_repair"]["applied"] is True
+    assert diagnostics["ordered_band_ids"] == [0, 1, 2, 9]
+    repaired = lines[-1]
+    assert repaired[0][0] == pytest.approx(100.0)
+    assert repaired[-1][0] == pytest.approx(1100.0)
 
 
 def test_contour_is_a_valid_ordering_strategy_and_uses_bow_turn_geometry():
@@ -746,6 +806,94 @@ def test_uniform_zone_global_phase_keeps_track_gauge_spacing_after_mask_gap():
     assert np.diff(positions_m) == pytest.approx([1.75] * 4)
     assert diagnostics["spacing_is_uniform"] is True
     assert diagnostics["actual_spacing_m"] == pytest.approx(1.75)
+
+
+def test_uniform_zone_bridges_internal_axial_break_instead_of_making_a_turn_endpoint():
+    from path_planner import _generate_uniform_zone_lines
+
+    class _Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.01
+
+    class _State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+
+    contour = [(0.0, 0.0), (2000.0, 0.0), (2000.0, 800.0), (0.0, 800.0)]
+    mask = np.zeros((800, 2000), dtype=np.uint8)
+    mask[:, :800] = 255
+    mask[:, 1200:1900] = 255
+    diagnostics = {}
+    lines = _generate_uniform_zone_lines(
+        {"id": 13, "profile_width_m": 8.0, "contour": contour},
+        0.0,
+        1.75,
+        geo=_Geo(),
+        state=_State(),
+        mask=mask,
+        diagnostics=diagnostics,
+    )
+
+    assert lines
+    assert diagnostics["internal_gap_bridge_enabled"] is True
+    assert min(
+        float(np.hypot(
+            line[-1][0] - line[0][0], line[-1][1] - line[0][1]
+        ))
+        for line in lines
+    ) > 1500.0
+
+
+def test_uniform_zone_endpoint_repair_uses_shared_headland_walls():
+    from path_planner import _repair_uniform_zone_endpoints
+
+    class _Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.01
+
+    class _State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+        mask_raw = np.zeros((500, 1400), dtype=np.uint8)
+        field_boundary = [
+            (0.0, 0.0), (1400.0, 0.0),
+            (1400.0, 500.0), (0.0, 500.0),
+        ]
+
+    reference_lines = [
+        [(100.0, 40.0 + index * 40.0),
+         (1100.0, 40.0 + index * 40.0)]
+        for index in range(4)
+    ]
+    short_uniform = [
+        [(400.0, 260.0), (700.0, 260.0)],
+        [(400.0, 320.0), (700.0, 320.0)],
+    ]
+    repaired, diagnostics = _repair_uniform_zone_endpoints(
+        short_uniform,
+        {"id": 8, "longitudinal_extent_m": 10.0},
+        reference_lines,
+        0.0,
+        geo=_Geo(),
+        state=_State(),
+        mask=_State.mask_raw,
+        config={"centerline_endpoint_repair_max_m": 20.0},
+    )
+
+    assert diagnostics["applied"] is True
+    assert all(len(line) == 2 for line in repaired)
+    assert all(line[0][0] == pytest.approx(100.0) for line in repaired)
+    assert all(line[-1][0] == pytest.approx(1100.0) for line in repaired)
 
 
 def test_uniform_zone_default_spacing_aligns_adjacent_track_centrelines():

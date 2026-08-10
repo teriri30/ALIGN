@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "fixture_type": "automated_test_contract",
+  "command": "D:\\zhl\\anaconda\\envs\\game\\python.exe -m ultralytics yolo predict model=data/models/yolo11m_seg_best.pt source=data/tif",
+  "no_inference_result_published": true
+}

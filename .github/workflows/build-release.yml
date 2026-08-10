@@ -1,0 +1,93 @@
+name: build-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel"
+        required: true
+        default: "stable"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      REUI_DISABLE_AUTO_START: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: developer/requirements/requirements.txt
+      - name: Install runtime and build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r developer/requirements/requirements.txt -r developer/requirements/requirements-ci.txt -r developer/requirements/requirements-build.txt
+      - name: Configure geospatial data paths
+        shell: pwsh
+        run: |
+          $proj = & python -c "import rasterio, os; print(os.path.join(os.path.dirname(rasterio.__file__), 'proj_data'))"
+          Add-Content -Path $env:GITHUB_ENV -Value "PROJ_DATA=$proj"
+          Add-Content -Path $env:GITHUB_ENV -Value "PROJ_LIB=$proj"
+      - name: Static checks, compile and tests
+        shell: pwsh
+        run: |
+          python -m ruff check --select E9,F63,F7,F82 .
+          python -m compileall -q .
+          python -m pytest -q --cov=. --cov-report=term --cov-fail-under=35
+          python -m pip check
+      - name: Generate build metadata
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") { $version = $env:GITHUB_REF_NAME.TrimStart("v") } else { $version = "0.1.0-dev" }
+          $channel = "${{ inputs.channel }}"
+          if ([string]::IsNullOrWhiteSpace($channel)) { $channel = "stable" }
+          python scripts/generate_build_info.py --version $version --channel $channel
+      - name: Build PyInstaller bundle
+        shell: pwsh
+        run: python -m PyInstaller packaging/reUI.spec --noconfirm --clean
+      - name: Frozen bundle self-test
+        shell: pwsh
+        run: dist/reUI/reUI.exe --self-test
+      - name: Package and checksum
+        id: package
+        shell: pwsh
+        run: |
+          $version = (Get-Content build_info.json -Raw | ConvertFrom-Json).version
+          Copy-Item build_info.json dist/reUI/version.json -Force
+          Copy-Item packaging/README-Windows.txt dist/reUI/README-Windows.txt -Force
+          $zip = "reUI-Windows-x64-v$version.zip"
+          Compress-Archive -Path dist/reUI/* -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zip" | Set-Content "$zip.sha256" -Encoding ascii
+          $size = (Get-Item $zip).Length
+          if ($size -ge 2040109465) { throw "Release ZIP is >= 1.9 GiB; split runtime and model assets before publishing." }
+          "zip=$zip" | Out-File $env:GITHUB_OUTPUT -Append
+          "sha=$zip.sha256" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Created $zip ($size bytes)"
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reUI-windows-portable
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.sha }}
+      - name: Publish tagged GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $version = (Get-Content build_info.json -Raw | ConvertFrom-Json).version
+          gh release create $env:GITHUB_REF_NAME ${{ steps.package.outputs.zip }} ${{ steps.package.outputs.sha }} --generate-notes --title "reUI $version"

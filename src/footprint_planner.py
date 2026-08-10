@@ -1433,10 +1433,21 @@ def assess_footprint_hard_constraints(
     require_optional_layers: bool = False,
     require_explicit_valid: bool = True,
 ) -> Dict:
-    """Apply the formal profile gates used before footprint soft ranking."""
+    """Apply formal footprint gates while keeping core overlap report-only by default.
+
+    ``track_core_overlap_pct`` remains a required finite audit metric, but the
+    default ``track_core_overlap_policy=report_only`` does not reject a route
+    on that metric alone.  Set the policy to ``hard_gate`` when a caller
+    explicitly needs the historical threshold gate.
+    """
     cfg = dict(config or {})
     metrics = dict(footprint or {})
     profile = str(cfg.get("validation_profile", metrics.get("validation_profile", "field_trial")))
+    core_overlap_policy = str(
+        cfg.get("track_core_overlap_policy", "report_only")
+    ).strip().lower()
+    if core_overlap_policy not in {"report_only", "hard_gate"}:
+        core_overlap_policy = "report_only"
     profile_limits = {
         "field_trial": {
             "outside_field": 1.0, "outside_support": 5.0,
@@ -1519,7 +1530,8 @@ def assess_footprint_hard_constraints(
             reasons.append(f"validation_gate_exceeded:{name}")
             issues.append(f"{name}={value:.6g} exceeds limit={limit:.6g}")
 
-    add_exceeded("track_core_overlap_pct")
+    if core_overlap_policy == "hard_gate":
+        add_exceeded("track_core_overlap_pct")
     coverage = values.get("planned_target_geometric_coverage_pct")
     try:
         minimum_coverage = float(limits["planned_target_geometric_coverage_pct"])
@@ -1552,6 +1564,7 @@ def assess_footprint_hard_constraints(
         "hard_reasons": hard_reasons,
         "issues": list(dict.fromkeys(issues)),
         "validation_profile": profile,
+        "track_core_overlap_policy": core_overlap_policy,
         "validation_limits_pct": {
             **limits,
             "machine_outside_field": 0.0 if profile == "machine_candidate" else None,

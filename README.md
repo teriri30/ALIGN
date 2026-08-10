@@ -2,6 +2,20 @@
 
 `reUI` 是面向宽窄行再生稻低碾压收获路径规划的科研软件。系统实现 GeoTIFF 导入、田块圈选、实例分割、行带正则化、农机约束路径规划、路径验证、模拟和 WGS84 路径导出。
 
+## 普通用户使用（Windows 便携版）
+
+普通用户使用发布文件夹根目录的 `reUI.exe`，完整保留旁边的 `_internal` 文件夹后双击启动。源码仓库和运行包是两种交付物；直接下载 GitHub 的 `Code → Download ZIP` 不会包含本地构建产生的 EXE。便携版已携带 Python 运行库、PySide6、模型推理依赖、GeoTIFF/坐标依赖和内置模型，不需要安装 Python、Conda、pip 或项目依赖。使用 GPU 推理时仍需要电脑安装兼容的 NVIDIA 显卡驱动。
+
+程序配置、缓存、日志和用户模型保存在 `%LOCALAPPDATA%\\reUI`，更新程序不会覆盖这些数据。`update.bat` 是开发者同步源代码到 GitHub 的工具，不是普通用户的 EXE 更新器。
+
+## 目录结构
+
+发布后的项目根目录直接包含 `reUI.exe` 和 `_internal/`；应用源码统一位于
+`src/`，PySide6 界面位于 `src/pyside6_app/`，测试、构建脚本、文档和模型数据
+分别位于 `tests/`、`packaging/`、`scripts/`、`docs/`、`data/` 和 `developer/`。
+
+掩膜处理统一使用“标准”档位；界面不再提供轻量、增强或强力切换，旧配置中的这些名称会自动归一为标准。
+
 ## 项目定位
 
 <!-- DECISION-008: 科研适用范围与指标含义。修改前阅读 docs/DECISIONS.md。 -->
@@ -11,10 +25,10 @@
 
 ## 运行环境
 
-已验证环境为 `D:\zhl\anaconda\envs\game`：Python 3.10.20、PyTorch 2.9.1+cu128、CUDA 12.8。完整版本见 `environment.game.yml` 和 `requirements.txt`。
+已验证环境为 `D:\zhl\anaconda\envs\game`：Python 3.10.20、PyTorch 2.9.1+cu128、CUDA 12.8。完整版本见 `developer/environment.game.yml` 和 `developer/requirements/requirements.txt`。
 
 ```powershell
-D:\zhl\anaconda\envs\game\python.exe main.py
+D:\zhl\anaconda\envs\game\python.exe src\main.py
 ```
 
 ## 验证
@@ -35,7 +49,7 @@ bash scripts/test.sh -q
 导出后可独立验证路径文件和阶段证据；加入 `--verify-sources` 会重新哈希源 GeoTIFF 和模型：
 
 ```powershell
-D:\zhl\anaconda\envs\game\python.exe integrity_check.py path_result.csv.manifest.json --verify-sources
+D:\zhl\anaconda\envs\game\python.exe src\integrity_check.py path_result.csv.manifest.json --verify-sources
 ```
 
 ## 数据安全规则

@@ -360,7 +360,14 @@ def test_segment_type_summary_reports_required_turn_semantics_with_zero_fill():
 def test_real_baseline_status_command_is_executable_and_not_placeholder():
     import json
 
-    status_path = Path("experiments/real_yolo11m_baseline_20260722/baseline_status.json")
+    # Keep the automated contract fixture under tests/; historical experiment
+    # output is not a source dependency and must not be recreated as evidence.
+    status_path = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "real_yolo11m_baseline_20260722"
+        / "baseline_status.json"
+    )
     payload = json.loads(status_path.read_text(encoding="utf-8"))
     assert "..." not in payload["command"]
     assert "ultralytics" in payload["command"]

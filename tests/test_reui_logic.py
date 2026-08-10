@@ -1227,7 +1227,7 @@ def test_connect_work_lines_uses_global_service_points_with_local_work_lines():
     assert full_path[-1][-1] == (50.0, 60.0)
 
 
-def test_service_points_default_to_reference_only_without_forced_connectors():
+def test_service_points_default_to_connect_with_explicit_route_connectors():
     from path_planner import _connect_work_lines
     from state import AppState
 
@@ -1247,19 +1247,80 @@ def test_service_points_default_to_reference_only_without_forced_connectors():
         return_diagnostics=True,
     )
 
+    assert segment_types[0] == "entry"
+    assert segment_types[-1] == "exit"
+    assert diagnostics["service_points"]["mode"] == "connect"
+    assert diagnostics["service_points"]["entry_reference_used"] is True
+    assert diagnostics["service_points"]["exit_reference_used"] is True
+    assert diagnostics["service_points"]["entry_connector_emitted"] is True
+    assert diagnostics["service_points"]["exit_connector_emitted"] is True
+    assert full_path[0][0] == (30.0, 50.0)
+    assert full_path[0][-1] == full_path[1][0]
+    assert full_path[-1][-1] == (90.0, 80.0)
+
+
+def test_service_points_can_explicitly_remain_reference_only():
+    from path_planner import _connect_work_lines
+    from state import AppState
+
+    state = AppState()
+    state.mask_offset_x = 100
+    state.mask_offset_y = 200
+    state.mask_raw = np.zeros((100, 100), dtype=np.uint8)
+    state.entry_point = (130.0, 250.0)
+    state.exit_point = (190.0, 280.0)
+
+    full_path, segment_types, diagnostics = _connect_work_lines(
+        [[(10, 20), (10, 60)], [(20, 60), (20, 20)]],
+        state=state,
+        geo=_FixedMetricGeo(),
+        min_turn_radius_m=1.0,
+        turn_strategy="auto",
+        config={"service_point_mode": "reference_only"},
+        return_diagnostics=True,
+    )
+
     assert segment_types[0] == "work"
     assert "entry" not in segment_types
     assert "exit" not in segment_types
-    assert "turn_reverse" not in segment_types
     assert diagnostics["service_points"]["mode"] == "reference_only"
-    assert diagnostics["service_points"]["entry_reference_used"] is True
-    assert diagnostics["service_points"]["exit_reference_used"] is True
     assert diagnostics["service_points"]["entry_connector_emitted"] is False
     assert diagnostics["service_points"]["exit_connector_emitted"] is False
     assert full_path[0][0] != (30.0, 50.0)
 
 
-def test_service_point_references_select_route_start_and_end_direction():
+def test_contour_starts_with_the_pair_containing_nearest_entry_row():
+    from path_planner import _connect_work_lines
+    from state import AppState
+
+    state = AppState()
+    state.mask_raw = np.zeros((120, 160), dtype=np.uint8)
+    state.entry_point = (0.0, 30.0)
+
+    full_path, segment_types, diagnostics = _connect_work_lines(
+        [
+            [(0.0, 10.0), (100.0, 10.0)],
+            [(0.0, 20.0), (100.0, 20.0)],
+            [(0.0, 30.0), (100.0, 30.0)],
+            [(0.0, 40.0), (100.0, 40.0)],
+            [(0.0, 50.0), (100.0, 50.0)],
+            [(0.0, 60.0), (100.0, 60.0)],
+        ],
+        state=state,
+        geo=_FixedMetricGeo(),
+        min_turn_radius_m=1.0,
+        turn_strategy="contour",
+        global_main_angle=0.0,
+        return_diagnostics=True,
+    )
+
+    first_work_index = segment_types.index("work")
+    assert full_path[first_work_index][0] == (0.0, 30.0)
+    assert diagnostics["contour_ordering"]["entry_priority_applied"] is True
+    assert diagnostics["contour_ordering"]["ordered_original_indices"][0] == 2
+
+
+def test_service_point_references_keep_nearest_entry_row_authoritative():
     """起终点都应参与首尾参考，而不是只使用起点。"""
     from path_planner import _connect_work_lines
     from state import AppState
@@ -1300,7 +1361,8 @@ def test_service_point_references_select_route_start_and_end_direction():
 
     assert first_diagnostics["reference_ordering"]["exit_reference_used"] is True
     assert second_diagnostics["reference_ordering"]["exit_reference_used"] is True
-    assert first_work != second_work
+    assert first_work == second_work
+    assert first_work[0][0] == (0.0, 10.0)
     assert first_diagnostics["reference_ordering"]["selected_exit_distance_m"] <= 10.0
     actual_exit_distance_m = float(
         np.hypot(
@@ -2176,6 +2238,111 @@ def test_terminal_headland_wall_ignores_short_internal_work_fragment():
     assert clean[85, 100] == 255
     assert corridor[40, 25] == 255
     assert diagnostics["terminal_shape"]["wall_rejected_short_row_count"] > 0
+
+
+def test_terminal_headland_wall_rejects_long_span_inward_endpoint_wedge():
+    """DECISION-009: a local inward endpoint defect cannot bend the field wall."""
+    import cv2
+
+    from row_geometry import resolve_terminal_headland_overlap
+
+    raw = np.zeros((180, 260), dtype=np.uint8)
+    body = np.zeros_like(raw)
+    reference = np.zeros_like(raw)
+    seed = np.zeros_like(raw)
+    body[20:160, 30:181] = 255
+    reference[20:160, 30:181] = 255
+    # This 3 m inward notch remains longer than the old 72% span gate, so the
+    # former endpoint interpolation treated it as a trusted wall and moved
+    # supported main-work pixels into the terminal corridor.
+    reference[70:112, 151:181] = 0
+    seed[20:160, 181:221] = 255
+    # The terminal candidate itself contains the same inward wedge.  A robust
+    # reference wall must bound both the generated corridor and the accepted
+    # seed; otherwise the candidate edge silently reintroduces the triangle.
+    seed[70:112, 151:181] = 255
+    raw = cv2.bitwise_or(body, seed)
+
+    clean, headland, corridor, diagnostics = resolve_terminal_headland_overlap(
+        raw,
+        body,
+        seed,
+        0.0,
+        0.1,
+        {
+            "headland_corridor_close_m": 0.5,
+            "headland_corridor_terminal_depth_m": 4.0,
+            "headland_corridor_min_span_ratio": 0.6,
+            "headland_corridor_min_seed_ratio": 0.1,
+            "headland_terminal_follow_max_depth_m": 5.0,
+            "headland_terminal_wall_outlier_tolerance_m": 0.8,
+        },
+        axial_reference_mask=reference,
+    )
+
+    assert corridor[90, 165] == 0
+    assert headland[90, 165] == 0
+    assert clean[90, 165] == 255
+    assert corridor[90, 200] == 255
+    assert diagnostics["terminal_shape"]["wall_outlier_replaced_row_count"] > 0
+
+
+def test_terminal_headland_restores_quantized_wall_from_field_end_edge():
+    """DECISION-009: a common axial clip must not flatten a sloped field end."""
+    import cv2
+
+    from row_geometry import resolve_terminal_headland_overlap
+
+    raw = np.zeros((180, 260), dtype=np.uint8)
+    reference = np.zeros_like(raw)
+    reference[20:160, 80:201] = 255
+    body = reference.copy()
+    seed = np.zeros_like(raw)
+    seed[20:160, 40:80] = 255
+    raw = cv2.bitwise_or(reference, seed)
+    # The selected field end spans the row lattice and preserves a 0.2 px/px
+    # physical slope.  The regularized reference above is deliberately flat,
+    # reproducing the quantization caused by one common axial body interval.
+    field_polygon = np.asarray(
+        [(30.0, 20.0), (58.0, 160.0), (240.0, 160.0), (240.0, 20.0)],
+        dtype=np.float64,
+    )
+
+    clean, headland, corridor, diagnostics = resolve_terminal_headland_overlap(
+        raw,
+        body,
+        seed,
+        0.0,
+        0.1,
+        {
+            "band_end_trim_m": 0.10,
+            "headland_corridor_close_m": 0.5,
+            "headland_corridor_terminal_depth_m": 5.0,
+            "headland_corridor_min_span_ratio": 0.6,
+            "headland_corridor_min_seed_ratio": 0.1,
+            "headland_terminal_follow_max_depth_m": 5.0,
+            "headland_terminal_wall_smooth_m": 0.1,
+            "headland_terminal_field_edge_min_span_ratio": 0.6,
+            "headland_terminal_field_edge_max_abs_slope": 0.25,
+            "headland_terminal_wall_quantized_mad_px": 0.5,
+        },
+        axial_reference_mask=reference,
+        field_polygon=field_polygon,
+    )
+
+    # The same x lies outside the restored upper wall but inside the lower
+    # wall.  A flat x=80 wall would classify both as headland.
+    assert corridor[30, 75] == 0
+    assert headland[30, 75] == 0
+    assert corridor[150, 75] == 255
+    assert headland[150, 75] == 255
+    assert clean[30, 80] == 255
+    shape = diagnostics["terminal_shape"]
+    assert "start" in shape["field_slope_applied_sides"]
+    assert shape["field_slope_hints"]["start"][
+        "slope_px_per_cross_row_px"
+    ] == pytest.approx(0.2)
+    assert shape["restored_band_end_trim_m"] == pytest.approx(0.1)
 
 
 def test_terminal_headland_classifies_regions_before_exposing_seed():

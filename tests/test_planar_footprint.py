@@ -123,6 +123,61 @@ def test_machine_candidate_validation_rejects_machine_envelope_risk(monkeypatch)
     assert any("整机平面包络越出田块" in issue for issue in result["issues"])
 
 
+def test_field_trial_core_overlap_is_report_only_by_default(monkeypatch):
+    import path_planner
+
+    footprint = {
+        "track_core_overlap_pct": 99.0,
+        "planned_target_geometric_coverage_pct": 100.0,
+        "track_outside_field_pct": 0.0,
+        "track_outside_support_pct": 0.0,
+        "track_uncertain_overlap_pct": 0.0,
+        "track_forbidden_overlap_pct": 0.0,
+    }
+    monkeypatch.setattr(
+        path_planner, "validate_footprints", lambda *_args, **_kwargs: footprint
+    )
+
+    result = path_planner.validate_path(
+        [[(1.0, 1.0), (20.0, 1.0)]],
+        np.ones((30, 30), dtype=np.uint8) * 255,
+        0.0,
+        geo=_Geo(),
+        state=_State(),
+        segment_types=["work"],
+        config={
+            "validation_profile": "field_trial",
+            "max_track_core_overlap_pct": 8.0,
+            "min_geometric_coverage_pct": 90.0,
+        },
+    )
+
+    assert result["valid"] is True
+    assert result["track_core_overlap_policy"] == "report_only"
+    assert not any("核心重叠" in issue for issue in result["issues"])
+
+
+def test_footprint_hard_constraints_keep_core_overlap_as_report_only_by_default():
+    from footprint_planner import assess_footprint_hard_constraints
+
+    result = assess_footprint_hard_constraints(
+        {
+            "valid": True,
+            "track_core_overlap_pct": 99.0,
+            "planned_target_geometric_coverage_pct": 100.0,
+            "track_outside_field_pct": 0.0,
+        },
+        {
+            "validation_profile": "field_trial",
+            "max_track_core_overlap_pct": 8.0,
+        },
+    )
+
+    assert result["valid"] is True
+    assert result["track_core_overlap_policy"] == "report_only"
+    assert "validation_gate_exceeded:track_core_overlap_pct" not in result["hard_reasons"]
+
+
 @pytest.mark.parametrize("metric", [float("nan"), float("inf"), "invalid"])
 def test_machine_candidate_validation_rejects_non_finite_machine_envelope_metric(monkeypatch, metric):
     import path_planner

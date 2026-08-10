@@ -11,8 +11,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-
-APP_VERSION = "0.1.0"
+from version import APP_VERSION
 PROVENANCE_SCHEMA_VERSION = 1
 
 

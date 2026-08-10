@@ -1,8 +1,10 @@
 """Configuration management and logging for the PySide6 application."""
-import os, json, logging, datetime, tempfile, glob as _glob, threading, math
+import os, json, logging, datetime, tempfile, glob as _glob, threading, math, shutil
 from contextlib import contextmanager
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Optional
+from runtime_paths import bundled_resource, legacy_config_path, user_config_path, logs_dir
 
 
 class ConfigValidationError(ValueError):
@@ -35,6 +37,14 @@ HARVESTER_PARAM_SOURCE_LABELS = {
     "legacy_unverified": "历史缓存（来源未记录）",
 }
 HARVESTER_FORMAL_MEASURED_SOURCES = frozenset({"user_measured"})
+
+# The mask pipeline has one audited operating profile. Older configuration
+# files may still contain the removed profile names; validation canonicalizes
+# them to this value so stale settings cannot silently change the result.
+MASK_PROCESSING_STRENGTH = "standard"
+LEGACY_MASK_PROCESSING_STRENGTHS = frozenset(
+    {"light", "standard", "strong", "very_strong"}
+)
 
 
 def _validated_number(section: dict, key: str, *, minimum=None, maximum=None, strict_min=False):
@@ -69,6 +79,30 @@ def validate_config(raw: dict) -> dict:
     _validated_number(model, "tile_overlap", minimum=0.0, maximum=0.95)
     _validated_number(model, "tile_capture_size", minimum=64, maximum=8192)
     _validated_number(model, "max_source_crop_pixels", minimum=1)
+    _validated_number(
+        model, "orthomosaic_recovery_conf_threshold", minimum=0.0, maximum=1.0
+    )
+    _validated_number(
+        model, "orthomosaic_context_capture_multiplier", minimum=1, maximum=4
+    )
+    _validated_number(
+        model, "orthomosaic_context_overlap", minimum=0.0, maximum=0.90
+    )
+    _validated_number(
+        model, "orthomosaic_context_support_ratio", minimum=0.0, maximum=1.0
+    )
+    _validated_number(
+        model, "orthomosaic_context_recovery_distance_m", minimum=0.0, maximum=5.0
+    )
+    _validated_number(
+        model, "orthomosaic_context_separator_ratio", minimum=0.0, maximum=1.0
+    )
+    _validated_number(
+        model, "orthomosaic_context_separator_min_votes", minimum=1, maximum=16
+    )
+    _validated_number(
+        model, "orthomosaic_context_separator_min_length_m", minimum=0.0, maximum=20.0
+    )
 
     harvester = raw.get("harvester", {})
     for key in (
@@ -116,6 +150,12 @@ def validate_config(raw: dict) -> dict:
         raise ConfigValidationError(
             "validation_profile must be research, field_trial, or machine_candidate"
         )
+    if "track_core_overlap_policy" in planning and str(
+        planning["track_core_overlap_policy"]
+    ) not in {"report_only", "hard_gate"}:
+        raise ConfigValidationError(
+            "track_core_overlap_policy must be report_only or hard_gate"
+        )
     if "service_point_mode" in planning and str(
         planning["service_point_mode"]
     ) not in {"reference_only", "connect"}:
@@ -129,9 +169,21 @@ def validate_config(raw: dict) -> dict:
     _validated_number(planning, "endpoint_shortfall_min_m", minimum=0.0)
     _validated_number(planning, "endpoint_extension_max_m", minimum=0.0)
     _validated_number(planning, "work_line_endpoint_extension_m", minimum=0.0)
+    _validated_number(planning, "centerline_endpoint_repair_completion_ratio",
+                      minimum=0.5, maximum=1.0)
+    _validated_number(planning, "centerline_endpoint_repair_min_cohort",
+                      minimum=2.0)
+    _validated_number(planning, "centerline_endpoint_repair_max_m", minimum=0.0)
     _validated_number(
         planning, "uniform_zone_min_line_length_ratio",
         minimum=0.5, maximum=1.0,
+    )
+    _validated_number(planning, "uniform_zone_min_width_m", minimum=0.1)
+    _validated_number(
+        planning, "planting_region_ambiguity_margin_m", minimum=0.0,
+    )
+    _validated_number(
+        planning, "uniform_internal_gap_bridge_m", minimum=0.0,
     )
     if planning.get("uniform_zone_line_spacing_m") is not None:
         _validated_number(planning, "uniform_zone_line_spacing_m", minimum=0.0, strict_min=True)
@@ -223,10 +275,15 @@ def validate_config(raw: dict) -> dict:
         )
 
     mask = raw.get("mask_processing", {})
-    if "strength" in mask and str(mask["strength"]) not in {
-        "light", "standard", "strong", "very_strong",
-    }:
-        raise ConfigValidationError("strength must be light, standard, strong, or very_strong")
+    if "strength" in mask:
+        strength = str(mask["strength"]).strip().lower()
+        if strength not in LEGACY_MASK_PROCESSING_STRENGTHS:
+            raise ConfigValidationError(
+                "strength must be the supported standard mask profile"
+            )
+        # Keep old config files readable while making the single active
+        # profile explicit in the canonical in-memory configuration.
+        mask["strength"] = MASK_PROCESSING_STRENGTH
     if "headland_corridor_enabled" in mask and not isinstance(
         mask["headland_corridor_enabled"], bool
     ):
@@ -257,7 +314,8 @@ def validate_config(raw: dict) -> dict:
     _validated_number(mask, "band_width_threshold_m", minimum=0.0, strict_min=True)
     for key in (
         "band_internal_gap_close_m", "band_end_gap_close_m",
-        "band_endpoint_gap_close_m", "band_end_guard_m",
+        "band_endpoint_gap_close_m", "band_end_guard_m", "band_end_trim_m",
+        "band_internal_gap_bridge_m", "band_terminal_fragment_min_m",
         "residual_body_attach_m", "residual_body_max_angle_deg",
         "residual_body_min_elongation", "headland_corridor_close_m",
         "headland_corridor_depth_smooth_m",
@@ -265,6 +323,9 @@ def validate_config(raw: dict) -> dict:
         "headland_corridor_endpoint_margin_m",
         "headland_terminal_follow_max_depth_m",
         "headland_terminal_wall_smooth_m",
+        "headland_terminal_wall_outlier_tolerance_m",
+        "headland_terminal_field_edge_max_abs_slope",
+        "headland_terminal_wall_quantized_mad_px",
         "headland_terminal_dense_seed_depth_m",
         "headland_terminal_dense_seed_gap_m",
         "headland_terminal_dense_seed_min_depth_m",
@@ -274,6 +335,10 @@ def validate_config(raw: dict) -> dict:
         "headland_terminal_separator_endpoint_tolerance_m",
     ):
         _validated_number(mask, key, minimum=0.0)
+    _validated_number(
+        mask, "headland_terminal_field_edge_min_span_ratio",
+        minimum=0.0, maximum=1.0,
+    )
     _validated_number(mask, "residual_body_min_attach_ratio", minimum=0.0, maximum=1.0)
     _validated_number(mask, "headland_corridor_min_span_ratio", minimum=0.0, maximum=1.0)
     _validated_number(
@@ -338,6 +403,7 @@ def save_json_atomic(path: str, data: dict):
     写入前进行 JSON 序列化校验，确保数据可序列化。"""
     content = json.dumps(data, indent=2, ensure_ascii=False)
     dir_name = os.path.dirname(os.path.abspath(path))
+    os.makedirs(dir_name, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=dir_name)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -371,25 +437,39 @@ class Config:
                 cls._instance = super().__new__(cls)
                 cls._instance._loaded = False
                 cls._instance._raw = {}
+                cls._instance._path = ""
                 cls._instance._lock = threading.RLock()
         return cls._instance
 
     def load(self, path: str = "") -> bool:
-        if not path:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            path = os.path.join(script_dir, "config.json")
-        if not os.path.exists(path):
-            example_path = os.path.join(os.path.dirname(os.path.abspath(path)), "config.example.json")
-            if os.path.exists(example_path):
-                path = example_path
-        if os.path.exists(path):
+        explicit_path = bool(str(path or "").strip())
+        if explicit_path:
+            target_path = os.path.abspath(str(path))
+            example_path = os.path.join(os.path.dirname(target_path), "config.example.json")
+        else:
+            # DECISION-018: user settings are outside the install directory.
+            target_path = os.path.abspath(
+                str(os.environ.get("REUI_CONFIG_PATH", "") or user_config_path())
+            )
+            example_path = str(bundled_resource("config.example.json"))
+            if not os.path.exists(target_path):
+                legacy_path = legacy_config_path()
+                source_path = legacy_path if legacy_path.is_file() else Path(example_path)
+                if source_path.is_file() and os.path.abspath(str(source_path)) != target_path:
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    shutil.copy2(str(source_path), target_path)
+        load_path = target_path
+        if not os.path.exists(load_path) and os.path.exists(example_path):
+            load_path = example_path
+        if os.path.exists(load_path):
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(load_path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 validated = validate_config(raw)
                 with self._lock:
                     self._raw = validated
                     self._loaded = True
+                    self._path = os.path.abspath(target_path if not explicit_path else load_path)
                 return True
             except ConfigValidationError:
                 with self._lock:
@@ -402,6 +482,11 @@ class Config:
             self._raw = {}
             self._loaded = False
         return False
+
+    def config_path(self) -> str:
+        """Return the writable config file used by the current session."""
+        with self._lock:
+            return str(self._path or user_config_path())
 
     def _get(self, *keys: str, default: Any = None) -> Any:
         with self._lock:
@@ -537,7 +622,7 @@ class Config:
     @property
     def BAND_AUTO_CALIBRATE(self) -> bool: return self._get("mask_processing", "band_auto_calibrate", default=True)
     @property
-    def MASK_PROCESSING_STRENGTH(self) -> str: return self._get("mask_processing", "strength", default="standard")
+    def MASK_PROCESSING_STRENGTH(self) -> str: return MASK_PROCESSING_STRENGTH
 
     @property
     def CUTTER_WIDTH_M(self) -> float: return self._get("harvester", "cutter_width_m", default=DEFAULT_HARVESTER_PARAMS["cutter_width_m"])
@@ -590,7 +675,7 @@ class AppLogger:
         if self._initialized:
             return
         if not log_dir:
-            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+            log_dir = str(logs_dir())
         os.makedirs(log_dir, exist_ok=True)
         self._cleanup_old_logs(log_dir, max_keep=5)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

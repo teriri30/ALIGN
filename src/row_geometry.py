@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-MASK_REGULARIZATION_VERSION = 14
+MASK_REGULARIZATION_VERSION = 17
 
 
 def odd_size(value: float, minimum: int = 3) -> int:
@@ -312,19 +312,33 @@ def repair_row_gaps(
     k_w = min(k_w, max(1, int(max(src.shape[:2]) * 0.01) | 1))
     if k_len <= 3:
         return src
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_len, max(1, k_w)))
-    center = (k_len // 2, max(1, k_w) // 2)
-    matrix = cv2.getRotationMatrix2D(center, math.degrees(float(main_angle)), 1.0)
-    rotated_kernel = cv2.warpAffine(
-        kernel,
-        matrix,
-        (k_len, max(1, k_w)),
+    # DECISION-009: rotate the evidence into the row-aligned frame before the
+    # close.  Rotating a long, thin kernel inside its original ``k_len x k_w``
+    # canvas clips almost the entire kernel at oblique angles (the real 108°
+    # case collapsed to only a few pixels), so valid internal gaps were not
+    # repaired and were later removed by the raw-support constraint.
+    aligned, matrix = rotate_bound(
+        src, math.degrees(float(main_angle)), cv2.INTER_NEAREST
+    )
+    k_len = min(k_len, max(3, int(aligned.shape[1] * 0.20) | 1))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (k_len, max(1, k_w))
+    )
+    repaired_aligned = cv2.morphologyEx(
+        aligned, cv2.MORPH_CLOSE, kernel, iterations=1
+    )
+    inverse = cv2.invertAffineTransform(matrix)
+    repaired = cv2.warpAffine(
+        repaired_aligned,
+        inverse,
+        (src.shape[1], src.shape[0]),
         flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
-    rotated_kernel = (rotated_kernel > 0).astype(np.uint8)
-    repaired = cv2.morphologyEx(src, cv2.MORPH_CLOSE, rotated_kernel, iterations=1)
-    return repaired
+    # Nearest-neighbour round trips can drop isolated edge pixels.  Gap repair
+    # may add supported bridges but must never delete original evidence.
+    return cv2.bitwise_or(src, (repaired > 0).astype(np.uint8) * 255)
 
 
 def constrain_generated_body_to_raw_support(
@@ -356,6 +370,7 @@ def resolve_terminal_headland_overlap(
     meters_per_px: float,
     config: Optional[Dict[str, Any]] = None,
     axial_reference_mask: Optional[np.ndarray] = None,
+    field_polygon: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     """Give strong terminal headland corridors precedence over rebuilt rows.
 
@@ -449,6 +464,16 @@ def resolve_terminal_headland_overlap(
             "wall_reference_axial_span_px": 0.0,
             "wall_trusted_row_count": 0,
             "wall_rejected_short_row_count": 0,
+            "wall_fit_method": "binned_theil_sen_outlier_replacement",
+            "wall_outlier_tolerance_m": float(max(
+                0.0,
+                cfg.get("headland_terminal_wall_outlier_tolerance_m", 0.75),
+            )),
+            "wall_outlier_replaced_row_count": 0,
+            "wall_outlier_replaced_by_side": {},
+            "field_slope_hints": {},
+            "field_slope_applied_sides": [],
+            "restored_band_end_trim_m": 0.0,
         },
         "axial_reference_source": (
             "regularized_longitudinal_body"
@@ -474,11 +499,14 @@ def resolve_terminal_headland_overlap(
         body, matrix, (out_w, out_h), flags=cv2.INTER_NEAREST,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
+    has_axial_reference = bool(
+        axial_reference_mask is not None
+        and np.asarray(axial_reference_mask).shape == body.shape
+    )
     axial_reference = (
         (np.asarray(axial_reference_mask, dtype=np.uint8) > 0).astype(np.uint8)
         * 255
-        if axial_reference_mask is not None
-        and np.asarray(axial_reference_mask).shape == body.shape
+        if has_axial_reference
         else body
     )
     reference_rotated = cv2.warpAffine(
@@ -504,6 +532,69 @@ def resolve_terminal_headland_overlap(
         float(cfg.get("headland_corridor_terminal_depth_m", 3.0))
         / float(meters_per_px)
     )))
+
+    # The regularized band polygons share a conservative axial sampling
+    # interval.  In a slightly skewed field this can quantize every endpoint
+    # to the same x coordinate and erase the real terminal-wall slope.  The
+    # selected field polygon still preserves that physical terminal-edge
+    # orientation, so retain long, cross-row polygon edges as slope hints.
+    # The hint is only consumed below when the reference endpoints are
+    # demonstrably quantized; genuine endpoint trends remain authoritative.
+    field_slope_hints: Dict[str, Dict[str, Any]] = {}
+    polygon = None
+    if field_polygon is not None:
+        candidate_polygon = np.asarray(field_polygon, dtype=np.float64).reshape(-1, 2)
+        if (
+            candidate_polygon.shape[0] >= 3
+            and np.all(np.isfinite(candidate_polygon))
+        ):
+            polygon = cv2.transform(
+                candidate_polygon.reshape(-1, 1, 2), matrix
+            ).reshape(-1, 2)
+    if polygon is not None:
+        min_field_span_ratio = float(np.clip(
+            cfg.get("headland_terminal_field_edge_min_span_ratio", 0.45),
+            0.10,
+            1.0,
+        ))
+        max_field_slope = float(max(
+            0.0,
+            cfg.get("headland_terminal_field_edge_max_abs_slope", 0.25),
+        ))
+        edge_candidates = []
+        for edge_index in range(polygon.shape[0]):
+            point_a = polygon[edge_index]
+            point_b = polygon[(edge_index + 1) % polygon.shape[0]]
+            delta_y = float(point_b[1] - point_a[1])
+            if abs(delta_y) < 1e-9:
+                continue
+            slope = float((point_b[0] - point_a[0]) / delta_y)
+            span_ratio = float(min(
+                1.0,
+                abs(delta_y) / max(float(body_cross_span), 1.0),
+            ))
+            if span_ratio < min_field_span_ratio or abs(slope) > max_field_slope:
+                continue
+            edge_candidates.append({
+                "edge_index": int(edge_index),
+                "slope_px_per_cross_row_px": slope,
+                "cross_row_span_ratio": span_ratio,
+                "midpoint_x_px": float((point_a[0] + point_b[0]) * 0.5),
+            })
+        if edge_candidates:
+            start_candidate = min(
+                edge_candidates, key=lambda item: item["midpoint_x_px"]
+            )
+            end_candidate = max(
+                edge_candidates, key=lambda item: item["midpoint_x_px"]
+            )
+            if start_candidate["midpoint_x_px"] < body_x_min:
+                field_slope_hints["start"] = start_candidate
+            if end_candidate["midpoint_x_px"] > body_x_max:
+                field_slope_hints["end"] = end_candidate
+    diagnostics["terminal_shape"]["field_slope_hints"] = {
+        side: dict(value) for side, value in field_slope_hints.items()
+    }
 
     # A wide, non-mask strip immediately beside the regularized body is a
     # stronger terminal wall than the raw crop fragments that continue along
@@ -640,7 +731,16 @@ def resolve_terminal_headland_overlap(
         / float(meters_per_px)
     )))
     max_body_cut_px = 0 if separator_limited else configured_body_cut_px
-    endpoint_margin_px = 0 if separator_limited else configured_endpoint_margin_px
+    # A trusted reference wall is already the semantic boundary.  Applying an
+    # additional inward margin moved the corridor about 0.3 m into visibly
+    # regular work rows and made a corrected wall look wrong in the UI.  Keep
+    # the legacy margin only for the compatibility path that lacks an explicit
+    # longitudinal reference body.
+    endpoint_margin_px = (
+        0
+        if separator_limited or has_axial_reference
+        else configured_endpoint_margin_px
+    )
     follow_raw_terminal = bool(cfg.get(
         "headland_corridor_follow_raw_terminal", True
     )) and not separator_limited
@@ -651,6 +751,9 @@ def resolve_terminal_headland_overlap(
             separator_limited and cfg.get("headland_corridor_follow_raw_terminal", True)
         ),
         "separator_sides": sorted(separator_sides),
+        "configured_endpoint_margin_m": float(
+            configured_endpoint_margin_px * meters_per_px
+        ),
         "effective_max_body_cut_m": float(max_body_cut_px * meters_per_px),
         "effective_endpoint_margin_m": float(endpoint_margin_px * meters_per_px),
     })
@@ -924,6 +1027,91 @@ def resolve_terminal_headland_overlap(
         valid = np.flatnonzero(np.isfinite(values))
         if valid.size < 2:
             return values
+
+        # A span threshold alone is insufficient: a broad planting-region
+        # fragment can still span >72% of the field while ending several
+        # metres inside the common terminal wall.  Interpolating those values
+        # produced the recurring triangular yellow wedges.  Estimate a robust
+        # global wall trend from cross-row bins and replace only endpoint rows
+        # that deviate materially from that trend.  Genuine gradual/sloped
+        # terminal walls remain because the Theil-Sen trend follows them.
+        valid_y = valid.astype(np.float64)
+        valid_values = values[valid]
+        bin_count = min(24, max(4, int(math.ceil(valid.size / 50.0))))
+        binned_y = []
+        binned_values = []
+        for indices in np.array_split(np.argsort(valid_y), bin_count):
+            if indices.size == 0:
+                continue
+            binned_y.append(float(np.median(valid_y[indices])))
+            binned_values.append(float(np.median(valid_values[indices])))
+        slopes = []
+        for left in range(len(binned_y)):
+            for right in range(left + 1, len(binned_y)):
+                delta_y = binned_y[right] - binned_y[left]
+                if abs(delta_y) > 1e-9:
+                    slopes.append(
+                        (binned_values[right] - binned_values[left]) / delta_y
+                    )
+        robust_slope = float(np.median(slopes)) if slopes else 0.0
+        robust_intercept = float(np.median(
+            valid_values - robust_slope * valid_y
+        ))
+        robust_prediction = robust_slope * valid_y + robust_intercept
+        residual = valid_values - robust_prediction
+        residual_median = float(np.median(residual))
+        residual_mad = float(np.median(np.abs(residual - residual_median)))
+        quantized_mad_px = float(max(
+            0.0,
+            cfg.get("headland_terminal_wall_quantized_mad_px", 0.5),
+        ))
+        field_hint = field_slope_hints.get(side)
+        field_slope_applied = bool(
+            field_hint is not None and residual_mad <= quantized_mad_px
+        )
+        if field_slope_applied:
+            robust_slope = float(field_hint["slope_px_per_cross_row_px"])
+            robust_intercept = float(np.median(
+                valid_values - robust_slope * valid_y
+            ))
+            robust_prediction = robust_slope * valid_y + robust_intercept
+            # The flat endpoint samples are an artefact of the common axial
+            # reconstruction interval, not independent wall observations.
+            # Once quantization is proven, restore the physical field-edge
+            # trend for every trusted row instead of waiting for an outlier
+            # test that a flat sequence can never trigger.
+            values[valid] = robust_prediction
+            shape_report["field_slope_applied_sides"].append(side)
+            residual = valid_values - robust_prediction
+            residual_median = float(np.median(residual))
+            residual_mad = float(np.median(
+                np.abs(residual - residual_median)
+            ))
+        configured_tolerance_px = float(max(
+            1.0,
+            shape_report["wall_outlier_tolerance_m"] / float(meters_per_px),
+        ))
+        adaptive_tolerance_px = float(max(
+            configured_tolerance_px,
+            4.0 * 1.4826 * residual_mad,
+        ))
+        outlier = (
+            np.zeros_like(residual, dtype=bool)
+            if field_slope_applied
+            else np.abs(residual - residual_median) > adaptive_tolerance_px
+        )
+        replaced_count = int(np.count_nonzero(outlier))
+        if replaced_count:
+            values[valid[outlier]] = robust_prediction[outlier]
+        shape_report["wall_outlier_replaced_row_count"] += replaced_count
+        shape_report["wall_outlier_replaced_by_side"][side] = replaced_count
+        shape_report.setdefault("wall_robust_fit", {})[side] = {
+            "slope_px_per_cross_row_px": robust_slope,
+            "intercept_px": robust_intercept,
+            "residual_mad_px": residual_mad,
+            "effective_tolerance_px": adaptive_tolerance_px,
+            "field_slope_applied": field_slope_applied,
+        }
         filled = np.interp(
             np.arange(out_h, dtype=np.float64),
             valid.astype(np.float64),
@@ -936,6 +1124,15 @@ def resolve_terminal_headland_overlap(
                 np.pad(filled, (pad, pad), mode="edge"),
                 kernel,
                 mode="valid",
+            )
+        restored_trim_px = float(max(
+            0.0,
+            cfg.get("band_end_trim_m", 0.10),
+        )) / float(meters_per_px)
+        if restored_trim_px > 0.0:
+            filled += -restored_trim_px if side == "start" else restored_trim_px
+            shape_report["restored_band_end_trim_m"] = float(
+                restored_trim_px * meters_per_px
             )
         return filled
 
@@ -1086,7 +1283,17 @@ def resolve_terminal_headland_overlap(
                             else low_edge[row_index]
                         )
                     if side == "start":
-                        inner = max(endpoint, high_edge[row_index])
+                        # The qualified reference wall is the body/headland
+                        # boundary.  Letting the candidate's inward edge win
+                        # here defeats the wall fit and recreates exactly the
+                        # triangular intrusion the fit rejected.  Compatibility
+                        # callers without an axial reference still need the
+                        # candidate edge to absorb periodic terminal islands.
+                        inner = (
+                            endpoint
+                            if has_axial_reference
+                            else max(endpoint, high_edge[row_index])
+                        )
                         outer = min(low_edge[row_index], endpoint - follow_depth_px)
                         column_start = max(0, int(math.floor(outer)))
                         column_end = min(
@@ -1094,7 +1301,11 @@ def resolve_terminal_headland_overlap(
                             int(math.ceil(inner + endpoint_margin_px)) + 1,
                         )
                     else:
-                        inner = min(endpoint, low_edge[row_index])
+                        inner = (
+                            endpoint
+                            if has_axial_reference
+                            else min(endpoint, low_edge[row_index])
+                        )
                         outer = max(high_edge[row_index], endpoint + follow_depth_px)
                         column_start = max(
                             0,
@@ -1267,6 +1478,11 @@ def resolve_terminal_headland_overlap(
         borderValue=0,
     )
     accepted_seed = (accepted_seed > 0).astype(np.uint8) * 255
+    # Region qualification decides whether a candidate may participate; the
+    # robust endpoint wall still decides where the semantic headland ends.
+    # Keep accepted seed evidence only inside that final corridor envelope.
+    if has_axial_reference:
+        accepted_seed = cv2.bitwise_and(accepted_seed, corridor)
     resolved_headland = cv2.bitwise_or(
         accepted_seed, cv2.bitwise_and(corridor, raw)
     )
@@ -1617,6 +1833,53 @@ def close_band_support_gaps(
         limit = int(terminal_max_gap if terminal else internal_max_gap)
         if gap <= max(0, limit):
             result[gap_start:gap_end] = True
+    return result
+
+
+def bridge_internal_support_gaps(
+    values: np.ndarray,
+    max_gap: int,
+    terminal_guard: int = 0,
+    min_adjacent_run: int = 0,
+) -> np.ndarray:
+    """Bridge a sufficiently supported internal gap without filling a tail.
+
+    ``close_band_support_gaps`` deliberately uses a strict terminal rule.  A
+    separate pass is needed for an interrupted crop row: both sides of the
+    interruption must be real, sufficiently long support runs before they may
+    be joined.  This prevents a short terminal fragment from being promoted to
+    a full work row while allowing an artificial break inside the same row to
+    remain one continuous path candidate.
+    """
+    source = np.asarray(values, dtype=bool)
+    runs = _runs(source)
+    if len(runs) < 2 or max_gap <= 0:
+        return source.copy()
+    result = source.copy()
+    limit = max(0, int(max_gap))
+    minimum_run = max(0, int(min_adjacent_run))
+    guard = max(0, int(terminal_guard))
+    for left, right in zip(runs, runs[1:]):
+        gap_start, gap_end = left[1], right[0]
+        if gap_end - gap_start > limit:
+            continue
+        if (
+            left[1] - left[0] < minimum_run
+            or right[1] - right[0] < minimum_run
+        ):
+            continue
+        # A short run touching either extent is a terminal fragment.  Do not
+        # bridge it merely because the gap itself is below the internal limit.
+        left_is_short_terminal = (
+            left[0] <= guard and left[1] - left[0] < minimum_run * 2
+        )
+        right_is_short_terminal = (
+            right[1] >= source.size - guard
+            and right[1] - right[0] < minimum_run * 2
+        )
+        if left_is_short_terminal or right_is_short_terminal:
+            continue
+        result[gap_start:gap_end] = True
     return result
 
 
@@ -2302,6 +2565,34 @@ def regularize_crop_mask(
             terminal_max_gap=terminal_gap_samples,
             terminal_guard=terminal_guard_samples,
         )
+        # A broken crop row must not become two work-line endpoints.  Bridge
+        # only an internal gap whose two neighbouring support runs are both
+        # substantial; the terminal pass above remains authoritative for
+        # headland/tail fragments.  Bound the configured bridge by half of the
+        # detected body span so a pathological value cannot fill a whole row.
+        body_length_m = max(0.0, float(body_end - body_start) * work_mpp)
+        configured_bridge_m = max(
+            0.0,
+            float(cfg.get("band_internal_gap_bridge_m", 30.0)),
+        )
+        bridge_limit_m = min(
+            configured_bridge_m,
+            body_length_m * 0.50,
+        )
+        terminal_fragment_min_m = max(
+            0.0,
+            float(cfg.get("band_terminal_fragment_min_m", 4.0)),
+        )
+        before_internal_bridge = extent_mask.copy()
+        extent_mask = bridge_internal_support_gaps(
+            extent_mask,
+            max_gap=int(round(bridge_limit_m / sample_m)),
+            terminal_guard=terminal_guard_samples,
+            min_adjacent_run=int(round(terminal_fragment_min_m / sample_m)),
+        )
+        internal_bridge_added_px = int(np.count_nonzero(
+            extent_mask & ~before_internal_bridge
+        ))
         extent_runs = _runs(extent_mask)
         if not extent_runs:
             skipped_bands.append({
@@ -2425,6 +2716,8 @@ def regularize_crop_mask(
             "longitudinal_extent_ratio": float((extent_end - extent_start) / max(xs.size, 1)),
             "longitudinal_extent_m": float((extent_end - extent_start) * sample_m),
             "largest_filled_gap_m": float(longest_gap_m),
+            "internal_gap_bridge_limit_m": float(bridge_limit_m),
+            "internal_gap_bridge_added_px": internal_bridge_added_px,
         })
         report(
             0.34 + 0.44 * (band_index + 1) / max(len(runs), 1),
@@ -2485,6 +2778,7 @@ def regularize_crop_mask(
             mpp,
             cfg,
             axial_reference_mask=rebuilt,
+            field_polygon=field_polygon,
         )
     )
     body_residual_mask = cv2.bitwise_and(
@@ -2528,6 +2822,17 @@ def regularize_crop_mask(
         "uncertain_residual_px": int(np.count_nonzero(uncertain_residual_mask)),
         "body_residual_px": int(np.count_nonzero(body_residual_mask)),
         "gap_repair_added_px": int(np.count_nonzero(gap_repair_added_mask)),
+        "internal_gap_bridge_added_px": int(sum(
+            int(item.get("internal_gap_bridge_added_px", 0))
+            for item in bands
+        )),
+        "internal_gap_bridge_limit_m": float(
+            max(
+                (float(item.get("internal_gap_bridge_limit_m", 0.0))
+                 for item in bands),
+                default=0.0,
+            )
+        ),
         "support_clip_removed_px": int(np.count_nonzero(support_clip_removed_mask)),
         "headland_corridor_px": int(np.count_nonzero(headland_corridor_mask)),
         "headland_corridor": headland_corridor_diagnostics,

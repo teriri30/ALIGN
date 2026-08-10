@@ -7,8 +7,10 @@ import uuid
 from contextlib import nullcontext
 from typing import Optional, Tuple, Dict, Any
 import numpy as np
+from runtime_paths import cache_dir
 
-CACHE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hillcache")
+# DECISION-002/018: cached project evidence is user data, not an install file.
+CACHE_ROOT = str(cache_dir())
 PROJECT_STATE_SCHEMA = 6
 _PROJECT_LOCKS = {}
 _PROJECT_LOCKS_GUARD = threading.Lock()

@@ -66,6 +66,43 @@ def test_repair_row_gaps_closes_short_breaks_along_row_direction():
     assert repaired[20, 63] == 0
 
 
+def test_repair_row_gaps_closes_short_breaks_at_oblique_row_angle():
+    """DECISION-009: an oriented close must not clip its long kernel."""
+    import cv2
+    import math
+
+    from row_geometry import repair_row_gaps
+
+    mask = np.zeros((220, 220), dtype=np.uint8)
+    angle = math.radians(108.0)
+    direction = np.array([math.cos(angle), math.sin(angle)])
+    center = np.array([110.0, 110.0])
+    cv2.line(
+        mask,
+        tuple(np.rint(center - 75.0 * direction).astype(int)),
+        tuple(np.rint(center - 10.0 * direction).astype(int)),
+        255,
+        5,
+    )
+    cv2.line(
+        mask,
+        tuple(np.rint(center + 10.0 * direction).astype(int)),
+        tuple(np.rint(center + 75.0 * direction).astype(int)),
+        255,
+        5,
+    )
+
+    repaired = repair_row_gaps(
+        mask,
+        angle,
+        meters_per_px=0.02,
+        config={"row_gap_close_m": 0.50, "row_gap_close_width_m": 0.06},
+    )
+
+    assert repaired[110, 110] == 255
+    assert repaired[80, 110] == 0
+
+
 def test_generated_body_is_constrained_to_raw_or_bidirectional_gap_support():
     from row_geometry import constrain_generated_body_to_raw_support
 

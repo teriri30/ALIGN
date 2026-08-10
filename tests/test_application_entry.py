@@ -5,7 +5,8 @@ from pathlib import Path
 def test_application_entrypoint_uses_the_conventional_main_name():
     project_root = Path(__file__).resolve().parents[1]
 
-    assert (project_root / "main.py").is_file()
+    assert (project_root / "src" / "main.py").is_file()
+    assert not list(project_root.glob("*.py"))
     assert not (project_root / "pyside6_main.py").exists()
 
 
@@ -29,9 +30,9 @@ def test_core_modules_use_short_role_names():
         "workflow.py",
     }
 
-    names = {path.name for path in project_root.glob("*.py")}
+    names = {path.name for path in (project_root / "src").glob("*.py")}
     assert required_modules <= names
-    assert not {name for name in names if name.startswith("app_")}
+    assert {"app_entry.py", "frozen_main.py"} <= names
 
 
 def test_startup_removes_foreign_site_packages_instead_of_only_reordering_them(monkeypatch, tmp_path):

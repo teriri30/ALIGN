@@ -6,7 +6,7 @@ import time
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 import cv2
-from config import Config, AppLogger
+from config import AppLogger, MASK_PROCESSING_STRENGTH
 from row_geometry import regularize_crop_mask
 from row_orientation import estimate_mask_axis_pca, estimate_row_orientation
 
@@ -76,72 +76,14 @@ def _perpendicular_angle(angle: float) -> float:
 
 
 def _apply_strength_profile(config: Optional[Dict]) -> Dict:
-    """Map a user-facing processing strength to regularization parameters."""
+    """Return the single supported mask-processing profile.
+
+    The former light/strong profiles are intentionally no longer selectable.
+    This normalization also protects direct callers and old cached settings
+    from changing the processing parameters behind the UI.
+    """
     cfg = dict(config or {})
-    raw_strength = cfg.get("strength", "standard")
-    aliases = {
-        "fast": "light",
-        "low": "light",
-        "normal": "standard",
-        "medium": "standard",
-        "high": "strong",
-        "max": "very_strong",
-    }
-    strength = aliases.get(str(raw_strength).strip().lower(), str(raw_strength).strip().lower())
-    if strength not in {"light", "standard", "strong", "very_strong"}:
-        strength = "standard"
-    cfg["strength"] = strength
-    profiles = {
-        "light": {
-            "max_work_dim": 3600,
-            "support_close_along_m": 0.85,
-            "support_close_across_m": 1.10,
-            "profile_smooth_m": 0.045,
-            "band_internal_gap_close_m": 3.0,
-            "band_end_gap_close_m": 0.25,
-            "band_end_guard_m": 0.8,
-            "row_gap_close_m": 1.4,
-            "body_gap_close_m": 0.65,
-            "body_end_extension_m": 0.22,
-            "center_detail_blend": 0.72,
-            "width_detail_blend": 0.14,
-            "center_smooth_m": 0.40,
-            "width_smooth_m": 0.32,
-        },
-        "strong": {
-            "support_close_along_m": 1.45,
-            "support_close_across_m": 1.85,
-            "profile_smooth_m": 0.075,
-            "band_internal_gap_close_m": 7.5,
-            "band_end_gap_close_m": 0.40,
-            "band_end_guard_m": 1.2,
-            "row_gap_close_m": 2.8,
-            "body_gap_close_m": 1.35,
-            "body_end_extension_m": 0.45,
-            "center_detail_blend": 0.78,
-            "width_detail_blend": 0.24,
-            "center_smooth_m": 0.70,
-            "width_smooth_m": 0.58,
-        },
-        "very_strong": {
-            "support_close_along_m": 1.75,
-            "support_close_across_m": 2.20,
-            "profile_smooth_m": 0.09,
-            "band_internal_gap_close_m": 9.0,
-            "band_end_gap_close_m": 0.50,
-            "band_end_guard_m": 1.4,
-            "row_gap_close_m": 3.4,
-            "body_gap_close_m": 1.65,
-            "body_end_extension_m": 0.58,
-            "center_detail_blend": 0.70,
-            "width_detail_blend": 0.28,
-            "center_smooth_m": 0.90,
-            "width_smooth_m": 0.72,
-            "center_outlier_m": 0.08,
-        },
-    }
-    for key, value in profiles.get(strength, {}).items():
-        cfg[key] = value
+    cfg["strength"] = MASK_PROCESSING_STRENGTH
     return cfg
 
 

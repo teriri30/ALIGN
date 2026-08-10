@@ -17,6 +17,7 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 from pathlib import Path
 from runtime_env import configure_geospatial_environment
+from runtime_paths import project_root
 
 
 def _path_key(path: str) -> str:
@@ -92,7 +93,8 @@ configure_geospatial_environment()
 PIP_INSTALL_TIMEOUT_SECONDS = int(os.environ.get("REUI_PIP_TIMEOUT_SECONDS", "1800"))
 
 # ── 依赖清单 ──────────────────────────────────────────────
-# 版本唯一来源为 requirements-core.txt；这里只维护显示名、导入名和 conda 名。
+# 版本唯一来源为 developer/requirements/requirements-core.txt；这里只维护
+# 显示名、导入名和 conda 名。
 _DEPENDENCY_METADATA = {
     "numpy": ("NumPy", "numpy", "numpy"),
     "opencv-python": ("OpenCV", "cv2", "opencv"),
@@ -107,7 +109,7 @@ _DEPENDENCY_METADATA = {
 
 
 def _core_requirements():
-    path = Path(__file__).with_name("requirements-core.txt")
+    path = project_root() / "developer" / "requirements" / "requirements-core.txt"
     packages = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         spec = raw.strip()

@@ -34,18 +34,18 @@
 
 修改以下文件时必须先搜索其决策锚点：
 
-- `geo.py`
-- `inference.py`
-- `raster_preprocessing.py`
-- `mask_processor.py`
-- `row_geometry.py`
-- `legacy_route_coverage.py`
-- `path_planner.py`
-- `pyside6_app/main_window.py`
-- `pyside6_app/workers.py`
-- `provenance.py`
-- `cache.py`
-- `integrity_check.py`
+- `src/geo.py`
+- `src/inference.py`
+- `src/raster_preprocessing.py`
+- `src/mask_processor.py`
+- `src/row_geometry.py`
+- `src/legacy_route_coverage.py`
+- `src/path_planner.py`
+- `src/pyside6_app/main_window.py`
+- `src/pyside6_app/workers.py`
+- `src/provenance.py`
+- `src/cache.py`
+- `src/integrity_check.py`
 
 ## 新决策规则
 

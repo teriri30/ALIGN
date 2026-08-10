@@ -6,10 +6,12 @@ import os
 import threading
 import traceback
 from typing import Dict, List, Optional
+from runtime_paths import logs_dir
 
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR = os.path.join(PROJECT_DIR, "logs")
+# DECISION-018: logs survive replacement of the frozen program directory.
+LOG_DIR = str(logs_dir())
 JOURNAL_PATH = os.path.join(LOG_DIR, "project_journal.jsonl")
 JOURNAL_MAX_BYTES = 10 * 1024 * 1024
 JOURNAL_BACKUP_COUNT = 3

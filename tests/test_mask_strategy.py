@@ -190,6 +190,32 @@ def test_terminal_band_gap_uses_stricter_threshold_than_internal_gap():
     assert np.all(closed_internal[70:76])
 
 
+def test_internal_support_bridge_joins_real_row_parts_but_not_short_terminal_tail():
+    from row_geometry import bridge_internal_support_gaps
+
+    internal = np.zeros(120, dtype=bool)
+    internal[10:55] = True
+    internal[68:108] = True
+    bridged = bridge_internal_support_gaps(
+        internal,
+        max_gap=20,
+        terminal_guard=5,
+        min_adjacent_run=20,
+    )
+    assert np.all(bridged[55:68])
+
+    terminal = np.zeros(120, dtype=bool)
+    terminal[10:80] = True
+    terminal[100:120] = True
+    guarded = bridge_internal_support_gaps(
+        terminal,
+        max_gap=20,
+        terminal_guard=5,
+        min_adjacent_run=15,
+    )
+    assert not np.any(guarded[80:88])
+
+
 def test_generated_body_keeps_internal_gap_fill_but_removes_isolated_fragment():
     from row_geometry import constrain_generated_body_to_raw_support
 

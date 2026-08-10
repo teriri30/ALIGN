@@ -8,10 +8,220 @@ from config import Config, AppLogger
 from state import AppState
 from geo import GeoUtils
 from task_lifecycle import TaskToken, make_task_token, result_is_admissible
+from runtime_paths import resolve_model_path
 # 掩膜处理和路径规划由独立步骤负责，不在推理运行器中调用
 
 
-INFERENCE_PIPELINE_VERSION = "source-tif-sahi-v2"
+# v5 keeps the v4 colour contract and adds a 2x contextual evidence pass for
+# native orthomosaics.  A 640 px source tile in the 12 m field data is only
+# about one four-row band wide, so it cannot expose both instance boundaries.
+# The native pass remains authoritative for detail; the contextual pass is
+# downsampled to 640 only to preserve between-band evidence and recover weak
+# detections close to native support.  Both scales and their fusion parameters
+# are recorded in provenance, so v4 caches must not be reused.
+#
+# v4 records both sides of the color contract explicitly. ``read_rgb_raster``
+# and the in-app preview are RGB, while Ultralytics 8.x interprets numpy arrays
+# as OpenCV BGR and flips them to RGB in ``BasePredictor.preprocess``.  The
+# adapter in ``ModelEngine.predict`` therefore performs exactly one RGB->BGR
+# conversion at the external-library boundary.  v3 passed RGB directly and its
+# cached masks must be recomputed.
+# DECISION-005: keep application arrays RGB and adapt once at the Ultralytics boundary.
+INFERENCE_PIPELINE_VERSION = "source-tif-sahi-v5-native-context-evidence"
+
+
+def _result_mask_stack(result, target_shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+    """Return aligned instance masks and confidences from one YOLO result.
+
+    DECISION-009: the semantic union is not the only useful evidence.  Keeping
+    the stack until contact boundaries are measured prevents adjacent model
+    instances from being irreversibly flattened by ``np.max``.
+    """
+    height, width = [max(1, int(value)) for value in target_shape[:2]]
+    if result is None or getattr(result, "masks", None) is None:
+        return (
+            np.zeros((0, height, width), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+        )
+    masks = np.asarray(result.masks.data.cpu().numpy(), dtype=np.float32)
+    if masks.ndim == 2:
+        masks = masks[None, ...]
+    if masks.ndim != 3 or masks.shape[0] == 0:
+        return (
+            np.zeros((0, height, width), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+        )
+    if masks.shape[1:] != (height, width):
+        masks = np.stack([
+            cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR)
+            for mask in masks
+        ]).astype(np.float32, copy=False)
+    boxes = getattr(result, "boxes", None)
+    box_conf = getattr(boxes, "conf", None) if boxes is not None else None
+    if box_conf is None:
+        confidences = np.ones((masks.shape[0],), dtype=np.float32)
+    else:
+        confidences = np.asarray(box_conf.cpu().numpy(), dtype=np.float32).reshape(-1)
+        if confidences.size != masks.shape[0]:
+            confidences = np.ones((masks.shape[0],), dtype=np.float32)
+    return masks, confidences
+
+
+def _contact_boundary_from_instances(
+    masks: np.ndarray,
+    confidences: np.ndarray,
+    *,
+    minimum_confidence: float,
+    contact_radius_px: int = 4,
+    border_guard_px: int = 6,
+) -> np.ndarray:
+    """Extract only boundaries supported by two touching YOLO instances.
+
+    Ordinary outer object contours are deliberately excluded.  This makes the
+    evidence useful for separating a four-row band from an adjacent uniform
+    block without drawing every tile edge into the semantic mask.
+    """
+    if masks.ndim != 3 or masks.shape[0] < 2:
+        shape = masks.shape[1:] if masks.ndim == 3 else (1, 1)
+        return np.zeros(shape, dtype=np.uint8)
+    keep = np.asarray(confidences, dtype=np.float32) >= float(minimum_confidence)
+    binary = np.asarray(masks[keep] >= 0.5, dtype=np.uint8)
+    if binary.shape[0] < 2:
+        return np.zeros(masks.shape[1:], dtype=np.uint8)
+    radius = max(1, int(contact_radius_px))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (radius * 2 + 1, radius * 2 + 1),
+    )
+    edge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    boundary = np.zeros(binary.shape[1:], dtype=np.uint8)
+    union = np.any(binary > 0, axis=0).astype(np.uint8)
+    for index, instance in enumerate(binary):
+        others = np.any(
+            np.delete(binary, index, axis=0) > 0,
+            axis=0,
+        ).astype(np.uint8)
+        if not np.any(others):
+            continue
+        edge = cv2.morphologyEx(instance, cv2.MORPH_GRADIENT, edge_kernel)
+        touching = cv2.dilate(others, kernel, iterations=1)
+        boundary[(edge > 0) & (touching > 0) & (union > 0)] = 255
+    guard = max(0, int(border_guard_px))
+    if guard:
+        boundary[:guard, :] = 0
+        boundary[-guard:, :] = 0
+        boundary[:, :guard] = 0
+        boundary[:, -guard:] = 0
+    return boundary
+
+
+def _axis_angle_from_mask(mask: np.ndarray) -> float:
+    points = np.column_stack(np.nonzero(np.asarray(mask) > 0))
+    if points.shape[0] < 2:
+        return 0.0
+    xy = points[:, ::-1].astype(np.float64)
+    xy -= np.mean(xy, axis=0, keepdims=True)
+    covariance = np.cov(xy, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    axis = vectors[:, int(np.argmax(values))]
+    return float(math.atan2(float(axis[1]), float(axis[0])) % math.pi)
+
+
+def _filter_context_separators(
+    candidate: np.ndarray,
+    reference_mask: np.ndarray,
+    *,
+    meters_per_pixel: float,
+    minimum_length_m: float,
+    angle_tolerance_deg: float = 25.0,
+) -> np.ndarray:
+    """Keep long context boundaries parallel to the field work direction."""
+    binary = (np.asarray(candidate) > 0).astype(np.uint8)
+    if not np.any(binary):
+        return np.zeros_like(binary, dtype=np.uint8)
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    main_angle = _axis_angle_from_mask(reference_mask)
+    tolerance = math.radians(max(0.0, float(angle_tolerance_deg)))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    filtered = np.zeros_like(binary, dtype=np.uint8)
+    for label in range(1, count):
+        points_yx = np.column_stack(np.nonzero(labels == label))
+        if points_yx.shape[0] < 2:
+            continue
+        points = points_yx[:, ::-1].astype(np.float64)
+        centered = points - np.mean(points, axis=0, keepdims=True)
+        covariance = np.cov(centered, rowvar=False)
+        values, vectors = np.linalg.eigh(covariance)
+        axis = vectors[:, int(np.argmax(values))]
+        projections = centered @ axis
+        length_m = float(np.ptp(projections)) * float(meters_per_pixel)
+        angle = float(math.atan2(float(axis[1]), float(axis[0])) % math.pi)
+        diff = abs(angle - main_angle) % math.pi
+        diff = min(diff, math.pi - diff)
+        if length_m >= float(minimum_length_m) and diff <= tolerance:
+            filtered[labels == label] = 255
+    return filtered
+
+
+def _fuse_context_evidence(
+    primary_mask: np.ndarray,
+    support_votes: np.ndarray,
+    boundary_votes: np.ndarray,
+    coverage_votes: np.ndarray,
+    *,
+    meters_per_pixel: float,
+    support_ratio: float = 0.50,
+    recovery_distance_m: float = 0.75,
+    separator_ratio: float = 0.30,
+    separator_min_votes: int = 2,
+    separator_min_length_m: float = 1.50,
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    """Fuse conservative contextual recovery and instance separation evidence."""
+    primary = np.where(np.asarray(primary_mask) > 0, 255, 0).astype(np.uint8)
+    coverage = np.asarray(coverage_votes, dtype=np.float32)
+    valid = coverage > 0
+    support_fraction = np.zeros_like(coverage, dtype=np.float32)
+    boundary_fraction = np.zeros_like(coverage, dtype=np.float32)
+    np.divide(support_votes, coverage, out=support_fraction, where=valid)
+    np.divide(boundary_votes, coverage, out=boundary_fraction, where=valid)
+
+    contextual_support = support_fraction >= float(support_ratio)
+    gap = (primary == 0).astype(np.uint8)
+    distance_px = cv2.distanceTransform(gap, cv2.DIST_L2, 5)
+    recovery_radius_px = max(
+        1.0,
+        float(recovery_distance_m) / max(float(meters_per_pixel), 1e-9),
+    )
+    recovered = contextual_support & (primary == 0) & (distance_px <= recovery_radius_px)
+    combined = primary.copy()
+    combined[recovered] = 255
+
+    separator_candidate = (
+        (np.asarray(boundary_votes) >= max(1, int(separator_min_votes)))
+        & (boundary_fraction >= float(separator_ratio))
+    ).astype(np.uint8) * 255
+    separator = _filter_context_separators(
+        separator_candidate,
+        combined,
+        meters_per_pixel=float(meters_per_pixel),
+        minimum_length_m=float(separator_min_length_m),
+    )
+    if np.any(separator):
+        separator = cv2.dilate(
+            separator,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        combined[separator > 0] = 0
+    diagnostics = {
+        "context_recovered_pixels": int(np.count_nonzero(recovered)),
+        "context_separator_pixels": int(np.count_nonzero(separator)),
+    }
+    return combined, diagnostics
 
 
 # ─── ModelEngine ────────────────────────────────────────────
@@ -24,7 +234,7 @@ class ModelEngine:
 
     def load(self, model_path: str) -> bool:
         if model_path and not os.path.isabs(model_path):
-            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path)
+            model_path = str(resolve_model_path(model_path))
         if not os.path.exists(model_path):
             self.log.error(f"模型文件不存在: {model_path}")
             return False
@@ -53,7 +263,30 @@ class ModelEngine:
     def predict(self, image: np.ndarray, conf: float = 0.5, iou: float = 0.5) -> Optional[Any]:
         if not self.is_loaded(): return None
         try:
-            return self._model.predict(image, imgsz=640, conf=conf, iou=iou, retina_masks=True, verbose=False)
+            # Ultralytics 8.x treats numpy inputs as BGR and reverses the last
+            # channel in BasePredictor.preprocess.  reUI owns an RGB contract,
+            # so adapt once here for both single-image and batched-list calls.
+            # Tensor inputs are left untouched because Ultralytics documents
+            # them as already preprocessed BCHW RGB tensors.
+            if isinstance(image, np.ndarray) and image.ndim >= 3 and image.shape[-1] == 3:
+                model_input = np.ascontiguousarray(image[..., ::-1])
+            elif isinstance(image, (list, tuple)):
+                model_input = [
+                    np.ascontiguousarray(item[..., ::-1])
+                    if isinstance(item, np.ndarray) and item.ndim >= 3 and item.shape[-1] == 3
+                    else item
+                    for item in image
+                ]
+            else:
+                model_input = image
+            return self._model.predict(
+                model_input,
+                imgsz=640,
+                conf=conf,
+                iou=iou,
+                retina_masks=True,
+                verbose=False,
+            )
         except Exception as e:
             self.log.error(f"推理失败: {e}")
             return None
@@ -212,10 +445,12 @@ class TiledInference:
                     tile_infer = cv2.resize(tile_raw, (infer_size, infer_size),
                                             interpolation=cv2.INTER_LINEAR)
 
-                tile_rgb = cv2.cvtColor(tile_infer, cv2.COLOR_BGR2RGB)
+                # ``read_rgb_raster`` and the preview loader both return RGB.
+                # Keep the internal array RGB; ModelEngine performs the single
+                # Ultralytics-specific RGB->BGR boundary adaptation.
                 ah = min(capture_sz, H - y0)
                 aw = min(capture_sz, W - x0)
-                batch_images.append(tile_rgb)
+                batch_images.append(np.ascontiguousarray(tile_infer))
                 batch_meta.append((x0, y0, ah, aw))
                 if len(batch_images) >= max(1, int(batch_size)):
                     flush_batch()
@@ -344,6 +579,20 @@ class InferenceRunner:
 
         capture_sz = int(self.cfg.TILE_CAPTURE_SIZE)
         overlap = min(max(float(self.cfg.TILE_OVERLAP), 0.0), 0.95)
+        model_cfg = self.cfg.section("model")
+        primary_conf = float(self.cfg.MODEL_CONF)
+        recovery_conf = min(
+            primary_conf,
+            float(model_cfg.get("orthomosaic_recovery_conf_threshold", 0.10)),
+        )
+        context_enabled = bool(
+            model_cfg.get("orthomosaic_context_enabled", True)
+            and getattr(src, "transform", None) is not None
+        )
+        context_multiplier = max(
+            1,
+            int(model_cfg.get("orthomosaic_context_capture_multiplier", 2)),
+        )
         stride = max(1, int(round(capture_sz * (1.0 - overlap))))
         n_cols = max(1, math.ceil((crop_w - capture_sz) / stride) + 1)
         n_rows = max(1, math.ceil((crop_h - capture_sz) / stride) + 1)
@@ -354,6 +603,9 @@ class InferenceRunner:
             "tile_capture_size": int(capture_sz),
             "tile_overlap": float(overlap),
             "tile_count": int(total),
+            "primary_conf_threshold": float(primary_conf),
+            "effective_recovery_conf_threshold": float(recovery_conf),
+            "context_enabled": bool(context_enabled and context_multiplier > 1),
             "tile_preprocessing": [],
         }
         processed = 0
@@ -366,11 +618,19 @@ class InferenceRunner:
             nonlocal processed, batch_images, batch_meta
             if not batch_images:
                 return
-            results = self.engine.predict(batch_images, conf=float(self.cfg.MODEL_CONF), iou=float(self.cfg.MODEL_IOU))
+            results = self.engine.predict(
+                batch_images,
+                conf=float(recovery_conf),
+                iou=float(self.cfg.MODEL_IOU),
+            )
             if results is None:
                 results = []
                 for image, meta in zip(batch_images, batch_meta):
-                    single = self.engine.predict(image, conf=float(self.cfg.MODEL_CONF), iou=float(self.cfg.MODEL_IOU))
+                    single = self.engine.predict(
+                        image,
+                        conf=float(recovery_conf),
+                        iou=float(self.cfg.MODEL_IOU),
+                    )
                     if not single:
                         raise RuntimeError(f"tile inference failed at source window ({meta[0]}, {meta[1]})")
                     results.append(single[0])
@@ -381,14 +641,19 @@ class InferenceRunner:
                 if result is None:
                     raise RuntimeError(f"tile inference failed at source window ({sx0}, {sy0})")
                 tile_mask = np.zeros((capture_sz, capture_sz), dtype=np.uint8)
-                if result.masks is not None:
-                    md = result.masks.data.cpu().numpy()
-                    if len(md) > 0:
-                        probability = np.max(md, axis=0)
-                        if probability.shape[:2] != (capture_sz, capture_sz):
-                            probability = cv2.resize(probability, (capture_sz, capture_sz), interpolation=cv2.INTER_LINEAR)
-                        prob_u8 = (np.clip(probability, 0, 1) * 255).astype(np.uint8)
-                        _, tile_mask = cv2.threshold(prob_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                masks, _confidences = _result_mask_stack(
+                    result,
+                    (capture_sz, capture_sz),
+                )
+                if len(masks) > 0:
+                    probability = np.max(masks, axis=0)
+                    prob_u8 = (np.clip(probability, 0, 1) * 255).astype(np.uint8)
+                    _, tile_mask = cv2.threshold(
+                        prob_u8,
+                        0,
+                        255,
+                        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+                    )
                 dx0 = int(math.floor((sx0 / max(1, crop_w)) * out_w))
                 dy0 = int(math.floor((sy0 / max(1, crop_h)) * out_h))
                 dx1 = int(math.ceil(((sx0 + sw) / max(1, crop_w)) * out_w))
@@ -400,7 +665,7 @@ class InferenceRunner:
                     np.maximum(out_mask[dy0:dy1, dx0:dx1], projected, out=out_mask[dy0:dy1, dx0:dx1])
                 processed += 1
             self._update(
-                inference_progress=0.04 + (processed / max(1, total)) * 0.84,
+                inference_progress=0.04 + (processed / max(1, total)) * 0.60,
                 status_message=f"原始影像流式切片推理中... {int(processed / max(1, total) * 100)}%",
             )
             batch_images = []
@@ -439,7 +704,9 @@ class InferenceRunner:
                         capture_sz - tile_img.shape[1],
                         cv2.BORDER_REFLECT,
                     )
-                batch_images.append(cv2.cvtColor(tile_img, cv2.COLOR_BGR2RGB))
+                # ``read_rgb_raster`` returns RGB. ModelEngine performs the
+                # single conversion required by Ultralytics' BGR ndarray API.
+                batch_images.append(np.ascontiguousarray(tile_img))
                 batch_meta.append((sx0, sy0, sw, sh))
                 if len(batch_images) >= 4:
                     flush_batch()
@@ -451,6 +718,195 @@ class InferenceRunner:
         if skipped_nodata_count:
             self.log.info(
                 f"source-tile inference skipped {skipped_nodata_count}/{total} all-NoData tiles"
+            )
+        if context_enabled and context_multiplier > 1:
+            context_capture = int(capture_sz * context_multiplier)
+            context_overlap = min(
+                max(float(model_cfg.get("orthomosaic_context_overlap", 0.50)), 0.0),
+                0.90,
+            )
+            context_stride = max(
+                1,
+                int(round(context_capture * (1.0 - context_overlap))),
+            )
+            context_cols = max(
+                1,
+                math.ceil((crop_w - context_capture) / context_stride) + 1,
+            )
+            context_rows = max(
+                1,
+                math.ceil((crop_h - context_capture) / context_stride) + 1,
+            )
+            context_total = context_rows * context_cols
+            support_votes = np.zeros((out_h, out_w), dtype=np.uint16)
+            boundary_votes = np.zeros((out_h, out_w), dtype=np.uint16)
+            coverage_votes = np.zeros((out_h, out_w), dtype=np.uint16)
+            context_images = []
+            context_meta = []
+            context_processed = 0
+            context_valid = 0
+            context_skipped = 0
+
+            def flush_context_batch():
+                nonlocal context_images, context_meta, context_processed
+                if not context_images:
+                    return
+                results = self.engine.predict(
+                    context_images,
+                    conf=float(recovery_conf),
+                    iou=float(self.cfg.MODEL_IOU),
+                )
+                if results is None:
+                    results = []
+                    for image, meta in zip(context_images, context_meta):
+                        single = self.engine.predict(
+                            image,
+                            conf=float(recovery_conf),
+                            iou=float(self.cfg.MODEL_IOU),
+                        )
+                        if not single:
+                            raise RuntimeError(
+                                f"context inference failed at source window ({meta[0]}, {meta[1]})"
+                            )
+                        results.append(single[0])
+                results = list(results)
+                if len(results) != len(context_meta):
+                    raise RuntimeError(
+                        "context inference failed: model result count does not match input tiles"
+                    )
+                for result, (sx0, sy0, sw, sh) in zip(results, context_meta):
+                    if result is None:
+                        raise RuntimeError(
+                            f"context inference failed at source window ({sx0}, {sy0})"
+                        )
+                    masks, confidences = _result_mask_stack(
+                        result,
+                        (TiledInference.INFER_SIZE, TiledInference.INFER_SIZE),
+                    )
+                    accepted = confidences >= float(recovery_conf)
+                    if np.any(accepted):
+                        tile_support = (
+                            np.max(masks[accepted], axis=0) >= 0.5
+                        ).astype(np.uint8) * 255
+                    else:
+                        tile_support = np.zeros(
+                            (TiledInference.INFER_SIZE, TiledInference.INFER_SIZE),
+                            dtype=np.uint8,
+                        )
+                    tile_boundary = _contact_boundary_from_instances(
+                        masks,
+                        confidences,
+                        minimum_confidence=float(primary_conf),
+                    )
+                    dx0 = int(math.floor((sx0 / max(1, crop_w)) * out_w))
+                    dy0 = int(math.floor((sy0 / max(1, crop_h)) * out_h))
+                    dx1 = int(math.ceil(((sx0 + sw) / max(1, crop_w)) * out_w))
+                    dy1 = int(math.ceil(((sy0 + sh) / max(1, crop_h)) * out_h))
+                    dx0, dy0 = max(0, dx0), max(0, dy0)
+                    dx1, dy1 = min(out_w, dx1), min(out_h, dy1)
+                    if dx1 > dx0 and dy1 > dy0:
+                        size = (dx1 - dx0, dy1 - dy0)
+                        projected_support = cv2.resize(
+                            tile_support,
+                            size,
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        projected_boundary = cv2.resize(
+                            tile_boundary,
+                            size,
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        support_votes[dy0:dy1, dx0:dx1] += (
+                            projected_support > 0
+                        ).astype(np.uint16)
+                        boundary_votes[dy0:dy1, dx0:dx1] += (
+                            projected_boundary > 0
+                        ).astype(np.uint16)
+                        coverage_votes[dy0:dy1, dx0:dx1] += 1
+                    context_processed += 1
+                self._update(
+                    inference_progress=(
+                        0.64
+                        + (context_processed / max(1, context_total)) * 0.24
+                    ),
+                    status_message=(
+                        "正在提取跨切片实例边界... "
+                        f"{int(context_processed / max(1, context_total) * 100)}%"
+                    ),
+                )
+                context_images = []
+                context_meta = []
+
+            for row in range(context_rows):
+                for col in range(context_cols):
+                    sx0 = min(col * context_stride, crop_w - context_capture)
+                    sy0 = min(row * context_stride, crop_h - context_capture)
+                    sx0, sy0 = max(0, sx0), max(0, sy0)
+                    sw = min(context_capture, crop_w - sx0)
+                    sh = min(context_capture, crop_h - sy0)
+                    try:
+                        tile_img, _tile_pre = read_rgb_raster(
+                            src,
+                            window=Window(x0_src + sx0, y0_src + sy0, sw, sh),
+                            config=self.cfg.section("raster_preprocessing"),
+                        )
+                    except EmptyRasterWindowError:
+                        context_skipped += 1
+                        context_processed += 1
+                        continue
+                    context_valid += 1
+                    if tile_img.shape[0] < context_capture or tile_img.shape[1] < context_capture:
+                        tile_img = cv2.copyMakeBorder(
+                            tile_img,
+                            0,
+                            context_capture - tile_img.shape[0],
+                            0,
+                            context_capture - tile_img.shape[1],
+                            cv2.BORDER_REFLECT,
+                        )
+                    tile_img = cv2.resize(
+                        tile_img,
+                        (TiledInference.INFER_SIZE, TiledInference.INFER_SIZE),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    context_images.append(np.ascontiguousarray(tile_img))
+                    context_meta.append((sx0, sy0, sw, sh))
+                    if len(context_images) >= 4:
+                        flush_context_batch()
+            flush_context_batch()
+
+            source_x_m = math.hypot(float(src.transform.a), float(src.transform.d))
+            source_y_m = math.hypot(float(src.transform.b), float(src.transform.e))
+            display_x_m = source_x_m * float(crop_w) / max(float(out_w), 1.0)
+            display_y_m = source_y_m * float(crop_h) / max(float(out_h), 1.0)
+            display_mpp = math.sqrt(max(display_x_m * display_y_m, 1e-12))
+            out_mask, context_diagnostics = _fuse_context_evidence(
+                out_mask,
+                support_votes,
+                boundary_votes,
+                coverage_votes,
+                meters_per_pixel=display_mpp,
+                support_ratio=float(model_cfg.get("orthomosaic_context_support_ratio", 0.50)),
+                recovery_distance_m=float(model_cfg.get("orthomosaic_context_recovery_distance_m", 0.75)),
+                separator_ratio=float(model_cfg.get("orthomosaic_context_separator_ratio", 0.30)),
+                separator_min_votes=int(model_cfg.get("orthomosaic_context_separator_min_votes", 2)),
+                separator_min_length_m=float(model_cfg.get("orthomosaic_context_separator_min_length_m", 1.50)),
+            )
+            preprocessing.update({
+                "context_capture_size": int(context_capture),
+                "context_resize_to": int(TiledInference.INFER_SIZE),
+                "context_overlap": float(context_overlap),
+                "context_tile_count": int(context_total),
+                "context_valid_tile_count": int(context_valid),
+                "context_skipped_nodata_tile_count": int(context_skipped),
+                "context_display_meters_per_pixel": float(display_mpp),
+                **context_diagnostics,
+            })
+            self.log.info(
+                "context evidence fusion complete: "
+                f"tiles={context_valid}/{context_total}, "
+                f"recovered={context_diagnostics['context_recovered_pixels']}px, "
+                f"separators={context_diagnostics['context_separator_pixels']}px"
             )
         return out_mask, preprocessing
 

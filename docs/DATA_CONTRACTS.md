@@ -9,6 +9,14 @@
 - `$PATH` 路径按当前兼容格式写入 `lat, lon`；使用时按目标终端的字段定义逐项核对。
 - 禁止无地理配准时写入伪坐标。
 
+## 运行时与发布包（DECISION-018）
+
+- 冻结版发布目录的入口固定为根目录 `reUI.exe`；PyInstaller 支持文件可以位于 `_internal`，不能要求用户调用 Python、Conda 或 pip。
+- `runtime_paths.bundled_resource()` 只解析随程序发布的只读资源；`config.example.json`、`data/models/model_registry.json` 和内置模型不得在运行时直接改写。
+- 用户配置、缓存、日志、用户模型和更新临时文件分别位于 `%LOCALAPPDATA%/reUI/config`、`cache`、`logs`、`models`、`updates`；首次运行从旧版 `config.json` 或内置示例迁移配置，更新不得覆盖这些目录。
+- 冻结包的 `build_info.json` 至少包含版本、提交号、频道、构建时间和科学代码指纹。正式导出 manifest 必须保留这些构建信息；缺失科学代码指纹时不得生成可追溯正式清单。
+- 源码 ZIP 与 Release 二进制 ZIP 是不同交付物。`update.bat` 只同步源代码；Release 工作流负责生成 `reUI-Windows-x64-<version>.zip` 和校验文件。
+
 ## 阶段证据
 
 每个阶段记录 `algorithm_version`、`inputs`、`input_fingerprint`、`artifact_sha256` 和总 `fingerprint`。
@@ -29,28 +37,40 @@
 
 ## 掩膜语义层
 
+- 掩膜处理档位固定为 `standard`。旧配置中的 `light`、`strong` 和 `very_strong` 仅作为兼容输入，加载后统一归一为 `standard`，不得改变当前处理参数。
+
 - `processed_mask`：经过验证、可作为作物主体和作业线依据的区域。
 - `headland_mask`：方向和位置证据支持的田头作物候选，用于田头碾压统计和全田真实作物碾压并集，不等同于低质量主体；与主体重叠的像素只计一次。生成前先记录规则化主体的连通区域分区；只有通过区域轴向跨度、端部邻接和跨行支持率分类的候选种子才可进入该层。
-- `headland_corridor_mask`：仅在规则化纵向行带的轴向端部、跨越足够多行且具有连续横向证据时重建的完整田头走廊；田头与主体粘连时可记录 `terminal_dense_seed` 作为补充种子来源，其语义优先于纵向规则化主体。接受后的走廊按平滑逐列端点墙在米制最大深度内展开，并与原始作物支持相交，不得填成矩形。端点墙只采纳达到 `headland_terminal_wall_min_axial_span_ratio` 的长跨度横截行，并记录参考跨度、可信行数和被拒短行数；稀疏纵向行尾、区域分界和内部短片段不得作为田头端点。`diagnostics.region_partition` 保存区域数量、边界框、端部分类、候选支持率和拒绝原因；未经区域分类接受的种子不进入 `headland_mask`。
+- `headland_corridor_mask`：仅在规则化纵向行带的轴向端部、跨越足够多行且具有连续横向证据时重建的完整田头走廊；田头与主体粘连时可记录 `terminal_dense_seed` 作为补充种子来源。接受后的走廊按稳健端点墙在米制最大深度内展开，并与原始作物支持相交，不得填成矩形。端点墙只采纳达到 `headland_terminal_wall_min_axial_span_ratio` 的长跨度横截行，再以分箱 Theil-Sen 趋势替换超过 `headland_terminal_wall_outlier_tolerance_m` 的局部异常端点；候选和种子均不得越过最终端墙进入主体。当统一轴向重构区间把端点量化成直墙时，只允许采用田块多边形中跨行跨度足够长的物理端边恢复墙体斜率，并向田头侧补偿 `band_end_trim_m` 的重构裁边，不能把去噪裁边当成主作业区语义边界。存在规则化纵向主体作为端墙证据时，`headland_corridor_endpoint_margin_m` 的有效主体内切值固定为 0。诊断记录参考跨度、可信/被拒/异常替换行数、田块端边斜率来源、裁边补偿、稳健斜率和有效容差；稀疏纵向行尾、区域分界和内部短片段不得作为田头端点。`diagnostics.region_partition` 保存区域数量、边界框、端部分类、候选支持率和拒绝原因；未经区域分类接受的种子不进入 `headland_mask`。
 - `uncertain_residual_mask`：不能可靠归属到主体或田头的原始残差，只用于显示和中性场地支撑。
 - `planning_support_mask`：场地支撑并集，只用于越界/支撑判断，不得替代 `processed_mask` 计算作物覆盖或碾压。
 - `forbidden_regions`：用户在显示坐标中确认的禁行多边形；规划时按掩膜偏移栅格化，不得由不确定残差自动生成。
 - `mask_result.diagnostics.profile_gate_basis` 必须为 `run_edge_midpoints`：相邻剖面行带的局部占用门控按 profile run 边界中点分隔，避免宽等距块吞并旁侧四行带的中心线。
-- 当前 `mask_result.diagnostics.algorithm_version` 为 `14`。版本 13 及更早的 `mask_processed`/`mask_result` 不包含上述门控契约，缓存恢复必须使掩膜处理和下游路径失效，不得仅因源影像、模型及数组形状相同而复用。
+- 当前 `mask_result.diagnostics.algorithm_version` 为 `17`。版本 16 及更早的 `mask_processed`/`mask_result` 不包含田块端边斜率恢复与重构裁边补偿契约，缓存恢复必须使掩膜处理和下游路径失效，不得仅因源影像、模型及数组形状相同而复用。
 
 这些数组与处理后主体保存在同一个原子 NPZ 产物中；项目 JSON 只保存轻量元数据。
 
 ## 路径段语义
 
+### 正射影像双尺度推理证据（DECISION-004/009）
+
+- `mask_raw` 仍以 640 px 原生源分辨率切片的语义结果为主体。
+- `1280→640` 上下文切片只提供邻近弱检测恢复和相邻实例接触边界，不得单独生成整块语义掩膜。
+- 弱检测阈值、上下文尺寸、重叠率、恢复像素数和实例分隔像素数必须写入 `raster_preprocessing`/推理 provenance。
+- 实例接触边界需获得跨切片重复支持，并通过米制长度和主方向一致性筛选；单个切片外轮廓不能切断作业带。
+
 ### 种植区域分类与分区路径（DECISION-017）
 
-- `layout.planting_region_classification` 保存分类器版本、宽度阈值、模糊保护带、逐带宽度/法向位置/结论/理由、分类计数、是否混合田块以及自动规划是否允许。类型只能是 `wide_narrow_rows`、`uniform_block` 或 `ambiguous`。
-- `layout.work_regions` 保存区域标识、类型、来源带、法向位置、作业线数量和来源语义；不得内嵌重复的完整作业线数组。`layout.region_execution_order` 保存实际完成顺序；有起点时按起点参考选择首区，有起终点时还用终点参考选择首尾方向并记录 `region_order_rule=entry_exit_reference_order`，无起点/终点时使用稳定回退顺序，不得以“左区/右区”表达类型。
+未显式配置 `uniform_zone_min_width_m` 时，默认值为 `4.0 m`。该默认值用于把真实数据中约 `2.5 m` 的完整四行宽窄行带与明显更宽的等距块分开；显式配置仍按配置值和歧义保护带执行，不能用默认值替代人工/上游证据。
+
+- `layout.planting_region_classification` 保存分类器版本、宽度阈值、模糊保护带、逐带宽度/法向位置/结论/理由、分类计数、是否混合田块以及自动规划是否允许。类型只能是 `wide_narrow_rows`、`uniform_block` 或 `ambiguous`。分类器还必须记录 `partition_basis` 和 `wide_narrow_region_count`；当一个 `uniform_block` 的法向位置位于两组宽窄行带之间时，两侧必须形成不同的 `wide_narrow_rows_N`，不能因类型相同而跨区合并。
+- 当 `profile_width_m` 落入模糊保护带时，只有同时具备上游 `band_type=wide`、低于均匀区下界的局部重构宽度，以及连续中心线跨度证据，才可记录 `borderline_resolution=upstream_band_type_and_continuous_centerline_support` 并归入 `wide_narrow_rows`；缺少任一证据仍必须是 `ambiguous`，不得按田块左右位置猜测。
+- `layout.work_regions` 保存区域标识、类型、来源带、法向位置、作业线数量和来源语义；不得内嵌重复的完整作业线数组。`layout.region_execution_order` 保存实际完成顺序；一至两个区域时可由起点选择首区，有起终点时还用终点参考选择首尾方向。三个及以上法向连续区域只能在正向、反向两种单调顺序中择优，并记录 `region_order_rule=monotonic_normal_order_minimum_entry_exit_connection`，不得从中间区出发后跨越已完成区域。无起点/终点时使用稳定回退顺序，不得以“左区/右区”表达类型。
 - UI/项目快照中的带记录用 `planning_contour` 保存最多 256 点的轻量规划边界，原始稠密 `contour` 不进入轻量状态。等距区诊断的 `reference_geometry_source` 必须说明使用 `contour`、`planning_contour` 或历史兼容的 `compact_centerline_and_mask`；当 `profile_width_m` 明显大于该轻量边界时，必须以实测剖面宽度扩展横向规划包络，并记录 `effective_geometry_source=<reference>_expanded_from_profile_width`、`profile_width_px`、`reference_geometry_width_px` 和 `effective_transverse_width_m`，不得静默按窄边界截断等距区。若等距区与宽窄行区相邻，扩展包络仍必须受最近宽窄行中心线的共享边界安全带限制；该中心线归属边界作业带，禁止等距区再生成近重复作业线。
-- 宽窄行区的 `line_source=four_row_band_centerlines`；等距区的 `line_source=cutter_width_uniform_swaths`。混合田块的套圈排序仅在各区域内部进行，`turn_assessment.contour_ordering.no_cross_region_pairing=true`；所有区域的 `shared_headland_wall_projections_px` 和逐侧 `shared_turn_clearance_m_by_side` 必须相同，后者记录 `shared_turn_clearance_scope=all_classified_regions`。套圈调头方向使用同一主航线轴，不得由单条短线尾部改变；局部凹边界只能使全田同侧切线共同内移。
+- 宽窄行区的 `line_source=four_row_band_centerlines`；等距区的 `line_source=cutter_width_uniform_swaths`。混合田块的套圈排序仅在各区域内部进行，`turn_assessment.contour_ordering.no_cross_region_pairing=true`；所有区域的 `shared_headland_wall_projections_px` 和逐侧 `shared_turn_clearance_m_by_side` 必须相同，后者记录 `shared_turn_clearance_scope=all_classified_regions`。套圈调头方向使用同一主航线轴，不得由单条短线尾部改变；局部凹边界只能使全田同侧切线共同内移。若规则化带的 `longitudinal_extent_m` 与至少 3 条完整邻线共同证明中心线被内部缝隙截短，可在短线过滤前沿主航向恢复到邻线中位田头墙；每个延长段必须完全位于已确认田界内，并在 `layout.endpoint_repair` 或 `layout.uniform_zones[].endpoint_repair` 记录来源、目标墙、延长距离和结果跨度。等距线恢复只改变轴向端点，不得改变法向位置和 `track_gauge_m` 等距间隔。
 - `turn_assessment.region_routes` 保存每区独立套圈诊断；`turn_assessment.region_transfers` 保存相邻区域间唯一 `turn_aux` 的起终点、策略、长度、田界检查、曲线非退化检查和机器可执行结论。任何转场失败都使整条候选失败关闭。
 - `layout.coverage_gap_recovery` 保存规划期漏线恢复版本、正常四行间距、异常间距倍数、来源带、目标法向位置、`phase_method`、左右稳定队列数量、中心线支持率、横截面轴向支持率/平均占用率、轴向长度比、被明确忽略的窄带标识与 `recovered_band_ids`；`layout.planning_recovered=true` 表示路径实际使用了恢复作业带。两侧相位证据不对称时从较长稳定队列外推，证据相当时才取中点；机器中心线可位于四行作物之间，不能因中心像素为空而漏掉整带。窄带中心不得提升为四行作业线，且处理后掩膜的原始分类不得被覆盖。`field_trial`/`machine_candidate` 仍默认关闭新的自动恢复；缓存中已有该标记时必须保留并显示该来源。默认研究导出不弹窗、不阻断，严格 `fail_closed` 模式才拒绝。
-- `turn_assessment.service_points` 保存 `mode`、起终点参考是否参与排序/方向、以及入口/出口连接是否实际写入路径。默认 `service_point_mode=reference_only`：起点和终点可以自由拖动，分别参与首尾作业线/方向参考，且界面标记始终显示用户坐标；不生成从参考点到作业线的强制长直线，也不会因终点落在反向端而自动生成 `turn_reverse`；只有显式 `service_point_mode=connect` 才启用 `exit_route` 的田头接驳审计。
+- `turn_assessment.service_points` 保存 `mode`、起终点参考是否参与排序/方向、以及入口/出口连接是否实际写入路径。默认 `service_point_mode=connect`：起点和终点可以自由拖动，分别参与首尾作业线/方向参考，并将服务点与路线首尾实际连接；若仅需要参考坐标而不输出连接段，必须显式设置 `service_point_mode=reference_only`。套圈排序会先将离起点最近的完整两行组移到首组，不改变对应间隔。
 
 - `work`：由作物中心线支持、启用割刀几何覆盖计算的作业段。
 - `turn_approach`：从作物端点到校正转弯锚点的田头直行段，不计入割台作物覆盖。
@@ -70,12 +90,12 @@
 - `agronomic_damage_cost_m2`：`track_body_overlap_area_m2 + headland_damage_weight * track_headland_overlap_area_m2`；仅用于报告和论文对照，不参与转弯策略选择，不得称为碾压率。
 - `headland_damage_weight`：田头单位物理碾压面积相对主体的规划权重，范围 `(0,1]`，无田间标定时必须使用 `1.0`。
 - `rolling_core_pct`：履带扫掠与作物核心区重叠面积 / 作物核心区总面积；只作为详细风险指标。
-- `track_core_overlap_pct`：履带扫掠中落在作物核心区的面积 / 履带总扫掠面积；用于路径安全门限，不得称为预计碾压率。
+- `track_core_overlap_pct`：履带扫掠中落在作物核心区的面积 / 履带总扫掠面积；始终保留为理论指标，不得称为预计碾压率。当前 `track_core_overlap_policy=report_only`，该指标不参与路径有效性和导出阻断；只有显式设置 `hard_gate` 才恢复阈值阻断。
 
 碾压模型只使用左右履带矩形扫掠，不把机身或割刀计入碾压。割刀线只参与主体作物掩膜几何覆盖率。通过硬约束的候选路径按主体碾压、核心区重叠、语义风险、几何覆盖率和长度排序；田头碾压及田头加权农业损伤只作报告，不得影响转弯策略。`rolling_crop_pct` 已废止，不得导出或作为兼容别名继续产生第二种“碾压率”定义。无掩膜区域不得仅凭分割结果自动视为确认无作物道路。
 
 - `work_line_mode=footprint_optimized`时，`requested_work_line_mode`记录请求模式，`work_line_mode`记录实际执行模式。成功结果必须同时包含`optimization_complete=true`、`footprint_optimization_scope=centerline_anchored_lateral_search`、相等且大于零的`baseline_pass_count/optimized_pass_count`，以及逐线横移和目标代价诊断；不完整或无改进时如实回退为`band_centerline_with_footprint_validation`。
-- 横向优化保留完整基准/优化工作线足迹关键指标摘要。正式比较必须使用与最终完整路径验证相同的 `detected_mask`、`planned_mask`、规划支撑、不确定区和确认禁行区证据。接受条件为：履带核心重叠、田界越界、语义支撑区、不确定区和确认禁行区均不得恶化，规划目标几何覆盖率不得下降，且至少一项指标严格改善；任一关键指标缺失、非有限或恶化都必须回退基准中心线。`machine_readiness` 只有在 `formal_comparison.accepted=true`、无退化/无效指标、至少一项严格改善且基准/优化摘要的核心重叠、规划覆盖率和田界越界均为有限数值时，才能通过该优化证据门禁。
+- 横向优化保留完整基准/优化工作线足迹关键指标摘要。正式比较必须使用与最终完整路径验证相同的 `detected_mask`、`planned_mask`、规划支撑、不确定区和确认禁行区证据。核心重叠保留作对照记录；当前默认不因该指标数值阻断路径或导出。田界越界、语义支撑区、不确定区和确认禁行区仍按当前策略处理，规划目标几何覆盖率不得下降；任一关键指标缺失、非有限或其他硬安全条件失败仍必须保留失败原因。
 - 中心线锚定优化只能在`lateral_search_m`限定范围内横移，保留四行带基准线的数量、排序和纵向范围。确认禁行区候选不可选，非有限搜索参数必须在配置边界拒绝。
 - `crop_mask_geometric_coverage_pct`：割刀有效割幅线段沿全部 `work` 段扫掠后，与处理后作物主体掩膜的交集面积 / 作物主体掩膜面积。
 - `planned_target_geometric_coverage_pct`：同一割刀扫掠区域对规划目标掩膜的几何覆盖比例，是路径有效性的默认覆盖门限。
@@ -161,9 +181,9 @@
 - 规划器保留 `requested_strategy`、`candidate_strategy`、`effective_strategy` 和 `fallback_reason`；`headland_turn_optimization_enabled` 只控制有限转弯候选选择，默认启用，不能把工作线推离四行带中心线。
 - `contour` 套圈策略记录 `ordering_strategy=contour`、`contour_ordering.algorithm_version`、`split_index`、`low_block_original_indices`、`high_block_original_indices`、`ordered_original_indices`、`corresponding_pairs`、`pair_count`、`normal_positions`、`adjacent_transition_count`、`headland_wall_projections_px`、`shared_turn_clearance_m_by_side`、`shared_turn_clearance_scope`、`turn_distances_m` 和 `center_single_finish`。规划先形成完整的平行主作业线集合，再按法向排序后两半交错（8 行为 `0,4,1,5,2,6,3,7`，9 行为 `0,5,1,6,2,7,3,8,4`）；`work_line_endpoint_extension_m` 只沿主航线向共享田头墙外延，且必须经过田界检查。宽间距局部转弯请求为 `bow`，中心间距仅在显式米制容差内允许用保持共同切线位置的小半圆，超过容差仍受最小半径安全回退。横向切线属于正式 `turn` 段并进入足迹归因，不得产生绕过路径协议的 `connector` 类型，也不得把合成闭合轮廓当作作业段。
 - 等距种植区未指定 `uniform_zone_line_spacing_m` 时，间距固定取 `track_gauge_m`，并记录 `line_spacing_basis=track_gauge_overlap` 与 `adjacent_track_centerline_offset_m=0`；这使上一趟右履带中心线与下一趟左履带中心线重合。生成器可为整块选择一个统一相位以跨过局部掩膜缝隙，但不得逐条移动作业线；manifest 必须记录 `actual_spacing_m`、`phase_offset_m` 和 `spacing_is_uniform=true`。显式间距仅作为有记录的研究对照，不得冒充该默认重叠口径。
-- 等距区边缘若只有一段明显短于主体作业跨度的掩膜碎片，生成器可在区域生成阶段丢弃该外侧碎片，避免把它与下一条完整作业线连接成跨田长斜线；内部短段和内部缺口不得被静默填补。`layout.uniform_zones` 必须记录 `line_lengths_m`、`median_supported_line_length_m`、`short_edge_line_indices`、`short_edge_line_filter_applied` 和 `accepted_pass_indices`，以便区分“边缘碎片被排除”和“推理/掩膜漏线”。
+- 等距区边缘若只有一段明显短于主体作业跨度的掩膜碎片，生成器可在区域生成阶段丢弃该外侧碎片，避免把它与下一条完整作业线连接成跨田长斜线；内部短段和内部缺口不得被静默填补。`layout.uniform_zones` 必须记录 `line_lengths_m`、`median_supported_line_length_m`、`short_edge_line_indices`、`short_edge_line_filter_applied` 和 `accepted_pass_indices`，以便区分“边缘碎片被排除”和“推理/掩膜漏线”；若使用上述邻线端墙恢复，还必须同时保留 `pre_repair_line_lengths_m`，不得覆盖原始截短证据。
 <!-- DECISION-016: contour ordering remains bound to crop-supported centerlines. -->
 
 - 混合区域的每个区域仍独立执行半分交错套圈；若上一区域最后一条作业线与下一区域默认首条线的法向间距小于跨区域安全间隔，规划器必须尝试将下一区域整体反向，从远侧开始套圈。诊断写入 `contour_ordering.cross_region_transition_records`、区域级 `cross_region_transition_spacing_m` 与 `normal_order_reversed`；这不是跨区域配圈。
-- 每个转弯候选在软代价排序前必须携带正式足迹验证的显式 `valid=True`、空 `issues`、`track_core_overlap_pct`、`planned_target_geometric_coverage_pct` 和 `track_outside_field_pct`；配置提供 `planning_support_mask`、`uncertain_mask` 或 `forbidden_mask` 时，还必须分别提供对应的履带重叠指标。缺失或超限均进入 `rejected_candidates`，不得按零值补齐。
+- 每个转弯候选在软代价排序前必须携带正式足迹验证的显式 `valid=True`、空 `issues`、`track_core_overlap_pct`、`planned_target_geometric_coverage_pct` 和 `track_outside_field_pct`；配置提供 `planning_support_mask`、`uncertain_mask` 或 `forbidden_mask` 时，还必须分别提供对应的履带重叠指标。缺失或其他硬条件超限进入 `rejected_candidates`，核心重叠在 `report_only` 模式下不得单独拒绝候选。
 <!-- DECISION-015: segment footprint and headland-turn metric contract. -->

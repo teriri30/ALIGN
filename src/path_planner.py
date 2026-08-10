@@ -31,7 +31,7 @@ from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
 from headland_turn_optimizer import build_turn_corridor_mask, has_non_degenerate_curve, polyline_inside_mask, select_turn_candidate
 
 
-PATH_PLANNING_VERSION = "footprint-path-v15"
+PATH_PLANNING_VERSION = "footprint-path-v17"
 HEADLAND_TURN_OPTIMIZER_VERSION = "headland-turn-corridor-v1"
 
 
@@ -524,10 +524,169 @@ def prepare_band_centerlines(
             "line": centerline,
             "normal": float(np.median(points @ normal)),
             "span_m": span_m,
+            "declared_span_m": _finite_float(
+                band.get("longitudinal_extent_m")
+            ),
+            "observed_span_ratio": _finite_float(
+                band.get("observed_span_ratio")
+            ),
         })
 
     if not candidates:
         return [], {"reason": "no_valid_four_row_centerlines"}
+
+    endpoint_repair_report = {
+        "enabled": bool(cfg.get("centerline_endpoint_repair_enabled", True)),
+        "applied": False,
+        "cohort_count": 0,
+        "target_low_projection_px": None,
+        "target_high_projection_px": None,
+        "target_span_m": None,
+        "lines": [],
+        "rejected": {},
+    }
+    # A row that is broken by a seam/occlusion often retains a reliable
+    # longitudinal extent in the regularized band record, but its sparse
+    # centerline contains only one side of that extent.  Restore the missing
+    # endpoint from a cohort of genuinely full-span neighbouring wide bands.
+    # This happens before the short-line filter; otherwise the evidence needed
+    # to repair the line would be discarded first.  No endpoint is extended
+    # without a selected field boundary, a multi-line cohort, and a complete
+    # boundary-covered segment check.
+    if endpoint_repair_report["enabled"] and state is not None:
+        field_polygon = field_polygon_local(state, mask.shape[:2])
+        declared = [
+            item["declared_span_m"] for item in candidates
+            if item["declared_span_m"] is not None
+            and item["declared_span_m"] > 0.0
+        ]
+        if field_polygon is None:
+            endpoint_repair_report["rejected"]["missing_field_boundary"] = 1
+        elif len(declared) < 2:
+            endpoint_repair_report["rejected"]["missing_declared_extent"] = 1
+        else:
+            declared_median = float(np.median(np.asarray(declared)))
+            completion_threshold = float(cfg.get(
+                "centerline_endpoint_repair_completion_ratio", 0.85
+            ))
+            cohort = [
+                item for item in candidates
+                if item["declared_span_m"] is not None
+                and item["declared_span_m"] > 0.0
+                and item["span_m"] / item["declared_span_m"]
+                >= completion_threshold
+                and item["span_m"] >= declared_median * 0.80
+            ]
+            min_cohort = max(2, int(cfg.get(
+                "centerline_endpoint_repair_min_cohort", 3
+            )))
+            endpoint_repair_report["cohort_count"] = len(cohort)
+            if len(cohort) < min_cohort:
+                endpoint_repair_report["rejected"]["insufficient_full_span_cohort"] = 1
+            else:
+                cohort_low = [
+                    float(np.min(np.asarray(item["line"]) @ direction))
+                    for item in cohort
+                ]
+                cohort_high = [
+                    float(np.max(np.asarray(item["line"]) @ direction))
+                    for item in cohort
+                ]
+                target_low = float(np.median(np.asarray(cohort_low)))
+                target_high = float(np.median(np.asarray(cohort_high)))
+                target_span_m = (target_high - target_low) * mpp
+                endpoint_repair_report.update({
+                    "target_low_projection_px": target_low,
+                    "target_high_projection_px": target_high,
+                    "target_span_m": float(target_span_m),
+                })
+                max_repair_m = max(0.0, float(cfg.get(
+                    "centerline_endpoint_repair_max_m", 60.0
+                )))
+                for item in candidates:
+                    line = list(item["line"])
+                    points = np.asarray(line, dtype=np.float64)
+                    projections = points @ direction
+                    laterals = points @ normal
+                    low = float(np.min(projections))
+                    high = float(np.max(projections))
+                    low_extension_m = max(0.0, (low - target_low) * mpp)
+                    high_extension_m = max(0.0, (target_high - high) * mpp)
+                    eligible = (
+                        item["declared_span_m"] is not None
+                        and item["declared_span_m"] >= target_span_m * 0.80
+                        and (
+                            low_extension_m > 1e-6
+                            or high_extension_m > 1e-6
+                        )
+                    )
+                    if not eligible:
+                        continue
+                    if low_extension_m > max_repair_m or high_extension_m > max_repair_m:
+                        endpoint_repair_report["rejected"][
+                            "endpoint_extension_over_limit"
+                        ] = int(endpoint_repair_report["rejected"].get(
+                            "endpoint_extension_over_limit", 0
+                        )) + 1
+                        continue
+
+                    repaired_line = line
+                    low_target = None
+                    high_target = None
+                    endpoint_sample_count = min(5, len(line))
+                    if low_extension_m > 1e-6:
+                        lateral = float(np.median(laterals[:endpoint_sample_count]))
+                        low_target = target_low * direction + lateral * normal
+                        if not segment_within_field_boundary(
+                            [tuple(low_target), tuple(points[0])],
+                            field_polygon,
+                        ):
+                            endpoint_repair_report["rejected"][
+                                "low_extension_leaves_field"
+                            ] = int(endpoint_repair_report["rejected"].get(
+                                "low_extension_leaves_field", 0
+                            )) + 1
+                            low_target = None
+                        else:
+                            repaired_line = [tuple(map(float, low_target))] + repaired_line
+                    if high_extension_m > 1e-6:
+                        lateral = float(np.median(laterals[-endpoint_sample_count:]))
+                        high_target = target_high * direction + lateral * normal
+                        if not segment_within_field_boundary(
+                            [tuple(points[-1]), tuple(high_target)],
+                            field_polygon,
+                        ):
+                            endpoint_repair_report["rejected"][
+                                "high_extension_leaves_field"
+                            ] = int(endpoint_repair_report["rejected"].get(
+                                "high_extension_leaves_field", 0
+                            )) + 1
+                            high_target = None
+                        else:
+                            repaired_line = repaired_line + [
+                                tuple(map(float, high_target))
+                            ]
+                    if low_target is None and high_target is None:
+                        continue
+                    item["line"] = repaired_line
+                    repaired_points = np.asarray(repaired_line, dtype=np.float64)
+                    item["span_m"] = float(
+                        np.ptp(repaired_points @ direction) * mpp
+                    )
+                    item["normal"] = float(
+                        np.median(repaired_points @ normal)
+                    )
+                    endpoint_repair_report["applied"] = True
+                    endpoint_repair_report["lines"].append({
+                        "band_id": item["id"],
+                        "low_extension_m": float(
+                            0.0 if low_target is None else low_extension_m
+                        ),
+                        "high_extension_m": float(
+                            0.0 if high_target is None else high_extension_m
+                        ),
+                        "result_span_m": float(item["span_m"]),
+                    })
 
     median_span = float(np.median([item["span_m"] for item in candidates]))
     min_span_ratio = float(cfg.get("centerline_min_span_ratio", 0.65))
@@ -547,6 +706,7 @@ def prepare_band_centerlines(
         "median_centerline_span_m": median_span,
         "ordered_band_ids": [item["id"] for item in accepted],
         "pass_count": len(accepted),
+        "endpoint_repair": endpoint_repair_report,
     }
 
 
@@ -2036,10 +2196,10 @@ def _connect_work_lines(
         return (float(point[0]) - ox, float(point[1]) - oy) if point else None
 
     service_point_mode = str(
-        cfg.get("service_point_mode", "reference_only")
+        cfg.get("service_point_mode", "connect")
     ).strip().lower()
     if service_point_mode not in {"reference_only", "connect"}:
-        service_point_mode = "reference_only"
+        service_point_mode = "connect"
     connect_service_points = service_point_mode == "connect"
     include_entry_service = bool(
         connect_service_points and cfg.get("_include_entry_service", True)
@@ -2139,6 +2299,102 @@ def _connect_work_lines(
         contour_ordering["work_line_point_counts"] = [
             len(line) for line in ordered_lines
         ]
+    if (
+        requested_strategy == "contour"
+        and entry_point
+        and ordered_lines
+        and not bool(cfg.get("_contour_reverse_normal_order", False))
+    ):
+        # Keep the contour pair topology, but rotate complete pair blocks so
+        # the physically nearest work row is visited first.  Rotating a single
+        # row would break the two-row loop spacing that contour mode is meant
+        # to preserve.
+        endpoint_distances = [
+            min(
+                math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
+                for point in (line[0], line[-1])
+            )
+            for line in ordered_lines
+            if len(line) >= 2
+        ]
+        if endpoint_distances:
+            nearest_index = int(np.argmin(np.asarray(endpoint_distances)))
+            nearest_pair_index = nearest_index // 2
+            pair_count = (len(ordered_lines) + 1) // 2
+            if nearest_pair_index > 0 and nearest_pair_index < pair_count:
+                line_pairs = [
+                    ordered_lines[index:index + 2]
+                    for index in range(0, len(ordered_lines), 2)
+                ]
+                ordered_lines = (
+                    line_pairs[nearest_pair_index:]
+                    + line_pairs[:nearest_pair_index]
+                )
+                ordered_lines = [
+                    line for pair in ordered_lines for line in pair
+                ]
+                ordered_indices = list(
+                    contour_ordering.get("ordered_original_indices") or []
+                )
+                if len(ordered_indices) != len(endpoint_distances):
+                    ordered_indices = list(range(len(endpoint_distances)))
+                index_pairs = [
+                    ordered_indices[index:index + 2]
+                    for index in range(0, len(ordered_indices), 2)
+                ]
+                ordered_indices = [
+                    item
+                    for pair in (
+                        index_pairs[nearest_pair_index:]
+                        + index_pairs[:nearest_pair_index]
+                    )
+                    for item in pair
+                ]
+                positions = list(contour_ordering.get("normal_positions") or [])
+                if len(positions) != len(endpoint_distances):
+                    positions = [None] * len(endpoint_distances)
+                position_pairs = [
+                    positions[index:index + 2]
+                    for index in range(0, len(positions), 2)
+                ]
+                positions = [
+                    item
+                    for pair in (
+                        position_pairs[nearest_pair_index:]
+                        + position_pairs[:nearest_pair_index]
+                    )
+                    for item in pair
+                ]
+                contour_ordering["ordered_original_indices"] = ordered_indices
+                contour_ordering["normal_positions"] = positions
+                contour_ordering["corresponding_pairs"] = [
+                    {
+                        "pair_index": pair_index,
+                        "original_indices": ordered_indices[index:index + 2],
+                        "normal_positions": positions[index:index + 2],
+                    }
+                    for pair_index, index in enumerate(
+                        range(0, len(ordered_indices), 2)
+                    )
+                ]
+                contour_ordering["entry_nearest_pair_index"] = int(
+                    nearest_pair_index
+                )
+                contour_ordering["entry_nearest_line_index_before_rotation"] = int(
+                    nearest_index
+                )
+                contour_ordering["entry_priority_applied"] = True
+            else:
+                contour_ordering["entry_nearest_pair_index"] = int(
+                    nearest_pair_index
+                )
+                contour_ordering["entry_nearest_line_index_before_rotation"] = int(
+                    nearest_index
+                )
+                contour_ordering["entry_priority_applied"] = False
+            contour_ordering["entry_nearest_line_distance_px"] = float(
+                endpoint_distances[nearest_index]
+            )
     if entry_point and len(ordered_lines) >= 2:
         first_distance = min(
             math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
@@ -2353,7 +2609,20 @@ def _connect_work_lines(
             scored.append((score, candidate_index, name, lines, indices, positions,
                            entry_distance, exit_distance, preview))
         if scored:
-            selected = min(scored, key=lambda item: (item[0], item[1]))
+            if entry_point is not None:
+                # The user-selected start row is authoritative.  Exit-side
+                # proximity may break ties, but must not move the route away
+                # from the row nearest the start marker.
+                selected = min(
+                    scored,
+                    key=lambda item: (
+                        float("inf") if item[6] is None else item[6],
+                        item[0],
+                        item[1],
+                    ),
+                )
+            else:
+                selected = min(scored, key=lambda item: (item[0], item[1]))
             (
                 score, candidate_index, name, selected_lines, selected_indices,
                 selected_positions, entry_distance, exit_distance,
@@ -3133,6 +3402,11 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         },
     }.get(profile)
     max_core_overlap = float(cfg.get("max_track_core_overlap_pct", 8.0))
+    core_overlap_policy = str(
+        cfg.get("track_core_overlap_policy", "report_only")
+    ).strip().lower()
+    if core_overlap_policy not in {"report_only", "hard_gate"}:
+        core_overlap_policy = "report_only"
     min_geometric_coverage = float(cfg.get("min_geometric_coverage_pct", 90.0))
     max_outside = float(
         profile_limits["outside_field"] if profile_limits
@@ -3156,7 +3430,10 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
     else:
         max_machine_outside = None
         max_machine_forbidden = None
-    if footprint["track_core_overlap_pct"] > max_core_overlap:
+    if (
+        core_overlap_policy == "hard_gate"
+        and footprint["track_core_overlap_pct"] > max_core_overlap
+    ):
         issues.append(
             f"履带与稻株核心重叠 {footprint['track_core_overlap_pct']:.1f}% "
             f"> {max_core_overlap:.1f}%"
@@ -3224,6 +3501,7 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         "crossing_count": int(crossing_count),
         "issues": issues,
         "validation_profile": profile,
+        "track_core_overlap_policy": core_overlap_policy,
         "validation_limits_pct": {
             "track_outside_field": max_outside,
             "track_outside_support": max_outside_support,
@@ -3421,13 +3699,15 @@ def auto_validate_path(full_path: List[List[Tuple[float, float]]],
         harvester=_harvester_specs(state),
         config={},
     )
+    # Core overlap remains in the returned description as a measured metric,
+    # but it is report-only by default and must not make this legacy helper
+    # reject an otherwise geometrically valid route.
     is_valid = (
-        metrics["track_core_overlap_pct"] <= 8.0
-        and metrics["crop_mask_geometric_coverage_pct"] >= 90.0
+        metrics["crop_mask_geometric_coverage_pct"] >= 90.0
         and metrics["track_outside_field_pct"] <= 2.0
     )
     description = (
-        f"履带核心重叠={metrics['track_core_overlap_pct']:.1f}%, "
+        f"履带核心重叠(仅报告)={metrics['track_core_overlap_pct']:.1f}%, "
         f"全田作物预计碾压={metrics['rolling_canopy_pct']:.1f}%, "
         f"作物核心碾压={metrics['rolling_core_pct']:.1f}%, "
         f"作物掩膜几何覆盖={metrics['crop_mask_geometric_coverage_pct']:.1f}%, "
@@ -4606,6 +4886,28 @@ def _generate_uniform_zone_lines(
 
     t_start = int(t_lo) - 30
     t_end = int(t_hi) + 30
+    cfg = dict(config or {})
+    try:
+        configured_bridge_m = max(
+            0.0,
+            float(cfg.get("uniform_internal_gap_bridge_m", 30.0)),
+        )
+    except (TypeError, ValueError):
+        configured_bridge_m = 30.0
+    axial_span_m = max(0.0, float(t_hi - t_lo) * mpp)
+    internal_bridge_m = min(configured_bridge_m, axial_span_m * 0.60)
+    internal_bridge_px = int(round(internal_bridge_m / max(mpp, 1e-9)))
+    terminal_guard_px = int(round(0.5 / max(mpp, 1e-9)))
+    try:
+        terminal_fragment_min_m = max(
+            0.0,
+            float(cfg.get("uniform_terminal_fragment_min_m", 4.0)),
+        )
+    except (TypeError, ValueError):
+        terminal_fragment_min_m = 4.0
+    terminal_fragment_min_px = int(round(
+        terminal_fragment_min_m / max(mpp, 1e-9)
+    ))
 
     def longest_supported_run(n_off: float):
         """Return the longest mask-supported axial run at one normal offset."""
@@ -4624,6 +4926,39 @@ def _generate_uniform_zone_lines(
                 seg_start = value
             prev = value
         segments.append((seg_start, prev))
+        # A local inference seam inside the crop body must not become a
+        # turn endpoint.  Merge only substantial neighbouring runs, and
+        # retain the terminal-fragment guard so a short headland residual is
+        # still rejected by the existing outer-run filter below.
+        merged = []
+        for start, end in segments:
+            if not merged:
+                merged.append([start, end])
+                continue
+            previous_start, previous_end = merged[-1]
+            gap = start - previous_end - 1
+            previous_length = previous_end - previous_start + 1
+            current_length = end - start + 1
+            previous_is_short_terminal = (
+                len(merged) == 1
+                and previous_start <= t_start + terminal_guard_px
+                and previous_length < terminal_fragment_min_px * 2
+            )
+            current_is_short_terminal = (
+                end >= t_end - terminal_guard_px
+                and current_length < terminal_fragment_min_px * 2
+            )
+            if (
+                0 <= gap <= internal_bridge_px
+                and previous_length >= terminal_fragment_min_px
+                and current_length >= terminal_fragment_min_px
+                and not previous_is_short_terminal
+                and not current_is_short_terminal
+            ):
+                merged[-1][1] = end
+            else:
+                merged.append([start, end])
+        segments = [tuple(item) for item in merged]
         longest = max(segments, key=lambda seg: seg[1] - seg[0])
         return longest if longest[1] - longest[0] >= 4 else None
 
@@ -4704,7 +5039,6 @@ def _generate_uniform_zone_lines(
             "supported_pass_count": int(_supported_count),
         })
 
-    cfg = dict(config or {})
     try:
         min_line_length_ratio = float(
             cfg.get("uniform_zone_min_line_length_ratio", 0.65)
@@ -4746,6 +5080,8 @@ def _generate_uniform_zone_lines(
             "short_edge_line_indices": [int(index) for index in short_edge_indices],
             "short_edge_line_filter_applied": bool(short_edge_indices),
             "accepted_pass_indices": sorted(int(index) for index in accepted_indices),
+            "internal_gap_bridge_limit_m": float(internal_bridge_m),
+            "internal_gap_bridge_enabled": bool(internal_bridge_px > 0),
         })
 
     lines = []
@@ -4764,6 +5100,177 @@ def _generate_uniform_zone_lines(
         )
         lines.append([p1, p2])
     return lines
+
+
+def _repair_uniform_zone_endpoints(
+    zone_lines: List[List[Tuple[float, float]]],
+    zone_band: Dict,
+    reference_lines: List[List[Tuple[float, float]]],
+    main_angle: float,
+    *,
+    geo=None,
+    state=None,
+    mask: Optional[np.ndarray] = None,
+    config: Optional[Dict] = None,
+) -> Tuple[List[List[Tuple[float, float]]], Dict]:
+    """Extend truncated uniform passes to the shared crop-body end walls.
+
+    A compact equal-distance contour can stop at an inference seam even when
+    the band's measured longitudinal extent and neighbouring complete rows
+    both show that the crop body continues.  Use the neighbouring full-span
+    row cohort as the end-wall reference, but only when every extension is
+    covered by the selected field boundary.  The pass normal positions are
+    unchanged, so equal track-gauge spacing remains exact.
+    """
+    cfg = dict(config or {})
+    report = {
+        "enabled": bool(cfg.get("centerline_endpoint_repair_enabled", True)),
+        "applied": False,
+        "source": "regular_centerline_shared_headland_walls",
+        "reference_line_count": len(reference_lines or []),
+        "target_low_projection_px": None,
+        "target_high_projection_px": None,
+        "target_span_m": None,
+        "lines": [],
+        "reason": None,
+    }
+    if not report["enabled"]:
+        report["reason"] = "disabled"
+        return [list(line) for line in zone_lines], report
+    if not zone_lines:
+        report["reason"] = "no_uniform_lines"
+        return [], report
+    if len(reference_lines or []) < 3:
+        report["reason"] = "insufficient_reference_lines"
+        return [list(line) for line in zone_lines], report
+    if mask is None or state is None:
+        report["reason"] = "missing_mask_or_state"
+        return [list(line) for line in zone_lines], report
+
+    field_polygon = field_polygon_local(state, mask.shape[:2])
+    if field_polygon is None:
+        report["reason"] = "missing_field_boundary"
+        return [list(line) for line in zone_lines], report
+    mpp = meters_per_pixel(mask, geo, state)
+    direction = np.asarray(
+        [math.cos(float(main_angle)), math.sin(float(main_angle))],
+        dtype=np.float64,
+    )
+    normal = np.asarray([-direction[1], direction[0]], dtype=np.float64)
+
+    reference_records = []
+    for line in reference_lines:
+        points = np.asarray(line, dtype=np.float64)
+        if points.ndim != 2 or points.shape[0] < 2:
+            continue
+        projections = points @ direction
+        reference_records.append({
+            "low": float(np.min(projections)),
+            "high": float(np.max(projections)),
+            "span_m": float(np.ptp(projections) * mpp),
+        })
+    if len(reference_records) < 3:
+        report["reason"] = "insufficient_valid_reference_lines"
+        return [list(line) for line in zone_lines], report
+
+    median_reference_span_m = float(np.median([
+        item["span_m"] for item in reference_records
+    ]))
+    full_reference = [
+        item for item in reference_records
+        if item["span_m"] >= median_reference_span_m * 0.85
+    ]
+    if len(full_reference) < 3:
+        report["reason"] = "insufficient_full_span_reference_cohort"
+        return [list(line) for line in zone_lines], report
+
+    target_low = float(np.median([item["low"] for item in full_reference]))
+    target_high = float(np.median([item["high"] for item in full_reference]))
+    target_span_m = float((target_high - target_low) * mpp)
+    declared_span_m = _finite_float(zone_band.get("longitudinal_extent_m"))
+    report.update({
+        "target_low_projection_px": target_low,
+        "target_high_projection_px": target_high,
+        "target_span_m": target_span_m,
+        "declared_span_m": declared_span_m,
+    })
+    if target_span_m <= 0.0:
+        report["reason"] = "invalid_reference_span"
+        return [list(line) for line in zone_lines], report
+    if declared_span_m is None or declared_span_m < target_span_m * 0.80:
+        report["reason"] = "zone_extent_does_not_support_shared_walls"
+        return [list(line) for line in zone_lines], report
+
+    try:
+        max_repair_m = max(0.0, float(cfg.get(
+            "centerline_endpoint_repair_max_m", 60.0
+        )))
+    except (TypeError, ValueError):
+        max_repair_m = 60.0
+    repaired_lines = []
+    for line_index, source_line in enumerate(zone_lines):
+        line = [tuple(map(float, point)) for point in source_line]
+        points = np.asarray(line, dtype=np.float64)
+        if points.ndim != 2 or points.shape[0] < 2:
+            repaired_lines.append(line)
+            continue
+        projections = points @ direction
+        if projections[0] > projections[-1]:
+            line.reverse()
+            points = np.asarray(line, dtype=np.float64)
+            projections = points @ direction
+        laterals = points @ normal
+        low = float(projections[0])
+        high = float(projections[-1])
+        low_extension_m = max(0.0, (low - target_low) * mpp)
+        high_extension_m = max(0.0, (target_high - high) * mpp)
+        if low_extension_m > max_repair_m or high_extension_m > max_repair_m:
+            repaired_lines.append(line)
+            report["lines"].append({
+                "line_index": int(line_index),
+                "repaired": False,
+                "reason": "endpoint_extension_over_limit",
+                "low_extension_m": low_extension_m,
+                "high_extension_m": high_extension_m,
+            })
+            continue
+
+        repaired = list(line)
+        low_repaired = False
+        high_repaired = False
+        if low_extension_m > 1e-6:
+            low_target = target_low * direction + float(laterals[0]) * normal
+            if segment_within_field_boundary(
+                [tuple(low_target), tuple(points[0])], field_polygon
+            ):
+                repaired[0] = tuple(map(float, low_target))
+                low_repaired = True
+        if high_extension_m > 1e-6:
+            high_target = target_high * direction + float(laterals[-1]) * normal
+            if segment_within_field_boundary(
+                [tuple(points[-1]), tuple(high_target)], field_polygon
+            ):
+                repaired[-1] = tuple(map(float, high_target))
+                high_repaired = True
+        repaired_lines.append(repaired)
+        repaired_points = np.asarray(repaired, dtype=np.float64)
+        result_span_m = float(np.ptp(repaired_points @ direction) * mpp)
+        repaired_now = bool(low_repaired or high_repaired)
+        report["applied"] = bool(report["applied"] or repaired_now)
+        report["lines"].append({
+            "line_index": int(line_index),
+            "repaired": repaired_now,
+            "low_extension_m": float(low_extension_m if low_repaired else 0.0),
+            "high_extension_m": float(
+                high_extension_m if high_repaired else 0.0
+            ),
+            "result_span_m": result_span_m,
+        })
+    if report["applied"]:
+        report["reason"] = "cohort_and_field_boundary_supported"
+    else:
+        report["reason"] = "no_boundary_supported_extension"
+    return repaired_lines, report
 
 
 def _uniform_zone_inner_limit(
@@ -4870,9 +5377,15 @@ def _classify_planting_regions(
     """
     cfg = dict(config or {})
     try:
-        threshold_m = float(cfg.get("uniform_zone_min_width_m", 2.5))
+        # A normal four-row band in the field-trial imagery is about 2.5 m
+        # wide. The old 2.5 m default put complete four-row bands inside the
+        # uniform-zone ambiguity guard and could fail an otherwise usable
+        # mixed-field plan closed. Keep explicit config overrides intact, but
+        # require a clearly broader (4 m+) transverse profile before treating
+        # a band as a uniform block by default.
+        threshold_m = float(cfg.get("uniform_zone_min_width_m", 4.0))
     except (TypeError, ValueError):
-        threshold_m = 2.5
+        threshold_m = 4.0
     try:
         ambiguity_margin_m = float(
             cfg.get("planting_region_ambiguity_margin_m", 0.25)
@@ -4897,7 +5410,15 @@ def _classify_planting_regions(
             if math.isfinite(number) and number > 0.0:
                 widths[key] = number
         any_measured_width = any_measured_width or bool(widths)
-        effective_width_m = max(widths.values()) if widths else None
+        # `profile_width_m` is the transverse profile/run measurement used by
+        # DECISION-017.  `width_m` is only a legacy fallback; taking the max
+        # of the two can turn a normal four-row band into a false borderline
+        # uniform block when the local reconstructed width is inflated.
+        effective_width_m = (
+            widths.get("profile_width_m")
+            if widths.get("profile_width_m") is not None
+            else widths.get("width_m")
+        )
         record = {
             "band_index": int(index),
             "band_id": band.get("id"),
@@ -4905,11 +5426,13 @@ def _classify_planting_regions(
             "width_m": widths.get("width_m"),
             "effective_width_m": effective_width_m,
             "normal_position": _band_normal_position(band, main_angle),
+            "upstream_band_type": str(band.get("band_type", "") or "").strip().lower(),
         }
         records.append(record)
 
     for record in records:
         width_m = record["effective_width_m"]
+        borderline_resolution = None
         if width_m is None:
             if any_measured_width:
                 classification = "ambiguous"
@@ -4926,32 +5449,111 @@ def _classify_planting_regions(
             classification = "uniform_block"
             reason = "effective_width_above_guarded_uniform_threshold"
         else:
-            classification = "ambiguous"
-            reason = "effective_width_inside_ambiguity_guard_band"
+            # The mask-processing stage has already performed an independent
+            # width classification.  A borderline profile is not genuinely
+            # ambiguous when that upstream evidence says it is a wide band,
+            # its reconstructed local width is clearly below the uniform-zone
+            # guard, and the centerline spans almost the complete body.  This
+            # resolves the real 2.449 m band at the wide/uniform boundary
+            # without guessing from image position.  Synthetic/legacy inputs
+            # without this complete evidence still fail closed below.
+            record_index = int(record["band_index"])
+            band = (bands or [])[record_index] if record_index < len(bands or []) else {}
+            local_width_m = _finite_float(record.get("width_m"))
+            observed_span_ratio = _finite_float(band.get("observed_span_ratio"))
+            longitudinal_extent_ratio = _finite_float(
+                band.get("longitudinal_extent_ratio")
+            )
+            complete_wide_evidence = (
+                record.get("upstream_band_type") == "wide"
+                and local_width_m is not None
+                and local_width_m <= lower_m
+                and observed_span_ratio is not None
+                and observed_span_ratio >= 0.80
+                and longitudinal_extent_ratio is not None
+                and longitudinal_extent_ratio >= 0.80
+            )
+            if complete_wide_evidence:
+                classification = "wide_narrow_rows"
+                reason = "borderline_profile_resolved_by_complete_wide_band_evidence"
+                borderline_resolution = {
+                    "source": "upstream_band_type_and_continuous_centerline_support",
+                    "upstream_band_type": "wide",
+                    "local_width_m": float(local_width_m),
+                    "observed_span_ratio": float(observed_span_ratio),
+                    "longitudinal_extent_ratio": float(longitudinal_extent_ratio),
+                }
+            else:
+                classification = "ambiguous"
+                reason = "effective_width_inside_ambiguity_guard_band"
         record["classification"] = classification
         record["reason"] = reason
+        if borderline_resolution is not None:
+            record["borderline_resolution"] = borderline_resolution["source"]
+            record["borderline_resolution_evidence"] = borderline_resolution
 
     groups = []
     regular_records = [
         item for item in records if item["classification"] == "wide_narrow_rows"
     ]
-    if regular_records:
+    uniform_records = [
+        item for item in records if item["classification"] == "uniform_block"
+    ]
+
+    # DECISION-017: a planting *type* is not a physical work region.  The old
+    # implementation put every four-row band in one global group, so a broad
+    # uniform block lying between two four-row cohorts made contour ordering
+    # pair lines across that block.  Partition the regular records wherever a
+    # measured uniform-block centre lies between two consecutive normal
+    # positions.  This is rotation/mirror invariant and uses only the same
+    # geometry evidence already persisted by the classifier.
+    regular_partitions = []
+    positioned_regular = sorted(
+        (
+            item for item in regular_records
+            if item.get("normal_position") is not None
+        ),
+        key=lambda item: float(item["normal_position"]),
+    )
+    unpositioned_regular = [
+        item for item in regular_records
+        if item.get("normal_position") is None
+    ]
+    uniform_positions = sorted(
+        float(item["normal_position"])
+        for item in uniform_records
+        if item.get("normal_position") is not None
+    )
+    for record in positioned_regular:
+        if regular_partitions:
+            previous = regular_partitions[-1][-1]
+            low = float(previous["normal_position"])
+            high = float(record["normal_position"])
+            if any(low < position < high for position in uniform_positions):
+                regular_partitions.append([])
+        if not regular_partitions:
+            regular_partitions.append([])
+        regular_partitions[-1].append(record)
+    if unpositioned_regular:
+        if not regular_partitions:
+            regular_partitions.append([])
+        regular_partitions[0].extend(unpositioned_regular)
+
+    for group_index, partition in enumerate(regular_partitions):
         groups.append({
-            "region_id": "wide_narrow_rows_1",
+            "region_id": f"wide_narrow_rows_{group_index + 1}",
             "kind": "wide_narrow_rows",
-            "band_indices": [item["band_index"] for item in regular_records],
-            "band_ids": [item["band_id"] for item in regular_records],
+            "band_indices": [item["band_index"] for item in partition],
+            "band_ids": [item["band_id"] for item in partition],
             "normal_position": float(np.median([
                 item["normal_position"]
-                for item in regular_records
+                for item in partition
                 if item["normal_position"] is not None
             ])) if any(
-                item["normal_position"] is not None for item in regular_records
+                item["normal_position"] is not None for item in partition
             ) else None,
         })
-    for group_index, record in enumerate(
-        item for item in records if item["classification"] == "uniform_block"
-    ):
+    for group_index, record in enumerate(uniform_records):
         groups.append({
             "region_id": f"uniform_block_{group_index + 1}",
             "kind": "uniform_block",
@@ -4964,8 +5566,12 @@ def _classify_planting_regions(
         item for item in records if item["classification"] == "ambiguous"
     ]
     diagnostics = {
-        "algorithm_version": "planting-region-classifier-v1",
+        "algorithm_version": "planting-region-classifier-v2",
         "classification_basis": "measured_band_width_not_image_side",
+        "partition_basis": (
+            "uniform_block_normal_position_separates_regular_rows"
+        ),
+        "wide_narrow_region_count": len(regular_partitions),
         "uniform_threshold_m": threshold_m,
         "ambiguity_margin_m": ambiguity_margin_m,
         "guard_band_m": [lower_m, upper_m],
@@ -4977,6 +5583,9 @@ def _classify_planting_regions(
             ),
             "ambiguous": len(ambiguous),
         },
+        "borderline_resolved_count": sum(
+            bool(item.get("borderline_resolution")) for item in records
+        ),
         "mixed_field": bool(regular_records) and any(
             item["classification"] == "uniform_block" for item in records
         ),
@@ -5083,12 +5692,13 @@ def _prepare_work_line_layout(
         if return_regions:
             return [], layout, []
         return [], layout
-    regular_group = next(
-        (item for item in region_groups if item["kind"] == "wide_narrow_rows"),
-        None,
-    )
+    regular_groups = [
+        item for item in region_groups if item["kind"] == "wide_narrow_rows"
+    ]
     workable_bands = [
-        wide_bands[index] for index in (regular_group or {}).get("band_indices", [])
+        wide_bands[index]
+        for group in regular_groups
+        for index in group.get("band_indices", [])
     ]
     uniform_groups = [
         item for item in region_groups if item["kind"] == "uniform_block"
@@ -5279,7 +5889,15 @@ def _prepare_work_line_layout(
                 for item in wide_bands
                 if len(item.get("centerline", [])) >= 2
             ]
-            layout = {"fallback": "raw_band_centerlines", "footprint_optimization_scope": "validation_only"}
+            layout = {
+                "fallback": "raw_band_centerlines",
+                "footprint_optimization_scope": "validation_only",
+                "ordered_band_ids": [
+                    int(item.get("id", index + 1))
+                    for index, item in enumerate(wide_bands)
+                    if len(item.get("centerline", [])) >= 2
+                ],
+            }
     elif mode == "band_centerline":
         work_lines, layout = prepare_band_centerlines(
             wide_bands,
@@ -5294,7 +5912,14 @@ def _prepare_work_line_layout(
                 for item in wide_bands
                 if len(item.get("centerline", [])) >= 2
             ]
-            layout = {"fallback": "raw_band_centerlines"}
+            layout = {
+                "fallback": "raw_band_centerlines",
+                "ordered_band_ids": [
+                    int(item.get("id", index + 1))
+                    for index, item in enumerate(wide_bands)
+                    if len(item.get("centerline", [])) >= 2
+                ],
+            }
     else:
         raise ValueError(f"unsupported work_line_mode: {mode}")
     layout = dict(layout or {})
@@ -5327,6 +5952,41 @@ def _prepare_work_line_layout(
                 diagnostics=zone_diagnostics,
                 config=cfg,
             )
+            pre_repair_lengths_m = list(
+                zone_diagnostics.get("line_lengths_m") or []
+            )
+            zone_lines, uniform_endpoint_repair = (
+                _repair_uniform_zone_endpoints(
+                    zone_lines,
+                    zone,
+                    regular_work_lines,
+                    main_angle,
+                    geo=geo,
+                    state=state,
+                    mask=processed_mask,
+                    config=cfg,
+                )
+            )
+            zone_diagnostics["endpoint_repair"] = uniform_endpoint_repair
+            if uniform_endpoint_repair.get("applied"):
+                repaired_lengths_m = [
+                    float(sum(
+                        math.hypot(
+                            float(right[0]) - float(left[0]),
+                            float(right[1]) - float(left[1]),
+                        )
+                        for left, right in zip(line, line[1:])
+                    ) * meters_per_pixel(processed_mask, geo, state))
+                    for line in zone_lines
+                ]
+                zone_diagnostics["pre_repair_line_lengths_m"] = (
+                    pre_repair_lengths_m
+                )
+                zone_diagnostics["line_lengths_m"] = repaired_lengths_m
+                zone_diagnostics["median_supported_line_length_m"] = float(
+                    np.median(repaired_lengths_m)
+                    if repaired_lengths_m else 0.0
+                )
             uniform_zone_lines.extend(zone_lines)
             uniform_region_lines.append(list(zone_lines))
             uniform_zone_report.append({
@@ -5378,6 +6038,10 @@ def _prepare_work_line_layout(
                 "accepted_pass_indices": zone_diagnostics.get(
                     "accepted_pass_indices", []
                 ),
+                "endpoint_repair": zone_diagnostics.get("endpoint_repair"),
+                "pre_repair_line_lengths_m": zone_diagnostics.get(
+                    "pre_repair_line_lengths_m"
+                ),
                 "inner_limit_applied": zone_diagnostics.get(
                     "inner_limit_applied"
                 ),
@@ -5392,11 +6056,26 @@ def _prepare_work_line_layout(
     layout.setdefault("work_line_mode", mode)
     layout["requested_work_line_mode"] = mode
     work_regions = []
-    if regular_group and regular_work_lines:
+    ordered_regular_band_ids = list(layout.get("ordered_band_ids") or [])
+    lines_by_band_id = {
+        band_id: line
+        for band_id, line in zip(
+            ordered_regular_band_ids,
+            regular_work_lines,
+        )
+    }
+    for regular_group in regular_groups:
+        region_lines = [
+            lines_by_band_id[band_id]
+            for band_id in regular_group.get("band_ids", [])
+            if band_id in lines_by_band_id
+        ]
+        if not region_lines:
+            continue
         work_regions.append({
             **regular_group,
-            "work_lines": regular_work_lines,
-            "line_count": len(regular_work_lines),
+            "work_lines": region_lines,
+            "line_count": len(region_lines),
             "line_source": "four_row_band_centerlines",
         })
     for group, zone_lines in zip(uniform_groups, uniform_region_lines):
@@ -6231,9 +6910,60 @@ def _connect_work_regions(
         ]
         return min(distances) if distances else float("inf")
 
-    if entry_reference is not None:
+    region_reference_ordering = {
+        "enabled": bool(entry_reference is not None or exit_reference is not None),
+        "selected_variant": "current",
+        "candidate_count": 1,
+    }
+    raw_regions = list(work_regions or [])
+    normal_positions_complete = bool(raw_regions) and all(
+        _finite_float(item.get("normal_position")) is not None
+        for item in raw_regions
+    )
+    monotonic_multi_region_order = (
+        len(raw_regions) >= 3 and normal_positions_complete
+    )
+    if monotonic_multi_region_order:
+        # Once one planting type has been split around an intervening region,
+        # sorting every region independently by entry distance can produce a
+        # middle -> edge -> opposite-edge sequence.  That necessarily crosses
+        # a completed region.  Only the two monotonic normal-axis traversals
+        # preserve physical adjacency; entry and exit choose between them.
+        forward_regions = sorted(
+            raw_regions,
+            key=lambda item: (
+                float(item["normal_position"]),
+                str(item.get("region_id", "")),
+            ),
+        )
+        reversed_regions = list(reversed(forward_regions))
+
+        def monotonic_reference_score(items):
+            score = 0.0
+            if entry_reference is not None:
+                score += region_reference_distance(items[0])
+            if exit_reference is not None:
+                score += region_end_distance(items[-1])
+            return float(score)
+
+        forward_score = monotonic_reference_score(forward_regions)
+        reversed_score = monotonic_reference_score(reversed_regions)
+        ordered_regions = forward_regions
+        if reversed_score + 1e-6 < forward_score:
+            ordered_regions = reversed_regions
+            region_reference_ordering["selected_variant"] = "reversed"
+        region_order_rule = (
+            "monotonic_normal_order_minimum_entry_exit_connection"
+        )
+        region_reference_ordering.update({
+            "candidate_count": 2,
+            "current_score_px": forward_score,
+            "reversed_score_px": reversed_score,
+            "physical_adjacency_preserved": True,
+        })
+    elif entry_reference is not None:
         ordered_regions = sorted(
-            work_regions or [],
+            raw_regions,
             key=lambda item: (
                 region_reference_distance(item),
                 float(item.get("normal_position"))
@@ -6245,7 +6975,7 @@ def _connect_work_regions(
         region_order_rule = "nearest_entry_region_then_distance_tiebreak"
     else:
         ordered_regions = sorted(
-            work_regions or [],
+            raw_regions,
             key=lambda item: (
                 0 if item.get("kind") == "wide_narrow_rows" else 1,
                 float(item.get("normal_position"))
@@ -6257,14 +6987,13 @@ def _connect_work_regions(
         region_order_rule = "stable_kind_order_without_entry_reference"
 
     # A free exit point is a real route-order reference, not merely metadata.
-    # Reversing the classified-region sequence is the only alternative that
-    # preserves each region's internal contour and shared-wall semantics.
-    region_reference_ordering = {
-        "enabled": bool(entry_reference is not None or exit_reference is not None),
-        "selected_variant": "current",
-        "candidate_count": 1,
-    }
-    if exit_reference is not None and len(ordered_regions) >= 2:
+    # For one or two regions, reversing the sequence is the only alternative
+    # that preserves each region's internal contour and shared-wall semantics.
+    if (
+        not monotonic_multi_region_order
+        and exit_reference is not None
+        and len(ordered_regions) >= 2
+    ):
         current_score = (
             region_reference_distance(ordered_regions[0])
             + region_end_distance(ordered_regions[-1])
@@ -6606,7 +7335,7 @@ def _connect_work_regions(
         "ordering_strategy": normalize_turn_strategy(turn_strategy),
         "contour_ordering": {
             "ordering": "classified_regions_then_independent_contours",
-            "algorithm_version": "mixed-region-order-v2",
+            "algorithm_version": "mixed-region-order-v3",
             "region_order": [item.get("region_id") for item in ordered_regions],
             "region_order_rule": region_order_rule,
             "entry_reference_local": list(entry_reference)

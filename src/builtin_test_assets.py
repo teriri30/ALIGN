@@ -4,11 +4,11 @@ from __future__ import annotations
 import os
 import json
 from typing import Dict, List
+from runtime_paths import builtin_model_dir, bundled_resource
 
 
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_TEST_IMAGE = os.path.join(_REPO_ROOT, "data", "tif", "result.tif")
-_DEFAULT_MODEL_DIR = os.path.join(_REPO_ROOT, "data", "models")
+_DEFAULT_TEST_IMAGE = str(bundled_resource(os.path.join("data", "tif", "result.tif")))
+_DEFAULT_MODEL_DIR = str(builtin_model_dir())
 
 _PACKAGED_MODEL_SPECS = (
     {

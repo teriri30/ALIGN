@@ -211,7 +211,7 @@ def test_cache_restore_rejects_mask_before_run_edge_gate_version(tmp_path, monke
     from row_geometry import MASK_REGULARIZATION_VERSION
     from state import AppState
 
-    assert MASK_REGULARIZATION_VERSION == 14
+    assert MASK_REGULARIZATION_VERSION == 17
     monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
     source = tmp_path / "field.tif"
     source.write_bytes(b"geotiff-source")

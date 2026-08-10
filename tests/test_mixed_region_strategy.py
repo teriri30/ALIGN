@@ -73,6 +73,105 @@ def test_region_classifier_fails_closed_inside_ambiguity_guard_band():
     assert report["hard_reasons"]
 
 
+def test_region_classifier_resolves_borderline_profile_with_complete_wide_evidence():
+    """真实缓存中的边界宽带不能把整块田误判成零作业线。"""
+    from path_planner import _classify_planting_regions
+
+    band = _band(7, 20.0, 2.449, 1.775, height=80.0)
+    band.update({
+        "band_type": "wide",
+        "observed_span_ratio": 0.987,
+        "longitudinal_extent_ratio": 0.987,
+    })
+
+    groups, report = _classify_planting_regions(
+        [band],
+        0.0,
+        config={
+            "uniform_zone_min_width_m": 2.5,
+            "planting_region_ambiguity_margin_m": 0.25,
+        },
+    )
+
+    assert [item["kind"] for item in groups] == ["wide_narrow_rows"]
+    assert report["counts"] == {
+        "wide_narrow_rows": 1,
+        "uniform_block": 0,
+        "ambiguous": 0,
+    }
+    assert report["borderline_resolved_count"] == 1
+    assert report["records"][0]["reason"] == (
+        "borderline_profile_resolved_by_complete_wide_band_evidence"
+    )
+    assert report["automatic_planning_allowed"] is True
+
+
+def test_default_region_classifier_accepts_complete_25m_four_row_bands():
+    """DECISION-017: the real default must not reject complete four-row bands."""
+    from path_planner import _classify_planting_regions
+
+    bands = []
+    for band_id, y, profile_width_m, width_m in (
+        (6, -30.0, 2.5566423, 2.5695059),
+        (7, -10.0, 12.4926840, 8.0463540),
+        (17, 10.0, 2.6147478, 2.5063089),
+    ):
+        band = _band(band_id, y, profile_width_m, width_m, height=80.0)
+        band.update({
+            "band_type": "wide",
+            "observed_span_ratio": 1.0,
+            "longitudinal_extent_ratio": 1.0,
+        })
+        bands.append(band)
+
+    groups, report = _classify_planting_regions(bands, 0.0)
+
+    assert [item["kind"] for item in groups] == [
+        "wide_narrow_rows", "wide_narrow_rows", "uniform_block"
+    ]
+    assert [item["band_ids"] for item in groups] == [[6], [17], [7]]
+    assert report["counts"] == {
+        "wide_narrow_rows": 2,
+        "uniform_block": 1,
+        "ambiguous": 0,
+    }
+    assert report["automatic_planning_allowed"] is True
+
+
+def test_region_classifier_splits_wide_rows_separated_by_uniform_block():
+    """DECISION-017: 等距区两侧宽窄行不得合并后跨田配圈。"""
+    from path_planner import _classify_planting_regions
+
+    bands = [
+        _band(1, -35.64, 2.5, 2.4),
+        _band(2, -34.96, 2.5, 2.4),
+        _band(3, -34.28, 2.5, 2.4),
+        _band(6, -29.35, 12.4, 8.0, height=120.0),
+        _band(7, -24.50, 2.5, 2.4),
+        _band(8, -23.27, 2.5, 2.4),
+        _band(9, -22.12, 2.5, 2.4),
+    ]
+    for band in bands:
+        band.update({
+            "band_type": "wide",
+            "observed_span_ratio": 1.0,
+            "longitudinal_extent_ratio": 1.0,
+        })
+
+    groups, report = _classify_planting_regions(bands, 0.0)
+
+    assert [item["kind"] for item in groups] == [
+        "wide_narrow_rows", "wide_narrow_rows", "uniform_block"
+    ]
+    assert [item["band_ids"] for item in groups] == [
+        [1, 2, 3], [7, 8, 9], [6]
+    ]
+    assert report["wide_narrow_region_count"] == 2
+    assert report["partition_basis"] == (
+        "uniform_block_normal_position_separates_regular_rows"
+    )
+
+
 def test_prepare_layout_keeps_classified_region_work_lines_separate():
     """DECISION-017: 宽窄行中心线和等距区割幅线形成两个独立工作区。"""
     from path_planner import _prepare_work_line_layout
@@ -400,7 +499,10 @@ def test_ambiguous_classification_is_a_plan_path_hard_reason():
         np.full((100, 100), 255, dtype=np.uint8),
         0.0,
         state=State(),
-        config={"planting_region_ambiguity_margin_m": 0.25},
+        config={
+            "uniform_zone_min_width_m": 2.5,
+            "planting_region_ambiguity_margin_m": 0.25,
+        },
     )
 
     assert result["is_valid"] is False
@@ -679,6 +781,68 @@ def test_region_nearest_entry_runs_first_and_uses_nearest_outer_line():
     assert assessment["contour_ordering"]["region_order_rule"] == (
         "nearest_entry_region_then_distance_tiebreak"
     )
+
+
+def test_three_regions_keep_monotonic_physical_order_without_cross_field_return():
+    """DECISION-017: 三块连续区域不能按类型/入口距离乱序后横跨已作业区。"""
+    from path_planner import _connect_work_regions
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.1
+
+    class State:
+        mask_raw = np.ones((220, 220), dtype=np.uint8) * 255
+        mask_offset_x = 0
+        mask_offset_y = 0
+        field_boundary = [
+            (0.0, 0.0), (220.0, 0.0), (220.0, 220.0), (0.0, 220.0)
+        ]
+        # Entry is nearest to the middle block.  Starting there would force a
+        # later jump across a completed region, so entry/exit choose between
+        # the two monotonic edge-to-edge traversals instead.
+        entry_point = (200.0, 110.0)
+        exit_point = (200.0, 190.0)
+        unload_points = []
+
+    regions = []
+    for region_id, kind, normal in (
+        ("wide_narrow_rows_1", "wide_narrow_rows", 30.0),
+        ("uniform_block_1", "uniform_block", 110.0),
+        ("wide_narrow_rows_2", "wide_narrow_rows", 190.0),
+    ):
+        regions.append({
+            "region_id": region_id,
+            "kind": kind,
+            "normal_position": normal,
+            "line_count": 2,
+            "work_lines": [
+                [(20.0, normal - 5.0), (200.0, normal - 5.0)],
+                [(20.0, normal + 5.0), (200.0, normal + 5.0)],
+            ],
+        })
+
+    _path, _types, assessment, ordered = _connect_work_regions(
+        regions,
+        geo=Geo(),
+        state=State(),
+        min_turn_radius_m=0.5,
+        turn_strategy="contour",
+        config={"contour_max_endpoint_extension_m": 0.0},
+        global_main_angle=0.0,
+        processed_mask=State.mask_raw,
+    )
+
+    assert [item["normal_position"] for item in ordered] == [30.0, 110.0, 190.0]
+    assert assessment["contour_ordering"]["region_order_rule"] == (
+        "monotonic_normal_order_minimum_entry_exit_connection"
+    )
+    assert len(assessment["region_transfers"]) == 2
 
 
 def test_mixed_regions_share_the_same_two_contour_headland_walls():
@@ -1145,3 +1309,4 @@ def test_exit_near_current_work_end_does_not_add_redundant_reverse_segment():
     assert segment_types == ["work", "exit"]
     assert path[-1] == [(90.0, 40.0), (90.0, 45.0)]
     assert diagnostics["service_points"]["exit_route"]["retrace_last_work"] is False
+

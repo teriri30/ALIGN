@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
 )
 from pyside6_app.styles import COLORS
 from config import save_json_atomic
+from runtime_paths import user_config_path
 import os
 
 
@@ -454,19 +455,10 @@ class SettingsDialog(QDialog):
 
     def _mask_tab(self):
         w = QWidget(); f = QFormLayout(w)
-        self.combo_strength = QComboBox()
-        for label, key in [
-            ("轻量/快速", "light"),
-            ("标准", "standard"),
-            ("增强", "strong"),
-            ("强力", "very_strong"),
-        ]:
-            self.combo_strength.addItem(label, key)
-        current_strength = self._config.get("mask_processing", {}).get("strength", "standard")
-        for i in range(self.combo_strength.count()):
-            if self.combo_strength.itemData(i) == current_strength:
-                self.combo_strength.setCurrentIndex(i)
-                break
+        self.mask_strength_value = QLabel("标准（固定）")
+        self.mask_strength_value.setToolTip(
+            "掩膜处理统一使用标准参数，保证不同任务的处理口径一致"
+        )
         self.spin_gap = QDoubleSpinBox(); self.spin_gap.setRange(0.2, 20.0); self.spin_gap.setSingleStep(0.5)
         self.spin_gap.setSuffix(" m"); self.spin_gap.setValue(self._config.get("mask_processing", {}).get("band_internal_gap_close_m", 6.0))
         self.spin_end_gap = QDoubleSpinBox(); self.spin_end_gap.setRange(0.0, 2.0); self.spin_end_gap.setSingleStep(0.05)
@@ -474,7 +466,7 @@ class SettingsDialog(QDialog):
         self.spin_end_gap.setSuffix(" m"); self.spin_end_gap.setValue(mask_cfg.get("band_end_gap_close_m", mask_cfg.get("band_endpoint_gap_close_m", 0.35)))
         self.spin_trim = QDoubleSpinBox(); self.spin_trim.setRange(0.0, 2.0); self.spin_trim.setSingleStep(0.05)
         self.spin_trim.setSuffix(" m"); self.spin_trim.setValue(self._config.get("mask_processing", {}).get("band_end_trim_m", 0.1))
-        f.addRow("处理强度:", self.combo_strength)
+        f.addRow("处理强度:", self.mask_strength_value)
         f.addRow("行内断裂补全:", self.spin_gap)
         f.addRow("端部断裂补全:", self.spin_end_gap)
         f.addRow("端部收缩:", self.spin_trim)
@@ -486,12 +478,13 @@ class SettingsDialog(QDialog):
         self._config.setdefault("model", {})["tile_capture_size"] = self.spin_tile.value()
         self._config.setdefault("path_planning", {})["path_point_interval_m"] = self.spin_interval.value()
         self._config.setdefault("path_planning", {})["headland_buffer_m"] = self.spin_buffer.value()
-        self._config.setdefault("mask_processing", {})["strength"] = self.combo_strength.currentData() or "standard"
+        # Keep the legacy config key for provenance/cache compatibility, but
+        # there is only one active mask-processing profile now.
+        self._config.setdefault("mask_processing", {})["strength"] = "standard"
         self._config.setdefault("mask_processing", {})["band_internal_gap_close_m"] = self.spin_gap.value()
         self._config.setdefault("mask_processing", {})["band_end_gap_close_m"] = self.spin_end_gap.value()
         self._config.setdefault("mask_processing", {})["band_end_trim_m"] = self.spin_trim.value()
-        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "config.json")
-        save_json_atomic(os.path.abspath(cfg_path), self._config)
+        save_json_atomic(str(user_config_path()), self._config)
         self.accept()
 
 

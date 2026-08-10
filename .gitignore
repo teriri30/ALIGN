@@ -50,3 +50,19 @@ Thumbs.db
 experiments/
 .tmp_test_runtime/
 archive/runtime/
+
+# Frozen application build output (published as GitHub Release assets).
+build/
+dist/
+*.spec.bak
+build_info.json
+coverage.xml
+.coverage*
+.runtime-self-test/
+.portable-build-venv/
+reUI-Windows-x64-*.zip
+reUI-Windows-x64-*.sha256
+/reUI.exe
+/_internal/
+/README-Windows.txt
+/version.json
