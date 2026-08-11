@@ -49,7 +49,7 @@ class TopToolbar(QWidget):
     ACTION_SPECS = [
         ("打开影像","OPEN",False), ("加载模型","MODEL",False),
         ("AI识别","AI_INFER",True), ("掩膜处理","MASK_PROCESS",False),
-        ("农机参数","PARAMS",False), ("起终点与卸粮点","ENTRY_EXIT",False),
+        ("农机参数","PARAMS",False), ("起点与可选服务点","ENTRY_EXIT",False),
         ("转弯策略","TURN_STRATEGY",False), ("生成路径","PLAN",True),
         ("演示","PLAY",False), ("导出","EXPORT",False),
         ("取消任务","CANCEL_TASK",False),

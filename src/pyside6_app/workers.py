@@ -219,6 +219,7 @@ def path_planning_config_snapshot(runtime_config=None):
     config = Config().section("path_planning")
     config.update(dict(runtime_config or {}))
     config.setdefault("headland_damage_weight", 1.0)
+    config.setdefault("footprint_metric_policy", "report_only")
     return config
 
 
@@ -719,11 +720,11 @@ class PipelineWorker(QObject):
             # ── Step 4: 路径规划 ──
             self.progress.emit(80, "路径规划...")
             from path_planner import build_band_mask, plan_path
-            planning_bands = wide_bands  # 只对4行带规划
-
+            # DECISION-009/017: only classified four-row bands are planning
+            # evidence.  Never fall back to the complete processed mask,
+            # because it also contains narrow two-row bands and terminal crop.
+            planning_bands = wide_bands
             planning_mask = build_band_mask(processed_mask.shape, planning_bands)
-            if not np.any(planning_mask):
-                planning_mask = processed_mask
 
             path_config = dict(self.path_config)
             path_config.setdefault(
@@ -954,9 +955,10 @@ class PlanWorker(QObject):
             wide_bands = self.mask_result.get("wide_bands", [])
             self.progress.emit(20, "正在构建可作业区域...")
             from path_planner import build_band_mask, plan_path
+            # Keep the planning mask empty when no four-row band was accepted;
+            # the processed mask is not a valid substitute for work-line
+            # evidence (it includes narrow two-row bands/headland crop).
             planning_mask = build_band_mask(processed_mask.shape, wide_bands)
-            if not np.any(planning_mask):
-                planning_mask = processed_mask
             if self._is_cancelled():
                 self._finish("cancelled")
                 return

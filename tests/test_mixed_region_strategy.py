@@ -18,6 +18,33 @@ def _band(band_id, y, profile_width_m, width_m=None, height=20.0):
     }
 
 
+def test_uniform_reference_geometry_ignores_malformed_cache_values():
+    """DECISION-009/017: malformed compact geometry must fail locally, not crash planning."""
+    from path_planner import _uniform_zone_reference_geometry
+
+    points, centroid, source = _uniform_zone_reference_geometry(
+        {
+            "contour": "not-a-point-array",
+            "planning_contour": [1.0, 2.0, 3.0],
+            "centerline": [(0.0, 1.0), (10.0, 1.0)],
+            "centroid": "bad-centroid",
+        },
+        0.0,
+    )
+
+    assert source == "compact_centerline_and_mask"
+    assert points.shape == (2, 2)
+    assert centroid.tolist() == [5.0, 1.0]
+
+    points, centroid, source = _uniform_zone_reference_geometry(
+        {"contour": "bad", "centerline": "also-bad", "bbox": "bad"},
+        0.0,
+    )
+    assert points is None
+    assert centroid is None
+    assert source == "missing_reference_geometry"
+
+
 def test_region_classifier_uses_width_evidence_not_left_or_right():
     """DECISION-017: 镜像田块不能改变种植类型判定。"""
     from path_planner import _classify_planting_regions
@@ -669,6 +696,78 @@ def test_mixed_region_transition_starts_from_far_side_when_boundary_passes_are_a
     assert len(path) == len(segment_types)
 
 
+def test_three_line_region_merges_with_nearest_large_region_for_safe_contour():
+    """DECISION-016/017 v11: keep all lines without an unavoidable adjacent turn."""
+    from path_planner import _connect_work_regions
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.1
+
+    class State:
+        mask_raw = np.ones((260, 260), dtype=np.uint8) * 255
+        mask_offset_x = 0
+        mask_offset_y = 0
+        field_boundary = [
+            (0.0, 0.0), (240.0, 0.0), (240.0, 240.0), (0.0, 240.0)
+        ]
+        entry_point = (20.0, 20.0)
+        exit_point = None
+        unload_points = []
+
+    large_lines = [
+        [(20.0, float(row)), (220.0, float(row))]
+        for row in range(20, 140, 10)
+    ]
+    small_lines = [
+        [(20.0, float(row)), (220.0, float(row))]
+        for row in (160, 170, 180)
+    ]
+    regions = [
+        {
+            "region_id": "uniform_block_1",
+            "kind": "uniform_block",
+            "normal_position": 75.0,
+            "line_count": len(large_lines),
+            "work_lines": large_lines,
+        },
+        {
+            "region_id": "wide_narrow_rows_1",
+            "kind": "wide_narrow_rows",
+            "normal_position": 170.0,
+            "line_count": len(small_lines),
+            "work_lines": small_lines,
+        },
+    ]
+
+    path, segment_types, assessment, ordered = _connect_work_regions(
+        regions,
+        geo=Geo(),
+        state=State(),
+        min_turn_radius_m=0.5,
+        turn_strategy="contour",
+        config={"contour_max_endpoint_extension_m": 0.0},
+        global_main_angle=0.0,
+        processed_mask=State.mask_raw,
+    )
+
+    assert len(ordered) == 1
+    assert ordered[0]["line_count"] == 15
+    assert set(ordered[0]["source_region_ids"]) == {
+        "uniform_block_1", "wide_narrow_rows_1"
+    }
+    assert segment_types.count("work") == 15
+    ordering = assessment["contour_ordering"]
+    assert ordering["adjacent_transition_count"] == 0
+    assert ordering["minimum_possible_adjacent_transition_count"] == 0
+    assert len(path) == len(segment_types)
+
+
 def test_contour_region_transfer_never_falls_back_to_a_pear_bulb():
     """窄交界仍使用套圈弓形转场，不生成灯泡/梨形回退。"""
     from path_planner import _build_inter_region_transfer
@@ -783,8 +882,8 @@ def test_region_nearest_entry_runs_first_and_uses_nearest_outer_line():
     )
 
 
-def test_three_regions_keep_monotonic_physical_order_without_cross_field_return():
-    """DECISION-017: 三块连续区域不能按类型/入口距离乱序后横跨已作业区。"""
+def test_three_regions_start_with_region_nearest_the_entry_endpoint():
+    """DECISION-017: 用户起点优先于三块区域的边到边固定顺序。"""
     from path_planner import _connect_work_regions
 
     class Geo:
@@ -803,11 +902,10 @@ def test_three_regions_keep_monotonic_physical_order_without_cross_field_return(
         field_boundary = [
             (0.0, 0.0), (220.0, 0.0), (220.0, 220.0), (0.0, 220.0)
         ]
-        # Entry is nearest to the middle block.  Starting there would force a
-        # later jump across a completed region, so entry/exit choose between
-        # the two monotonic edge-to-edge traversals instead.
+        # The user explicitly starts beside the middle block.  The first work
+        # endpoint must therefore come from that block rather than an edge.
         entry_point = (200.0, 110.0)
-        exit_point = (200.0, 190.0)
+        exit_point = None
         unload_points = []
 
     regions = []
@@ -838,10 +936,14 @@ def test_three_regions_keep_monotonic_physical_order_without_cross_field_return(
         processed_mask=State.mask_raw,
     )
 
-    assert [item["normal_position"] for item in ordered] == [30.0, 110.0, 190.0]
+    assert ordered[0]["normal_position"] == 110.0
     assert assessment["contour_ordering"]["region_order_rule"] == (
-        "monotonic_normal_order_minimum_entry_exit_connection"
+        "nearest_entry_region_then_adjacent_normal_walk"
     )
+    first_work = next(
+        segment for segment, kind in zip(_path, _types) if kind == "work"
+    )
+    assert first_work[0] == pytest.approx((200.0, 105.0))
     assert len(assessment["region_transfers"]) == 2
 
 
@@ -1309,4 +1411,3 @@ def test_exit_near_current_work_end_does_not_add_redundant_reverse_segment():
     assert segment_types == ["work", "exit"]
     assert path[-1] == [(90.0, 40.0), (90.0, 45.0)]
     assert diagnostics["service_points"]["exit_route"]["retrace_last_work"] is False
-

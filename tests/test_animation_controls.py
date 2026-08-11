@@ -76,6 +76,39 @@ def test_animation_controls_emit_seek_pause_and_slow_speed():
     group.close()
 
 
+def test_route_display_selector_keeps_modes_and_file_information_explicit():
+    app = QApplication.instance() or QApplication([])
+    group = ImageViewerGroup()
+    group.resize(900, 600)
+    group.show()
+    app.processEvents()
+
+    machine_index = group.route_display_combo.findData("machine_file")
+    assert group.route_display_combo.itemText(0) == "连续轨迹"
+    assert group.route_display_combo.itemText(machine_index) == "农机文件"
+    assert group.route_display_combo.model().item(machine_index).isEnabled() is False
+
+    emitted = []
+    group.route_display_mode_changed.connect(emitted.append)
+    group.set_route_display_visible(True)
+    group.set_machine_route_available(
+        True,
+        "004.txt｜42点｜1份｜作业边21/转弯边20",
+        "C:/route/004.txt（42点）",
+    )
+    group.set_route_display_mode("machine_file", emit=True)
+    app.processEvents()
+
+    assert group.route_display_bar.isVisible() is True
+    assert group.route_display_mode() == "machine_file"
+    assert emitted == ["machine_file"]
+    assert "004.txt" in group.route_display_info_label.text()
+    assert "42点" in group.route_display_info_label.text()
+    assert group.route_display_info_label.toolTip() == "C:/route/004.txt（42点）"
+    assert group.route_display_combo.geometry().right() <= group.route_display_bar.width()
+    group.close()
+
+
 def test_task_panel_simulate_action_pauses_instead_of_exiting_active_animation():
     from pyside6_app.main_window import MainWindow
 

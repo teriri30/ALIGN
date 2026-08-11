@@ -95,6 +95,69 @@ def test_contour_order_interleaves_even_and_odd_line_counts():
     assert odd_diagnostics["corresponding_pairs"][-1]["original_indices"] == [4]
 
 
+def test_entry_rotation_does_not_expose_an_adjacent_centre_seam():
+    """DECISION-016 v11: start-row priority must preserve the final invariant."""
+    from path_planner import (
+        _contour_order_work_lines,
+        _select_contour_entry_rotation,
+    )
+
+    lines = [
+        [(0.0, float(index)), (100.0, float(index))]
+        for index in range(6)
+    ]
+    ordered, diagnostics = _contour_order_work_lines(
+        lines, None, main_angle=0.0
+    )
+
+    selected = _select_contour_entry_rotation(
+        ordered,
+        diagnostics,
+        entry_point=(0.0, 4.0),
+        policy="nearest",
+    )
+
+    assert selected[0] == lines[4]
+    assert diagnostics["algorithm_version"] == "contour-order-v6"
+    assert diagnostics["adjacent_transition_count"] == 0
+    assert diagnostics["final_order_validated"] is True
+    assert all(
+        abs(right - left) != 1
+        for left, right in zip(
+            diagnostics["ordered_original_indices"],
+            diagnostics["ordered_original_indices"][1:],
+        )
+    )
+
+
+def test_far_side_handoff_rotation_is_safe_for_twelve_lines():
+    """DECISION-017: a far-side retry is a safe rotation, not list reversal."""
+    from path_planner import (
+        _contour_order_work_lines,
+        _select_contour_entry_rotation,
+    )
+
+    lines = [
+        [(0.0, float(index)), (100.0, float(index))]
+        for index in range(12)
+    ]
+    ordered, diagnostics = _contour_order_work_lines(
+        lines, None, main_angle=0.0
+    )
+
+    selected = _select_contour_entry_rotation(
+        ordered,
+        diagnostics,
+        entry_point=(0.0, 11.0),
+        policy="farthest",
+    )
+
+    assert selected[0] == lines[0]
+    assert diagnostics["normal_order_reversed"] is True
+    assert diagnostics["adjacent_transition_count"] == 0
+    assert diagnostics["minimum_possible_adjacent_transition_count"] == 0
+
+
 def test_contour_order_uses_normal_axis_for_skewed_lines():
     """排序必须沿垂直于主方向的法向，而不是直接按 x/y 轴。"""
     from path_planner import _contour_order_work_lines
@@ -294,6 +357,76 @@ def test_contour_connection_failure_is_reported_in_final_diagnostics():
         reason.startswith("contour_geometry_unavailable:")
         for reason in diagnostics["fallback_reasons"]
     )
+
+
+def test_boundary_truncated_pass_finishes_route_without_diagonal_connector():
+    """DECISION-016 v11: a blocked long shortfall is a terminal work endpoint."""
+    from path_planner import _connect_work_lines
+
+    class _Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 1.0
+
+    class _State:
+        mask_raw = np.ones((100, 100), dtype=np.uint8) * 255
+        mask_offset_x = 0
+        mask_offset_y = 0
+        field_boundary = [
+            (20.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (20.0, 100.0),
+            (20.0, 60.0),
+            (40.0, 60.0),
+            (40.0, 40.0),
+            (20.0, 40.0),
+        ]
+        entry_point = (20.0, 10.0)
+        exit_point = None
+        unload_points = []
+
+    short_endpoint = (40.0, 50.0)
+    lines = [
+        [(20.0, 10.0), (80.0, 10.0)],
+        [(20.0, 20.0), (80.0, 20.0)],
+        [(20.0, 30.0), (80.0, 30.0)],
+        [short_endpoint, (80.0, 50.0)],
+        [(20.0, 70.0), (80.0, 70.0)],
+    ]
+
+    path, segment_types, diagnostics = _connect_work_lines(
+        lines,
+        geo=_Geo(),
+        state=_State(),
+        min_turn_radius_m=0.5,
+        turn_strategy="contour",
+        config={
+            "_contour_allow_terminal_short_line": True,
+            "contour_max_endpoint_extension_m": 4.0,
+            "work_line_endpoint_extension_m": 0.0,
+        },
+        global_main_angle=0.0,
+        processed_mask=_State.mask_raw,
+        return_diagnostics=True,
+    )
+
+    work_segments = [
+        segment
+        for segment, kind in zip(path, segment_types)
+        if kind == "work"
+    ]
+    assert len(work_segments) == len(lines)
+    assert segment_types[-1] == "work"
+    assert work_segments[-1][-1] == pytest.approx(short_endpoint)
+    ordering = diagnostics["contour_ordering"]
+    assert ordering["terminal_constraint_applied"] is True
+    assert ordering["adjacent_transition_count"] == 0
+    assert diagnostics["contour_connector"]["terminal_unaligned_finish"] is True
 
 
 def test_contour_route_reuses_headland_lines_and_keeps_center_single():

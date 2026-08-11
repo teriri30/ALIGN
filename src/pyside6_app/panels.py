@@ -11,6 +11,10 @@ from pyside6_app.task_state import TASK_ORDER
 
 UI_FONT = '"Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif'
 
+# 真实窗口 show() 后逐级缩窄测得：路径规划卡片展开且出现纵向滚动条时，
+# 328 px 仍会产生 1 px 横向滚动，330 px 起全部控件不再横向挤压。
+TASK_PANEL_COMPACT_MIN_WIDTH = 330
+
 HARVESTER_PARAM_LABELS = {
     "cutter_width_m": "割台有效割幅",
     "cutter_forward_offset_m": "割刀前置距离",
@@ -35,8 +39,8 @@ TASK_DEFS = [
     {"id": "segment", "label": "AI识别", "hint": "使用模型分割作物行带。", "color": "#649C7E", "action": "运行"},
     {"id": "process", "label": "掩膜处理", "hint": "优化 AI 识别掩膜并提取作物行带。", "color": "#648C82", "action": "处理"},
     {"id": "params", "label": "农机参数", "hint": "设置农机参数。", "color": "#AC7E56", "action": "设置"},
-    {"id": "entry", "label": "起点", "hint": "可自由布设或拖动；用于选择首条作业线和行驶方向，默认不强行拉接长直线。", "color": "#589C94", "action": "布设"},
-    {"id": "exit", "label": "终点", "hint": "可自由布设或拖动；用于选择末条作业线和离田方向，默认不强行拉接长直线。", "color": "#C76B6B", "action": "布设"},
+    {"id": "entry", "label": "起点（必选）", "hint": "可自由布设或拖动；规划必须从离起点最近的作业线端点开始。", "color": "#589C94", "action": "布设"},
+    {"id": "exit", "label": "终点（可选）", "hint": "不设置时完成最后一条作业线即结束；设置后仅用于末段方向参考。", "color": "#C76B6B", "action": "布设"},
     {"id": "unload", "label": "卸粮点", "hint": "按需要添加一个或多个卸粮点，可为空。", "color": "#C9A64A", "action": "布设"},
     {"id": "plan", "label": "路径规划", "hint": "生成作业路线。", "color": "#589862", "action": "生成"},
     {"id": "simulate", "label": "模拟演示", "hint": "沿规划路径模拟农机运动。", "color": "#4C8C7C", "action": "演示"},
@@ -293,6 +297,7 @@ class TaskPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setMinimumWidth(TASK_PANEL_COMPACT_MIN_WIDTH)
         self._task_widgets = {}
         self._step_cards = []
         self._current_step = 0
@@ -358,9 +363,9 @@ class TaskPanel(QWidget):
                     sep.setFixedHeight(1)
                     sep.setStyleSheet(f"color:{COLORS.get('border', '#383848')};background:{COLORS.get('border', '#383848')};")
                     rows.append(sep)
-                    self.recommend_service_points_btn = QPushButton("智能推荐起点 / 终点")
+                    self.recommend_service_points_btn = QPushButton("智能推荐起点")
                     self.recommend_service_points_btn.setToolTip(
-                        "推荐点仅作为路径排序与方向参考；可在影像上任意拖动或重新布设，默认不会把起终点强行连入作业线"
+                        "推荐一个靠近作业线端部的起点；确认或拖动后，路径从离它最近的作业线端点开始"
                     )
                     self.recommend_service_points_btn.setMinimumHeight(30)
                     self.recommend_service_points_btn.clicked.connect(
@@ -418,7 +423,10 @@ class TaskPanel(QWidget):
                     turn_layout.addWidget(self.turn_combo, 1)
                     rows.append(turn_row)
                     self.route_edit_btn = QPushButton("编辑路线")
-                    self.route_edit_btn.setToolTip("进入人工路线编辑：Alt+左键在线段插点，拖动控制点，Backspace 删除选中点")
+                    self.route_edit_btn.setToolTip(
+                        "进入人工路线编辑：拖动作业线与调头段共用的橙色端点，"
+                        "相邻弧线会实时重新衔接；Alt+左键插点，Backspace 删除选中点"
+                    )
                     self.route_edit_btn.setMinimumHeight(30)
                     self.route_edit_btn.setStyleSheet(
                         f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
@@ -842,7 +850,7 @@ class RouteInfoPanel(QWidget):
         self._empty_label.setVisible(not items)
         for row_idx,(kind,point_idx,label,is_work) in enumerate(items):
             row=RouteSegmentRow(row_idx,label,0.0,is_work); row.clicked.connect(lambda _r,k=kind,i=point_idx: self.service_point_selected.emit(k,i)); self._add_row(row)
-        self._summary.setText(f"起终点与卸粮点 {len(items)}")
+        self._summary.setText(f"起点 / 可选终点与卸粮点 {len(items)}")
         self._safety.setText("路径状态：尚未规划")
         self._safety.setToolTip("")
     def clear_info(self):

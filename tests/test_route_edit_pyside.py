@@ -116,6 +116,59 @@ def test_route_control_polyline_uses_only_work_line_endpoints():
     assert statuses == [1, 0, 1]
 
 
+def test_machine_file_preview_uses_outgoing_status_and_never_joins_volumes():
+    window = _window()
+    records = [
+        {"pixel_x": 0.0, "pixel_y": 0.0, "status": 1},
+        {"pixel_x": 5.0, "pixel_y": 0.0, "status": 0},
+        {"pixel_x": 5.0, "pixel_y": 5.0, "status": 1},
+        {"pixel_x": 20.0, "pixel_y": 20.0, "status": 0},
+        {"pixel_x": 25.0, "pixel_y": 20.0, "status": 1},
+        {"pixel_x": 25.0, "pixel_y": 25.0, "status": 0},
+    ]
+
+    preview = window._build_machine_route_preview(records, {
+        "points_per_file": [3, 3],
+        "output_files": ["C:/route/004.txt", "C:/route/005.txt"],
+    })
+
+    assert preview["point_count"] == 6
+    assert preview["file_count"] == 2
+    assert preview["path_result"]["segment_types"] == [
+        "work", "turn", "turn", "work"
+    ]
+    assert [
+        [(float(x), float(y)) for x, y in edge]
+        for edge in preview["path_result"]["full_path"]
+    ] == [
+        [(0.0, 0.0), (5.0, 0.0)],
+        [(5.0, 0.0), (5.0, 5.0)],
+        [(20.0, 20.0), (25.0, 20.0)],
+        [(25.0, 20.0), (25.0, 25.0)],
+    ]
+    assert "004.txt…005.txt" in preview["info"]
+    window.close()
+
+
+def test_continuous_display_reports_degraded_straight_turn_without_faking_curve():
+    window = _window()
+    result = window._normalise_path_result({
+        "full_path": [
+            [(0.0, 0.0), (10.0, 0.0)],
+            [(10.0, 0.0), (10.0, 8.0)],
+            [(10.0, 8.0), (0.0, 8.0)],
+        ],
+        "segment_types": ["work", "turn_aux", "work"],
+    })
+
+    info, degraded_count = window._canonical_route_display_info(result)
+
+    assert degraded_count == 1
+    assert "1条不可行直连" in info
+    assert result["full_path"][1] == [(10.0, 0.0), (10.0, 8.0)]
+    window.close()
+
+
 def test_route_edit_insert_delete_drag_and_sync_auto_path():
     window = _window()
     window.state.path_points = [(0.0, 0.0), (10.0, 0.0)]
@@ -206,7 +259,50 @@ def test_edit_route_keeps_protocol_chord_but_simulation_turn_is_curved():
     turn = [segment for segment in window.state.auto_path if segment.segment_type == "turn"]
     assert len(turn) == 1
     assert len(turn[0].points) > 2
+    displayed = window._pipeline_result["path"]
+    displayed_turn = displayed["full_path"][1]
+    assert len(displayed_turn) > 2
+    assert displayed["control_full_path"][1] == [
+        (100.0, 0.0), (100.0, 30.0)
+    ]
     assert window._build_anim_segments({}, window.state.auto_path_segments) == window.state.auto_path_segments
+
+
+def test_dragged_missing_endpoint_reconnects_work_and_turn_without_a_gap():
+    """DECISION-016 v13: one shared node owns both the work end and turn start."""
+    window = _window()
+    window.state.path_points = [
+        (0.0, 0.0),
+        (100.0, 0.0),
+        (100.0, 30.0),
+        (0.0, 30.0),
+    ]
+    window.state.path_status = [1, 0, 1]
+
+    moved = (118.0, -12.0)
+    assert window._route_edit_move_point(1, moved) is True
+    window._sync_auto_path_from_editable_route()
+
+    work_before, turn, work_after = window.state.auto_path
+    assert work_before.segment_type == "work"
+    assert turn.segment_type == "turn"
+    assert work_after.segment_type == "work"
+    assert len(turn.points) > 2
+    assert (work_before.points[-1].pixel_x, work_before.points[-1].pixel_y) == moved
+    assert (turn.points[0].pixel_x, turn.points[0].pixel_y) == moved
+    assert (
+        turn.points[-1].pixel_x,
+        turn.points[-1].pixel_y,
+    ) == (
+        work_after.points[0].pixel_x,
+        work_after.points[0].pixel_y,
+    )
+    displayed = window._pipeline_result["path"]
+    assert displayed["full_path"][0][-1] == moved
+    assert displayed["full_path"][1][0] == moved
+    assert len(displayed["full_path"][1]) > 2
+    assert displayed["control_full_path"][1] == [moved, (100.0, 30.0)]
+    window.close()
 
 
 def test_harvester_dialog_hides_internal_wheelbase_and_source_selector():

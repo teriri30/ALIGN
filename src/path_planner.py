@@ -31,7 +31,7 @@ from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
 from headland_turn_optimizer import build_turn_corridor_mask, has_non_degenerate_curve, polyline_inside_mask, select_turn_candidate
 
 
-PATH_PLANNING_VERSION = "footprint-path-v17"
+PATH_PLANNING_VERSION = "footprint-path-v21"
 HEADLAND_TURN_OPTIMIZER_VERSION = "headland-turn-corridor-v1"
 
 
@@ -156,6 +156,186 @@ def _contour_order_work_lines(
     diagnostics["main_angle_rad"] = float(angle)
     diagnostics["fallback_reason"] = None
     return [item["line"] for item in ordered_records], diagnostics
+
+
+def _refresh_contour_order_diagnostics(
+    diagnostics: Dict,
+    ordered_indices: List[int],
+    normal_positions: List[Optional[float]],
+) -> None:
+    """Recompute DECISION-016 invariants after every ordering mutation.
+
+    The initial half-split sequence is only an intermediate result.  Entry
+    rotation and cross-region handoff selection may change it, so reporting
+    the pre-mutation adjacency count would make an unsafe final order look
+    valid.
+    """
+    diagnostics["ordered_original_indices"] = list(ordered_indices)
+    diagnostics["normal_positions"] = list(normal_positions)
+    diagnostics["corresponding_pairs"] = [
+        {
+            "pair_index": pair_index,
+            "original_indices": ordered_indices[index:index + 2],
+            "normal_positions": normal_positions[index:index + 2],
+        }
+        for pair_index, index in enumerate(range(0, len(ordered_indices), 2))
+    ]
+    diagnostics["pair_count"] = (len(ordered_indices) + 1) // 2
+    if (
+        len(normal_positions) != len(ordered_indices)
+        or any(value is None for value in normal_positions)
+    ):
+        ranks = {value: rank for rank, value in enumerate(sorted(ordered_indices))}
+        gaps = [
+            abs(ranks[right] - ranks[left])
+            for left, right in zip(ordered_indices, ordered_indices[1:])
+        ]
+    else:
+        ranked = sorted(
+            range(len(normal_positions)),
+            key=lambda index: (float(normal_positions[index]), ordered_indices[index]),
+        )
+        rank_by_original_index = {
+            ordered_indices[position_index]: rank
+            for rank, position_index in enumerate(ranked)
+        }
+        gaps = [
+            abs(rank_by_original_index[right] - rank_by_original_index[left])
+            for left, right in zip(ordered_indices, ordered_indices[1:])
+        ]
+    diagnostics["adjacent_transition_count"] = int(sum(gap == 1 for gap in gaps))
+    diagnostics["minimum_normal_index_gap"] = int(min(gaps, default=0))
+    diagnostics["final_order_validated"] = True
+
+
+def _select_contour_entry_rotation(
+    ordered_lines: List[List[Tuple[float, float]]],
+    diagnostics: Dict,
+    entry_point: Optional[Tuple[float, float]],
+    policy: str = "nearest",
+    terminal_original_index: Optional[int] = None,
+) -> List[List[Tuple[float, float]]]:
+    """Rotate a contour sequence without introducing an adjacent-row seam.
+
+    A half-split contour of four or more lines normally forms a safe cycle.
+    Rotating *pair blocks* or reversing the final list can expose the central
+    adjacent rows at the seam.  Enumerating line-level rotations and retaining
+    only the minimum-adjacency candidates lets the route honour the operator's
+    start reference (or a far-side inter-region retry) without that defect.
+    """
+    lines = [list(line) for line in ordered_lines]
+    indices = list(diagnostics.get("ordered_original_indices") or [])
+    positions = list(diagnostics.get("normal_positions") or [])
+    if len(indices) != len(lines):
+        indices = list(range(len(lines)))
+    if len(positions) != len(lines):
+        positions = [None] * len(lines)
+    if not lines:
+        _refresh_contour_order_diagnostics(diagnostics, indices, positions)
+        return lines
+
+    records = list(zip(lines, indices, positions))
+    variants = []
+    seen = set()
+    for reversed_order, base in (
+        (False, records),
+        (True, list(reversed(records))),
+    ):
+        for offset in range(len(base)):
+            candidate = base[offset:] + base[:offset]
+            key = tuple(item[1] for item in candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidate_diagnostics = {}
+            _refresh_contour_order_diagnostics(
+                candidate_diagnostics,
+                [item[1] for item in candidate],
+                [item[2] for item in candidate],
+            )
+            variants.append({
+                "records": candidate,
+                "adjacent": int(
+                    candidate_diagnostics["adjacent_transition_count"]
+                ),
+                "offset": int(offset),
+                "reversed": bool(reversed_order),
+            })
+
+    minimum_adjacent = min(item["adjacent"] for item in variants)
+    safe_variants = [
+        item for item in variants if item["adjacent"] == minimum_adjacent
+    ]
+    terminal_variants = [
+        item
+        for item in safe_variants
+        if terminal_original_index is not None
+        and item["records"][-1][1] == terminal_original_index
+    ]
+    if terminal_variants:
+        safe_variants = terminal_variants
+
+    def endpoint_distance(item):
+        if entry_point is None:
+            return 0.0
+        line = item["records"][0][0]
+        return min(
+            math.hypot(
+                float(point[0]) - float(entry_point[0]),
+                float(point[1]) - float(entry_point[1]),
+            )
+            for point in (line[0], line[-1])
+        )
+
+    normalized_policy = str(policy or "nearest").strip().lower()
+    if normalized_policy not in {"nearest", "farthest"}:
+        normalized_policy = "nearest"
+    if entry_point is None:
+        selected = safe_variants[0]
+    elif normalized_policy == "farthest":
+        selected = min(
+            safe_variants,
+            key=lambda item: (
+                -endpoint_distance(item),
+                item["reversed"],
+                item["offset"],
+            ),
+        )
+    else:
+        selected = min(
+            safe_variants,
+            key=lambda item: (
+                endpoint_distance(item),
+                item["reversed"],
+                item["offset"],
+            ),
+        )
+
+    selected_records = selected["records"]
+    selected_indices = [item[1] for item in selected_records]
+    selected_positions = [item[2] for item in selected_records]
+    _refresh_contour_order_diagnostics(
+        diagnostics, selected_indices, selected_positions
+    )
+    diagnostics.update({
+        "algorithm_version": "contour-order-v6",
+        "entry_selection_policy": normalized_policy,
+        "entry_rotation_offset": int(selected["offset"]),
+        "entry_rotation_reversed": bool(selected["reversed"]),
+        "normal_order_reversed": normalized_policy == "farthest",
+        "entry_priority_applied": bool(
+            entry_point is not None
+            and (selected["offset"] or selected["reversed"])
+        ),
+        "minimum_possible_adjacent_transition_count": int(minimum_adjacent),
+        "terminal_original_index": terminal_original_index,
+        "terminal_constraint_applied": bool(terminal_variants),
+    })
+    if entry_point is not None:
+        diagnostics["entry_selected_line_distance_px"] = float(
+            endpoint_distance(selected)
+        )
+    return [list(item[0]) for item in selected_records]
 
 
 def _build_contour_connector_anchors(
@@ -297,6 +477,15 @@ def _build_contour_connector_anchors(
         line_index = record["line_index"]
         for endpoint_name in ("start", "end"):
             endpoint = record[endpoint_name]
+            if (
+                bool(cfg.get("_contour_terminal_unaligned_finish", False))
+                and line_index == len(endpoint_records) - 1
+                and endpoint_name == "end"
+            ):
+                anchors[line_index][endpoint_name] = tuple(map(float, endpoint))
+                endpoint_adjustments.append(0.0)
+                diagnostics["terminal_unaligned_finish"] = True
+                continue
             projection = record[f"{endpoint_name}_projection"]
             side = record[f"{endpoint_name}_side"]
             target_projection = wall_projection[side]
@@ -491,6 +680,7 @@ def prepare_band_centerlines(
     geo=None,
     state=None,
     config: Optional[Dict] = None,
+    reference_bands: Optional[List[Dict]] = None,
 ) -> Tuple[List[List[Tuple[float, float]]], Dict]:
     """Filter, smooth and order four-row band centerlines across the field."""
     cfg = dict(config or {})
@@ -538,6 +728,8 @@ def prepare_band_centerlines(
     endpoint_repair_report = {
         "enabled": bool(cfg.get("centerline_endpoint_repair_enabled", True)),
         "applied": False,
+        "reference_basis": None,
+        "reference_band_count": 0,
         "cohort_count": 0,
         "target_low_projection_px": None,
         "target_high_projection_px": None,
@@ -545,14 +737,11 @@ def prepare_band_centerlines(
         "lines": [],
         "rejected": {},
     }
-    # A row that is broken by a seam/occlusion often retains a reliable
-    # longitudinal extent in the regularized band record, but its sparse
-    # centerline contains only one side of that extent.  Restore the missing
-    # endpoint from a cohort of genuinely full-span neighbouring wide bands.
-    # This happens before the short-line filter; otherwise the evidence needed
-    # to repair the line would be discarded first.  No endpoint is extended
-    # without a selected field boundary, a multi-line cohort, and a complete
-    # boundary-covered segment check.
+    # Automatic endpoint repair remains evidence-bound: a band may reach a
+    # neighbouring common wall only when its own declared longitudinal extent
+    # supports that wall and the complete extension stays inside the selected
+    # field. Orthomosaic gaps outside that evidence are corrected explicitly in
+    # route editing, where the user moves the shared work/turn control point.
     if endpoint_repair_report["enabled"] and state is not None:
         field_polygon = field_polygon_local(state, mask.shape[:2])
         declared = [
@@ -560,6 +749,9 @@ def prepare_band_centerlines(
             if item["declared_span_m"] is not None
             and item["declared_span_m"] > 0.0
         ]
+        min_cohort = max(2, int(cfg.get(
+            "centerline_endpoint_repair_min_cohort", 3
+        )))
         if field_polygon is None:
             endpoint_repair_report["rejected"]["missing_field_boundary"] = 1
         elif len(declared) < 2:
@@ -577,9 +769,12 @@ def prepare_band_centerlines(
                 >= completion_threshold
                 and item["span_m"] >= declared_median * 0.80
             ]
-            min_cohort = max(2, int(cfg.get(
-                "centerline_endpoint_repair_min_cohort", 3
-            )))
+            endpoint_repair_report["reference_basis"] = (
+                "candidate_declared_longitudinal_extent"
+            )
+            endpoint_repair_report["reference_band_count"] = len(
+                candidates
+            )
             endpoint_repair_report["cohort_count"] = len(cohort)
             if len(cohort) < min_cohort:
                 endpoint_repair_report["rejected"]["insufficient_full_span_cohort"] = 1
@@ -605,6 +800,7 @@ def prepare_band_centerlines(
                 )))
                 for item in candidates:
                     line = list(item["line"])
+                    source_span_m = float(item["span_m"])
                     points = np.asarray(line, dtype=np.float64)
                     projections = points @ direction
                     laterals = points @ normal
@@ -612,13 +808,14 @@ def prepare_band_centerlines(
                     high = float(np.max(projections))
                     low_extension_m = max(0.0, (low - target_low) * mpp)
                     high_extension_m = max(0.0, (target_high - high) * mpp)
-                    eligible = (
+                    self_evidence_supported = (
                         item["declared_span_m"] is not None
-                        and item["declared_span_m"] >= target_span_m * 0.80
-                        and (
-                            low_extension_m > 1e-6
-                            or high_extension_m > 1e-6
-                        )
+                        and item["declared_span_m"]
+                        >= target_span_m * 0.80
+                    )
+                    eligible = self_evidence_supported and (
+                        low_extension_m > 1e-6
+                        or high_extension_m > 1e-6
                     )
                     if not eligible:
                         continue
@@ -679,6 +876,7 @@ def prepare_band_centerlines(
                     endpoint_repair_report["applied"] = True
                     endpoint_repair_report["lines"].append({
                         "band_id": item["id"],
+                        "source_span_m": source_span_m,
                         "low_extension_m": float(
                             0.0 if low_target is None else low_extension_m
                         ),
@@ -686,6 +884,8 @@ def prepare_band_centerlines(
                             0.0 if high_target is None else high_extension_m
                         ),
                         "result_span_m": float(item["span_m"]),
+                        "completion_kind": "declared_extent_repair",
+                        "inferred": False,
                     })
 
     median_span = float(np.median([item["span_m"] for item in candidates]))
@@ -1870,9 +2070,9 @@ def connect_centerlines(bands: List[Dict], main_angle: float,
 def _harvester_specs(state=None) -> Dict[str, float]:
     cfg = Config()
     values = getattr(state, "harvester_params", {}) or {}
-    cutter_forward_offset = values.get(
-        "cutter_forward_offset_m", cfg.CUTTER_FORWARD_OFFSET_M
-    )
+    cutter_forward_offset = values.get("cutter_forward_offset_m")
+    if cutter_forward_offset in (None, ""):
+        cutter_forward_offset = cfg.CUTTER_FORWARD_OFFSET_M
     if cutter_forward_offset is None:
         raise ValueError(
             "missing measured cutter_forward_offset_m; "
@@ -1887,6 +2087,79 @@ def _harvester_specs(state=None) -> Dict[str, float]:
         "track_length_m": float(values.get("track_length_m", cfg.TRACK_LENGTH_M)),
         "turn_radius_m": float(values.get("turn_radius_m", cfg.TURN_RADIUS_M)),
     }
+
+
+def _find_terminal_short_line(
+    work_lines: List[List[Tuple[float, float]]],
+    main_angle: Optional[float],
+    mpp: float,
+    field_polygon: Optional[np.ndarray],
+    config: Optional[Dict] = None,
+) -> Optional[Dict]:
+    """Find one field-edge-truncated pass that can safely finish the route.
+
+    The candidate is not extended or deleted.  It is eligible only when its
+    missing axial tail is both longer than the configured contour compensation
+    and blocked by the selected field boundary.  Putting that pass last leaves
+    its real crop-supported endpoint as the route finish and avoids a diagonal
+    connector across the unharvested field.
+    """
+    cfg = dict(config or {})
+    if (
+        len(work_lines) < 3
+        or main_angle is None
+        or not math.isfinite(float(main_angle))
+        or field_polygon is None
+    ):
+        return None
+    direction = np.asarray(
+        (math.cos(float(main_angle)), math.sin(float(main_angle))),
+        dtype=np.float64,
+    )
+    projections = []
+    for line in work_lines:
+        if len(line) < 2:
+            return None
+        values = [
+            float(np.dot(np.asarray(point, dtype=np.float64), direction))
+            for point in (line[0], line[-1])
+        ]
+        projections.append(values)
+    target_low = float(np.median([min(values) for values in projections]))
+    target_high = float(np.median([max(values) for values in projections]))
+    max_extension_m = float(
+        cfg.get(
+            "contour_max_endpoint_extension_m",
+            cfg.get("endpoint_extension_max_m", 4.0),
+        )
+    )
+    candidates = []
+    for line_index, (line, values) in enumerate(zip(work_lines, projections)):
+        for endpoint_index, (point, projection) in enumerate(
+            zip((line[0], line[-1]), values)
+        ):
+            low_side = projection <= 0.5 * (values[0] + values[1])
+            target_projection = target_low if low_side else target_high
+            delta = target_projection - projection
+            outward = delta < -1e-9 if low_side else delta > 1e-9
+            extension_m = abs(delta) * mpp
+            if not outward or extension_m <= max_extension_m + 1e-6:
+                continue
+            target = (
+                float(point[0] + direction[0] * delta),
+                float(point[1] + direction[1] * delta),
+            )
+            if _segment_inside_field_boundary([point, target], field_polygon):
+                continue
+            candidates.append({
+                "original_index": int(line_index),
+                "endpoint_index": int(endpoint_index),
+                "endpoint": (float(point[0]), float(point[1])),
+                "side": "low" if low_side else "high",
+                "extension_m": float(extension_m),
+                "reason": "long_extension_blocked_by_field_boundary",
+            })
+    return max(candidates, key=lambda item: item["extension_m"], default=None)
 
 
 def _align_short_turn_anchors(
@@ -1963,6 +2236,12 @@ def _align_short_turn_anchors(
             ("start", line[0], projections[0]),
             ("end", line[-1], projections[1]),
         ):
+            if (
+                bool(cfg.get("_contour_terminal_unaligned_finish", False))
+                and line_index == len(work_lines) - 1
+                and endpoint_name == "end"
+            ):
+                continue
             low_side = projection <= midpoint
             target_projection = target_low if low_side else target_high
             delta_px = target_projection - projection
@@ -2196,10 +2475,10 @@ def _connect_work_lines(
         return (float(point[0]) - ox, float(point[1]) - oy) if point else None
 
     service_point_mode = str(
-        cfg.get("service_point_mode", "connect")
+        cfg.get("service_point_mode", "reference_only")
     ).strip().lower()
     if service_point_mode not in {"reference_only", "connect"}:
-        service_point_mode = "connect"
+        service_point_mode = "reference_only"
     connect_service_points = service_point_mode == "connect"
     include_entry_service = bool(
         connect_service_points and cfg.get("_include_entry_service", True)
@@ -2228,6 +2507,19 @@ def _connect_work_lines(
             else None
         )
     unload_points = [to_local(point) for point in unload_globals if point]
+    terminal_short_line = None
+    if (
+        requested_strategy == "contour"
+        and bool(cfg.get("_contour_allow_terminal_short_line", False))
+        and exit_point is None
+    ):
+        terminal_short_line = _find_terminal_short_line(
+            work_lines,
+            global_main_angle,
+            mpp,
+            _field_boundary_local_polygon(state),
+            cfg,
+        )
     ordered_lines = [list(line) for line in work_lines]
     contour_ordering = {
         "ordering": "snake_row_order",
@@ -2247,35 +2539,6 @@ def _connect_work_lines(
                 else None
             ),
         )
-        if bool(cfg.get("_contour_reverse_normal_order", False)):
-            # DECISION-017: a region may have to be entered from its far side
-            # when the previous region ends on the shared boundary.  Reversing
-            # the complete interleaved sequence preserves the pair spacing
-            # (for example 0,4,1,5 becomes 7,3,6,2,...) while moving the
-            # cross-region handoff away from an adjacent row.
-            ordered_lines.reverse()
-            ordered_indices = list(
-                reversed(contour_ordering.get("ordered_original_indices") or [])
-            )
-            normal_positions = list(
-                reversed(contour_ordering.get("normal_positions") or [])
-            )
-            contour_ordering["ordered_original_indices"] = ordered_indices
-            contour_ordering["normal_positions"] = normal_positions
-            contour_ordering["corresponding_pairs"] = [
-                {
-                    "pair_index": pair_index,
-                    "original_indices": ordered_indices[index:index + 2],
-                    "normal_positions": normal_positions[index:index + 2],
-                }
-                for pair_index, index in enumerate(
-                    range(0, len(ordered_indices), 2)
-                )
-            ]
-            contour_ordering["ordering_variant"] = (
-                "half_split_interleave_reversed_normal"
-            )
-            contour_ordering["normal_order_reversed"] = True
         # Wide nested-loop transitions use the two-quarter-arc bow geometry so
         # their transverse tangents overlap on one headland line.  Keep the
         # contour request visible to the selector: a narrow contour transition
@@ -2299,145 +2562,36 @@ def _connect_work_lines(
         contour_ordering["work_line_point_counts"] = [
             len(line) for line in ordered_lines
         ]
-    if (
-        requested_strategy == "contour"
-        and entry_point
-        and ordered_lines
-        and not bool(cfg.get("_contour_reverse_normal_order", False))
-    ):
-        # Keep the contour pair topology, but rotate complete pair blocks so
-        # the physically nearest work row is visited first.  Rotating a single
-        # row would break the two-row loop spacing that contour mode is meant
-        # to preserve.
-        endpoint_distances = [
-            min(
-                math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
-                for point in (line[0], line[-1])
+        entry_policy = str(
+            cfg.get(
+                "_contour_entry_policy",
+                "farthest"
+                if bool(cfg.get("_contour_reverse_normal_order", False))
+                else "nearest",
             )
-            for line in ordered_lines
-            if len(line) >= 2
-        ]
-        if endpoint_distances:
-            nearest_index = int(np.argmin(np.asarray(endpoint_distances)))
-            nearest_pair_index = nearest_index // 2
-            pair_count = (len(ordered_lines) + 1) // 2
-            if nearest_pair_index > 0 and nearest_pair_index < pair_count:
-                line_pairs = [
-                    ordered_lines[index:index + 2]
-                    for index in range(0, len(ordered_lines), 2)
-                ]
-                ordered_lines = (
-                    line_pairs[nearest_pair_index:]
-                    + line_pairs[:nearest_pair_index]
-                )
-                ordered_lines = [
-                    line for pair in ordered_lines for line in pair
-                ]
-                ordered_indices = list(
-                    contour_ordering.get("ordered_original_indices") or []
-                )
-                if len(ordered_indices) != len(endpoint_distances):
-                    ordered_indices = list(range(len(endpoint_distances)))
-                index_pairs = [
-                    ordered_indices[index:index + 2]
-                    for index in range(0, len(ordered_indices), 2)
-                ]
-                ordered_indices = [
-                    item
-                    for pair in (
-                        index_pairs[nearest_pair_index:]
-                        + index_pairs[:nearest_pair_index]
-                    )
-                    for item in pair
-                ]
-                positions = list(contour_ordering.get("normal_positions") or [])
-                if len(positions) != len(endpoint_distances):
-                    positions = [None] * len(endpoint_distances)
-                position_pairs = [
-                    positions[index:index + 2]
-                    for index in range(0, len(positions), 2)
-                ]
-                positions = [
-                    item
-                    for pair in (
-                        position_pairs[nearest_pair_index:]
-                        + position_pairs[:nearest_pair_index]
-                    )
-                    for item in pair
-                ]
-                contour_ordering["ordered_original_indices"] = ordered_indices
-                contour_ordering["normal_positions"] = positions
-                contour_ordering["corresponding_pairs"] = [
-                    {
-                        "pair_index": pair_index,
-                        "original_indices": ordered_indices[index:index + 2],
-                        "normal_positions": positions[index:index + 2],
-                    }
-                    for pair_index, index in enumerate(
-                        range(0, len(ordered_indices), 2)
-                    )
-                ]
-                contour_ordering["entry_nearest_pair_index"] = int(
-                    nearest_pair_index
-                )
-                contour_ordering["entry_nearest_line_index_before_rotation"] = int(
-                    nearest_index
-                )
-                contour_ordering["entry_priority_applied"] = True
-            else:
-                contour_ordering["entry_nearest_pair_index"] = int(
-                    nearest_pair_index
-                )
-                contour_ordering["entry_nearest_line_index_before_rotation"] = int(
-                    nearest_index
-                )
-                contour_ordering["entry_priority_applied"] = False
-            contour_ordering["entry_nearest_line_distance_px"] = float(
-                endpoint_distances[nearest_index]
-            )
+        )
+        ordered_lines = _select_contour_entry_rotation(
+            ordered_lines,
+            contour_ordering,
+            entry_point,
+            policy=entry_policy,
+            terminal_original_index=(
+                terminal_short_line.get("original_index")
+                if terminal_short_line is not None
+                else None
+            ),
+        )
+        if terminal_short_line is not None:
+            contour_ordering["terminal_short_line"] = {
+                key: (list(value) if key == "endpoint" else value)
+                for key, value in terminal_short_line.items()
+            }
     if entry_point and len(ordered_lines) >= 2:
         first_distance = min(
             math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
             for point in (ordered_lines[0][0], ordered_lines[0][-1])
         )
-        if requested_strategy == "contour":
-            # The first two lines are the first low/high pair. Select the
-            # nearer side without reversing the whole interleaved sequence.
-            other_distance = min(
-                math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
-                for point in (ordered_lines[1][0], ordered_lines[1][-1])
-            )
-            if other_distance < first_distance:
-                for pair_index in range(0, len(ordered_lines) - 1, 2):
-                    ordered_lines[pair_index], ordered_lines[pair_index + 1] = (
-                        ordered_lines[pair_index + 1],
-                        ordered_lines[pair_index],
-                    )
-                for key in ("ordered_original_indices", "normal_positions"):
-                    values = list(contour_ordering.get(key) or [])
-                    for pair_index in range(0, len(values) - 1, 2):
-                        values[pair_index], values[pair_index + 1] = (
-                            values[pair_index + 1],
-                            values[pair_index],
-                        )
-                    contour_ordering[key] = values
-                pairs = []
-                pair_indices = contour_ordering.get("corresponding_pairs") or []
-                for pair in pair_indices:
-                    item = dict(pair)
-                    for key in ("original_indices", "normal_positions"):
-                        pair_values = list(item.get(key) or [])
-                        if len(pair_values) >= 2:
-                            pair_values[0], pair_values[1] = (
-                                pair_values[1], pair_values[0]
-                            )
-                        item[key] = pair_values
-                    pairs.append(item)
-                contour_ordering["corresponding_pairs"] = pairs
-                contour_ordering["outside_side_reversed_for_entry"] = True
-            else:
-                contour_ordering["outside_side_reversed_for_entry"] = False
-        else:
+        if requested_strategy != "contour":
             last_distance = min(
                 math.hypot(point[0] - entry_point[0], point[1] - entry_point[1])
                 for point in (ordered_lines[-1][0], ordered_lines[-1][-1])
@@ -2494,31 +2648,48 @@ def _connect_work_lines(
         "exit_reference_used": bool(exit_point is not None),
     }
 
-    def _contour_pair_swap(lines, indices, positions):
-        swapped_lines = [list(line) for line in lines]
-        swapped_indices = list(indices)
-        swapped_positions = list(positions)
-        for pair_index in range(0, len(swapped_lines) - 1, 2):
-            swapped_lines[pair_index], swapped_lines[pair_index + 1] = (
-                swapped_lines[pair_index + 1],
-                swapped_lines[pair_index],
-            )
-            if pair_index < len(swapped_indices) - 1:
-                swapped_indices[pair_index], swapped_indices[pair_index + 1] = (
-                    swapped_indices[pair_index + 1],
-                    swapped_indices[pair_index],
-                )
-            if pair_index < len(swapped_positions) - 1:
-                swapped_positions[pair_index], swapped_positions[pair_index + 1] = (
-                    swapped_positions[pair_index + 1],
-                    swapped_positions[pair_index],
-                )
-        return swapped_lines, swapped_indices, swapped_positions
+    forced_contour_start_reverse = None
+    if (
+        requested_strategy == "contour"
+        and terminal_short_line is not None
+        and contour_ordering.get("terminal_constraint_applied")
+        and ordered_lines
+        and alignment_angle is not None
+    ):
+        terminal_endpoint = np.asarray(
+            terminal_short_line["endpoint"], dtype=np.float64
+        )
+        last_line = list(ordered_lines[-1])
+        direction = np.asarray((
+            math.cos(float(alignment_angle)),
+            math.sin(float(alignment_angle)),
+        ), dtype=np.float64)
+        if float(np.dot(
+            np.asarray(last_line[-1], dtype=np.float64)
+            - np.asarray(last_line[0], dtype=np.float64),
+            direction,
+        )) < 0.0:
+            last_line.reverse()
+        terminal_is_low_endpoint = bool(
+            np.linalg.norm(np.asarray(last_line[0]) - terminal_endpoint)
+            <= np.linalg.norm(np.asarray(last_line[-1]) - terminal_endpoint)
+        )
+        desired_last_line_reversed = terminal_is_low_endpoint
+        forced_contour_start_reverse = bool(
+            desired_last_line_reversed ^ bool((len(ordered_lines) - 1) % 2)
+        )
+        cfg["_contour_terminal_unaligned_finish"] = True
+        contour_ordering["terminal_finish_orientation_forced"] = True
 
     def _preview_oriented(lines):
         preview = []
-        start_reverse = False
-        if entry_point and lines and len(lines[0]) >= 2:
+        start_reverse = bool(forced_contour_start_reverse or False)
+        if (
+            forced_contour_start_reverse is None
+            and entry_point
+            and lines
+            and len(lines[0]) >= 2
+        ):
             first = lines[0]
             distance_start = math.hypot(
                 first[0][0] - entry_point[0],
@@ -2563,19 +2734,13 @@ def _connect_work_lines(
             "current", [list(line) for line in ordered_lines],
             current_indices, current_positions,
         ))
-        if requested_strategy == "contour":
-            pair_lines, pair_indices, pair_positions = _contour_pair_swap(
-                ordered_lines, current_indices, current_positions
-            )
-            candidate_specs.append((
-                "pair_side_swapped", pair_lines, pair_indices, pair_positions
-            ))
-        base_specs = list(candidate_specs)
-        for name, lines, indices, positions in base_specs:
-            candidate_specs.append((
-                f"{name}_reversed", list(reversed(lines)),
-                list(reversed(indices)), list(reversed(positions)),
-            ))
+        if requested_strategy != "contour":
+            base_specs = list(candidate_specs)
+            for name, lines, indices, positions in base_specs:
+                candidate_specs.append((
+                    f"{name}_reversed", list(reversed(lines)),
+                    list(reversed(indices)), list(reversed(positions)),
+                ))
 
         scored = []
         for candidate_index, (name, lines, indices, positions) in enumerate(
@@ -2655,14 +2820,26 @@ def _connect_work_lines(
                 ]
                 contour_ordering["reference_order_variant"] = name
 
+    if requested_strategy == "contour":
+        _refresh_contour_order_diagnostics(
+            contour_ordering,
+            list(contour_ordering.get("ordered_original_indices") or []),
+            list(contour_ordering.get("normal_positions") or []),
+        )
+
     if selected_preview is not None:
         # Candidate scoring already produced the exact oriented route.  Do
         # not orient it a second time using only the entry point: that used to
         # undo the exit-side choice for same-side start/end markers.
         oriented = [list(line) for line in selected_preview]
     else:
-        start_reversed = False
-        if entry_point and ordered_lines and len(ordered_lines[0]) >= 2:
+        start_reversed = bool(forced_contour_start_reverse or False)
+        if (
+            forced_contour_start_reverse is None
+            and entry_point
+            and ordered_lines
+            and len(ordered_lines[0]) >= 2
+        ):
             first = ordered_lines[0]
             distance_start = math.hypot(
                 first[0][0] - entry_point[0],
@@ -2738,6 +2915,43 @@ def _connect_work_lines(
                 config=cfg,
             )
         )
+        if (
+            not contour_connector_anchors
+            and contour_connector_diagnostics.get("fallback_reason")
+            == "headland_wall_extension_leaves_boundary"
+            and float(cfg.get("work_line_endpoint_extension_m", 0.0) or 0.0)
+            > 0.0
+        ):
+            # The optional outward straight must yield to the selected field
+            # boundary.  Retry on the crop-supported shared wall itself; this
+            # keeps every actual turn aligned and avoids degrading the route
+            # to a long diagonal merely because the extra 0.5 m is unavailable
+            # at one notched boundary endpoint.
+            retry_cfg = dict(cfg)
+            original_extension_m = float(
+                retry_cfg.get("work_line_endpoint_extension_m", 0.0) or 0.0
+            )
+            retry_cfg["work_line_endpoint_extension_m"] = 0.0
+            retry_anchors, retry_diagnostics = _build_contour_connector_anchors(
+                contour_seed_lines,
+                float(alignment_angle),
+                field_polygon,
+                mpp,
+                config=retry_cfg,
+            )
+            if retry_anchors:
+                contour_connector_anchors = retry_anchors
+                contour_connector_diagnostics = retry_diagnostics
+                contour_connector_diagnostics.update({
+                    "outward_endpoint_extension_reduced": True,
+                    "outward_endpoint_extension_requested_m": (
+                        original_extension_m
+                    ),
+                    "outward_endpoint_extension_applied_m": 0.0,
+                    "outward_endpoint_extension_reduction_reason": (
+                        "selected_field_boundary"
+                    ),
+                })
         if contour_connector_anchors:
             # A boundary-supported contour owns its endpoint geometry.  Do
             # not subsequently replace these common pair anchors with the
@@ -3407,6 +3621,11 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
     ).strip().lower()
     if core_overlap_policy not in {"report_only", "hard_gate"}:
         core_overlap_policy = "report_only"
+    footprint_metric_policy = str(
+        cfg.get("footprint_metric_policy", "report_only")
+    ).strip().lower()
+    if footprint_metric_policy not in {"report_only", "hard_gate"}:
+        footprint_metric_policy = "report_only"
     min_geometric_coverage = float(cfg.get("min_geometric_coverage_pct", 90.0))
     max_outside = float(
         profile_limits["outside_field"] if profile_limits
@@ -3438,7 +3657,10 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
             f"履带与稻株核心重叠 {footprint['track_core_overlap_pct']:.1f}% "
             f"> {max_core_overlap:.1f}%"
         )
-    if footprint["planned_target_geometric_coverage_pct"] < min_geometric_coverage:
+    if (
+        footprint_metric_policy == "hard_gate"
+        and footprint["planned_target_geometric_coverage_pct"] < min_geometric_coverage
+    ):
         issues.append(
             f"规划目标几何覆盖率 {footprint['planned_target_geometric_coverage_pct']:.1f}% "
             f"< {min_geometric_coverage:.1f}%"
@@ -3502,6 +3724,7 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         "issues": issues,
         "validation_profile": profile,
         "track_core_overlap_policy": core_overlap_policy,
+        "footprint_metric_policy": footprint_metric_policy,
         "validation_limits_pct": {
             "track_outside_field": max_outside,
             "track_outside_support": max_outside_support,
@@ -4699,25 +4922,58 @@ def _uniform_zone_reference_geometry(
     from the compact four-row record: its centerline defines the axial extent,
     while the raw/processed mask still owns the actual transverse support.
     """
+    if not isinstance(zone_band, dict):
+        return None, None, "missing_reference_geometry"
+
+    def _finite_points(value, minimum_rows):
+        """Decode compact JSON points without allowing malformed cache data to raise."""
+        try:
+            array = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if array.ndim == 1:
+            if array.size == 0 or array.size % 2:
+                return None
+            array = array.reshape(-1, 2)
+        if (
+            array.ndim != 2
+            or array.shape[1] != 2
+            or array.shape[0] < int(minimum_rows)
+            or not np.all(np.isfinite(array))
+        ):
+            return None
+        return array
+
+    def _finite_vector(value, minimum_size):
+        try:
+            array = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if array.ndim != 1 or array.size < int(minimum_size):
+            return None
+        if not np.all(np.isfinite(array[:minimum_size])):
+            return None
+        return array
+
     contour_value = zone_band.get("contour")
     contour_source = "contour"
     if contour_value is None:
         contour_value = zone_band.get("planning_contour")
         contour_source = "planning_contour"
     if contour_value is not None:
-        contour = np.asarray(contour_value, dtype=np.float64).reshape(-1, 2)
-        if len(contour) >= 3 and np.all(np.isfinite(contour)):
+        contour = _finite_points(contour_value, 3)
+        if contour is not None:
             return contour, contour.mean(axis=0), contour_source
 
     centerline_value = zone_band.get("centerline")
     if centerline_value is not None:
-        centerline = np.asarray(centerline_value, dtype=np.float64).reshape(-1, 2)
-        if len(centerline) >= 2 and np.all(np.isfinite(centerline)):
+        centerline = _finite_points(centerline_value, 2)
+        if centerline is not None:
             centroid_value = zone_band.get("centroid")
             centroid = None
             if centroid_value is not None:
-                candidate = np.asarray(centroid_value, dtype=np.float64).reshape(-1)
-                if len(candidate) >= 2 and np.all(np.isfinite(candidate[:2])):
+                candidate = _finite_vector(centroid_value, 2)
+                if candidate is not None:
                     centroid = candidate[:2]
             if centroid is None:
                 centroid = centerline.mean(axis=0)
@@ -4725,8 +4981,8 @@ def _uniform_zone_reference_geometry(
 
     bbox_value = zone_band.get("bbox")
     if bbox_value is not None:
-        bbox = np.asarray(bbox_value, dtype=np.float64).reshape(-1)
-        if len(bbox) >= 4 and np.all(np.isfinite(bbox[:4])):
+        bbox = _finite_vector(bbox_value, 4)
+        if bbox is not None:
             x, y, width, height = map(float, bbox[:4])
             if width > 0.0 and height > 0.0:
                 points = np.asarray([
@@ -5197,7 +5453,10 @@ def _repair_uniform_zone_endpoints(
     if target_span_m <= 0.0:
         report["reason"] = "invalid_reference_span"
         return [list(line) for line in zone_lines], report
-    if declared_span_m is None or declared_span_m < target_span_m * 0.80:
+    if (
+        declared_span_m is None
+        or declared_span_m < target_span_m * 0.80
+    ):
         report["reason"] = "zone_extent_does_not_support_shared_walls"
         return [list(line) for line in zone_lines], report
 
@@ -5224,12 +5483,14 @@ def _repair_uniform_zone_endpoints(
         high = float(projections[-1])
         low_extension_m = max(0.0, (low - target_low) * mpp)
         high_extension_m = max(0.0, (target_high - high) * mpp)
+        source_span_m = float(np.ptp(projections) * mpp)
         if low_extension_m > max_repair_m or high_extension_m > max_repair_m:
             repaired_lines.append(line)
             report["lines"].append({
                 "line_index": int(line_index),
                 "repaired": False,
                 "reason": "endpoint_extension_over_limit",
+                "source_span_m": source_span_m,
                 "low_extension_m": low_extension_m,
                 "high_extension_m": high_extension_m,
             })
@@ -5260,11 +5521,14 @@ def _repair_uniform_zone_endpoints(
         report["lines"].append({
             "line_index": int(line_index),
             "repaired": repaired_now,
+            "source_span_m": source_span_m,
             "low_extension_m": float(low_extension_m if low_repaired else 0.0),
             "high_extension_m": float(
                 high_extension_m if high_repaired else 0.0
             ),
             "result_span_m": result_span_m,
+            "completion_kind": "declared_extent_repair",
+            "inferred": False,
         })
     if report["applied"]:
         report["reason"] = "cohort_and_field_boundary_supported"
@@ -5653,6 +5917,7 @@ def _prepare_work_line_layout(
     progress_callback=None,
     detected_mask: Optional[np.ndarray] = None,
     planned_mask: Optional[np.ndarray] = None,
+    reference_bands: Optional[List[Dict]] = None,
     return_regions: bool = False,
 ):
     """Select the declared work-line generator without silent mode fallback."""
@@ -5732,6 +5997,7 @@ def _prepare_work_line_layout(
             geo=geo,
             state=state,
             config=cfg,
+            reference_bands=reference_bands,
         )
         if not baseline_lines:
             work_lines = []
@@ -5881,6 +6147,7 @@ def _prepare_work_line_layout(
                 geo=geo,
                 state=state,
                 config=cfg,
+                reference_bands=reference_bands,
             )
             layout["footprint_optimization_scope"] = "validation_only"
         if not work_lines and wide_bands:
@@ -5905,6 +6172,7 @@ def _prepare_work_line_layout(
             geo=geo,
             state=state,
             config=cfg,
+            reference_bands=reference_bands,
         )
         if not work_lines and wide_bands:
             work_lines = [
@@ -5924,6 +6192,7 @@ def _prepare_work_line_layout(
         raise ValueError(f"unsupported work_line_mode: {mode}")
     layout = dict(layout or {})
     regular_work_lines = list(work_lines)
+    endpoint_reference_lines = list(regular_work_lines)
     # 等距区（大片等距种植区）按固定作业间距细分平行作业线，与宽窄行中心线统筹
     uniform_zone_lines = []
     uniform_region_lines = []
@@ -5959,7 +6228,7 @@ def _prepare_work_line_layout(
                 _repair_uniform_zone_endpoints(
                     zone_lines,
                     zone,
-                    regular_work_lines,
+                    endpoint_reference_lines,
                     main_angle,
                     geo=geo,
                     state=state,
@@ -6851,7 +7120,7 @@ def _connect_work_regions(
     global_main_angle: Optional[float] = None,
     processed_mask: Optional[np.ndarray] = None,
 ) -> Tuple[List[List[Tuple[float, float]]], List[str], Dict, List[Dict]]:
-    """DECISION-017: finish each classified region before entering the next."""
+    """DECISION-017: connect classified regions with auditable contour groups."""
     cfg = dict(config or {})
     entry_global = getattr(state, "entry_point", None) if state is not None else None
     exit_global = getattr(state, "exit_point", None) if state is not None else None
@@ -6915,7 +7184,104 @@ def _connect_work_regions(
         "selected_variant": "current",
         "candidate_count": 1,
     }
-    raw_regions = list(work_regions or [])
+    raw_regions = [dict(item) for item in (work_regions or [])]
+    small_region_merges = []
+    if normalize_turn_strategy(turn_strategy) == "contour" and len(raw_regions) > 1:
+        # A two- or three-line physical region has no Hamiltonian ordering that
+        # can visit every line without at least one adjacent-row transition.
+        # Merge only that undersized region with its closest normal neighbour
+        # for execution ordering; classification and source region ids remain
+        # intact in diagnostics.  This is narrower than flattening the whole
+        # mixed field and is the only way to satisfy the operator's explicit
+        # no-adjacent-turn requirement without dropping a crop-supported line.
+        while len(raw_regions) > 1:
+            small_indices = [
+                index
+                for index, item in enumerate(raw_regions)
+                if 2 <= len(item.get("work_lines") or []) <= 3
+                and any(
+                    other_index != index
+                    and len(other.get("work_lines") or []) >= 4
+                    for other_index, other in enumerate(raw_regions)
+                )
+            ]
+            if not small_indices:
+                break
+            small_index = small_indices[0]
+            small = raw_regions[small_index]
+            small_normal = _finite_float(small.get("normal_position"))
+            neighbor_candidates = []
+            for index, item in enumerate(raw_regions):
+                if index == small_index:
+                    continue
+                if len(item.get("work_lines") or []) < 4:
+                    continue
+                item_normal = _finite_float(item.get("normal_position"))
+                normal_gap = (
+                    abs(item_normal - small_normal)
+                    if item_normal is not None and small_normal is not None
+                    else float("inf")
+                )
+                neighbor_candidates.append((normal_gap, abs(index - small_index), index))
+            _gap, _index_gap, neighbor_index = min(neighbor_candidates)
+            neighbor = raw_regions[neighbor_index]
+            members = []
+            for item in (small, neighbor):
+                members.extend(
+                    item.get("source_regions")
+                    or [{
+                        "region_id": item.get("region_id"),
+                        "kind": item.get("kind"),
+                        "line_count": len(item.get("work_lines") or []),
+                    }]
+                )
+            combined_lines = list(small.get("work_lines") or []) + list(
+                neighbor.get("work_lines") or []
+            )
+            weighted_normals = [
+                (
+                    _finite_float(item.get("normal_position")),
+                    len(item.get("work_lines") or []),
+                )
+                for item in (small, neighbor)
+            ]
+            finite_weighted = [
+                (value, weight)
+                for value, weight in weighted_normals
+                if value is not None and weight > 0
+            ]
+            merged_normal = (
+                sum(value * weight for value, weight in finite_weighted)
+                / sum(weight for _value, weight in finite_weighted)
+                if finite_weighted
+                else None
+            )
+            source_ids = [str(item.get("region_id")) for item in members]
+            merged = {
+                "region_id": "+".join(source_ids),
+                "kind": "contour_execution_group",
+                "normal_position": merged_normal,
+                "line_count": len(combined_lines),
+                "work_lines": combined_lines,
+                "source_regions": members,
+                "source_region_ids": source_ids,
+                "line_source": "nearest_region_merge_for_non_adjacent_contour",
+            }
+            insert_at = min(small_index, neighbor_index)
+            raw_regions = [
+                item
+                for index, item in enumerate(raw_regions)
+                if index not in {small_index, neighbor_index}
+            ]
+            raw_regions.insert(insert_at, merged)
+            small_region_merges.append({
+                "small_region_id": small.get("region_id"),
+                "merged_with_region_id": neighbor.get("region_id"),
+                "execution_region_id": merged["region_id"],
+                "reason": "independent_2_or_3_line_contour_requires_adjacent_turn",
+                "source_region_ids": source_ids,
+                "line_count": len(combined_lines),
+            })
     normal_positions_complete = bool(raw_regions) and all(
         _finite_float(item.get("normal_position")) is not None
         for item in raw_regions
@@ -6924,11 +7290,13 @@ def _connect_work_regions(
         len(raw_regions) >= 3 and normal_positions_complete
     )
     if monotonic_multi_region_order:
-        # Once one planting type has been split around an intervening region,
-        # sorting every region independently by entry distance can produce a
-        # middle -> edge -> opposite-edge sequence.  That necessarily crosses
-        # a completed region.  Only the two monotonic normal-axis traversals
-        # preserve physical adjacency; entry and exit choose between them.
+        # The operator drives to the selected field-edge start before enabling
+        # automatic tracking.  Therefore the region containing the globally
+        # nearest work-line endpoint is authoritative, even when it is a
+        # middle region.  After that first region, walk one adjacent normal
+        # direction to its edge, then finish the remaining side.  A middle
+        # start necessarily creates one later cross-over; this is preferable
+        # to silently moving the route start away from the operator's marker.
         forward_regions = sorted(
             raw_regions,
             key=lambda item: (
@@ -6936,31 +7304,90 @@ def _connect_work_regions(
                 str(item.get("region_id", "")),
             ),
         )
-        reversed_regions = list(reversed(forward_regions))
 
-        def monotonic_reference_score(items):
-            score = 0.0
-            if entry_reference is not None:
-                score += region_reference_distance(items[0])
-            if exit_reference is not None:
-                score += region_end_distance(items[-1])
-            return float(score)
+        def inter_region_reference_distance(first, second):
+            distances = [
+                math.hypot(
+                    float(first_point[0]) - float(second_point[0]),
+                    float(first_point[1]) - float(second_point[1]),
+                )
+                for first_line in (first.get("work_lines") or [])
+                if len(first_line) >= 2
+                for second_line in (second.get("work_lines") or [])
+                if len(second_line) >= 2
+                for first_point in (first_line[0], first_line[-1])
+                for second_point in (second_line[0], second_line[-1])
+            ]
+            return min(distances) if distances else float("inf")
 
-        forward_score = monotonic_reference_score(forward_regions)
-        reversed_score = monotonic_reference_score(reversed_regions)
-        ordered_regions = forward_regions
-        if reversed_score + 1e-6 < forward_score:
-            ordered_regions = reversed_regions
-            region_reference_ordering["selected_variant"] = "reversed"
-        region_order_rule = (
-            "monotonic_normal_order_minimum_entry_exit_connection"
-        )
-        region_reference_ordering.update({
-            "candidate_count": 2,
-            "current_score_px": forward_score,
-            "reversed_score_px": reversed_score,
-            "physical_adjacency_preserved": True,
-        })
+        if entry_reference is None:
+            ordered_regions = forward_regions
+            region_order_rule = "monotonic_normal_order_without_entry_reference"
+            region_reference_ordering.update({
+                "candidate_count": 1,
+                "selected_variant": "stable_forward",
+                "physical_adjacency_preserved": True,
+            })
+        else:
+            nearest_region_index = min(
+                range(len(forward_regions)),
+                key=lambda index: (
+                    region_reference_distance(forward_regions[index]),
+                    index,
+                ),
+            )
+            start = forward_regions[nearest_region_index]
+            low_first = (
+                [start]
+                + list(reversed(forward_regions[:nearest_region_index]))
+                + forward_regions[nearest_region_index + 1:]
+            )
+            high_first = (
+                [start]
+                + forward_regions[nearest_region_index + 1:]
+                + list(reversed(forward_regions[:nearest_region_index]))
+            )
+            candidates = [("low_first", low_first), ("high_first", high_first)]
+
+            def reference_walk_score(items):
+                score = region_reference_distance(items[0])
+                score += sum(
+                    inter_region_reference_distance(first, second)
+                    for first, second in zip(items, items[1:])
+                )
+                if exit_reference is not None:
+                    score += region_end_distance(items[-1])
+                return float(score)
+
+            scored_candidates = [
+                (reference_walk_score(items), index, name, items)
+                for index, (name, items) in enumerate(candidates)
+            ]
+            selected_score, _, selected_name, ordered_regions = min(
+                scored_candidates,
+                key=lambda item: (item[0], item[1]),
+            )
+            region_order_rule = "nearest_entry_region_then_adjacent_normal_walk"
+            region_reference_ordering.update({
+                "candidate_count": len(candidates),
+                "selected_variant": selected_name,
+                "selected_score_px": float(selected_score),
+                "nearest_entry_region_id": start.get("region_id"),
+                "nearest_entry_region_normal_index": int(nearest_region_index),
+                "nearest_entry_distance_px": float(
+                    region_reference_distance(start)
+                ),
+                "candidate_scores_px": {
+                    name: float(score)
+                    for score, _index, name, _items in scored_candidates
+                },
+                "physical_adjacency_preserved": bool(
+                    nearest_region_index in {0, len(forward_regions) - 1}
+                ),
+                "middle_start_requires_one_crossover": bool(
+                    nearest_region_index not in {0, len(forward_regions) - 1}
+                ),
+            })
     elif entry_reference is not None:
         ordered_regions = sorted(
             raw_regions,
@@ -7018,13 +7445,16 @@ def _connect_work_regions(
             region_reference_ordering["selected_variant"] = "reversed"
     if len(ordered_regions) <= 1:
         region = ordered_regions[0] if ordered_regions else {"work_lines": []}
+        single_region_cfg = dict(cfg)
+        if exit_reference is None:
+            single_region_cfg["_contour_allow_terminal_short_line"] = True
         path, types, assessment = _connect_work_lines(
             region.get("work_lines") or [],
             geo=geo,
             state=state,
             min_turn_radius_m=min_turn_radius_m,
             turn_strategy=turn_strategy,
-            config=cfg,
+            config=single_region_cfg,
             return_diagnostics=True,
             global_main_angle=global_main_angle,
             processed_mask=processed_mask,
@@ -7033,6 +7463,9 @@ def _connect_work_regions(
             "region_id": region.get("region_id"),
             "kind": region.get("kind"),
             "line_count": int(region.get("line_count", 0)),
+            "source_region_ids": list(
+                region.get("source_region_ids") or [region.get("region_id")]
+            ),
             "assessment": assessment.copy(),
         }] if ordered_regions else []
         return path, types, assessment, ordered_regions
@@ -7088,6 +7521,10 @@ def _connect_work_regions(
             audit_cfg["_allow_reference_ordering_with_handoff"] = (
                 region_index == len(ordered_regions) - 1
             )
+            audit_cfg["_contour_allow_terminal_short_line"] = bool(
+                region_index == len(ordered_regions) - 1
+                and exit_reference is None
+            )
             audit_cfg["_contour_forced_wall_projections"] = (
                 shared_contour_walls
             )
@@ -7138,6 +7575,10 @@ def _connect_work_regions(
         region_cfg["_allow_reference_ordering_with_handoff"] = (
             region_index == len(ordered_regions) - 1
         )
+        region_cfg["_contour_allow_terminal_short_line"] = bool(
+            region_index == len(ordered_regions) - 1
+            and exit_reference is None
+        )
         if shared_contour_walls is not None:
             region_cfg["_contour_forced_wall_projections"] = shared_contour_walls
         if shared_contour_clearances:
@@ -7183,7 +7624,7 @@ def _connect_work_regions(
             if default_gap is not None and default_gap < minimum_gap:
                 reverse_attempted = True
                 reverse_cfg = dict(region_cfg)
-                reverse_cfg["_contour_reverse_normal_order"] = True
+                reverse_cfg["_contour_entry_policy"] = "farthest"
                 reversed_path, reversed_types, reversed_assessment = (
                     _connect_work_lines(
                         region.get("work_lines") or [],
@@ -7270,6 +7711,9 @@ def _connect_work_regions(
             "region_id": region.get("region_id"),
             "kind": region.get("kind"),
             "line_count": int(region.get("line_count", 0)),
+            "source_region_ids": list(
+                region.get("source_region_ids") or [region.get("region_id")]
+            ),
             "segment_start_index": segment_offset,
             "segment_end_index": len(combined_path) - 1,
             "assessment": region_assessment,
@@ -7334,8 +7778,8 @@ def _connect_work_regions(
         "requested_strategy": normalize_turn_strategy(turn_strategy),
         "ordering_strategy": normalize_turn_strategy(turn_strategy),
         "contour_ordering": {
-            "ordering": "classified_regions_then_independent_contours",
-            "algorithm_version": "mixed-region-order-v3",
+            "ordering": "classified_regions_with_small_region_execution_merge",
+            "algorithm_version": "mixed-region-order-v4",
             "region_order": [item.get("region_id") for item in ordered_regions],
             "region_order_rule": region_order_rule,
             "entry_reference_local": list(entry_reference)
@@ -7351,7 +7795,8 @@ def _connect_work_regions(
                 for item in ordered_regions
             } if exit_reference is not None else {},
             "reference_ordering": region_reference_ordering,
-            "no_cross_region_pairing": True,
+            "no_cross_region_pairing": not bool(small_region_merges),
+            "small_region_execution_merges": small_region_merges,
             "shared_headland_wall_projections_px": shared_contour_walls,
             "shared_turn_clearance_m_by_side": shared_contour_clearances,
             "cross_region_transition_records": cross_region_transition_records,
@@ -7525,6 +7970,7 @@ def plan_path(wide_bands: List[Dict],
         progress_callback=progress_callback,
         detected_mask=detected_mask,
         planned_mask=planned_mask,
+        reference_bands=all_bands,
         return_regions=True,
     )
     layout["coverage_gap_recovery"] = coverage_gap_recovery
@@ -7593,6 +8039,10 @@ def plan_path(wide_bands: List[Dict],
                 "region_id": region.get("region_id"),
                 "kind": region.get("kind"),
                 "line_count": int(region.get("line_count", 0)),
+                "source_region_ids": list(
+                    region.get("source_region_ids")
+                    or [region.get("region_id")]
+                ),
             }
             for index, region in enumerate(ordered_regions)
         ]

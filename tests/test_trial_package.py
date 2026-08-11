@@ -133,6 +133,8 @@ def test_machine_compatibility_preview_exports_without_formal_machine_evidence(
     ]
     assert len(rows) == 2
     assert all(row.rstrip("*").split(",")[-1] in {"0", "1"} for row in rows)
+    assert window._machine_route_preview["point_count"] == 2
+    assert "compatibility-preview.path" in window._machine_route_preview["info"]
     window.close()
 
 
@@ -222,6 +224,9 @@ def test_machine_compatibility_export_matches_visible_compact_control_points(
     )
     assert captured["protocol"]["control_route_point_count"] == 4
     assert captured["protocol"]["canonical_route_point_count"] == 10
+    assert window._machine_route_preview["path_result"]["segment_types"] == [
+        "work", "turn", "work"
+    ]
     window.close()
 
 

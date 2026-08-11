@@ -173,7 +173,28 @@ def test_planning_card_fully_expands_in_scroll_area_without_overlap():
     window.close()
 
 
-def test_planning_panel_recommend_button_restores_start_and_end_recommendation(monkeypatch):
+def test_task_panel_uses_smallest_width_without_horizontal_squeeze():
+    """路径规划卡片展开并纵向滚动时，紧凑左栏不得再出现横向滚动。"""
+    from pyside6_app.panels import TASK_PANEL_COMPACT_MIN_WIDTH, TaskPanel
+
+    app = QApplication.instance() or QApplication([])
+    panel = TaskPanel()
+    panel.resize(TASK_PANEL_COMPACT_MIN_WIDTH, 520)
+    panel.show()
+    planning_card = panel._step_cards[5]
+    planning_card.set_expanded(True)
+    for other in panel._step_cards:
+        if other is not planning_card:
+            other.set_expanded(False)
+    app.processEvents()
+
+    assert panel.width() == TASK_PANEL_COMPACT_MIN_WIDTH
+    assert panel._scroll.verticalScrollBar().maximum() > 0
+    assert panel._scroll.horizontalScrollBar().maximum() == 0
+    panel.close()
+
+
+def test_planning_panel_recommend_button_only_requires_start_recommendation(monkeypatch):
     window = _window()
     window.state.mask_processed = True
     window.state.mask_result = {"wide_bands": [{}, {}], "main_angle": 0.0}
@@ -185,7 +206,6 @@ def test_planning_panel_recommend_button_restores_start_and_end_recommendation(m
             calls.append("suggest"),
             window.state.safe_update(
                 entry_point=(2.0, 3.0),
-                exit_point=(17.0, 18.0),
             ),
         ),
     )
@@ -194,7 +214,7 @@ def test_planning_panel_recommend_button_restores_start_and_end_recommendation(m
 
     assert calls == ["suggest"]
     assert window.state.entry_point == (2.0, 3.0)
-    assert window.state.exit_point == (17.0, 18.0)
+    assert window.state.exit_point is None
     assert window._service_points_visible is True
     window.close()
 
@@ -264,7 +284,7 @@ def test_mask_processing_start_prompt_defers_service_points_to_path_planning(mon
     window._on_mask_process()
 
     assert messages == [
-        "掩膜处理已开始，完成后请进入“路径规划”布设起点、终点与卸粮点。"
+        "掩膜处理已开始，完成后请进入“路径规划”确认起点；终点和卸粮点可选。"
     ]
 
 def test_pending_segment_completion_enables_mask_process_action():
@@ -668,7 +688,7 @@ def test_source_tif_inference_rejects_crop_with_only_nodata_tiles(monkeypatch):
         )
 
 
-def test_default_harvester_params_require_measured_cutter_offset():
+def test_default_harvester_params_use_1_35m_cutter_offset():
     window = _window()
     window.state.harvester_params = {}
     window.cfg._raw.setdefault("harvester", {})["cutter_forward_offset_m"] = None
@@ -679,7 +699,7 @@ def test_default_harvester_params_require_measured_cutter_offset():
     assert params["track_width_m"] > 0
     assert params["track_gauge_m"] > 0
     assert params["turn_radius_m"] > 0
-    assert params["cutter_forward_offset_m"] is None
+    assert params["cutter_forward_offset_m"] == pytest.approx(1.35)
 
 
 def test_machine_recommendation_dialog_allows_partial_candidate_without_cutter_offset():
@@ -750,7 +770,7 @@ def test_recommended_harvester_params_can_be_saved_without_inventing_cutter_offs
     assert ok is True
     assert window.state.harvester_params["track_width_m"] == 0.40
     assert window.state.harvester_params["wheelbase_m"] == 1.8
-    assert window.state.harvester_params["cutter_forward_offset_m"] is None
+    assert window.state.harvester_params["cutter_forward_offset_m"] == pytest.approx(1.35)
 
 
 def test_recommended_harvester_params_sync_state_when_same_as_config(monkeypatch):
@@ -790,7 +810,7 @@ def test_recommended_harvester_params_sync_state_when_same_as_config(monkeypatch
     assert ok is True
     assert window.state.harvester_params["track_width_m"] == defaults["track_width_m"]
     assert window.state.harvester_params["track_length_m"] == defaults["track_length_m"]
-    assert window.state.harvester_params["cutter_forward_offset_m"] is None
+    assert window.state.harvester_params["cutter_forward_offset_m"] == pytest.approx(1.35)
     assert window.task_panel._task_widgets["plan"]._action_btn.isEnabled()
 
 
@@ -975,7 +995,7 @@ def test_mask_completion_stops_at_parameter_confirmation_before_path_planning():
     assert statuses["plan"].status == "pending"
 
 
-def test_path_planning_unlocks_only_after_parameters_and_recommended_points_are_confirmed():
+def test_path_planning_unlocks_after_parameters_and_start_are_confirmed():
     from state import AppState
     from pyside6_app.task_state import derive_task_statuses
 
@@ -998,15 +1018,84 @@ def test_path_planning_unlocks_only_after_parameters_and_recommended_points_are_
     }
     state.harvester_params_confirmed = True
     state.entry_point = (1, 1)
-    state.exit_point = (2, 2)
+    state.exit_point = None
     state.entry_point_locked = True
-    state.exit_point_locked = True
+    state.exit_point_locked = False
 
     statuses = derive_task_statuses(state, has_image=True)
     assert statuses["params"].status == "done"
     assert statuses["entry"].status == "done"
     assert statuses["exit"].status == "done"
+    assert statuses["exit"].text == "可选未设置"
     assert statuses["plan"].status == "available"
+
+
+def test_plan_action_accepts_confirmed_start_without_optional_exit(monkeypatch):
+    from pyside6_app import main_window, workers
+
+    window = _window()
+    raw = np.ones((20, 20), dtype=np.uint8) * 255
+    window.state.safe_update(
+        mask_processed=True,
+        mask_result={
+            "processed_mask": raw,
+            "planning_support_mask": raw,
+        },
+        field_boundary=[(0, 0), (19, 0), (19, 19), (0, 19)],
+        harvester_params_confirmed=True,
+        entry_point=(2.0, 3.0),
+        entry_point_locked=True,
+        exit_point=None,
+        exit_point_locked=False,
+    )
+    created = []
+
+    class _Signal:
+        def connect(self, _callback):
+            return None
+
+    class _Worker:
+        def __init__(self, _mask, _geo, state, config, **_kwargs):
+            self.finished = _Signal()
+            created.append((state.entry_point, state.exit_point, dict(config)))
+
+    monkeypatch.setattr(main_window, "PlanWorker", _Worker)
+    monkeypatch.setattr(workers, "require_metric_scale", lambda *_args: None)
+    monkeypatch.setattr(window, "_planning_preflight", lambda _result: True)
+    monkeypatch.setattr(window, "_has_background_worker", lambda: False)
+    monkeypatch.setattr(window, "_save_system_undo", lambda _label: None)
+    monkeypatch.setattr(window, "_invalidate_analysis_from", lambda *_args: None)
+    monkeypatch.setattr(window, "_start_background_worker", lambda *_args: True)
+
+    window._on_plan()
+
+    assert created
+    assert created[0][0] == (2.0, 3.0)
+    assert created[0][1] is None
+    assert created[0][2]["service_point_mode"] == "reference_only"
+
+
+def test_start_recommendation_removes_only_unconfirmed_legacy_exit(monkeypatch):
+    import path_planner
+
+    window = _window()
+    window.state.mask_result = {
+        "main_angle": 0.0,
+        "wide_bands": [{"id": 1}],
+    }
+    window.state.exit_point = (17.0, 18.0)
+    window.state.exit_point_locked = False
+    monkeypatch.setattr(
+        path_planner,
+        "prepare_band_centerlines",
+        lambda *_args, **_kwargs: ([[(2.0, 3.0), (12.0, 3.0)]], {}),
+    )
+
+    window._suggest_service_points()
+
+    assert window.state.entry_point is not None
+    assert window.state.exit_point is None
+    assert window.state.exit_point_locked is False
 
 
 def test_recommended_service_point_confirmation_is_explicit_and_stepwise():
@@ -1227,7 +1316,7 @@ def test_connect_work_lines_uses_global_service_points_with_local_work_lines():
     assert full_path[-1][-1] == (50.0, 60.0)
 
 
-def test_service_points_default_to_connect_with_explicit_route_connectors():
+def test_service_points_default_to_reference_only_without_route_connectors():
     from path_planner import _connect_work_lines
     from state import AppState
 
@@ -1247,16 +1336,50 @@ def test_service_points_default_to_connect_with_explicit_route_connectors():
         return_diagnostics=True,
     )
 
-    assert segment_types[0] == "entry"
-    assert segment_types[-1] == "exit"
-    assert diagnostics["service_points"]["mode"] == "connect"
+    assert segment_types[0] == "work"
+    assert segment_types[-1] == "work"
+    assert diagnostics["service_points"]["mode"] == "reference_only"
     assert diagnostics["service_points"]["entry_reference_used"] is True
     assert diagnostics["service_points"]["exit_reference_used"] is True
-    assert diagnostics["service_points"]["entry_connector_emitted"] is True
-    assert diagnostics["service_points"]["exit_connector_emitted"] is True
-    assert full_path[0][0] == (30.0, 50.0)
-    assert full_path[0][-1] == full_path[1][0]
-    assert full_path[-1][-1] == (90.0, 80.0)
+    assert diagnostics["service_points"]["entry_connector_emitted"] is False
+    assert diagnostics["service_points"]["exit_connector_emitted"] is False
+    assert "entry" not in segment_types
+    assert "exit" not in segment_types
+
+
+def test_missing_optional_exit_finishes_on_last_work_line_without_return():
+    from path_planner import _connect_work_lines
+    from state import AppState
+
+    state = AppState()
+    state.mask_raw = np.zeros((120, 160), dtype=np.uint8)
+    state.entry_point = (0.0, 30.0)
+    state.exit_point = None
+
+    full_path, segment_types, diagnostics = _connect_work_lines(
+        [
+            [(0.0, 10.0), (100.0, 10.0)],
+            [(0.0, 20.0), (100.0, 20.0)],
+            [(0.0, 30.0), (100.0, 30.0)],
+            [(0.0, 40.0), (100.0, 40.0)],
+        ],
+        state=state,
+        geo=_FixedMetricGeo(),
+        min_turn_radius_m=1.0,
+        turn_strategy="contour",
+        global_main_angle=0.0,
+        return_diagnostics=True,
+    )
+
+    first_work = next(
+        segment for segment, kind in zip(full_path, segment_types)
+        if kind == "work"
+    )
+    assert first_work[0] == (0.0, 30.0)
+    assert "entry" not in segment_types
+    assert "exit" not in segment_types
+    assert "turn_reverse" not in segment_types
+    assert diagnostics["service_points"]["exit_present"] is False
 
 
 def test_service_points_can_explicitly_remain_reference_only():
@@ -1320,8 +1443,8 @@ def test_contour_starts_with_the_pair_containing_nearest_entry_row():
     assert diagnostics["contour_ordering"]["ordered_original_indices"][0] == 2
 
 
-def test_service_point_references_keep_nearest_entry_row_authoritative():
-    """起终点都应参与首尾参考，而不是只使用起点。"""
+def test_service_point_references_keep_nearest_safe_entry_row_authoritative():
+    """终点不能覆盖起点；四行时先满足零相邻转弯的不变量。"""
     from path_planner import _connect_work_lines
     from state import AppState
 
@@ -1362,7 +1485,10 @@ def test_service_point_references_keep_nearest_entry_row_authoritative():
     assert first_diagnostics["reference_ordering"]["exit_reference_used"] is True
     assert second_diagnostics["reference_ordering"]["exit_reference_used"] is True
     assert first_work == second_work
-    assert first_work[0][0] == (0.0, 10.0)
+    # Four lines cannot start at the outermost row, visit all four and avoid
+    # every adjacent-row transition.  The nearest safe contour starts at the
+    # second row (1,3,0,2); the optional exit must not alter that choice.
+    assert first_work[0][0] == (0.0, 20.0)
     assert first_diagnostics["reference_ordering"]["selected_exit_distance_m"] <= 10.0
     actual_exit_distance_m = float(
         np.hypot(

@@ -706,17 +706,23 @@ def test_cache_model_identity_requires_the_loaded_engine_weight_to_match(tmp_pat
     assert MainWindow._cache_model_matches_active_engine(state, engine) is True
 
 
-def test_segment_blocks_inference_when_restored_cache_model_differs_from_active_engine(tmp_path, monkeypatch):
-    """DECISION-002/006: historical cache provenance cannot authorize new inference."""
+def test_segment_allows_fresh_inference_when_restored_cache_model_differs_from_active_engine(tmp_path):
+    """DECISION-002/006: a new active model may run, but cannot reuse the old mask."""
     import numpy as np
-    from pyside6_app.main_window import MainWindow, QMessageBox
+    import pytest
+    from pyside6_app.main_window import MainWindow
     from provenance import file_sha256
 
     historical_path = tmp_path / "historical.pt"
     active_path = tmp_path / "active.pt"
     historical_path.write_bytes(b"historical-weight")
     active_path.write_bytes(b"active-weight")
-    warnings = []
+    messages = []
+    fresh_run_started = []
+
+    class _FreshRunReached(RuntimeError):
+        pass
+
     window = MainWindow.__new__(MainWindow)
     window._tif_rgb = np.zeros((2, 2, 3), dtype=np.uint8)
     window.state = SimpleNamespace(
@@ -729,15 +735,23 @@ def test_segment_blocks_inference_when_restored_cache_model_differs_from_active_
         _model_path=str(active_path),
         is_loaded=lambda: True,
     )
-    monkeypatch.setattr(
-        "pyside6_app.main_window.QMessageBox.warning",
-        lambda *_args: warnings.append(_args),
+    window.log_panel = SimpleNamespace(
+        info=lambda message: messages.append(message),
+        warn=lambda message: messages.append(f"WARN:{message}"),
     )
+    def reach_fresh_run(label):
+        fresh_run_started.append(label)
+        raise _FreshRunReached()
 
-    window._on_segment()
+    window._save_system_undo = reach_fresh_run
+
+    with pytest.raises(_FreshRunReached):
+        window._on_segment()
 
     assert window.state.cache_model_matches_active_engine is False
-    assert len(warnings) == 1
+    assert fresh_run_started == ["AI识别"]
+    assert any("不会读取历史掩膜" in message for message in messages)
+    assert not any(message.startswith("WARN:") for message in messages)
 
 
 def test_failed_mask_completion_clears_only_the_matching_running_state():

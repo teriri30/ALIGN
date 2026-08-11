@@ -137,11 +137,64 @@ def test_manual_route_edit_refreshes_path_but_blocks_unvalidated_export(monkeypa
     path_result = window._normalise_path_result(window._pipeline_result["path"])
     geo_points = path_result["geo_points"]
 
-    assert path_result["full_path"] == [[(0.0, 0.0), (10.0, 0.0)], [(10.0, 0.0), (10.0, 5.0)]]
-    assert [point["pixel_x"] for point in geo_points] == [0.0, 10.0, 10.0, 10.0]
+    assert path_result["control_full_path"] == [
+        [(0.0, 0.0), (10.0, 0.0)],
+        [(10.0, 0.0), (10.0, 5.0)],
+    ]
+    assert path_result["full_path"][0] == [(0.0, 0.0), (10.0, 0.0)]
+    assert len(path_result["full_path"][1]) > 2
+    assert path_result["full_path"][1][0] == (10.0, 0.0)
+    assert path_result["full_path"][1][-1] == (10.0, 5.0)
+    assert geo_points[0]["pixel_x"] == 0.0
+    assert geo_points[-1]["pixel_x"] == 10.0
     assert all(point["lon"] >= 120.0 for point in geo_points)
     with pytest.raises(ValueError, match="未通过安全验证"):
         window._geo_export_payload()
+
+
+def test_manual_route_edit_can_export_current_compatibility_control_route(
+    tmp_path, monkeypatch
+):
+    """Manual endpoint repair must reach the 0/1 compatibility file."""
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tif_rgb = np.zeros((40, 40, 3), dtype=np.uint8)
+    window.geo = _GoodGeo()
+    window.state.path_points = [
+        (2.0, 2.0),
+        (20.0, 2.0),
+        (20.0, 20.0),
+        (4.0, 20.0),
+    ]
+    window.state.path_status = [1, 0, 1]
+    monkeypatch.setattr(window.route_info, "update_from_auto_path", lambda _path: None)
+    monkeypatch.setattr(
+        window,
+        "_write_export_manifest",
+        lambda path, *_args, **_kwargs: str(path) + ".manifest.json",
+    )
+
+    window._sync_auto_path_from_editable_route()
+    route_path, _manifest = window._export_candidate_path(
+        str(tmp_path),
+        machine_compatibility=True,
+        preview_only=True,
+    )
+
+    rows = [
+        line
+        for line in (tmp_path / "001.txt").read_text(encoding="utf-8").splitlines()
+        if line.startswith("$PATH")
+    ]
+    assert route_path == str(tmp_path / "001.txt")
+    assert len(rows) == len(window.state.path_points)
+    assert [row.rstrip("*").split(",")[-1] for row in rows] == [
+        "1", "0", "1", "0"
+    ]
+    assert window._pipeline_result["path"]["full_path"][1][0] == (20.0, 2.0)
+    assert window._pipeline_result["path"]["full_path"][1][-1] == (20.0, 20.0)
+    assert len(window._pipeline_result["path"]["full_path"][1]) > 2
+    window.close()
 
 
 def test_confirm_gate_exports_metric_failure_without_warning_block(monkeypatch):

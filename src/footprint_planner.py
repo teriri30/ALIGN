@@ -1433,12 +1433,15 @@ def assess_footprint_hard_constraints(
     require_optional_layers: bool = False,
     require_explicit_valid: bool = True,
 ) -> Dict:
-    """Apply formal footprint gates while keeping core overlap report-only by default.
+    """Apply structural footprint checks and optional metric thresholds.
 
     ``track_core_overlap_pct`` remains a required finite audit metric, but the
     default ``track_core_overlap_policy=report_only`` does not reject a route
     on that metric alone.  Set the policy to ``hard_gate`` when a caller
-    explicitly needs the historical threshold gate.
+    explicitly needs the historical threshold gate.  The separate
+    ``footprint_metric_policy=report_only`` default keeps rolling/coverage
+    comparisons as report fields; it does not suppress missing metrics,
+    coordinate integrity, crossings, or confirmed semantic/field violations.
     """
     cfg = dict(config or {})
     metrics = dict(footprint or {})
@@ -1448,6 +1451,11 @@ def assess_footprint_hard_constraints(
     ).strip().lower()
     if core_overlap_policy not in {"report_only", "hard_gate"}:
         core_overlap_policy = "report_only"
+    metric_policy = str(
+        cfg.get("footprint_metric_policy", "report_only")
+    ).strip().lower()
+    if metric_policy not in {"report_only", "hard_gate"}:
+        metric_policy = "report_only"
     profile_limits = {
         "field_trial": {
             "outside_field": 1.0, "outside_support": 5.0,
@@ -1532,16 +1540,23 @@ def assess_footprint_hard_constraints(
 
     if core_overlap_policy == "hard_gate":
         add_exceeded("track_core_overlap_pct")
-    coverage = values.get("planned_target_geometric_coverage_pct")
-    try:
-        minimum_coverage = float(limits["planned_target_geometric_coverage_pct"])
-    except (TypeError, ValueError):
-        minimum_coverage = float("nan")
-    if coverage is not None and np.isfinite(minimum_coverage) and coverage < minimum_coverage:
-        reasons.append("validation_gate_below_minimum:planned_target_geometric_coverage_pct")
-        issues.append(
-            f"planned_target_geometric_coverage_pct={coverage:.6g} "
-        )
+    if metric_policy == "hard_gate":
+        coverage = values.get("planned_target_geometric_coverage_pct")
+        try:
+            minimum_coverage = float(limits["planned_target_geometric_coverage_pct"])
+        except (TypeError, ValueError):
+            minimum_coverage = float("nan")
+        if (
+            coverage is not None
+            and np.isfinite(minimum_coverage)
+            and coverage < minimum_coverage
+        ):
+            reasons.append(
+                "validation_gate_below_minimum:planned_target_geometric_coverage_pct"
+            )
+            issues.append(
+                f"planned_target_geometric_coverage_pct={coverage:.6g} "
+            )
     for name in (
         "track_outside_field_pct", "track_outside_support_pct",
         "track_uncertain_overlap_pct", "track_forbidden_overlap_pct",
@@ -1565,6 +1580,7 @@ def assess_footprint_hard_constraints(
         "issues": list(dict.fromkeys(issues)),
         "validation_profile": profile,
         "track_core_overlap_policy": core_overlap_policy,
+        "footprint_metric_policy": metric_policy,
         "validation_limits_pct": {
             **limits,
             "machine_outside_field": 0.0 if profile == "machine_candidate" else None,

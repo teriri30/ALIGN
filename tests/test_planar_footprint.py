@@ -157,6 +157,68 @@ def test_field_trial_core_overlap_is_report_only_by_default(monkeypatch):
     assert not any("核心重叠" in issue for issue in result["issues"])
 
 
+def test_report_only_metric_policy_keeps_low_coverage_as_a_report_field(monkeypatch):
+    import path_planner
+
+    footprint = {
+        "track_core_overlap_pct": 99.0,
+        "planned_target_geometric_coverage_pct": 12.0,
+        "track_outside_field_pct": 0.0,
+        "track_outside_support_pct": 0.0,
+        "track_uncertain_overlap_pct": 0.0,
+        "track_forbidden_overlap_pct": 0.0,
+        "rolling_canopy_pct": 46.0,
+    }
+    monkeypatch.setattr(
+        path_planner, "validate_footprints", lambda *_args, **_kwargs: footprint
+    )
+
+    result = path_planner.validate_path(
+        [[(1.0, 1.0), (20.0, 1.0)]],
+        np.ones((30, 30), dtype=np.uint8) * 255,
+        0.0,
+        geo=_Geo(),
+        state=_State(),
+        segment_types=["work"],
+        config={
+            "validation_profile": "field_trial",
+            "footprint_metric_policy": "report_only",
+            "max_track_core_overlap_pct": 8.0,
+            "min_geometric_coverage_pct": 90.0,
+        },
+    )
+
+    assert result["valid"] is True
+    assert result["footprint_metric_policy"] == "report_only"
+    assert result["rolling_canopy_pct"] == pytest.approx(46.0)
+    assert not any("覆盖率" in issue for issue in result["issues"])
+
+
+def test_hard_gate_metric_policy_preserves_explicit_coverage_gate():
+    from footprint_planner import assess_footprint_hard_constraints
+
+    result = assess_footprint_hard_constraints(
+        {
+            "valid": True,
+            "track_core_overlap_pct": 0.0,
+            "planned_target_geometric_coverage_pct": 12.0,
+            "track_outside_field_pct": 0.0,
+        },
+        {
+            "validation_profile": "field_trial",
+            "footprint_metric_policy": "hard_gate",
+            "min_geometric_coverage_pct": 90.0,
+        },
+    )
+
+    assert result["valid"] is False
+    assert result["footprint_metric_policy"] == "hard_gate"
+    assert (
+        "validation_gate_below_minimum:planned_target_geometric_coverage_pct"
+        in result["hard_reasons"]
+    )
+
+
 def test_footprint_hard_constraints_keep_core_overlap_as_report_only_by_default():
     from footprint_planner import assess_footprint_hard_constraints
 

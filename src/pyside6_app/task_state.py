@@ -44,8 +44,8 @@ TASK_DESCRIPTIONS: Dict[str, str] = {
     "segment": "AI 识别结果及其后的掩膜、起终点、路径、演示、导出都会清除；底图和田块边界保留。",
     "process": "掩膜处理结果及其后的智能起终点、路径、演示、导出都会清除；原始 AI 识别和田块边界保留。",
     "params": "农机参数及其后的起终点、路径、演示、导出都会回退。",
-    "entry": "起点及其后的终点、卸粮点、路径、演示、导出都会回退。",
-    "exit": "终点及其后的卸粮点、路径、演示、导出都会回退。",
+    "entry": "起点及其后的可选终点、卸粮点、路径、演示、导出都会回退。",
+    "exit": "可选终点及其后的卸粮点、路径、演示、导出都会回退。",
     "unload": "卸粮点及其后的路径、演示、导出都会回退；起点和终点保留。",
     "plan": "路径规划、模拟演示和导出结果会清除；影像、田块、掩膜、起终点和卸粮点保留。",
     "simulate": "仅回退模拟演示状态；已规划路径保留。",
@@ -86,8 +86,8 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     Rules follow common GIS/CAD workflow logic:
     - completed prerequisites are green;
     - exactly actionable next steps are marked available;
-    - optional unload point is not a blocker once start/end exist;
-    - auto-suggested start/end are complete but labelled as recommendations.
+    - start is the required route anchor; end and unload points are optional;
+    - an auto-suggested start remains pending until the user confirms it.
     """
     statuses = {tid: TaskStatus() for tid in TASK_ORDER}
 
@@ -143,14 +143,14 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
             locked = bool(getattr(state, "exit_point_locked", False))
             statuses["exit"] = TaskStatus(
                 "done" if locked else "available",
-                "已确认" if locked else "推荐待确认",
+                "已确认（可选）" if locked else "待确认（可选）",
                 action="调整" if locked else "确认",
             )
         else:
-            statuses["exit"] = TaskStatus("available", "待设置")
+            statuses["exit"] = TaskStatus("done", "可选未设置", action="布设")
         if unload_points:
             statuses["unload"] = TaskStatus("done", f"{len(unload_points)} 个")
-        elif entry and exit_point:
+        elif entry:
             statuses["unload"] = TaskStatus("done", "可选")
         else:
             statuses["unload"] = TaskStatus("pending", "可选")
@@ -160,9 +160,7 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
         and params_ready
         and params_confirmed
         and _has_points(entry)
-        and _has_points(exit_point)
         and getattr(state, "entry_point_locked", False)
-        and getattr(state, "exit_point_locked", False)
     )
     if ready_to_plan:
         statuses["plan"] = TaskStatus("done" if path_done else "available", action="重算" if path_done else "生成")

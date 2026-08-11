@@ -147,6 +147,117 @@ def test_pipeline_worker_forwards_all_planning_mask_evidence(monkeypatch):
     assert captured["config"]["planning_support_mask"] is support
 
 
+def test_pipeline_worker_does_not_promote_processed_mask_to_planning_evidence(monkeypatch):
+    """DECISION-009/017: an empty four-row set must not plan the two-row mask."""
+    import numpy as np
+    import footprint_planner
+    import inference
+    import mask_processor
+    import path_planner
+    import pyside6_app.workers as workers
+
+    shape = (4, 5)
+    detected = np.full(shape, 1, dtype=np.uint8)
+    processed_mask = np.full(shape, 255, dtype=np.uint8)
+    empty_planning_mask = np.zeros(shape, dtype=np.uint8)
+    mask_result = {
+        "processed_mask": processed_mask,
+        "main_angle": 0.0,
+        "wide_bands": [],
+        # This simulates a processed mask that still contains two-row bands.
+        "all_bands": [{"id": 1, "band_type": "narrow"}],
+    }
+    captured = {}
+
+    class FakeInference:
+        def __init__(self, _engine):
+            pass
+
+        def run(self, *_args, **_kwargs):
+            return detected
+
+    def fake_plan_path(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"full_path": [], "segment_types": []}
+
+    monkeypatch.setattr(inference, "TiledInference", FakeInference)
+    monkeypatch.setattr(mask_processor, "process_mask", lambda *_a, **_k: mask_result)
+    monkeypatch.setattr(mask_processor, "extract_centerlines", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        path_planner,
+        "build_band_mask",
+        lambda shape, _bands: empty_planning_mask.copy(),
+    )
+    monkeypatch.setattr(path_planner, "plan_path", fake_plan_path)
+    monkeypatch.setattr(
+        footprint_planner,
+        "rasterize_forbidden_regions",
+        lambda *_a, **_k: np.zeros(shape, dtype=np.uint8),
+    )
+    monkeypatch.setattr(workers, "require_metric_scale", lambda *_a, **_k: 0.1)
+
+    worker = workers.PipelineWorker(
+        SimpleNamespace(
+            inference_original_mask=detected,
+            forbidden_regions_confirmed=False,
+        ),
+        object(),
+        object(),
+        image=np.zeros((4, 5, 3), dtype=np.uint8),
+        params={"path_config": {"turn_strategy": "dubins"}},
+    )
+    worker.run()
+
+    assert np.count_nonzero(captured["planned_mask"]) == 0
+
+
+def test_plan_worker_does_not_promote_processed_mask_to_planning_evidence(monkeypatch):
+    """The direct re-plan entry point must obey the same four-row contract."""
+    import numpy as np
+    import footprint_planner
+    import path_planner
+    import pyside6_app.workers as workers
+
+    shape = (4, 5)
+    processed_mask = np.full(shape, 255, dtype=np.uint8)
+    mask_result = {
+        "processed_mask": processed_mask,
+        "main_angle": 0.0,
+        "wide_bands": [],
+        "all_bands": [{"id": 1, "band_type": "narrow"}],
+        "provenance": {"fingerprint": "mask-fingerprint"},
+    }
+    captured = {}
+
+    monkeypatch.setattr(
+        path_planner,
+        "build_band_mask",
+        lambda shape, _bands: np.zeros(shape, dtype=np.uint8),
+    )
+
+    def fake_plan_path(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"full_path": [], "segment_types": []}
+
+    monkeypatch.setattr(path_planner, "plan_path", fake_plan_path)
+    monkeypatch.setattr(
+        footprint_planner,
+        "rasterize_forbidden_regions",
+        lambda *_a, **_k: np.zeros(shape, dtype=np.uint8),
+    )
+    monkeypatch.setattr(workers, "require_metric_scale", lambda *_a, **_k: 0.1)
+
+    worker = workers.PlanWorker(
+        mask_result,
+        object(),
+        SimpleNamespace(forbidden_regions_confirmed=False),
+        {"turn_strategy": "dubins"},
+    )
+    worker.run()
+
+    assert np.count_nonzero(captured["planned_mask"]) == 0
+
+
 def test_pipeline_worker_completed_path_contains_verifiable_provenance(monkeypatch):
     """A completed background pipeline must already satisfy the export path evidence gate."""
     import numpy as np

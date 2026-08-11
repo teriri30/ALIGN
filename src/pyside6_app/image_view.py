@@ -721,6 +721,7 @@ class ImageViewerGroup(QWidget):
     snapshot_requested = Signal()
     mask_compare_requested = Signal()
     measure_tool_changed = Signal(str)
+    route_display_mode_changed = Signal(str)
     animation_pause_requested = Signal()
     animation_seek_requested = Signal(float)
     animation_speed_requested = Signal(float)
@@ -741,6 +742,8 @@ class ImageViewerGroup(QWidget):
         super().__init__(parent)
         self._ppm = 0.0
         self._tb_buttons = []
+        self._machine_route_info = ""
+        self._machine_route_tooltip = ""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
@@ -895,6 +898,37 @@ class ImageViewerGroup(QWidget):
         tbar.addStretch()
 
         layout.addLayout(tbar)
+
+        # 路径有两套用途不同的几何：连续规划轨迹用于模拟/评价，农机
+        # 文件视图严格复现已经写出的 $PATH 控制点折线。单独占一行可
+        # 避免把主工具栏继续横向挤窄，也让当前显示口径始终可见。
+        self.route_display_bar = QWidget()
+        self.route_display_bar.setObjectName("routeDisplayBar")
+        route_display_layout = QHBoxLayout(self.route_display_bar)
+        route_display_layout.setContentsMargins(6, 0, 6, 2)
+        route_display_layout.setSpacing(6)
+        route_display_layout.addWidget(QLabel("路径显示："))
+        self.route_display_combo = QComboBox()
+        self.route_display_combo.setFixedWidth(104)
+        self.route_display_combo.addItem("连续轨迹", "continuous")
+        self.route_display_combo.addItem("农机文件", "machine_file")
+        self.route_display_combo.setToolTip(
+            "连续轨迹：规划器的连续几何，用于模拟和理论评价；\n"
+            "农机文件：严格按最近一次导出的 $PATH 控制点与 0/1 状态绘制。"
+        )
+        self.route_display_combo.currentIndexChanged.connect(
+            self._emit_route_display_mode
+        )
+        route_display_layout.addWidget(self.route_display_combo)
+        self.route_display_info_label = QLabel("连续规划轨迹")
+        self.route_display_info_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse
+        )
+        route_display_layout.addWidget(self.route_display_info_label, 1)
+        self.route_display_bar.hide()
+        layout.addWidget(self.route_display_bar)
+
+        self.set_machine_route_available(False)
         self.viewer.mouse_moved.connect(
             lambda x, y, b: self.lbl_coord.setText(f"x:{x}  y:{y}"))
         self.viewer.view_scale_changed.connect(
@@ -905,6 +939,59 @@ class ImageViewerGroup(QWidget):
         value = self.anim_speed_combo.itemData(index)
         if value is not None:
             self.animation_speed_requested.emit(float(value))
+
+    def _emit_route_display_mode(self, index):
+        mode = self.route_display_combo.itemData(index)
+        if mode:
+            if str(mode) == "machine_file" and self._machine_route_info:
+                self.set_route_display_info(
+                    self._machine_route_info,
+                    tooltip=self._machine_route_tooltip,
+                )
+            self.route_display_mode_changed.emit(str(mode))
+
+    def route_display_mode(self):
+        mode = self.route_display_combo.currentData()
+        return str(mode or "continuous")
+
+    def set_route_display_mode(self, mode, *, emit=False):
+        mode = str(mode or "continuous")
+        index = self.route_display_combo.findData(mode)
+        if index < 0:
+            index = self.route_display_combo.findData("continuous")
+        machine_index = self.route_display_combo.findData("machine_file")
+        if index == machine_index:
+            item = self.route_display_combo.model().item(machine_index)
+            if item is not None and not item.isEnabled():
+                index = self.route_display_combo.findData("continuous")
+        self.route_display_combo.blockSignals(True)
+        self.route_display_combo.setCurrentIndex(index)
+        self.route_display_combo.blockSignals(False)
+        if emit:
+            self._emit_route_display_mode(index)
+
+    def set_route_display_visible(self, visible):
+        self.route_display_bar.setVisible(bool(visible))
+
+    def set_route_display_info(self, text, *, tooltip=None):
+        value = str(text or "")
+        self.route_display_info_label.setText(value)
+        self.route_display_info_label.setToolTip(
+            str(tooltip if tooltip is not None else value)
+        )
+
+    def set_machine_route_available(self, available, info="", tooltip=""):
+        self._machine_route_info = str(info or "") if available else ""
+        self._machine_route_tooltip = str(tooltip or info or "") if available else ""
+        index = self.route_display_combo.findData("machine_file")
+        if index >= 0:
+            item = self.route_display_combo.model().item(index)
+            if item is not None:
+                item.setEnabled(bool(available))
+        if not available and self.route_display_mode() == "machine_file":
+            self.set_route_display_mode("continuous")
+        if available and info and self.route_display_mode() == "machine_file":
+            self.set_route_display_info(info, tooltip=tooltip or info)
 
     def set_animation_controls_visible(self, visible):
         self.animation_bar.setVisible(bool(visible))
@@ -964,6 +1051,7 @@ class ImageViewerGroup(QWidget):
         self._ppm = 0.0
         self._scale_bar.update_scale(0.0, 1.0)
         self.lbl_coord.setText("x:0  y:0")
+        self.route_display_bar.hide()
 
     def refresh_theme(self):
         """主题切换后重新应用工具栏样式"""
@@ -982,6 +1070,14 @@ class ImageViewerGroup(QWidget):
                 f"border-top:1px solid {COLORS['border']};}}"
             )
             self.anim_progress_label.setStyleSheet(
+                f"color:{COLORS['text_dim']};font-size:11px;"
+            )
+        if hasattr(self, 'route_display_bar'):
+            self.route_display_bar.setStyleSheet(
+                f"QWidget#routeDisplayBar{{background:{COLORS['bg_dark']};"
+                f"border-top:1px solid {COLORS['border']};}}"
+            )
+            self.route_display_info_label.setStyleSheet(
                 f"color:{COLORS['text_dim']};font-size:11px;"
             )
         # 更新 ImageViewer 背景

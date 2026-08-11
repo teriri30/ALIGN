@@ -13,6 +13,7 @@ class ConfigValidationError(ValueError):
 
 DEFAULT_HARVESTER_PARAMS = {
     "cutter_width_m": 2.00,
+    "cutter_forward_offset_m": 1.35,
     "track_width_m": 0.35,
     "track_gauge_m": 1.30,
     "wheelbase_m": 1.80,
@@ -26,9 +27,7 @@ DEFAULT_HARVESTER_PARAMS = {
 # Parameter provenance is deliberately orthogonal to the numerical defaults.
 # A value copied from config or a heuristic recommendation remains unverified
 # until an operator explicitly records a measured source.
-HARVESTER_PARAM_KEYS = tuple(DEFAULT_HARVESTER_PARAMS) + (
-    "cutter_forward_offset_m",
-)
+HARVESTER_PARAM_KEYS = tuple(DEFAULT_HARVESTER_PARAMS)
 HARVESTER_PARAM_SOURCE_LABELS = {
     "default": "系统默认值",
     "recommended": "智能推荐值",
@@ -155,6 +154,12 @@ def validate_config(raw: dict) -> dict:
     ) not in {"report_only", "hard_gate"}:
         raise ConfigValidationError(
             "track_core_overlap_policy must be report_only or hard_gate"
+        )
+    if "footprint_metric_policy" in planning and str(
+        planning["footprint_metric_policy"]
+    ) not in {"report_only", "hard_gate"}:
+        raise ConfigValidationError(
+            "footprint_metric_policy must be report_only or hard_gate"
         )
     if "service_point_mode" in planning and str(
         planning["service_point_mode"]
@@ -627,7 +632,17 @@ class Config:
     @property
     def CUTTER_WIDTH_M(self) -> float: return self._get("harvester", "cutter_width_m", default=DEFAULT_HARVESTER_PARAMS["cutter_width_m"])
     @property
-    def CUTTER_FORWARD_OFFSET_M(self) -> Optional[float]: return self._get("harvester", "cutter_forward_offset_m", default=None)
+    def CUTTER_FORWARD_OFFSET_M(self) -> Optional[float]:
+        value = self._get(
+            "harvester",
+            "cutter_forward_offset_m",
+            default=DEFAULT_HARVESTER_PARAMS["cutter_forward_offset_m"],
+        )
+        return (
+            float(value)
+            if value not in (None, "")
+            else float(DEFAULT_HARVESTER_PARAMS["cutter_forward_offset_m"])
+        )
     @property
     def TRACK_WIDTH_M(self) -> float: return self._get("harvester", "track_width_m", default=DEFAULT_HARVESTER_PARAMS["track_width_m"])
     @property
