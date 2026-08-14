@@ -80,6 +80,13 @@ jobs:
                       for name, details in failures:
                           safe_details = details.replace("```", "[triple-backtick]")[:8000]
                           handle.write(f"### `{name}`\n\n```text\n{safe_details}\n```\n\n")
+                          # Expose the failing test through the public check-run
+                          # annotations as well as the step summary.  Anonymous
+                          # callers can read annotations even when Actions logs
+                          # and artifact downloads require authentication.
+                          annotation = f"{name}: {details[:1500]}".replace("%", "%25")
+                          annotation = annotation.replace("\r", "%0D").replace("\n", "%0A")
+                          print(f"::error title=Pytest failure::{annotation}")
           '@
           $summary_script | python -
       - name: Upload test diagnostics
