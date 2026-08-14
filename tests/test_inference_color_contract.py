@@ -92,6 +92,28 @@ def test_source_tif_inference_keeps_rgb_channel_order(monkeypatch):
     assert engine.confidences == [0.10]
 
 
+def test_context_separator_filter_keeps_long_parallel_components():
+    """DECISION-009: ROI filtering preserves the separator acceptance rule."""
+    from inference import _filter_context_separators
+
+    reference = np.zeros((128, 128), dtype=np.uint8)
+    reference[64:68, 8:120] = 255
+    candidate = np.zeros((128, 128), dtype=np.uint8)
+    candidate[70, 8:120] = 255
+    candidate[10:20, 40] = 255
+
+    filtered = _filter_context_separators(
+        candidate,
+        reference,
+        meters_per_pixel=0.02,
+        minimum_length_m=1.0,
+        angle_tolerance_deg=10.0,
+    )
+
+    assert filtered[70, 20] == 255
+    assert filtered[15, 40] == 0
+
+
 def test_contact_boundary_keeps_only_evidence_between_two_instances():
     """DECISION-009: do not flatten touching instance evidence into a union."""
     from inference import _contact_boundary_from_instances
@@ -139,3 +161,26 @@ def test_context_fusion_recovers_nearby_support_and_preserves_long_separator():
     assert diagnostics["context_separator_pixels"] > 0
     assert np.count_nonzero(fused[20:120, 49:52]) == 0
     assert np.count_nonzero(fused[20:120, 46:49]) > 0
+
+
+def test_context_fusion_default_requires_repeated_support():
+    """DECISION-004/009: weak single-context support is not mask recovery."""
+    from inference import _fuse_context_evidence
+
+    primary = np.zeros((60, 60), dtype=np.uint8)
+    coverage = np.full((60, 60), 2, dtype=np.uint16)
+    support = np.zeros((60, 60), dtype=np.uint16)
+    support[20:40, 10:50] = 1
+    boundaries = np.zeros((60, 60), dtype=np.uint16)
+
+    fused, diagnostics = _fuse_context_evidence(
+        primary,
+        support,
+        boundaries,
+        coverage,
+        meters_per_pixel=0.10,
+        recovery_distance_m=0.75,
+    )
+
+    assert diagnostics["context_recovered_pixels"] == 0
+    assert np.count_nonzero(fused) == 0

@@ -12,6 +12,12 @@ from runtime_paths import resolve_model_path
 # 掩膜处理和路径规划由独立步骤负责，不在推理运行器中调用
 
 
+# v6 keeps the v5 evidence contract and makes the selected inference runtime
+# explicit (GPU/FP16 when available) while using the configured batch size.
+# The native pass remains authoritative; runtime details are part of the
+# provenance so a result is never silently treated as equivalent after the
+# execution contract changes.
+#
 # v5 keeps the v4 colour contract and adds a 2x contextual evidence pass for
 # native orthomosaics.  A 640 px source tile in the 12 m field data is only
 # about one four-row band wide, so it cannot expose both instance boundaries.
@@ -27,7 +33,98 @@ from runtime_paths import resolve_model_path
 # conversion at the external-library boundary.  v3 passed RGB directly and its
 # cached masks must be recomputed.
 # DECISION-005: keep application arrays RGB and adapt once at the Ultralytics boundary.
-INFERENCE_PIPELINE_VERSION = "source-tif-sahi-v5-native-context-evidence"
+INFERENCE_PIPELINE_VERSION = "source-tif-sahi-v7-native-context-conservative"
+
+
+INFERENCE_DEFAULT_BATCH_SIZE = 8
+INFERENCE_MAX_BATCH_SIZE = 32
+# Context evidence is auxiliary to the native-resolution pass.  Requiring
+# repeated support in most overlapping context tiles prevents one weak
+# 1280px response from expanding the semantic mask across an orthomosaic.
+INFERENCE_DEFAULT_CONTEXT_SUPPORT_RATIO = 0.80
+
+
+def _model_config(cfg=None) -> dict:
+    source = cfg if cfg is not None else Config()
+    if hasattr(source, "section"):
+        return source.section("model")
+    return dict(source or {})
+
+
+def configured_inference_batch_size(cfg=None) -> int:
+    """Return the bounded batch size used by formal tile inference.
+
+    ``inference_batch_size`` is preferred.  ``eval_batch_size`` remains a
+    compatibility fallback for existing user configurations, which already
+    carry the value 8 in the shipped configuration.  The value changes the
+    execution grouping only; it is recorded in inference provenance.
+    """
+    model_cfg = _model_config(cfg)
+    raw = model_cfg.get("inference_batch_size", model_cfg.get(
+        "eval_batch_size", INFERENCE_DEFAULT_BATCH_SIZE
+    ))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = INFERENCE_DEFAULT_BATCH_SIZE
+    return max(1, min(INFERENCE_MAX_BATCH_SIZE, value))
+
+
+def resolve_inference_runtime(cfg=None) -> dict:
+    """Resolve the reproducible device/precision policy for model inference."""
+    model_cfg = _model_config(cfg)
+    requested_device = str(model_cfg.get("inference_device", "auto") or "auto").strip().lower()
+    requested_precision = str(
+        model_cfg.get("inference_precision", "auto") or "auto"
+    ).strip().lower()
+    try:
+        import torch
+
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception:
+        cuda_available = False
+
+    if requested_device == "cpu":
+        device = "cpu"
+    elif requested_device in {"cuda", "cuda:0", "0"}:
+        device = "cuda:0" if cuda_available else "cpu"
+    else:
+        device = "cuda:0" if cuda_available else "cpu"
+
+    use_half = (
+        device.startswith("cuda")
+        and requested_precision in {"auto", "fp16", "half"}
+    )
+    return {
+        "device": device,
+        "precision": "fp16" if use_half else "fp32",
+    }
+
+
+def build_inference_config(cfg=None, engine=None, batch_size=None) -> dict:
+    """Build the exact execution settings bound into inference provenance."""
+    runtime = None
+    if engine is not None:
+        runtime_getter = getattr(engine, "runtime_config", None)
+        if callable(runtime_getter):
+            try:
+                runtime = dict(runtime_getter() or {})
+            except Exception:
+                runtime = None
+    runtime = runtime or resolve_inference_runtime(cfg)
+    return {
+        "capture_size": int((cfg or Config()).TILE_CAPTURE_SIZE),
+        "overlap": float((cfg or Config()).TILE_OVERLAP),
+        "conf": float((cfg or Config()).MODEL_CONF),
+        "iou": float((cfg or Config()).MODEL_IOU),
+        "batch_size": int(
+            configured_inference_batch_size(cfg)
+            if batch_size is None
+            else max(1, min(INFERENCE_MAX_BATCH_SIZE, int(batch_size)))
+        ),
+        "device": str(runtime.get("device", "cpu")),
+        "precision": str(runtime.get("precision", "fp32")),
+    }
 
 
 def _result_mask_stack(result, target_shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
@@ -149,7 +246,16 @@ def _filter_context_separators(
     count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     filtered = np.zeros_like(binary, dtype=np.uint8)
     for label in range(1, count):
-        points_yx = np.column_stack(np.nonzero(labels == label))
+        # Keep the same connected-component pixels and PCA rule, but limit
+        # each membership scan to its component bounding box.  Scanning the
+        # full native orthomosaic once per component made this post-processing
+        # dominate large-source inference time.
+        x, y, width, height = [int(value) for value in stats[label, :4]]
+        if width <= 0 or height <= 0:
+            continue
+        component_labels = labels[y:y + height, x:x + width]
+        component = component_labels == label
+        points_yx = np.column_stack(np.nonzero(component))
         if points_yx.shape[0] < 2:
             continue
         points = points_yx[:, ::-1].astype(np.float64)
@@ -163,7 +269,8 @@ def _filter_context_separators(
         diff = abs(angle - main_angle) % math.pi
         diff = min(diff, math.pi - diff)
         if length_m >= float(minimum_length_m) and diff <= tolerance:
-            filtered[labels == label] = 255
+            filtered_roi = filtered[y:y + height, x:x + width]
+            filtered_roi[component] = 255
     return filtered
 
 
@@ -174,7 +281,7 @@ def _fuse_context_evidence(
     coverage_votes: np.ndarray,
     *,
     meters_per_pixel: float,
-    support_ratio: float = 0.50,
+    support_ratio: float = INFERENCE_DEFAULT_CONTEXT_SUPPORT_RATIO,
     recovery_distance_m: float = 0.75,
     separator_ratio: float = 0.30,
     separator_min_votes: int = 2,
@@ -230,6 +337,7 @@ class ModelEngine:
         self._model = None
         self._model_path = ""
         self._loaded = False
+        self._runtime_config = resolve_inference_runtime()
         self.log = AppLogger()
 
     def load(self, model_path: str) -> bool:
@@ -244,6 +352,12 @@ class ModelEngine:
             self._model = YOLO(model_path)
             self._model_path = model_path
             self._loaded = True
+            self._runtime_config = resolve_inference_runtime()
+            self.log.info(
+                "推理运行时: "
+                f"device={self._runtime_config['device']}, "
+                f"precision={self._runtime_config['precision']}"
+            )
             self.log.info("模型加载成功")
             return True
         except Exception as e:
@@ -259,6 +373,10 @@ class ModelEngine:
         self._model = None
         self._model_path = ""
         self._loaded = False
+
+    def runtime_config(self) -> dict:
+        """Return the device/precision settings used by ``predict``."""
+        return dict(self._runtime_config or resolve_inference_runtime())
 
     def predict(self, image: np.ndarray, conf: float = 0.5, iou: float = 0.5) -> Optional[Any]:
         if not self.is_loaded(): return None
@@ -279,6 +397,7 @@ class ModelEngine:
                 ]
             else:
                 model_input = image
+            runtime = self.runtime_config()
             return self._model.predict(
                 model_input,
                 imgsz=640,
@@ -286,6 +405,8 @@ class ModelEngine:
                 iou=iou,
                 retina_masks=True,
                 verbose=False,
+                device=str(runtime.get("device", "cpu")),
+                half=str(runtime.get("precision", "fp32")) == "fp16",
             )
         except Exception as e:
             self.log.error(f"推理失败: {e}")
@@ -593,6 +714,7 @@ class InferenceRunner:
             1,
             int(model_cfg.get("orthomosaic_context_capture_multiplier", 2)),
         )
+        batch_size = configured_inference_batch_size(self.cfg)
         stride = max(1, int(round(capture_sz * (1.0 - overlap))))
         n_cols = max(1, math.ceil((crop_w - capture_sz) / stride) + 1)
         n_rows = max(1, math.ceil((crop_h - capture_sz) / stride) + 1)
@@ -605,6 +727,7 @@ class InferenceRunner:
             "tile_count": int(total),
             "primary_conf_threshold": float(primary_conf),
             "effective_recovery_conf_threshold": float(recovery_conf),
+            "batch_size": int(batch_size),
             "context_enabled": bool(context_enabled and context_multiplier > 1),
             "tile_preprocessing": [],
         }
@@ -708,7 +831,7 @@ class InferenceRunner:
                 # single conversion required by Ultralytics' BGR ndarray API.
                 batch_images.append(np.ascontiguousarray(tile_img))
                 batch_meta.append((sx0, sy0, sw, sh))
-                if len(batch_images) >= 4:
+                if len(batch_images) >= batch_size:
                     flush_batch()
         flush_batch()
         preprocessing["valid_tile_count"] = int(valid_tile_count)
@@ -871,7 +994,7 @@ class InferenceRunner:
                     )
                     context_images.append(np.ascontiguousarray(tile_img))
                     context_meta.append((sx0, sy0, sw, sh))
-                    if len(context_images) >= 4:
+                    if len(context_images) >= batch_size:
                         flush_context_batch()
             flush_context_batch()
 
@@ -886,7 +1009,12 @@ class InferenceRunner:
                 boundary_votes,
                 coverage_votes,
                 meters_per_pixel=display_mpp,
-                support_ratio=float(model_cfg.get("orthomosaic_context_support_ratio", 0.50)),
+                support_ratio=float(
+                    model_cfg.get(
+                        "orthomosaic_context_support_ratio",
+                        INFERENCE_DEFAULT_CONTEXT_SUPPORT_RATIO,
+                    )
+                ),
                 recovery_distance_m=float(model_cfg.get("orthomosaic_context_recovery_distance_m", 0.75)),
                 separator_ratio=float(model_cfg.get("orthomosaic_context_separator_ratio", 0.30)),
                 separator_min_votes=int(model_cfg.get("orthomosaic_context_separator_min_votes", 2)),
@@ -1011,7 +1139,7 @@ class InferenceRunner:
                     erode=False,
                     conf=float(self.cfg.MODEL_CONF),
                     iou=float(self.cfg.MODEL_IOU),
-                    batch_size=4,
+                    batch_size=configured_inference_batch_size(self.cfg),
                 )
             if crop_mask_src is not None:
                 self._update(inference_progress=0.92, status_message="正在裁剪田块范围...")
@@ -1035,13 +1163,7 @@ class InferenceRunner:
             model_sha256 = str(getattr(self.state, "model_sha256", "") or "")
             if model_path and not model_sha256:
                 model_sha256 = file_sha256(model_path)
-            inference_config = {
-                "capture_size": int(self.cfg.TILE_CAPTURE_SIZE),
-                "overlap": float(self.cfg.TILE_OVERLAP),
-                "conf": float(self.cfg.MODEL_CONF),
-                "iou": float(self.cfg.MODEL_IOU),
-                "batch_size": 4,
-            }
+            inference_config = build_inference_config(self.cfg, self.engine)
             provenance_inputs = {
                 "source_sha256": source_sha256,
                 "model_sha256": model_sha256,
@@ -1177,7 +1299,7 @@ class InferenceRunner:
                     erode=False,
                     conf=float(self.cfg.MODEL_CONF),
                     iou=float(self.cfg.MODEL_IOU),
-                    batch_size=4,
+                    batch_size=configured_inference_batch_size(self.cfg),
                 )
                 if crop_mask is not None:
                     self._update(
@@ -1219,13 +1341,7 @@ class InferenceRunner:
                 "source_array_sha256": array_sha256(image),
                 "model_sha256": model_sha256,
                 "field_boundary": boundary_meta,
-                "inference_config": {
-                    "capture_size": int(self.cfg.TILE_CAPTURE_SIZE),
-                    "overlap": float(self.cfg.TILE_OVERLAP),
-                    "conf": float(self.cfg.MODEL_CONF),
-                    "iou": float(self.cfg.MODEL_IOU),
-                    "batch_size": 4,
-                },
+                "inference_config": build_inference_config(self.cfg, self.engine),
             }
             inference_provenance = make_stage_record(
                 "inference", INFERENCE_PIPELINE_VERSION, provenance_inputs, mask

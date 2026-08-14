@@ -107,6 +107,9 @@ def reset_project_state(state, *, preserve_model=True, preserve_machine=True) ->
                 getattr(state, "harvester_param_sources", {}) or {}
             ),
             turn_strategy=str(getattr(state, "turn_strategy", "auto") or "auto"),
+            turn_strategy_user_selected=bool(
+                getattr(state, "turn_strategy_user_selected", False)
+            ),
         )
     if preserve_model:
         preserved.update(

@@ -11,10 +11,13 @@ config.json
 recent_files.json
 .hillcache/
 .reasonix/
+.mimosa/
 logs/
 *.log
 *.tmp
 .tmp_*.png
+/runs/
+*.tmpbuild-pytest/
 
 # Generated/decompiled artifacts
 docs/archive/*decompiled*
@@ -28,7 +31,6 @@ data/models/*.onnx
 !data/models/yolo11m_seg_best.pt
 !data/models/yolo11s_seg_best.pt
 !data/models/yolov8s_seg_best.pt
-!data/models/yolo11s_seg_tiller12m_best.pt
 !data/models/yolo11s_seg_transplant_12m_best.pt
 !data/models/yolo11s_seg_greenup_12m_best.pt
 !data/models/yolo11s_seg_greenup_30m_best.pt
@@ -41,6 +43,10 @@ data/tif/
 
 # Local assistant/runtime workspace
 .hermes/
+
+# One-off source backups belong under research/archive, not live code.
+src/**/*.bak
+src/**/*.bak_*
 
 # IDE / OS
 .idea/

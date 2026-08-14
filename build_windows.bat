@@ -24,8 +24,13 @@ echo [3/6] Generating build metadata
 if errorlevel 1 exit /b 1
 
 echo [4/6] Running static checks and tests
-"%PYTHON%" -m compileall -q .
-if errorlevel 1 exit /b 1
+rem Compile only project-owned Python trees.  The repository may contain a
+rem developer .venv or pytest/build scratch directories created by another
+rem interpreter; compileall . would incorrectly treat those as release code.
+for %%D in (src scripts tests) do (
+  "%PYTHON%" -m compileall -q "%%D"
+  if errorlevel 1 exit /b 1
+)
 "%PYTHON%" -m pytest -q
 if errorlevel 1 exit /b 1
 

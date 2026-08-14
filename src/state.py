@@ -222,6 +222,9 @@ class AppState:
 
         # 转弯策略下拉选择
         self.turn_strategy: str = "contour"     # 当前选择的转弯策略（默认套圈收割）
+        # Legacy caches could contain a wheel-mutated strategy without any
+        # explicit operator action. Only a popup/button selection sets this.
+        self.turn_strategy_user_selected: bool = False
         self.turn_dropdown_open: bool = False
         self.turn_dropdown_rect = None
         self.turn_dropdown_items: List[Dict] = [
@@ -288,7 +291,8 @@ class AppState:
             "mask_raw", "inference_original_mask", "mask_offset_x", "mask_offset_y",
             "inference_done", "mask_processed", "mask_result",
             "smooth_original_mask", "smoothed_result", "_show_original",
-            "band_list", "corridors", "harvester_params", "harvester_param_sources", "turn_strategy",
+            "band_list", "corridors", "harvester_params", "harvester_param_sources",
+            "turn_strategy", "turn_strategy_user_selected",
             "harvester_params_confirmed",
             "entry_point", "exit_point", "unload_points", "unload_point",
             "entry_point_locked", "exit_point_locked", "unload_point_locked",

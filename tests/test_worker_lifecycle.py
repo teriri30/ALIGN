@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication
 from shiboken6 import isValid
 
 from pyside6_app.main_window import MainWindow
+from pyside6_app.workers import TifLoadWorker
 
 
 class _LifecycleWorker(QObject):
@@ -31,6 +32,71 @@ class _ThreadProbeWindow(MainWindow):
     @Slot(dict)
     def _on_plan_worker_done(self, result):
         self.completion_thread = QThread.currentThread()
+
+
+class _RunningThreadProbe:
+    def isRunning(self):
+        return True
+
+
+class _CancellableProbe:
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def test_cancelled_tif_loader_emits_terminal_result(tmp_path):
+    """DECISION-004: cancelling preview load must still terminate its QThread."""
+    import numpy as np
+    import rasterio
+    from affine import Affine
+
+    tif_path = tmp_path / "cancel-before-read.tif"
+    with rasterio.open(
+        tif_path,
+        "w",
+        driver="GTiff",
+        width=3,
+        height=3,
+        count=1,
+        dtype="uint8",
+        crs="EPSG:32650",
+        transform=Affine(0.2, 0.0, 500000.0, 0.0, -0.2, 3400000.0),
+    ) as dataset:
+        dataset.write(np.ones((1, 3, 3), dtype=np.uint8))
+
+    results = []
+    worker = TifLoadWorker(str(tif_path))
+    worker.finished.connect(results.append)
+    worker.cancel()
+    worker.run()
+
+    assert results == [{"status": "cancelled", "path": str(tif_path)}]
+
+
+def test_close_hides_window_immediately_while_worker_cancels():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    worker = _CancellableProbe()
+    window._worker_thread = _RunningThreadProbe()
+    window._worker = worker
+    window.show()
+    app.processEvents()
+    assert window.isVisible()
+
+    assert window.close() is False
+    app.processEvents()
+
+    assert worker.cancelled is True
+    assert window._close_after_worker_cancel is True
+    assert window.isVisible() is False
+
+    window._worker_thread = None
+    window._worker = None
+    window._close_after_worker_cancel = False
+    window.close()
 
 
 def test_plan_completion_slot_runs_on_gui_thread_when_worker_emits_from_qthread():

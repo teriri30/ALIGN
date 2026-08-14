@@ -77,6 +77,8 @@ def validate_config(raw: dict) -> dict:
     _validated_number(model, "iou_threshold", minimum=0.0, maximum=1.0)
     _validated_number(model, "tile_overlap", minimum=0.0, maximum=0.95)
     _validated_number(model, "tile_capture_size", minimum=64, maximum=8192)
+    _validated_number(model, "inference_batch_size", minimum=1, maximum=32)
+    _validated_number(model, "eval_batch_size", minimum=1, maximum=32)
     _validated_number(model, "max_source_crop_pixels", minimum=1)
     _validated_number(
         model, "orthomosaic_recovery_conf_threshold", minimum=0.0, maximum=1.0
@@ -102,6 +104,20 @@ def validate_config(raw: dict) -> dict:
     _validated_number(
         model, "orthomosaic_context_separator_min_length_m", minimum=0.0, maximum=20.0
     )
+    if "inference_device" in model:
+        if str(model["inference_device"]).lower() not in {
+            "auto", "cpu", "cuda", "cuda:0", "0"
+        }:
+            raise ConfigValidationError(
+                "inference_device must be auto, cpu, or cuda"
+            )
+    if "inference_precision" in model:
+        if str(model["inference_precision"]).lower() not in {
+            "auto", "fp32", "fp16", "half"
+        }:
+            raise ConfigValidationError(
+                "inference_precision must be auto, fp32, or fp16"
+            )
 
     harvester = raw.get("harvester", {})
     for key in (
@@ -583,6 +599,18 @@ class Config:
     @property
     def TILE_CAPTURE_SIZE(self) -> int:
         return self._get("model", "tile_capture_size", default=640)
+
+    @property
+    def INFERENCE_BATCH_SIZE(self) -> int:
+        value = self._get(
+            "model",
+            "inference_batch_size",
+            default=self._get("model", "eval_batch_size", default=8),
+        )
+        try:
+            return max(1, min(32, int(value)))
+        except (TypeError, ValueError):
+            return 8
 
     @property
     def ERODE_KERNEL_SIZE(self) -> int:

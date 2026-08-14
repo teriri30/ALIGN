@@ -165,8 +165,9 @@ def test_semicircle_generator_rejects_subminimum_radius():
         )
 
 
-def test_boundary_direct_fallback_is_reported_as_kinematic_failure():
-    """DECISION-010: a straight connector cannot masquerade as a valid turn."""
+@pytest.mark.parametrize("strategy", ["bow", "semicircle"])
+def test_boundary_failure_keeps_named_curve_for_review(strategy):
+    """DECISION-010: a named curve stays curved while validation fails closed."""
     from path_planner import _connect_work_lines
 
     state = FieldState()
@@ -181,20 +182,63 @@ def test_boundary_direct_fallback_is_reported_as_kinematic_failure():
         geo=MetricGeo(),
         state=state,
         min_turn_radius_m=0.5,
-        turn_strategy="semicircle",
+        turn_strategy=strategy,
         config={"turn_outward_clearance_m": 0.6},
         return_diagnostics=True,
     )
 
     turn = path[segment_types.index("turn")]
-    assert len(turn) == 2
+    assert len(turn) > 2
     assert diagnostics["feasible"] is False
-    assert diagnostics["kinematically_infeasible"] is True
-    assert diagnostics["display_only_connectors"]
-    connector = diagnostics["display_only_connectors"][0]
-    assert connector["display_only_connector"] is True
-    assert connector["kinematically_infeasible"] is True
-    assert any("straight segment" in reason for reason in diagnostics["hard_reasons"])
+    assert diagnostics["display_only_connectors"] == []
+    assert diagnostics["turn_decisions"][0][
+        "boundary_curve_preserved_for_review"
+    ] is True
+    assert diagnostics["boundary_constraints"]["non_work_violations"] == [
+        {"segment_index": 1, "segment_type": "turn"}
+    ]
+    assert diagnostics["machine_executable"] is False
+    assert not any("straight segment" in reason for reason in diagnostics["hard_reasons"])
+
+
+def test_contour_boundary_review_keeps_curved_candidate_for_manual_adjustment():
+    """DECISION-010/016: contour display keeps an outside curve for red review."""
+    from path_planner import _connect_work_lines
+
+    state = FieldState()
+    state.field_boundary = [(5, 5), (80, 5), (80, 80), (5, 80)]
+    lines = [
+        [(20.0, 20.0), (80.0, 20.0)],
+        [(20.0, 30.0), (80.0, 30.0)],
+    ]
+
+    path, segment_types, diagnostics = _connect_work_lines(
+        lines,
+        geo=MetricGeo(),
+        state=state,
+        min_turn_radius_m=0.5,
+        turn_strategy="contour",
+        config={
+            "turn_outward_clearance_m": 0.6,
+            "turn_safety_margin_m": 0.1,
+            "contour_max_endpoint_extension_m": 0.0,
+        },
+        global_main_angle=0.0,
+        return_diagnostics=True,
+    )
+
+    turn = path[segment_types.index("turn")]
+    assert len(turn) > 2
+    assert diagnostics["turn_decisions"][0][
+        "boundary_curve_preserved_for_review"
+    ] is True
+    assert diagnostics["boundary_constraints"]["non_work_violations"] == [
+        {"segment_index": 1, "segment_type": "turn"}
+    ]
+    assert diagnostics["machine_executable"] is False
+    assert "display-only straight connector is kinematically infeasible" not in diagnostics[
+        "hard_reasons"
+    ]
 
 
 def test_fishtail_and_alpha_use_distinct_outer_and_inner_reverse_geometry():

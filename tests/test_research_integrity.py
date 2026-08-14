@@ -146,7 +146,7 @@ def test_cache_restore_rejects_old_mask_when_model_file_changes(tmp_path, monkey
     """DECISION-002: cache restoration rejects evidence from a changed model."""
     import cache
     from config import Config
-    from inference import INFERENCE_PIPELINE_VERSION
+    from inference import INFERENCE_PIPELINE_VERSION, build_inference_config
     from provenance import file_sha256, make_stage_record
     from pyside6_app.workers import CacheRestoreWorker
     from state import AppState
@@ -162,13 +162,7 @@ def test_cache_restore_rejects_old_mask_when_model_file_changes(tmp_path, monkey
         "source_sha256": file_sha256(source),
         "model_sha256": file_sha256(model),
         "field_boundary": [[0.0, 0.0], [5.0, 0.0], [5.0, 5.0]],
-        "inference_config": {
-            "capture_size": int(cfg.TILE_CAPTURE_SIZE),
-            "overlap": float(cfg.TILE_OVERLAP),
-            "conf": float(cfg.MODEL_CONF),
-            "iou": float(cfg.MODEL_IOU),
-            "batch_size": 4,
-        },
+        "inference_config": build_inference_config(cfg),
         "preprocessing_config": cfg.section("raster_preprocessing"),
     }
     record = make_stage_record(
@@ -205,7 +199,7 @@ def test_cache_restore_rejects_mask_before_run_edge_gate_version(tmp_path, monke
     """DECISION-009: v13 geometry cannot survive the run-edge gate change."""
     import cache
     from config import Config
-    from inference import INFERENCE_PIPELINE_VERSION
+    from inference import INFERENCE_PIPELINE_VERSION, build_inference_config
     from provenance import file_sha256, make_stage_record
     from pyside6_app.workers import CacheRestoreWorker
     from row_geometry import MASK_REGULARIZATION_VERSION
@@ -224,13 +218,7 @@ def test_cache_restore_rejects_mask_before_run_edge_gate_version(tmp_path, monke
         "source_sha256": file_sha256(source),
         "model_sha256": file_sha256(model),
         "field_boundary": [[0.0, 0.0], [5.0, 0.0], [5.0, 5.0]],
-        "inference_config": {
-            "capture_size": int(cfg.TILE_CAPTURE_SIZE),
-            "overlap": float(cfg.TILE_OVERLAP),
-            "conf": float(cfg.MODEL_CONF),
-            "iou": float(cfg.MODEL_IOU),
-            "batch_size": 4,
-        },
+        "inference_config": build_inference_config(cfg),
         "preprocessing_config": cfg.section("raster_preprocessing"),
     }
     inference_record = make_stage_record(
@@ -362,10 +350,12 @@ def test_builtin_model_registry_matches_present_weight_files():
     model_dir = Path(__file__).resolve().parents[1] / "data" / "models"
     registry = json.loads((model_dir / "model_registry.json").read_text(encoding="utf-8"))
     assert registry["schema"] == 2
+    registered_names = {item["name"] for item in registry["models"]}
+    present_names = {path.name for path in model_dir.glob("*.pt")}
+    assert present_names == registered_names
     for item in registry["models"]:
         weight = model_dir / item["name"]
-        if weight.exists():
-            assert file_sha256(weight) == item["sha256"]
+        assert file_sha256(weight) == item["sha256"]
 
 
 def test_stage_height_models_are_registered_with_complete_training_metadata():

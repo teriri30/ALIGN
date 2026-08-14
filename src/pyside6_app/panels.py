@@ -1,10 +1,11 @@
 ﻿import math
 import time
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, Signal, QMimeData
+from PySide6.QtGui import QDrag, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QScrollArea, QFrame, QTextEdit, QToolButton
+    QScrollArea, QFrame, QTextEdit, QToolButton, QMenu,
+    QApplication,
 )
 from pyside6_app.styles import COLORS
 from pyside6_app.task_state import TASK_ORDER
@@ -31,6 +32,22 @@ HARVESTER_SOURCE_LABELS = {
     "legacy_unverified": "历史来源未记录",
     "user_measured": "用户实测",
 }
+
+
+class ExplicitPopupComboBox(QComboBox):
+    """Ignore wheel selection unless the popup list is explicitly open.
+
+    A planning strategy is a scientific input, not a scrollable convenience
+    value.  The task panel itself sits in a scroll area, so forwarding a wheel
+    event to a closed combo made ordinary panel scrolling silently alter the
+    route and persist that accidental value in the project cache.
+    """
+
+    def wheelEvent(self, event):
+        if self.view().isVisible():
+            super().wheelEvent(event)
+            return
+        event.ignore()
 
 
 TASK_DEFS = [
@@ -244,10 +261,33 @@ class StepCard(QWidget):
         最小高度仍是表头高度，卡片会被压扁，内容互相覆盖。
         """
         if self._expanded:
-            hint = self.sizeHint()
-            self.setMinimumHeight(hint.height())
+            # A child can become visible after the card was expanded (route
+            # editing does this).  Drop the stale explicit minimum before
+            # asking the layouts for a new hint, otherwise the QScrollArea
+            # keeps the old height and clips the newly visible controls.
+            self.setMinimumHeight(0)
+            content_layout = self._content.layout()
+            if content_layout is not None:
+                content_layout.invalidate()
+                content_layout.activate()
+            own_layout = self.layout()
+            if own_layout is not None:
+                own_layout.invalidate()
+                own_layout.activate()
+                hint_height = own_layout.sizeHint().height()
+            else:
+                hint_height = self.sizeHint().height()
+            self.setMinimumHeight(max(40, int(hint_height)))
         else:
             self.setMinimumHeight(40)
+        self.updateGeometry()
+
+    def refresh_content_geometry(self):
+        """Recompute an expanded card after a runtime child visibility change."""
+        self._sync_minimum_height()
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.updateGeometry()
 
     def refresh_state(self):
         task_rows = [row for row in self._rows if hasattr(row, "_done")]
@@ -292,6 +332,7 @@ class TaskPanel(QWidget):
     confirm_no_forbidden_requested = Signal()
     draw_forbidden_requested = Signal()
     route_edit_requested = Signal()
+    route_edit_tool_requested = Signal(str)
     recommend_service_points_requested = Signal()
     step_deleted = Signal(str)
 
@@ -403,8 +444,10 @@ class TaskPanel(QWidget):
                     turn_layout.setSpacing(6)
                     turn_label = QLabel("调头方式")
                     turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};")
-                    self.turn_combo = QComboBox()
-                    self.turn_combo.setToolTip("选择路径规划使用的调头/转弯方式，可重算对比不同效果")
+                    self.turn_combo = ExplicitPopupComboBox()
+                    self.turn_combo.setToolTip(
+                        "点击展开后选择调头/转弯方式；未展开时滚轮只滚动面板，不会改策略"
+                    )
                     self.turn_combo.setMinimumHeight(28)
                     self.turn_combo.setStyleSheet(
                         f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
@@ -418,14 +461,16 @@ class TaskPanel(QWidget):
                         ("梨形调头", "pear"), ("鱼尾折返", "fishtail"), ("紧凑 Alpha", "alpha"),
                     ]:
                         self.turn_combo.addItem(label, key)
-                    self.turn_combo.currentIndexChanged.connect(self._on_turn_combo_changed)
+                    # Only an explicit popup selection may change this
+                    # scientific input. Programmatic synchronisation and a
+                    # closed-combo wheel event must stay silent.
+                    self.turn_combo.activated.connect(self._on_turn_combo_changed)
                     turn_layout.addWidget(turn_label)
                     turn_layout.addWidget(self.turn_combo, 1)
                     rows.append(turn_row)
                     self.route_edit_btn = QPushButton("编辑路线")
                     self.route_edit_btn.setToolTip(
-                        "进入人工路线编辑：拖动作业线与调头段共用的橙色端点，"
-                        "相邻弧线会实时重新衔接；Alt+左键插点，Backspace 删除选中点"
+                        "进入人工路线编辑；画布负责点线拖动，下面的路径结果负责结构操作与验证"
                     )
                     self.route_edit_btn.setMinimumHeight(30)
                     self.route_edit_btn.setStyleSheet(
@@ -647,12 +692,40 @@ class TaskPanel(QWidget):
         for card in self._step_cards:
             card.refresh_state()
 
+    def set_route_editing_active(self, active):
+        active = bool(active)
+        if hasattr(self, "route_edit_btn"):
+            self.route_edit_btn.setText("完成编辑" if active else "编辑路线")
+
+    def set_route_edit_mode(self, mode):
+        mode = str(mode or "select")
+        mapping = {
+            "select": getattr(self, "route_select_btn", None),
+            "add_work": getattr(self, "route_add_work_btn", None),
+            "add_point": getattr(self, "route_add_point_btn", None),
+        }
+        for key, button in mapping.items():
+            if button is not None:
+                button.setChecked(key == mode)
+
 
 class RouteSegmentRow(QWidget):
     clicked = Signal(int)
-    def __init__(self, index, label, distance_m, is_work=True, parent=None, segment_type=None):
+    edit_clicked = Signal(int, int)
+    edit_action_requested = Signal(str, int, int)
+    reorder_requested = Signal(int, int)
+    _WORK_MIME = "application/x-reui-work-line-index"
+
+    def __init__(self, index, label, distance_m, is_work=True, parent=None,
+                 segment_type=None, point_count=None, edit_meta=None,
+                 display_number=None):
         super().__init__(parent); self._index = index; self._is_work = is_work
         self._segment_type = str(segment_type or ("work" if is_work else "turn"))
+        self._edit_meta = dict(edit_meta or {})
+        self._edit_selected = False
+        self._drag_start = None
+        self.setMinimumHeight(28)
+        self.setAcceptDrops(bool(self._edit_meta and self._is_work))
         lo = QHBoxLayout(self); lo.setContentsMargins(8, 3, 8, 3); lo.setSpacing(8)
         badge = {
             "work": "线", "turn_approach": "接", "turn": "转",
@@ -660,12 +733,22 @@ class RouteSegmentRow(QWidget):
             "exit": "出", "unload": "卸",
         }.get(self._segment_type, "段")
         self._badge = QLabel(badge); self._badge.setFixedSize(24, 18); self._badge.setAlignment(Qt.AlignCenter)
-        self._label = QLabel(f"{label} {index + 1:02d}")
+        number = index + 1 if display_number is None else int(display_number)
+        self._label = QLabel(f"{label} {number:02d}")
+        self._point_count = QLabel(f"{int(point_count)}点") if point_count is not None else None
         self._dist = QLabel(f"{distance_m:.1f} m")
         lo.addWidget(self._badge)
         lo.addWidget(self._label, 1)
+        if self._point_count is not None:
+            lo.addWidget(self._point_count)
         lo.addWidget(self._dist)
+        if self._edit_meta:
+            self.setToolTip(
+                "单击联动画布；右击编辑线段"
+                + ("；拖动卡片调整作业顺序" if self._is_work else "")
+            )
         self.refresh_theme()
+
     def refresh_theme(self):
         color = {
             "work": "#529C62", "turn_approach": "#4C7FA8", "turn": "#BA9648",
@@ -674,14 +757,138 @@ class RouteSegmentRow(QWidget):
         }.get(self._segment_type, "#6A7780")
         self._badge.setStyleSheet(f"background:{color};color:white;border-radius:2px;font-size:10px;")
         self._label.setStyleSheet(f"color:{COLORS['text']};font-size:12px;")
+        if self._point_count is not None:
+            self._point_count.setStyleSheet(
+                f"color:{COLORS['text_dim']};font-size:10px;"
+            )
         self._dist.setStyleSheet(f"color:{COLORS['text_dim']};font-family:Consolas;")
+        self.setStyleSheet(
+            f"RouteSegmentRow{{background:{COLORS['bg_accent'] if self._edit_selected else COLORS['bg']};"
+            f"border:1px solid {COLORS['accent'] if self._edit_selected else 'transparent'};"
+            "border-radius:4px;}}"
+        )
+
+    def set_edit_selected(self, selected):
+        self._edit_selected = bool(selected)
+        self.refresh_theme()
+
+    def available_edit_actions(self):
+        if not self._edit_meta:
+            return []
+        actions = ["toggle_segment", "add_waypoint", "validate_route"]
+        if int(self._edit_meta.get("node_end", -1)) - int(
+            self._edit_meta.get("node_start", -1)
+        ) >= 2:
+            actions.append("delete_waypoint")
+        if self._is_work:
+            actions.extend(["add_work_after", "reverse_work", "delete_work"])
+        return actions
+
+    def trigger_edit_action(self, action, node_index=None):
+        if not self._edit_meta:
+            return
+        if action == "delete_waypoint" and node_index is not None:
+            first = last = int(node_index)
+        else:
+            first = int(self._edit_meta.get("edge_start", -1))
+            last = int(self._edit_meta.get("edge_end", first))
+        self.edit_action_requested.emit(str(action), first, last)
+
     def mousePressEvent(self, event):
-        self.clicked.emit(self._index); super().mousePressEvent(event)
+        if event.button() == Qt.LeftButton:
+            self._drag_start = event.position().toPoint()
+            if self._edit_meta:
+                self.edit_clicked.emit(
+                    int(self._edit_meta.get("edge_start", -1)),
+                    int(self._edit_meta.get("edge_end", -1)),
+                )
+            else:
+                self.clicked.emit(self._index)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        work_index = int(self._edit_meta.get("work_index", -1))
+        if (
+            self._drag_start is not None
+            and work_index >= 0
+            and event.buttons() & Qt.LeftButton
+            and (event.position().toPoint() - self._drag_start).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData(self._WORK_MIME, str(work_index).encode("ascii"))
+            drag.setMimeData(mime)
+            drag.setPixmap(self.grab())
+            drag.exec(Qt.MoveAction)
+            self._drag_start = None
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
+
+    def dragEnterEvent(self, event):
+        if self._is_work and event.mimeData().hasFormat(self._WORK_MIME):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        target = int(self._edit_meta.get("work_index", -1))
+        try:
+            source = int(bytes(event.mimeData().data(self._WORK_MIME)).decode("ascii"))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            event.ignore()
+            return
+        if source >= 0 and target >= 0 and source != target:
+            self.reorder_requested.emit(source, target)
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def contextMenuEvent(self, event):
+        if not self._edit_meta:
+            super().contextMenuEvent(event)
+            return
+        menu = QMenu(self)
+        status = int(self._edit_meta.get("status", 1))
+        toggle = menu.addAction("切换为转弯" if status == 1 else "切换为作业")
+        toggle.triggered.connect(lambda: self.trigger_edit_action("toggle_segment"))
+        add_point = menu.addAction("在中点添加航点")
+        add_point.triggered.connect(lambda: self.trigger_edit_action("add_waypoint"))
+        node_start = int(self._edit_meta.get("node_start", -1))
+        node_end = int(self._edit_meta.get("node_end", -1))
+        internal_nodes = list(range(node_start + 1, node_end))
+        if internal_nodes:
+            delete_menu = menu.addMenu("删除内部航点")
+            for node_index in internal_nodes:
+                action = delete_menu.addAction(f"航点 {node_index + 1}")
+                action.triggered.connect(
+                    lambda _checked=False, value=node_index:
+                    self.trigger_edit_action("delete_waypoint", value)
+                )
+        if self._is_work:
+            menu.addSeparator()
+            add_work = menu.addAction("在此后新增作业线")
+            add_work.triggered.connect(lambda: self.trigger_edit_action("add_work_after"))
+            reverse_work = menu.addAction("反向当前作业线")
+            reverse_work.triggered.connect(lambda: self.trigger_edit_action("reverse_work"))
+            delete_work = menu.addAction("删除整条作业线")
+            delete_work.triggered.connect(lambda: self.trigger_edit_action("delete_work"))
+        menu.addSeparator()
+        validate = menu.addAction("验证当前人工路线")
+        validate.triggered.connect(lambda: self.trigger_edit_action("validate_route"))
+        menu.exec(event.globalPos())
 
 
 class RouteInfoPanel(QWidget):
     segment_selected = Signal(int)
     service_point_selected = Signal(str, int)
+    edit_segment_selected = Signal(int, int)
+    edit_action_requested = Signal(str, int, int)
+    work_reorder_requested = Signal(int, int)
     def __init__(self, parent=None):
         super().__init__(parent); self._segments = []; self._build_ui()
     def _build_ui(self):
@@ -694,7 +901,14 @@ class RouteInfoPanel(QWidget):
         self._safety = QLabel("路径状态：未评估")
         self._safety.setWordWrap(True)
         self._safety.setStyleSheet(f"font-size:11px;color:{COLORS['orange']};padding:2px 14px 6px;")
+        self._edit_hint = QLabel("单击联动画布｜右击编辑或验证｜拖动作业线排序")
+        self._edit_hint.setWordWrap(True)
+        self._edit_hint.setStyleSheet(
+            f"font-size:10px;color:{COLORS['text_accent']};padding:0 14px 6px;"
+        )
+        self._edit_hint.setVisible(False)
         lo.addWidget(self._title_hdr); lo.addWidget(self._summary); lo.addWidget(self._safety)
+        lo.addWidget(self._edit_hint)
         sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
         self._scroll = sc
         self._list_container = QWidget(); self._list_layout = QVBoxLayout(self._list_container); self._list_layout.setContentsMargins(8,0,8,0); self._list_layout.setSpacing(2)
@@ -704,9 +918,15 @@ class RouteInfoPanel(QWidget):
         while self._list_layout.count():
             item = self._list_layout.takeAt(0); w = item.widget()
             if w and w != self._empty_label: w.deleteLater()
-        self._segments.clear(); self._list_layout.addStretch()
+        self._segments.clear()
+        self._list_layout.addWidget(self._empty_label)
+        self._list_layout.addStretch()
     def _add_row(self, row):
+        self._segments.append(row)
         self._list_layout.insertWidget(max(0, self._list_layout.count()-1), row)
+
+    def _set_editable(self, editable):
+        self._edit_hint.setVisible(bool(editable))
     @staticmethod
     def _segment_label(segment_type):
         return {
@@ -715,6 +935,7 @@ class RouteInfoPanel(QWidget):
             "exit": "出田段", "unload": "卸粮段",
         }.get(str(segment_type), "其他路段")
     def update_route(self, data, validation=None):
+        self._set_editable(False)
         data = data or {}
         tracks = data.get("tracks", []); turns = data.get("turns", [])
         validation = validation or data.get("validation", {}) or {}
@@ -822,7 +1043,66 @@ class RouteInfoPanel(QWidget):
                 "不确定<={track_uncertain_overlap:g}, 禁行<={track_forbidden_overlap:g}".format(**limits)
             )
         self._safety.setToolTip("\n".join(details))
+
+    def update_editable_route(self, records):
+        """DECISION-019: render direct editors for the shared control route."""
+        records = [dict(record) for record in (records or [])]
+        self._set_editable(True)
+        self._clear_list()
+        self._empty_label.setVisible(not records)
+        work_count = sum(int(record.get("status", 1)) == 1 for record in records)
+        turn_count = len(records) - work_count
+        total_length = sum(float(record.get("length_m", 0.0) or 0.0) for record in records)
+        display_counts = {"work": 0, "turn": 0}
+        for fallback_index, record in enumerate(records):
+            segment_index = int(record.get("segment_index", fallback_index))
+            segment_type = str(record.get("type", "work"))
+            display_counts[segment_type] = display_counts.get(segment_type, 0) + 1
+            row = RouteSegmentRow(
+                segment_index,
+                self._segment_label(segment_type),
+                float(record.get("length_m", 0.0) or 0.0),
+                segment_type == "work",
+                segment_type=segment_type,
+                point_count=int(record.get("point_count", 2) or 2),
+                edit_meta=record,
+                display_number=record.get(
+                    "display_number", display_counts[segment_type]
+                ),
+            )
+            row.edit_clicked.connect(self.edit_segment_selected.emit)
+            row.edit_action_requested.connect(self.edit_action_requested.emit)
+            row.reorder_requested.connect(self.work_reorder_requested.emit)
+            self._add_row(row)
+        self._summary.setText(
+            f"作业线 {work_count} / 转弯段 {turn_count} / 总长 {total_length:.1f}m"
+        )
+        self._summary.setToolTip("人工控制路线；卡片和画布共享同一几何与顺序")
+        self._safety.setText("路径状态：手动编辑后需重新验证")
+        self._safety.setToolTip("右击任一路径卡片，选择“验证当前人工路线”重新计算指标")
+
+    def set_edit_selection(self, selected_type, selected_index):
+        try:
+            selected_index = int(selected_index)
+        except (TypeError, ValueError):
+            selected_index = -1
+        for row in self._segments:
+            meta = row._edit_meta
+            if not meta:
+                row.set_edit_selected(False)
+                continue
+            node_start = int(meta.get("node_start", -1))
+            node_end = int(meta.get("node_end", -1))
+            edge_start = int(meta.get("edge_start", -1))
+            edge_end = int(meta.get("edge_end", -1))
+            selected = (
+                selected_type == "edge" and edge_start <= selected_index <= edge_end
+            ) or (
+                selected_type == "node" and node_start <= selected_index <= node_end
+            )
+            row.set_edit_selected(selected)
     def update_from_auto_path(self, auto_path):
+        self._set_editable(False)
         self._clear_list(); self._empty_label.setVisible(not bool(auto_path))
         counts = {}; total = work_len = turn_len = 0.0
         for idx, seg in enumerate(auto_path or []):
@@ -843,6 +1123,7 @@ class RouteInfoPanel(QWidget):
         self._safety.setText("路径状态：手动编辑后需重新验证")
         self._safety.setToolTip("手动编辑后必须重新规划并完成全部验证")
     def update_service_points(self, entry_point=None, exit_point=None, unload_points=None):
+        self._set_editable(False)
         self._clear_list(); items=[]
         if entry_point: items.append(("entry",0,"起点",True))
         if exit_point: items.append(("exit",0,"终点",False))
@@ -854,6 +1135,7 @@ class RouteInfoPanel(QWidget):
         self._safety.setText("路径状态：尚未规划")
         self._safety.setToolTip("")
     def clear_info(self):
+        self._set_editable(False)
         self._clear_list(); self._empty_label.setVisible(True); self._summary.setText("作业线 0 / 转弯段 0")
         self._safety.setText("路径状态：未评估"); self._safety.setToolTip("")
     def refresh_theme(self):
@@ -866,6 +1148,9 @@ class RouteInfoPanel(QWidget):
         self._title_hdr.setStyleSheet(f"font-size:13px;font-weight:600;color:{COLORS['text']};padding:8px 14px 2px;")
         self._summary.setStyleSheet(f"font-size:11px;color:{COLORS['text_dim']};padding:2px 14px 4px;")
         self._safety.setStyleSheet(f"font-size:11px;color:{COLORS['orange']};padding:2px 14px 6px;")
+        self._edit_hint.setStyleSheet(
+            f"font-size:10px;color:{COLORS['text_accent']};padding:0 14px 6px;"
+        )
         self._empty_label.setStyleSheet(f"font-size:12px;color:{COLORS['text_dimmer']};padding:8px;")
         for row in self.findChildren(RouteSegmentRow):
             row.refresh_theme()

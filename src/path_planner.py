@@ -31,7 +31,7 @@ from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
 from headland_turn_optimizer import build_turn_corridor_mask, has_non_degenerate_curve, polyline_inside_mask, select_turn_candidate
 
 
-PATH_PLANNING_VERSION = "footprint-path-v21"
+PATH_PLANNING_VERSION = "footprint-path-v27"
 HEADLAND_TURN_OPTIMIZER_VERSION = "headland-turn-corridor-v1"
 
 
@@ -214,14 +214,16 @@ def _select_contour_entry_rotation(
     entry_point: Optional[Tuple[float, float]],
     policy: str = "nearest",
     terminal_original_index: Optional[int] = None,
+    terminal_endpoint: Optional[Tuple[float, float]] = None,
+    main_angle: Optional[float] = None,
 ) -> List[List[Tuple[float, float]]]:
-    """Rotate a contour sequence without introducing an adjacent-row seam.
+    """Choose the contour entry while preserving an optional terminal line.
 
-    A half-split contour of four or more lines normally forms a safe cycle.
-    Rotating *pair blocks* or reversing the final list can expose the central
-    adjacent rows at the seam.  Enumerating line-level rotations and retaining
-    only the minimum-adjacency candidates lets the route honour the operator's
-    start reference (or a far-side inter-region retry) without that defect.
+    The operator's confirmed entry is the primary ordering objective.  Normal
+    adjacency is only a tie-break between equally close entry candidates.  A
+    uniquely short, blocked line may be reserved as the final line; it is
+    removed from the rotation cycle and appended afterwards so that reserving
+    it does not silently reduce the possible first lines to one or two.
     """
     lines = [list(line) for line in ordered_lines]
     indices = list(diagnostics.get("ordered_original_indices") or [])
@@ -235,14 +237,26 @@ def _select_contour_entry_rotation(
         return lines
 
     records = list(zip(lines, indices, positions))
+    terminal_record = None
+    if terminal_original_index is not None:
+        terminal_record = next(
+            (item for item in records if item[1] == terminal_original_index),
+            None,
+        )
+    rotatable_records = [
+        item for item in records if item is not terminal_record
+    ]
     variants = []
     seen = set()
     for reversed_order, base in (
-        (False, records),
-        (True, list(reversed(records))),
+        (False, rotatable_records),
+        (True, list(reversed(rotatable_records))),
     ):
-        for offset in range(len(base)):
+        offsets = range(len(base)) if base else range(1)
+        for offset in offsets:
             candidate = base[offset:] + base[:offset]
+            if terminal_record is not None:
+                candidate = candidate + [terminal_record]
             key = tuple(item[1] for item in candidate)
             if key in seen:
                 continue
@@ -263,49 +277,56 @@ def _select_contour_entry_rotation(
             })
 
     minimum_adjacent = min(item["adjacent"] for item in variants)
-    safe_variants = [
-        item for item in variants if item["adjacent"] == minimum_adjacent
-    ]
-    terminal_variants = [
-        item
-        for item in safe_variants
-        if terminal_original_index is not None
-        and item["records"][-1][1] == terminal_original_index
-    ]
-    if terminal_variants:
-        safe_variants = terminal_variants
+
+    def candidate_start_point(item):
+        line = item["records"][0][0]
+        if entry_point is None:
+            return (float(line[0][0]), float(line[0][1]))
+        return min(
+            (line[0], line[-1]),
+            key=lambda point: math.hypot(
+                float(point[0]) - float(entry_point[0]),
+                float(point[1]) - float(entry_point[1]),
+            ),
+        )
 
     def endpoint_distance(item):
         if entry_point is None:
             return 0.0
-        line = item["records"][0][0]
-        return min(
-            math.hypot(
-                float(point[0]) - float(entry_point[0]),
-                float(point[1]) - float(entry_point[1]),
-            )
-            for point in (line[0], line[-1])
+        point = candidate_start_point(item)
+        return math.hypot(
+            float(point[0]) - float(entry_point[0]),
+            float(point[1]) - float(entry_point[1]),
         )
 
     normalized_policy = str(policy or "nearest").strip().lower()
     if normalized_policy not in {"nearest", "farthest"}:
         normalized_policy = "nearest"
     if entry_point is None:
-        selected = safe_variants[0]
+        selected = min(
+            variants,
+            key=lambda item: (
+                item["adjacent"],
+                item["reversed"],
+                item["offset"],
+            ),
+        )
     elif normalized_policy == "farthest":
         selected = min(
-            safe_variants,
+            variants,
             key=lambda item: (
                 -endpoint_distance(item),
+                item["adjacent"],
                 item["reversed"],
                 item["offset"],
             ),
         )
     else:
         selected = min(
-            safe_variants,
+            variants,
             key=lambda item: (
                 endpoint_distance(item),
+                item["adjacent"],
                 item["reversed"],
                 item["offset"],
             ),
@@ -318,23 +339,33 @@ def _select_contour_entry_rotation(
         diagnostics, selected_indices, selected_positions
     )
     diagnostics.update({
-        "algorithm_version": "contour-order-v6",
+        "algorithm_version": "contour-order-v8",
         "entry_selection_policy": normalized_policy,
         "entry_rotation_offset": int(selected["offset"]),
         "entry_rotation_reversed": bool(selected["reversed"]),
         "normal_order_reversed": normalized_policy == "farthest",
-        "entry_priority_applied": bool(
-            entry_point is not None
-            and (selected["offset"] or selected["reversed"])
-        ),
+        "entry_priority_applied": bool(entry_point is not None),
+        "entry_eligible_candidate_count": int(len(variants)),
         "minimum_possible_adjacent_transition_count": int(minimum_adjacent),
+        "selected_adjacent_transition_count": int(selected["adjacent"]),
+        "entry_priority_overrode_minimum_adjacency": bool(
+            entry_point is not None
+            and selected["adjacent"] > minimum_adjacent
+        ),
+        # DECISION-016/017: the terminal short line may remain last, but its
+        # blocked endpoint is a local final-transition constraint.  It must
+        # never reverse the whole route away from the confirmed entry.
+        "entry_orientation_constrained_by_terminal": False,
         "terminal_original_index": terminal_original_index,
-        "terminal_constraint_applied": bool(terminal_variants),
+        "terminal_constraint_applied": bool(terminal_record is not None),
     })
     if entry_point is not None:
         diagnostics["entry_selected_line_distance_px"] = float(
             endpoint_distance(selected)
         )
+        diagnostics["entry_selected_endpoint_local"] = [
+            float(value) for value in candidate_start_point(selected)
+        ]
     return [list(item[0]) for item in selected_records]
 
 
@@ -477,14 +508,20 @@ def _build_contour_connector_anchors(
         line_index = record["line_index"]
         for endpoint_name in ("start", "end"):
             endpoint = record[endpoint_name]
+            terminal_unaligned_endpoint = cfg.get(
+                "_contour_terminal_unaligned_endpoint_name"
+            )
+            if terminal_unaligned_endpoint is None and bool(
+                cfg.get("_contour_terminal_unaligned_finish", False)
+            ):
+                terminal_unaligned_endpoint = "end"
             if (
-                bool(cfg.get("_contour_terminal_unaligned_finish", False))
-                and line_index == len(endpoint_records) - 1
-                and endpoint_name == "end"
+                line_index == len(endpoint_records) - 1
+                and endpoint_name == terminal_unaligned_endpoint
             ):
                 anchors[line_index][endpoint_name] = tuple(map(float, endpoint))
                 endpoint_adjustments.append(0.0)
-                diagnostics["terminal_unaligned_finish"] = True
+                diagnostics["terminal_unaligned_endpoint"] = endpoint_name
                 continue
             projection = record[f"{endpoint_name}_projection"]
             side = record[f"{endpoint_name}_side"]
@@ -1061,8 +1098,17 @@ def _adjust_turn_to_field_boundary(
     polygon: Optional[np.ndarray],
     semicircle_radius_tolerance_m: float = 0.0,
     semicircle_tangent_radius_m: Optional[float] = None,
+    preserve_curve_on_boundary_failure: bool = False,
 ) -> Tuple[List[Tuple[float, float]], str, Optional[str]]:
-    """Generate a turn, shrinking outward clearance when it would leave the selected field."""
+    """Generate a turn, shrinking outward clearance when it would leave the selected field.
+
+    The normal planner still prefers a boundary-contained candidate.  Review
+    needs to show the actual named curved candidate even when the selected
+    field polygon cannot contain it: the GUI can then colour the outside pieces
+    red and the operator can adjust the shared endpoint. Keeping that candidate
+    also prevents a bow/semicircle/pear turn from being silently replaced by a
+    visually misleading two-point chord. Validation remains fail-closed.
+    """
     turn_function = TURN_STRATEGIES.get(selected_strategy, _turn_bow)
     clearances = []
     for scale in (1.0, 0.5, 0.25, 0.0):
@@ -1100,6 +1146,13 @@ def _adjust_turn_to_field_boundary(
             if abs(value - float(clearance_m)) > 1e-9:
                 reason = "转弯外扩会越出框选田块，已自动收缩地头外扩距离"
             return turn, selected_strategy, reason
+
+    if preserve_curve_on_boundary_failure and best_turn and len(best_turn) > 2:
+        return (
+            best_turn,
+            selected_strategy,
+            "转弯曲线超出框选田块，保留曲线供人工调整并以红色标示越界部分",
+        )
 
     # Last safe fallback: connect endpoints directly. It is less smooth, but never
     # knowingly leaves the user's selected field boundary.
@@ -2236,10 +2289,16 @@ def _align_short_turn_anchors(
             ("start", line[0], projections[0]),
             ("end", line[-1], projections[1]),
         ):
+            terminal_unaligned_endpoint = cfg.get(
+                "_contour_terminal_unaligned_endpoint_name"
+            )
+            if terminal_unaligned_endpoint is None and bool(
+                cfg.get("_contour_terminal_unaligned_finish", False)
+            ):
+                terminal_unaligned_endpoint = "end"
             if (
-                bool(cfg.get("_contour_terminal_unaligned_finish", False))
-                and line_index == len(work_lines) - 1
-                and endpoint_name == "end"
+                line_index == len(work_lines) - 1
+                and endpoint_name == terminal_unaligned_endpoint
             ):
                 continue
             low_side = projection <= midpoint
@@ -2528,6 +2587,16 @@ def _connect_work_lines(
         "fallback_reason": None,
     }
     turn_request_strategy = requested_strategy
+    # DECISION-010/016/017: a named curved candidate that reaches the selected
+    # field edge remains visible for manual endpoint adjustment.  The boundary
+    # validator still fails it closed; this only changes displayed/canonical
+    # geometry from a misleading chord to the curve the operator must inspect.
+    preserve_boundary_curve = bool(
+        cfg.get(
+            "_preserve_curve_on_boundary_failure",
+            True,
+        )
+    )
     if requested_strategy == "contour":
         ordered_lines, contour_ordering = _contour_order_work_lines(
             ordered_lines,
@@ -2579,6 +2648,17 @@ def _connect_work_lines(
                 terminal_short_line.get("original_index")
                 if terminal_short_line is not None
                 else None
+            ),
+            terminal_endpoint=(
+                terminal_short_line.get("endpoint")
+                if terminal_short_line is not None
+                else None
+            ),
+            main_angle=(
+                float(global_main_angle)
+                if global_main_angle is not None
+                and math.isfinite(float(global_main_angle))
+                else contour_ordering.get("main_angle_rad")
             ),
         )
         if terminal_short_line is not None:
@@ -2648,71 +2728,47 @@ def _connect_work_lines(
         "exit_reference_used": bool(exit_point is not None),
     }
 
-    forced_contour_start_reverse = None
-    if (
-        requested_strategy == "contour"
-        and terminal_short_line is not None
-        and contour_ordering.get("terminal_constraint_applied")
-        and ordered_lines
-        and alignment_angle is not None
-    ):
-        terminal_endpoint = np.asarray(
-            terminal_short_line["endpoint"], dtype=np.float64
+    if terminal_short_line is not None:
+        contour_ordering["terminal_finish_orientation_forced"] = False
+
+    def _axially_normalized_line(line):
+        points = list(line)
+        if requested_strategy == "contour" and len(points) >= 2:
+            direction = (
+                math.cos(float(alignment_angle)),
+                math.sin(float(alignment_angle)),
+            )
+            axial_delta = (
+                (float(points[-1][0]) - float(points[0][0])) * direction[0]
+                + (float(points[-1][1]) - float(points[0][1])) * direction[1]
+            )
+            if axial_delta < 0.0:
+                points.reverse()
+        return points
+
+    def _entry_start_reversed(lines):
+        if entry_point is None or not lines or len(lines[0]) < 2:
+            return False
+        # Upstream centreline endpoint order is geometric, not an execution
+        # direction.  Compare the confirmed entry only after normalizing the
+        # first line to the common axial direction; otherwise the subsequent
+        # normalization silently flips the chosen entry side.
+        first = _axially_normalized_line(lines[0])
+        distance_start = math.hypot(
+            first[0][0] - entry_point[0],
+            first[0][1] - entry_point[1],
         )
-        last_line = list(ordered_lines[-1])
-        direction = np.asarray((
-            math.cos(float(alignment_angle)),
-            math.sin(float(alignment_angle)),
-        ), dtype=np.float64)
-        if float(np.dot(
-            np.asarray(last_line[-1], dtype=np.float64)
-            - np.asarray(last_line[0], dtype=np.float64),
-            direction,
-        )) < 0.0:
-            last_line.reverse()
-        terminal_is_low_endpoint = bool(
-            np.linalg.norm(np.asarray(last_line[0]) - terminal_endpoint)
-            <= np.linalg.norm(np.asarray(last_line[-1]) - terminal_endpoint)
+        distance_end = math.hypot(
+            first[-1][0] - entry_point[0],
+            first[-1][1] - entry_point[1],
         )
-        desired_last_line_reversed = terminal_is_low_endpoint
-        forced_contour_start_reverse = bool(
-            desired_last_line_reversed ^ bool((len(ordered_lines) - 1) % 2)
-        )
-        cfg["_contour_terminal_unaligned_finish"] = True
-        contour_ordering["terminal_finish_orientation_forced"] = True
+        return distance_end < distance_start
 
     def _preview_oriented(lines):
         preview = []
-        start_reverse = bool(forced_contour_start_reverse or False)
-        if (
-            forced_contour_start_reverse is None
-            and entry_point
-            and lines
-            and len(lines[0]) >= 2
-        ):
-            first = lines[0]
-            distance_start = math.hypot(
-                first[0][0] - entry_point[0],
-                first[0][1] - entry_point[1],
-            )
-            distance_end = math.hypot(
-                first[-1][0] - entry_point[0],
-                first[-1][1] - entry_point[1],
-            )
-            start_reverse = distance_end < distance_start
+        start_reverse = _entry_start_reversed(lines)
         for index, line in enumerate(lines):
-            points = list(line)
-            if requested_strategy == "contour" and len(points) >= 2:
-                direction = (
-                    math.cos(float(alignment_angle)),
-                    math.sin(float(alignment_angle)),
-                )
-                axial_delta = (
-                    (float(points[-1][0]) - float(points[0][0])) * direction[0]
-                    + (float(points[-1][1]) - float(points[0][1])) * direction[1]
-                )
-                if axial_delta < 0.0:
-                    points.reverse()
+            points = _axially_normalized_line(line)
             if bool(index % 2) ^ start_reverse:
                 points.reverse()
             if len(points) >= 2:
@@ -2833,42 +2889,46 @@ def _connect_work_lines(
         # undo the exit-side choice for same-side start/end markers.
         oriented = [list(line) for line in selected_preview]
     else:
-        start_reversed = bool(forced_contour_start_reverse or False)
-        if (
-            forced_contour_start_reverse is None
-            and entry_point
-            and ordered_lines
-            and len(ordered_lines[0]) >= 2
-        ):
-            first = ordered_lines[0]
-            distance_start = math.hypot(
-                first[0][0] - entry_point[0],
-                first[0][1] - entry_point[1],
-            )
-            distance_end = math.hypot(
-                first[-1][0] - entry_point[0],
-                first[-1][1] - entry_point[1],
-            )
-            start_reversed = distance_end < distance_start
+        start_reversed = _entry_start_reversed(ordered_lines)
 
         oriented = []
         for index, line in enumerate(ordered_lines):
-            points = list(line)
-            if requested_strategy == "contour" and len(points) >= 2:
-                direction = (
-                    math.cos(float(alignment_angle)),
-                    math.sin(float(alignment_angle)),
-                )
-                axial_delta = (
-                    (float(points[-1][0]) - float(points[0][0])) * direction[0]
-                    + (float(points[-1][1]) - float(points[0][1])) * direction[1]
-                )
-                if axial_delta < 0.0:
-                    points.reverse()
+            points = _axially_normalized_line(line)
             if bool(index % 2) ^ start_reversed:
                 points.reverse()
             if len(points) >= 2:
                 oriented.append(points)
+
+    if (
+        requested_strategy == "contour"
+        and terminal_short_line is not None
+        and contour_ordering.get("terminal_constraint_applied")
+        and oriented
+    ):
+        terminal_endpoint = np.asarray(
+            terminal_short_line["endpoint"], dtype=np.float64
+        )
+        final_start = np.asarray(oriented[-1][0], dtype=np.float64)
+        final_end = np.asarray(oriented[-1][-1], dtype=np.float64)
+        terminal_endpoint_role = (
+            "start"
+            if float(np.linalg.norm(final_start - terminal_endpoint))
+            <= float(np.linalg.norm(final_end - terminal_endpoint))
+            else "end"
+        )
+        cfg["_contour_terminal_unaligned_endpoint_name"] = (
+            terminal_endpoint_role
+        )
+        contour_ordering.update({
+            "terminal_blocked_endpoint_role": terminal_endpoint_role,
+            "terminal_blocked_endpoint_is_route_finish": bool(
+                terminal_endpoint_role == "end"
+            ),
+            "terminal_local_incoming_turn_required": bool(
+                terminal_endpoint_role == "start"
+            ),
+            "terminal_finish_orientation_forced": False,
+        })
 
     full_path = []
     segment_types = []
@@ -3002,6 +3062,130 @@ def _connect_work_lines(
                     continue
                 line[point_index] = anchor
         endpoint_alignment["long_anchor_extensions_merged_into_work_lines"] = True
+
+    # DECISION-016/017: audit the entry against the geometry that will actually
+    # be emitted.  Ordering happens before short-end repair and shared-headland
+    # projection, so the pre-alignment endpoint is not sufficient evidence that
+    # the final canonical route still starts at the nearest feasible endpoint.
+    if requested_strategy == "contour" and entry_point is not None and oriented:
+        before_endpoint = contour_ordering.get("entry_selected_endpoint_local")
+        before_distance = contour_ordering.get("entry_selected_line_distance_px")
+        if before_endpoint is not None:
+            contour_ordering[
+                "entry_selected_endpoint_before_headland_alignment_local"
+            ] = list(before_endpoint)
+        if before_distance is not None:
+            contour_ordering[
+                "entry_selected_line_distance_before_headland_alignment_px"
+            ] = float(before_distance)
+
+        actual_start = (
+            float(oriented[0][0][0]),
+            float(oriented[0][0][1]),
+        )
+        actual_distance_px = math.hypot(
+            actual_start[0] - entry_point[0],
+            actual_start[1] - entry_point[1],
+        )
+        terminal_constrained = bool(
+            contour_ordering.get("entry_orientation_constrained_by_terminal")
+        )
+        direction = np.asarray((
+            math.cos(float(alignment_angle)),
+            math.sin(float(alignment_angle)),
+        ), dtype=np.float64)
+        actual_projection = float(np.dot(np.asarray(actual_start), direction))
+        first_line_projections = [
+            float(np.dot(np.asarray(point, dtype=np.float64), direction))
+            for point in (oriented[0][0], oriented[0][-1])
+        ]
+        actual_side = (
+            "low"
+            if actual_projection <= min(first_line_projections) + 1e-7
+            else "high"
+        )
+        terminal_original_index = contour_ordering.get("terminal_original_index")
+        ordered_original_indices = list(
+            contour_ordering.get("ordered_original_indices") or []
+        )
+        eligible = []
+        unconstrained = []
+        for line_index, line in enumerate(oriented):
+            if len(line) < 2:
+                continue
+            original_index = (
+                ordered_original_indices[line_index]
+                if line_index < len(ordered_original_indices)
+                else line_index
+            )
+            if (
+                terminal_original_index is not None
+                and original_index == terminal_original_index
+            ):
+                continue
+            endpoints = [
+                (float(line[0][0]), float(line[0][1])),
+                (float(line[-1][0]), float(line[-1][1])),
+            ]
+            unconstrained.extend(endpoints)
+            if terminal_constrained:
+                projections = [
+                    float(np.dot(np.asarray(point), direction))
+                    for point in endpoints
+                ]
+                endpoint = endpoints[
+                    int(np.argmin(projections))
+                    if actual_side == "low"
+                    else int(np.argmax(projections))
+                ]
+                eligible.append(endpoint)
+            else:
+                eligible.extend(endpoints)
+
+        def _entry_distance(point):
+            return math.hypot(
+                point[0] - entry_point[0], point[1] - entry_point[1]
+            )
+
+        nearest_feasible = min(eligible, key=_entry_distance, default=actual_start)
+        nearest_feasible_distance_px = _entry_distance(nearest_feasible)
+        nearest_unconstrained = min(
+            unconstrained, key=_entry_distance, default=actual_start
+        )
+        nearest_unconstrained_distance_px = _entry_distance(nearest_unconstrained)
+        nearest_feasible_verified = bool(
+            actual_distance_px <= nearest_feasible_distance_px + 1e-6
+        )
+        contour_ordering.update({
+            "entry_selected_endpoint_local": list(actual_start),
+            "entry_selected_line_distance_px": float(actual_distance_px),
+            "entry_selected_line_distance_m": float(actual_distance_px * mpp),
+            "entry_nearest_feasible_endpoint_local": list(nearest_feasible),
+            "entry_nearest_feasible_distance_px": float(
+                nearest_feasible_distance_px
+            ),
+            "entry_nearest_feasible_distance_m": float(
+                nearest_feasible_distance_px * mpp
+            ),
+            "entry_nearest_feasible_verified": nearest_feasible_verified,
+            "entry_nearest_unconstrained_endpoint_local": list(
+                nearest_unconstrained
+            ),
+            "entry_nearest_unconstrained_distance_m": float(
+                nearest_unconstrained_distance_px * mpp
+            ),
+            "entry_side_constraint": actual_side if terminal_constrained else None,
+            "entry_side_constrained_by_terminal_short_line": terminal_constrained,
+            "entry_unconstrained_endpoint_blocked_by_terminal_constraint": bool(
+                terminal_constrained
+                and nearest_unconstrained_distance_px + 1e-6
+                < nearest_feasible_distance_px
+            ),
+        })
+        if not nearest_feasible_verified:
+            boundary_hard_reasons.append(
+                "final route does not start at the nearest feasible entry endpoint"
+            )
 
     endpoint_alignment["path_reference_shift_applied"] = False
     turn_optimizer_cfg = dict(cfg)
@@ -3324,6 +3508,7 @@ def _connect_work_lines(
                     and selected_strategy == "semicircle"
                     else None
                 ),
+                preserve_curve_on_boundary_failure=preserve_boundary_curve,
             )
             base_turn_parts = [(turn, "turn")]
             turn_parts, optimization = _optimize_headland_turn(
@@ -3355,6 +3540,10 @@ def _connect_work_lines(
                 boundary_reason = None
             if boundary_reason:
                 boundary_adjustments.append(boundary_reason)
+                if len(turn) > 2 and preserve_boundary_curve:
+                    turn_decisions[-1][
+                        "boundary_curve_preserved_for_review"
+                    ] = True
                 if len(turn) <= 2:
                     reason = (
                         "turn geometry degraded to a straight segment because no "
@@ -3483,6 +3672,26 @@ def _connect_work_lines(
             "unload_count": len(unload_points) if include_exit_service else 0,
             "unload_visit_count": sum(1 for item in segment_types if item == "unload"),
             "route_start_reference_present": entry_point is not None,
+            "entry_actual_start_local": contour_ordering.get(
+                "entry_selected_endpoint_local"
+            ),
+            "entry_actual_distance_m": contour_ordering.get(
+                "entry_selected_line_distance_m"
+            ),
+            "entry_nearest_feasible_verified": contour_ordering.get(
+                "entry_nearest_feasible_verified"
+            ),
+            "entry_side_constrained_by_terminal_short_line": (
+                contour_ordering.get(
+                    "entry_side_constrained_by_terminal_short_line", False
+                )
+            ),
+            "entry_unconstrained_endpoint_blocked_by_terminal_constraint": (
+                contour_ordering.get(
+                    "entry_unconstrained_endpoint_blocked_by_terminal_constraint",
+                    False,
+                )
+            ),
             "exit_route": exit_service_route,
         },
     }
@@ -3945,7 +4154,7 @@ def _count_path_intersections_proper(
     """统计非相邻作业段之间的真实交叉次数。
 
     路径现在允许在第一条作业线前包含 ``entry``，在最后一条作业线后
-    包含 ``exit``，并且区域转场还可能插入 ``turn_aux``。因此不能再用
+    包含 ``exit``，运动学策略也可能插入 ``turn_reverse``。因此不能再用
     段索引的奇偶性推断作业段；有语义标签时只统计 ``segment_type ==
     "work"`` 的段。没有标签的旧调用仍保留原有的偶数索引兼容行为。
     """
@@ -4271,14 +4480,30 @@ def _machine_compatibility_copy_point(
     return copied
 
 
+def _machine_compatibility_same_point(first: Dict, second: Dict) -> bool:
+    """Compare route points in pixel space when that evidence is available."""
+    try:
+        first_xy = (float(first["pixel_x"]), float(first["pixel_y"]))
+        second_xy = (float(second["pixel_x"]), float(second["pixel_y"]))
+    except (KeyError, TypeError, ValueError):
+        return _machine_compatibility_distance_m(first, second) <= 1e-4
+    if not all(math.isfinite(value) for value in (*first_xy, *second_xy)):
+        return _machine_compatibility_distance_m(first, second) <= 1e-4
+    return math.hypot(
+        second_xy[0] - first_xy[0],
+        second_xy[1] - first_xy[1],
+    ) <= 1e-5
+
+
 def _machine_compatibility_edges(groups: List[Dict]) -> List[Tuple[Dict, Dict, int, str]]:
     """Build work edges and one straight chord for every non-work run.
 
     The target terminal protocol does not receive the research turn geometry
-    or its internal motion labels.  ``turn_reverse`` is therefore treated the
-    same as every other non-work segment here: it becomes one status-0 chord
-    between adjacent work-line endpoints.  This projection does not mutate
-    the canonical research route or claim that the terminal performs reverse.
+    or its internal motion labels.  The one topology-critical exception is a
+    full retrace of the immediately preceding harvested work line: collapsing
+    that retrace together with the following transfer would recreate the very
+    cross-field diagonal it prevents.  Preserve its endpoint as a second
+    status-0 edge, while every other non-work run remains one chord.
     """
     if not groups:
         raise ValueError("没有有效路径段，不能生成农机兼容文件")
@@ -4316,15 +4541,62 @@ def _machine_compatibility_edges(groups: List[Dict]) -> List[Tuple[Dict, Dict, i
         ))
 
         if position + 1 < len(work_indices):
-            next_work = groups[work_indices[position + 1]]
-            # The controller receives only this chord for the whole non-work
-            # run.  It is deliberately not used for scientific validation.
-            edges.append((
-                work_points[-1],
-                next_work["points"][0],
-                0,
-                "turn",
-            ))
+            next_work_index = work_indices[position + 1]
+            next_work = groups[next_work_index]
+            between_groups = groups[work_index + 1:next_work_index]
+            non_work_points = []
+            for group in between_groups:
+                for point in group["points"]:
+                    if (
+                        non_work_points
+                        and _machine_compatibility_same_point(
+                            non_work_points[-1], point
+                        )
+                    ):
+                        non_work_points[-1] = point
+                    else:
+                        non_work_points.append(point)
+            retrace_endpoint = next(
+                (
+                    point
+                    for point in non_work_points[1:]
+                    if _machine_compatibility_same_point(point, work_points[0])
+                ),
+                None,
+            )
+            preserves_harvested_retrace = bool(
+                len(non_work_points) >= 2
+                and _machine_compatibility_same_point(
+                    non_work_points[0], work_points[-1]
+                )
+                and retrace_endpoint is not None
+            )
+            if preserves_harvested_retrace:
+                edges.append((
+                    work_points[-1],
+                    retrace_endpoint,
+                    0,
+                    "turn_reverse",
+                ))
+                if not _machine_compatibility_same_point(
+                    retrace_endpoint, next_work["points"][0]
+                ):
+                    edges.append((
+                        retrace_endpoint,
+                        next_work["points"][0],
+                        0,
+                        "turn_aux",
+                    ))
+            else:
+                # The controller receives only this chord for the whole
+                # ordinary non-work run.  It is deliberately not used for
+                # scientific validation.
+                edges.append((
+                    work_points[-1],
+                    next_work["points"][0],
+                    0,
+                    "turn",
+                ))
         elif work_index < len(groups) - 1:
             exit_end = groups[-1]["points"][-1]
             edges.append((work_points[-1], exit_end, 0, "turn"))
@@ -4477,6 +4749,9 @@ def prepare_machine_compatibility_points(
                 )
             )
         ),
+        "preserved_harvested_retrace_count": int(sum(
+            str(edge[3]) == "turn_reverse" for edge in edges
+        )),
         "removed_near_duplicate_count": int(removed_count),
         "work_line_geometry": "straight_endpoint_chord",
         "work_line_point_compression": True,
@@ -6820,6 +7095,42 @@ def _region_route_endpoint(
     return None
 
 
+def _region_route_last_work_retrace(
+    path_segments: List[List[Tuple[float, float]]],
+    segment_types: List[str],
+) -> Optional[List[Tuple[float, float]]]:
+    """Return the final harvested pass in reverse travel order.
+
+    DECISION-016/017: an even-pass target region can have its entry side fixed
+    by a terminal short line.  When that side differs from the previous
+    region's exit, the only crop-supported way to change headlands is to
+    retrace the already harvested final pass; a direct chord would cross the
+    unharvested field.
+    """
+    last_work = next(
+        (
+            segment
+            for segment, segment_type in reversed(
+                list(zip(path_segments or [], segment_types or []))
+            )
+            if segment_type == "work" and len(segment) >= 2
+        ),
+        None,
+    )
+    if last_work is None:
+        return None
+    retrace = [
+        (float(point[0]), float(point[1]))
+        for point in reversed(last_work)
+    ]
+    if sum(
+        math.hypot(b[0] - a[0], b[1] - a[1])
+        for a, b in zip(retrace, retrace[1:])
+    ) <= 1e-9:
+        return None
+    return retrace
+
+
 def _contour_region_transition_gap_m(
     previous_path: List[List[Tuple[float, float]]],
     previous_types: List[str],
@@ -6923,6 +7234,37 @@ def _minimum_contour_region_transition_gap_m(
     return max(2.0 * max(track_gauge, 0.0), 1.25 * max(cutter_width, 0.0))
 
 
+def _headland_side_for_endpoint(
+    endpoint: Tuple[float, float],
+    path_groups: List[Tuple[List[List[Tuple[float, float]]], List[str]]],
+    main_angle: Optional[float],
+) -> Optional[str]:
+    """Classify a region endpoint against the shared low/high headland walls."""
+    if main_angle is None or not math.isfinite(float(main_angle)):
+        return None
+    axis = np.asarray((
+        math.cos(float(main_angle)),
+        math.sin(float(main_angle)),
+    ), dtype=np.float64)
+    projections = []
+    for path, types in path_groups:
+        for segment, segment_type in zip(path or [], types or []):
+            if segment_type != "work" or len(segment) < 2:
+                continue
+            projections.extend(
+                float(np.asarray(point, dtype=np.float64) @ axis)
+                for point in (segment[0], segment[-1])
+            )
+    if len(projections) < 2:
+        return None
+    low = min(projections)
+    high = max(projections)
+    if high - low <= 1e-9:
+        return None
+    projection = float(np.asarray(endpoint, dtype=np.float64) @ axis)
+    return "low" if abs(projection - low) <= abs(projection - high) else "high"
+
+
 def _build_inter_region_transfer(
     previous_path: List[List[Tuple[float, float]]],
     previous_types: List[str],
@@ -6934,20 +7276,46 @@ def _build_inter_region_transfer(
     min_turn_radius_m: float,
     requested_strategy: str = "bow",
     config: Optional[Dict] = None,
+    global_main_angle: Optional[float] = None,
+    previous_work_retrace: Optional[List[Tuple[float, float]]] = None,
 ) -> Tuple[List[Tuple[float, float]], Dict]:
     """DECISION-017: build one formal, boundary-checked region transfer."""
     cfg = dict(config or {})
-    start = _region_route_endpoint(previous_path, previous_types, first=False)
+    direct_start = _region_route_endpoint(
+        previous_path, previous_types, first=False
+    )
+    retrace = [
+        (float(point[0]), float(point[1]))
+        for point in (previous_work_retrace or [])
+    ]
+    retrace_requested = bool(retrace)
+    retrace_valid = bool(
+        len(retrace) >= 2
+        and direct_start is not None
+        and math.hypot(
+            retrace[0][0] - direct_start[0],
+            retrace[0][1] - direct_start[1],
+        ) <= 1e-6
+    )
+    start = retrace[-1] if retrace_valid else direct_start
     end = _region_route_endpoint(next_path, next_types, first=True)
     diagnostics = {
-        "algorithm_version": "inter-region-transfer-v1",
+        "algorithm_version": "inter-region-transfer-v3",
         "segment_type": "turn_aux",
         "start": list(start) if start else None,
         "end": list(end) if end else None,
+        "retrace_previous_work": bool(retrace_valid),
+        "retrace_start": list(retrace[0]) if retrace_valid else None,
+        "retrace_end": list(retrace[-1]) if retrace_valid else None,
         "valid": False,
         "machine_executable": False,
         "hard_reasons": [],
     }
+    if retrace_requested and not retrace_valid:
+        diagnostics["hard_reasons"].append(
+            "previous work retrace does not start at the region exit"
+        )
+        return [], diagnostics
     if start is None or end is None:
         diagnostics["hard_reasons"].append("missing region work endpoint")
         return [], diagnostics
@@ -6961,8 +7329,9 @@ def _build_inter_region_transfer(
         ),
         None,
     )
-    dx = float(start[0] - last_work[-2][0])
-    dy = float(start[1] - last_work[-2][1])
+    heading_source = retrace if retrace_valid else last_work
+    dx = float(heading_source[-1][0] - heading_source[-2][0])
+    dy = float(heading_source[-1][1] - heading_source[-2][1])
     norm = math.hypot(dx, dy)
     if norm <= 1e-9:
         diagnostics["hard_reasons"].append("previous region exit heading unavailable")
@@ -7015,6 +7384,24 @@ def _build_inter_region_transfer(
         if normalized_request == "contour"
         else float(min_turn_radius_m)
     )
+    effective_main_angle = global_main_angle
+    if effective_main_angle is None:
+        effective_main_angle = _finite_float(cfg.get("_global_main_angle"))
+    previous_headland_side = _headland_side_for_endpoint(
+        start,
+        [(previous_path, previous_types), (next_path, next_types)],
+        effective_main_angle,
+    )
+    next_headland_side = _headland_side_for_endpoint(
+        end,
+        [(previous_path, previous_types), (next_path, next_types)],
+        effective_main_angle,
+    )
+    same_headland_side = (
+        None
+        if previous_headland_side is None or next_headland_side is None
+        else previous_headland_side == next_headland_side
+    )
     transfer, _, boundary_reason = _adjust_turn_to_field_boundary(
         start,
         end,
@@ -7029,6 +7416,12 @@ def _build_inter_region_transfer(
             max(0.0, float(cfg.get("turn_radius_geometry_tolerance_m", 0.05)))
             if selected_strategy == "semicircle"
             else 0.0
+        ),
+        preserve_curve_on_boundary_failure=bool(
+            cfg.get(
+                "_preserve_curve_on_boundary_failure",
+                normalized_request == "contour",
+            )
         ),
     )
     inside_boundary = _segment_inside_field_boundary(transfer, field_polygon)
@@ -7077,12 +7470,23 @@ def _build_inter_region_transfer(
             math.hypot(b[0] - a[0], b[1] - a[1])
             for a, b in zip(transfer, transfer[1:])
         ) * mpp),
+        "retrace_distance_m": (
+            float(sum(
+                math.hypot(b[0] - a[0], b[1] - a[1])
+                for a, b in zip(retrace, retrace[1:])
+            ) * mpp)
+            if retrace_valid
+            else 0.0
+        ),
         "transverse_spacing_m": float(spacing_m),
         "inside_field_boundary": bool(inside_boundary),
         "non_degenerate_curve": bool(curved),
         "start_heading_alignment_cos": start_alignment,
         "end_heading_alignment_cos": end_alignment,
         "boundary_adjustment_reason": boundary_reason,
+        "previous_headland_side": previous_headland_side,
+        "next_headland_side": next_headland_side,
+        "same_headland_side": same_headland_side,
     })
     if not inside_boundary:
         diagnostics["hard_reasons"].append(
@@ -7104,12 +7508,17 @@ def _build_inter_region_transfer(
         diagnostics["hard_reasons"].append(
             "inter-region transfer is not tangent to next work line"
         )
+    if same_headland_side is False:
+        diagnostics["hard_reasons"].append(
+            "inter-region transfer changes headland side; target region must "
+            "enter from the same headland wall"
+        )
     diagnostics["valid"] = not diagnostics["hard_reasons"]
     diagnostics["machine_executable"] = diagnostics["valid"]
     return transfer, diagnostics
 
 
-def _connect_work_regions(
+def _connect_work_regions_independently_legacy(
     work_regions: List[Dict],
     *,
     geo=None,
@@ -7120,7 +7529,7 @@ def _connect_work_regions(
     global_main_angle: Optional[float] = None,
     processed_mask: Optional[np.ndarray] = None,
 ) -> Tuple[List[List[Tuple[float, float]]], List[str], Dict, List[Dict]]:
-    """DECISION-017: connect classified regions with auditable contour groups."""
+    """Legacy regional executor retained only for historical result comparison."""
     cfg = dict(config or {})
     entry_global = getattr(state, "entry_point", None) if state is not None else None
     exit_global = getattr(state, "exit_point", None) if state is not None else None
@@ -7598,6 +8007,10 @@ def _connect_work_regions(
             global_main_angle=global_main_angle,
             processed_mask=processed_mask,
         )
+        handoff_transfer = None
+        handoff_transfer_report = None
+        handoff_retrace_segment = None
+        handoff_candidate_label = "current"
         if (
             region_index > 0
             and normalize_turn_strategy(turn_strategy) == "contour"
@@ -7683,23 +8096,266 @@ def _connect_work_regions(
                 "reverse_attempted": reverse_attempted,
                 "reversed": reversed_for_transition,
             })
+        if (
+            region_index > 0
+            and normalize_turn_strategy(turn_strategy) == "contour"
+            and previous_path
+        ):
+            # A region can satisfy the no-adjacent-row invariant in more than
+            # one cyclic entry/orientation.  The old code selected the route
+            # only by normal spacing, so a valid contour could still enter the
+            # next planting block from the opposite headland wall and create a
+            # long diagonal transfer.  Evaluate the available contour entry
+            # policies against the actual transfer tangents and keep a same-
+            # wall candidate whenever one exists.
+            handoff_candidates = [
+                (region_path, region_types, region_assessment, "current")
+            ]
+            candidate_policies = ("nearest", "farthest")
+            for policy in candidate_policies:
+                candidate_cfg = dict(region_cfg)
+                candidate_cfg["_contour_entry_policy"] = policy
+                candidate_cfg["_preserve_curve_on_boundary_failure"] = True
+                candidate_path, candidate_types, candidate_assessment = (
+                    _connect_work_lines(
+                        region.get("work_lines") or [],
+                        geo=geo,
+                        state=state,
+                        min_turn_radius_m=min_turn_radius_m,
+                        turn_strategy=turn_strategy,
+                        config=candidate_cfg,
+                        return_diagnostics=True,
+                        global_main_angle=global_main_angle,
+                        processed_mask=processed_mask,
+                    )
+                )
+                signature = (
+                    tuple(
+                        tuple(
+                            (round(float(point[0]), 6), round(float(point[1]), 6))
+                            for point in segment
+                        )
+                        for segment in candidate_path
+                    ),
+                    tuple(candidate_types),
+                )
+                if not any(
+                    signature == (
+                        tuple(
+                            tuple(
+                                (round(float(point[0]), 6), round(float(point[1]), 6))
+                                for point in segment
+                            )
+                            for segment in existing_path
+                        ),
+                        tuple(existing_types),
+                    )
+                    for existing_path, existing_types, _existing_assessment, _label
+                    in handoff_candidates
+                ):
+                    handoff_candidates.append(
+                        (
+                            candidate_path,
+                            candidate_types,
+                            candidate_assessment,
+                            policy,
+                        )
+                    )
+
+            transfer_cfg = dict(cfg)
+            transfer_cfg["_preserve_curve_on_boundary_failure"] = True
+            if global_main_angle is not None and math.isfinite(float(global_main_angle)):
+                transfer_cfg["_global_main_angle"] = float(global_main_angle)
+
+            scored_handoffs = []
+            for candidate_index, (
+                candidate_path,
+                candidate_types,
+                candidate_assessment,
+                candidate_label,
+            ) in enumerate(handoff_candidates):
+                candidate_transfer, candidate_report = _build_inter_region_transfer(
+                    previous_path,
+                    previous_types,
+                    candidate_path,
+                    candidate_types,
+                    geo=geo,
+                    state=state,
+                    min_turn_radius_m=min_turn_radius_m,
+                    requested_strategy=turn_strategy,
+                    config=transfer_cfg,
+                    global_main_angle=global_main_angle,
+                )
+                transfer_options = [(
+                    candidate_transfer,
+                    candidate_report,
+                    None,
+                    candidate_label,
+                )]
+                if candidate_report.get("same_headland_side") is False:
+                    retrace = _region_route_last_work_retrace(
+                        previous_path, previous_types
+                    )
+                    if retrace is not None:
+                        retraced_transfer, retraced_report = (
+                            _build_inter_region_transfer(
+                                previous_path,
+                                previous_types,
+                                candidate_path,
+                                candidate_types,
+                                geo=geo,
+                                state=state,
+                                min_turn_radius_m=min_turn_radius_m,
+                                requested_strategy=turn_strategy,
+                                config=transfer_cfg,
+                                global_main_angle=global_main_angle,
+                                previous_work_retrace=retrace,
+                            )
+                        )
+                        transfer_options.append((
+                            retraced_transfer,
+                            retraced_report,
+                            retrace,
+                            f"{candidate_label}_after_retrace",
+                        ))
+                contour_data = candidate_assessment.get("contour_ordering", {})
+                adjacent_count = int(
+                    contour_data.get("adjacent_transition_count", 0) or 0
+                )
+                candidate_gap = None
+                gap_violation = 0
+                if global_main_angle is not None and math.isfinite(float(global_main_angle)):
+                    candidate_gap = _contour_region_transition_gap_m(
+                        previous_path,
+                        previous_types,
+                        candidate_path,
+                        candidate_types,
+                        main_angle=float(global_main_angle),
+                        geo=geo,
+                        state=state,
+                    )
+                    if (
+                        candidate_gap is not None
+                        and candidate_gap < minimum_gap
+                    ):
+                        gap_violation = 1
+                for option_index, (
+                    option_transfer,
+                    option_report,
+                    option_retrace,
+                    option_label,
+                ) in enumerate(transfer_options):
+                    tangent_values = [
+                        value
+                        for value in (
+                            option_report.get("start_heading_alignment_cos"),
+                            option_report.get("end_heading_alignment_cos"),
+                        )
+                        if value is not None and math.isfinite(float(value))
+                    ]
+                    tangent_quality = min(tangent_values, default=-1.0)
+                    same_side = option_report.get("same_headland_side")
+                    same_side_rank = (
+                        0 if same_side is True
+                        else 1 if same_side is None
+                        else 2
+                    )
+                    total_transfer_distance = float(
+                        option_report.get("distance_m", float("inf"))
+                    ) + float(option_report.get("retrace_distance_m", 0.0))
+                    scored_handoffs.append({
+                        "score": (
+                            same_side_rank,
+                            gap_violation,
+                            0 if option_report.get("valid") else 1,
+                            0 if option_report.get("non_degenerate_curve") else 1,
+                            adjacent_count,
+                            0 if option_retrace is None else 1,
+                            -float(tangent_quality),
+                            total_transfer_distance,
+                            candidate_index,
+                            option_index,
+                        ),
+                        "path": candidate_path,
+                        "types": candidate_types,
+                        "assessment": candidate_assessment,
+                        "label": option_label,
+                        "transfer": option_transfer,
+                        "report": option_report,
+                        "retrace": option_retrace,
+                    })
+            if scored_handoffs:
+                selected_handoff = min(
+                    scored_handoffs,
+                    key=lambda item: item["score"],
+                )
+                region_path = selected_handoff["path"]
+                region_types = selected_handoff["types"]
+                region_assessment = selected_handoff["assessment"]
+                handoff_candidate_label = selected_handoff["label"]
+                handoff_transfer = selected_handoff["transfer"]
+                handoff_transfer_report = selected_handoff["report"]
+                handoff_retrace_segment = selected_handoff["retrace"]
+                contour_ordering = region_assessment.setdefault(
+                    "contour_ordering", {}
+                )
+                contour_ordering["handoff_entry_candidate"] = (
+                    handoff_candidate_label
+                )
+                contour_ordering["handoff_same_headland_side"] = (
+                    handoff_transfer_report.get("same_headland_side")
+                )
+                contour_ordering["handoff_retrace_previous_work"] = bool(
+                    handoff_retrace_segment
+                )
+                if global_main_angle is not None and math.isfinite(float(global_main_angle)):
+                    selected_gap = _contour_region_transition_gap_m(
+                        previous_path,
+                        previous_types,
+                        region_path,
+                        region_types,
+                        main_angle=float(global_main_angle),
+                        geo=geo,
+                        state=state,
+                    )
+                    contour_ordering["cross_region_transition_spacing_m"] = (
+                        selected_gap
+                    )
+                    if cross_region_transition_records:
+                        cross_region_transition_records[-1].update({
+                            "selected_spacing_m": selected_gap,
+                            "handoff_entry_candidate": handoff_candidate_label,
+                            "same_headland_side": handoff_transfer_report.get(
+                                "same_headland_side"
+                            ),
+                        })
         if region_index > 0:
-            transfer, transfer_report = _build_inter_region_transfer(
-                previous_path,
-                previous_types,
-                region_path,
-                region_types,
-                geo=geo,
-                state=state,
-                min_turn_radius_m=min_turn_radius_m,
-                requested_strategy=turn_strategy,
-                config=cfg,
-            )
+            if handoff_transfer is None or handoff_transfer_report is None:
+                transfer, transfer_report = _build_inter_region_transfer(
+                    previous_path,
+                    previous_types,
+                    region_path,
+                    region_types,
+                    geo=geo,
+                    state=state,
+                    min_turn_radius_m=min_turn_radius_m,
+                    requested_strategy=turn_strategy,
+                    config=cfg,
+                    global_main_angle=global_main_angle,
+                )
+            else:
+                transfer = handoff_transfer
+                transfer_report = handoff_transfer_report
             transfer_report.update({
                 "from_region_id": ordered_regions[region_index - 1].get("region_id"),
                 "to_region_id": region.get("region_id"),
-                "segment_index": len(combined_path),
+                "handoff_entry_candidate": handoff_candidate_label,
             })
+            if handoff_retrace_segment:
+                transfer_report["retrace_segment_index"] = len(combined_path)
+                combined_path.append(handoff_retrace_segment)
+                combined_types.append("turn_reverse")
+            transfer_report["segment_index"] = len(combined_path)
             if transfer:
                 combined_path.append(transfer)
                 combined_types.append("turn_aux")
@@ -7779,7 +8435,7 @@ def _connect_work_regions(
         "ordering_strategy": normalize_turn_strategy(turn_strategy),
         "contour_ordering": {
             "ordering": "classified_regions_with_small_region_execution_merge",
-            "algorithm_version": "mixed-region-order-v4",
+            "algorithm_version": "mixed-region-order-v6",
             "region_order": [item.get("region_id") for item in ordered_regions],
             "region_order_rule": region_order_rule,
             "entry_reference_local": list(entry_reference)
@@ -7860,6 +8516,93 @@ def _connect_work_regions(
         },
     })
     return combined_path, combined_types, assessment, ordered_regions
+
+
+def _connect_work_regions(
+    work_regions: List[Dict],
+    *,
+    geo=None,
+    state=None,
+    min_turn_radius_m: float,
+    turn_strategy: str,
+    config: Optional[Dict] = None,
+    global_main_angle: Optional[float] = None,
+    processed_mask: Optional[np.ndarray] = None,
+) -> Tuple[List[List[Tuple[float, float]]], List[str], Dict, List[Dict]]:
+    """DECISION-017: generate region lines first, then connect them globally.
+
+    Planting regions remain the provenance boundary for line density and line
+    geometry.  They are deliberately *not* execution groups: every generated
+    line is flattened into one field-wide set before DECISION-016 ordering,
+    direction selection, shared-headland construction and turn generation.
+    """
+    source_regions = [dict(item) for item in (work_regions or [])]
+    global_work_lines: List[List[Tuple[float, float]]] = []
+    line_provenance = []
+    region_generation = []
+    for region in source_regions:
+        region_id = region.get("region_id")
+        lines = [
+            list(line)
+            for line in (region.get("work_lines") or [])
+            if len(line) >= 2
+        ]
+        region_generation.append({
+            "region_id": region_id,
+            "kind": region.get("kind"),
+            "line_source": region.get("line_source"),
+            "generated_line_count": len(lines),
+            "normal_position": region.get("normal_position"),
+        })
+        for region_line_index, line in enumerate(lines):
+            line_provenance.append({
+                "global_input_index": len(global_work_lines),
+                "region_id": region_id,
+                "region_line_index": region_line_index,
+                "kind": region.get("kind"),
+                "line_source": region.get("line_source"),
+            })
+            global_work_lines.append(line)
+
+    global_config = dict(config or {})
+    if normalize_turn_strategy(turn_strategy) == "contour":
+        # DECISION-016/017: endpoint evidence is now audited across the one
+        # field-wide set.  A uniquely short, boundary-blocked line may finish
+        # the route, but may never sit mid-route and force a diagonal turn to
+        # the next full-length line.
+        global_config["_contour_allow_terminal_short_line"] = True
+    full_path, segment_types, assessment = _connect_work_lines(
+        global_work_lines,
+        geo=geo,
+        state=state,
+        min_turn_radius_m=min_turn_radius_m,
+        turn_strategy=turn_strategy,
+        config=global_config,
+        return_diagnostics=True,
+        global_main_angle=global_main_angle,
+        processed_mask=processed_mask,
+    )
+    assessment = dict(assessment or {})
+    contour_ordering = dict(assessment.get("contour_ordering") or {})
+    contour_ordering.update({
+        "execution_scope": "all_generated_work_lines",
+        "execution_topology_version": "global-after-region-generation-v1",
+        "region_boundaries_affect_turns": False,
+        "global_line_count": len(global_work_lines),
+        "source_region_ids": [
+            item.get("region_id") for item in source_regions
+        ],
+        "line_provenance": line_provenance,
+    })
+    assessment.update({
+        "execution_scope": "all_generated_work_lines",
+        "region_boundaries_affect_turns": False,
+        "region_generation": region_generation,
+        "region_routes": [],
+        "region_transfers": [],
+        "contour_ordering": contour_ordering,
+    })
+    return full_path, segment_types, assessment, source_regions
 
 
 def plan_path(wide_bands: List[Dict],
@@ -8022,7 +8765,7 @@ def plan_path(wide_bands: List[Dict],
             candidate_segments,
             candidate_types,
             candidate_assessment,
-            ordered_regions,
+            source_regions,
         ) = _connect_work_regions(
             work_regions,
             geo=geo,
@@ -8033,26 +8776,22 @@ def plan_path(wide_bands: List[Dict],
             global_main_angle=main_angle,
             processed_mask=processed_mask,
         )
-        layout["region_execution_order"] = [
+        layout["region_generation_order"] = [
             {
                 "sequence": index + 1,
                 "region_id": region.get("region_id"),
                 "kind": region.get("kind"),
                 "line_count": int(region.get("line_count", 0)),
-                "source_region_ids": list(
-                    region.get("source_region_ids")
-                    or [region.get("region_id")]
-                ),
+                "line_source": region.get("line_source"),
             }
-            for index, region in enumerate(ordered_regions)
+            for index, region in enumerate(source_regions)
         ]
-        layout["region_order_rule"] = (
-            (candidate_assessment.get("contour_ordering") or {}).get(
-                "region_order_rule", "nearest_entry_region_then_distance_tiebreak"
-            )
-            if len(ordered_regions) > 1
-            else "single_classified_region"
-        )
+        # DECISION-017: region membership ends after work-line generation.
+        # There is no regional execution order or inter-region transfer layer.
+        layout["region_execution_order"] = []
+        layout["region_order_rule"] = "not_applicable_global_turn_planning"
+        layout["turn_planning_scope"] = "all_generated_work_lines"
+        layout["region_boundaries_affect_turns"] = False
         candidate_assessment["user_requested_strategy"] = turn_strategy
         candidate_assessment["candidate_strategy"] = strategy_key
         for decision in candidate_assessment.get("turn_decisions", []) or []:
@@ -8087,7 +8826,14 @@ def plan_path(wide_bands: List[Dict],
             candidate_assessment.get("machine_executable", True)
             and not candidate_assessment.get("kinematically_infeasible", False)
         )
-        if not candidate_assessment["machine_executable"]:
+        # A retained outside-field curve is deliberately non-executable, but
+        # it is not a degraded straight connector.  Only attach the legacy
+        # display-only diagnosis when the selected geometry actually contains
+        # a kinematically infeasible connector.
+        if (
+            not candidate_assessment["machine_executable"]
+            and candidate_assessment.get("kinematically_infeasible", False)
+        ):
             candidate_assessment.setdefault("hard_reasons", []).append(
                 "display-only straight connector is kinematically infeasible"
             )

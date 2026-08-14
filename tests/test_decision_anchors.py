@@ -122,6 +122,13 @@ DECISION_ANCHORS = {
         "src/app_entry.py",
         "tests/test_runtime_packaging.py",
     ),
+    "DECISION-019": (
+        "docs/DECISIONS.md",
+        "docs/DATA_CONTRACTS.md",
+        "src/pyside6_app/main_window.py",
+        "src/pyside6_app/panels.py",
+        "tests/test_route_edit_pyside.py",
+    ),
 }
 
 

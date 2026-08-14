@@ -315,14 +315,26 @@ class TifLoadWorker(QObject):
 
     def __init__(self, path: str, parent=None):
         super().__init__(parent)
-        self.path = path
+        # Preserve an already-absolute path's separator spelling so existing
+        # per-source cache keys remain addressable; relative paths are still
+        # promoted to absolute paths before any I/O.
+        self.path = os.fspath(path)
+        if not os.path.isabs(self.path):
+            self.path = os.path.abspath(self.path)
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
 
+    def _finish_cancelled(self):
+        """Emit a terminal result so the owning QThread can always quit."""
+        self.finished.emit({"status": "cancelled", "path": self.path})
+
     def run(self):
         try:
+            if self._cancelled:
+                self._finish_cancelled()
+                return
             self.progress.emit(5, "正在打开影像...")
             import rasterio
             from rasterio.enums import Resampling
@@ -385,6 +397,7 @@ class TifLoadWorker(QObject):
                     ),
                 }
             if self._cancelled:
+                self._finish_cancelled()
                 return
             render_rgb = bounded_render_preview(rgb)
             preview_preprocessing.update({
@@ -396,6 +409,9 @@ class TifLoadWorker(QObject):
             })
             self.progress.emit(75, "正在计算源影像完整性哈希...")
             source_sha256 = file_sha256(self.path)
+            if self._cancelled:
+                self._finish_cancelled()
+                return
             self.finished.emit({
                 "path": self.path,
                 "rgb": rgb,
@@ -468,7 +484,7 @@ class CacheRestoreWorker(QObject):
                 self._finish("completed", {"path": self.path, "saved": {}})
                 return
             from config import Config
-            from inference import INFERENCE_PIPELINE_VERSION
+            from inference import INFERENCE_PIPELINE_VERSION, build_inference_config
             from path_planner import PATH_PLANNING_VERSION
             from provenance import ProvenanceError, file_sha256, verify_stage_record
             cfg = Config()
@@ -486,13 +502,7 @@ class CacheRestoreWorker(QObject):
                 if not model_path or not os.path.isfile(model_path):
                     raise ProvenanceError("inference model file is missing")
                 current_inputs["model_sha256"] = file_sha256(model_path)
-                current_inputs["inference_config"] = {
-                    "capture_size": int(cfg.TILE_CAPTURE_SIZE),
-                    "overlap": float(cfg.TILE_OVERLAP),
-                    "conf": float(cfg.MODEL_CONF),
-                    "iou": float(cfg.MODEL_IOU),
-                    "batch_size": 4,
-                }
+                current_inputs["inference_config"] = build_inference_config(cfg)
                 current_inputs["preprocessing_config"] = cfg.section("raster_preprocessing")
                 if str(inference_record.get("algorithm_version", "")) != INFERENCE_PIPELINE_VERSION:
                     raise ProvenanceError("inference algorithm version changed")

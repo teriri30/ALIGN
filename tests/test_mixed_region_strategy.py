@@ -541,8 +541,8 @@ def test_ambiguous_classification_is_a_plan_path_hard_reason():
     )
 
 
-def test_mixed_regions_are_contoured_independently_with_one_transfer():
-    """DECISION-017: 不跨区配圈，完成一区后仅用一个正式转场进入二区。"""
+def test_mixed_region_lines_are_all_generated_before_one_global_contour_route():
+    """DECISION-017: 分区只生成直线，套圈排序和转弯必须全田统一。"""
     from path_planner import _connect_work_regions
 
     class Geo:
@@ -603,27 +603,32 @@ def test_mixed_regions_are_contoured_independently_with_one_transfer():
         processed_mask=State.mask_raw,
     )
 
-    assert [item["kind"] for item in ordered] == [
-        "wide_narrow_rows", "uniform_block"
+    assert [item["region_id"] for item in ordered] == [
+        "uniform_block_1", "wide_narrow_rows_1"
     ]
-    assert segment_types.count("turn_aux") == 1
+    assert segment_types.count("turn_aux") == 0
+    assert segment_types.count("turn_reverse") == 0
     assert "connector" not in segment_types
     work_y = [
         segment[0][1]
         for segment, segment_type in zip(path, segment_types)
         if segment_type == "work"
     ]
-    assert work_y == [10.0, 20.0, 60.0, 70.0]
-    assert assessment["contour_ordering"]["no_cross_region_pairing"] is True
-    assert len(assessment["region_routes"]) == 2
-    assert len(assessment["region_transfers"]) == 1
-    assert assessment["region_transfers"][0]["segment_type"] == "turn_aux"
-    assert assessment["region_transfers"][0]["machine_executable"] is True
+    assert work_y == [20.0, 70.0, 10.0, 60.0]
+    ordering = assessment["contour_ordering"]
+    assert ordering["execution_scope"] == "all_generated_work_lines"
+    assert ordering["region_boundaries_affect_turns"] is False
+    assert ordering["global_line_count"] == 4
+    assert ordering["source_region_ids"] == [
+        "uniform_block_1", "wide_narrow_rows_1"
+    ]
+    assert len(assessment["region_routes"]) == 0
+    assert len(assessment["region_transfers"]) == 0
     assert assessment["machine_executable"] is True
 
 
-def test_mixed_region_transition_starts_from_far_side_when_boundary_passes_are_adjacent():
-    """DECISION-016/017: region handoff must not become an adjacent-row U-turn."""
+def test_mixed_region_boundary_does_not_create_a_special_handoff():
+    """DECISION-016/017: all lines use one global contour topology."""
     from path_planner import _connect_work_regions
 
     class Geo:
@@ -682,22 +687,135 @@ def test_mixed_region_transition_starts_from_far_side_when_boundary_passes_are_a
         processed_mask=State.mask_raw,
     )
 
-    transition = assessment["contour_ordering"][
-        "cross_region_transition_records"
-    ][0]
-    assert transition["default_spacing_m"] == pytest.approx(1.0)
-    assert transition["reversed"] is True
-    assert transition["selected_spacing_m"] >= 2.6 - 1e-9
-    assert assessment["region_transfers"][0]["transverse_spacing_m"] >= 2.6
-    target = assessment["region_routes"][1]["assessment"]["contour_ordering"]
-    assert target["normal_order_reversed"] is True
-    assert target["adjacent_transition_count"] == 0
-    assert segment_types.count("turn_aux") == 1
+    ordering = assessment["contour_ordering"]
+    assert ordering["execution_scope"] == "all_generated_work_lines"
+    assert ordering["global_line_count"] == 16
+    assert ordering["adjacent_transition_count"] == 0
+    assert assessment["region_routes"] == []
+    assert assessment["region_transfers"] == []
+    assert segment_types.count("turn_aux") == 0
+    assert segment_types.count("turn_reverse") == 0
     assert len(path) == len(segment_types)
 
 
-def test_three_line_region_merges_with_nearest_large_region_for_safe_contour():
-    """DECISION-016/017 v11: keep all lines without an unavoidable adjacent turn."""
+def test_terminal_short_line_does_not_trigger_a_region_retrace():
+    """DECISION-016/017: a region boundary cannot create a full-pass retrace."""
+    from path_planner import _connect_work_regions
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.1
+
+    class State:
+        mask_raw = np.ones((220, 120), dtype=np.uint8) * 255
+        mask_offset_x = 0
+        mask_offset_y = 0
+        # The right-headland notch blocks extension of the short line at
+        # y=130.  The line remains final, but its blocked endpoint must not
+        # use route parity to override the confirmed entry.
+        field_boundary = [
+            (0.0, 0.0),
+            (110.0, 0.0),
+            (110.0, 120.0),
+            (60.0, 120.0),
+            (60.0, 140.0),
+            (110.0, 140.0),
+            (110.0, 210.0),
+            (0.0, 210.0),
+        ]
+        entry_point = (20.0, 10.0)
+        exit_point = None
+        unload_points = []
+        harvester_params = {
+            "track_gauge_m": 1.3,
+            "cutter_width_m": 2.0,
+        }
+
+    regions = [
+        {
+            "region_id": "wide_narrow_rows_1",
+            "kind": "wide_narrow_rows",
+            "normal_position": 35.0,
+            "line_count": 6,
+            "work_lines": [
+                # Upstream centreline endpoint order is not an execution
+                # direction guarantee.  Use the opposite axial order to
+                # exercise normalization before entry-side selection.
+                [(80.0, float(row)), (20.0, float(row))]
+                for row in (10, 20, 30, 40, 50, 60)
+            ],
+        },
+        {
+            "region_id": "uniform_block_1",
+            "kind": "uniform_block",
+            "normal_position": 125.0,
+            "line_count": 4,
+            "work_lines": [
+                [
+                    (60.0 if row == 130 else 80.0, float(row)),
+                    (20.0, float(row)),
+                ]
+                for row in (100, 110, 130, 150)
+            ],
+        },
+    ]
+
+    path, segment_types, assessment, _ordered = _connect_work_regions(
+        regions,
+        geo=Geo(),
+        state=State(),
+        min_turn_radius_m=0.5,
+        turn_strategy="contour",
+        config={
+            "contour_max_endpoint_extension_m": 0.4,
+            "work_line_endpoint_extension_m": 0.0,
+            "turn_outward_clearance_m": 0.1,
+            "turn_safety_margin_m": 0.1,
+        },
+        global_main_angle=0.0,
+        processed_mask=State.mask_raw,
+    )
+
+    assert segment_types.count("work") == 10
+    assert segment_types.count("turn_reverse") == 0
+    assert segment_types.count("turn_aux") == 0
+    assert assessment["region_routes"] == []
+    assert assessment["region_transfers"] == []
+    assert assessment["contour_ordering"]["global_line_count"] == 10
+    work_segments = [
+        segment
+        for segment, segment_type in zip(path, segment_types)
+        if segment_type == "work"
+    ]
+    # DECISION-016/017: reserving the blocked short line as the final pass may
+    # only affect its local incoming turn.  It must never use even/odd pass
+    # parity to reverse the whole route away from the confirmed entry.
+    assert work_segments[0][0] == pytest.approx((20.0, 10.0))
+    contour = assessment["contour_ordering"]
+    assert contour["entry_priority_applied"] is True
+    assert contour["entry_orientation_constrained_by_terminal"] is False
+    assert contour["entry_selected_endpoint_local"] == pytest.approx([20.0, 10.0])
+    assert contour["entry_selected_line_distance_px"] == pytest.approx(0.0)
+    assert contour["entry_nearest_feasible_verified"] is True
+    assert contour["entry_side_constrained_by_terminal_short_line"] is False
+    assert contour[
+        "entry_unconstrained_endpoint_blocked_by_terminal_constraint"
+    ] is False
+    assert contour["terminal_blocked_endpoint_role"] == "start"
+    assert contour["terminal_finish_orientation_forced"] is False
+    assert work_segments[-1][0][1] == pytest.approx(130.0)
+    assert work_segments[-1][-1][1] == pytest.approx(130.0)
+    assert assessment["contour_ordering"]["terminal_constraint_applied"] is True
+    assert len(path) == len(segment_types)
+
+
+def test_three_line_region_enters_the_global_line_set_without_execution_merge():
+    """DECISION-016/017: source regions remain provenance, not route groups."""
     from path_planner import _connect_work_regions
 
     class Geo:
@@ -756,15 +874,16 @@ def test_three_line_region_merges_with_nearest_large_region_for_safe_contour():
         processed_mask=State.mask_raw,
     )
 
-    assert len(ordered) == 1
-    assert ordered[0]["line_count"] == 15
-    assert set(ordered[0]["source_region_ids"]) == {
+    assert len(ordered) == 2
+    assert [item["region_id"] for item in ordered] == [
         "uniform_block_1", "wide_narrow_rows_1"
-    }
+    ]
     assert segment_types.count("work") == 15
     ordering = assessment["contour_ordering"]
+    assert ordering["global_line_count"] == 15
     assert ordering["adjacent_transition_count"] == 0
     assert ordering["minimum_possible_adjacent_transition_count"] == 0
+    assert assessment["region_transfers"] == []
     assert len(path) == len(segment_types)
 
 
@@ -808,8 +927,8 @@ def test_contour_region_transfer_never_falls_back_to_a_pear_bulb():
     assert len(transfer) > 2
 
 
-def test_region_nearest_entry_runs_first_and_uses_nearest_outer_line():
-    """DECISION-017: the entry point selects both the first region and outer side."""
+def test_entry_selects_the_nearest_line_in_the_global_contour_set():
+    """DECISION-017: entry selection has no region-execution stage."""
     from path_planner import _connect_work_regions
 
     class Geo:
@@ -871,19 +990,25 @@ def test_region_nearest_entry_runs_first_and_uses_nearest_outer_line():
     )
 
     assert [item["kind"] for item in ordered] == [
-        "uniform_block", "wide_narrow_rows"
+        "wide_narrow_rows", "uniform_block"
     ]
     first_work = next(
         segment for segment, kind in zip(path, segment_types) if kind == "work"
     )
-    assert first_work[0][1] == pytest.approx(70.0)
-    assert assessment["contour_ordering"]["region_order_rule"] == (
-        "nearest_entry_region_then_distance_tiebreak"
+    assert first_work[0] == pytest.approx((80.0, 70.0))
+    contour = assessment["contour_ordering"]
+    assert contour["entry_priority_applied"] is True
+    assert contour["entry_nearest_feasible_verified"] is True
+    assert contour["entry_side_constrained_by_terminal_short_line"] is False
+    assert contour["entry_selected_line_distance_px"] == pytest.approx(10.0)
+    assert assessment["contour_ordering"]["execution_scope"] == (
+        "all_generated_work_lines"
     )
+    assert assessment["region_transfers"] == []
 
 
-def test_three_regions_start_with_region_nearest_the_entry_endpoint():
-    """DECISION-017: 用户起点优先于三块区域的边到边固定顺序。"""
+def test_three_regions_use_entry_only_for_the_global_line_order():
+    """DECISION-017: 起点选择全田直线，不重排来源区域。"""
     from path_planner import _connect_work_regions
 
     class Geo:
@@ -936,15 +1061,15 @@ def test_three_regions_start_with_region_nearest_the_entry_endpoint():
         processed_mask=State.mask_raw,
     )
 
-    assert ordered[0]["normal_position"] == 110.0
-    assert assessment["contour_ordering"]["region_order_rule"] == (
-        "nearest_entry_region_then_adjacent_normal_walk"
+    assert [item["normal_position"] for item in ordered] == [30.0, 110.0, 190.0]
+    assert assessment["contour_ordering"]["execution_scope"] == (
+        "all_generated_work_lines"
     )
     first_work = next(
         segment for segment, kind in zip(_path, _types) if kind == "work"
     )
-    assert first_work[0] == pytest.approx((200.0, 105.0))
-    assert len(assessment["region_transfers"]) == 2
+    assert first_work[0] == pytest.approx((200.0, 115.0))
+    assert assessment["region_transfers"] == []
 
 
 def test_mixed_regions_share_the_same_two_contour_headland_walls():
@@ -1005,18 +1130,12 @@ def test_mixed_regions_share_the_same_two_contour_headland_walls():
         processed_mask=State.mask_raw,
     )
 
-    assert assessment["contour_ordering"][
-        "shared_headland_wall_projections_px"
-    ] == {"low": 20.0, "high": 80.0}
-    connectors = assessment["contour_connector"]["regions"]
-    assert all(
-        item["shared_headland_scope"] == "all_classified_regions"
-        for item in connectors
-    )
-    assert all(
-        item["headland_wall_projections_px"] == {"low": 20.0, "high": 80.0}
-        for item in connectors
-    )
+    connector = assessment["contour_connector"]
+    assert connector["headland_wall_projections_px"] == {
+        "low": 20.0, "high": 80.0
+    }
+    assert assessment["contour_ordering"]["global_line_count"] == 4
+    assert assessment["region_transfers"] == []
 
 
 def test_mixed_regions_share_most_restrictive_safe_turn_clearance():
@@ -1091,19 +1210,11 @@ def test_mixed_regions_share_most_restrictive_safe_turn_clearance():
         processed_mask=State.mask_raw,
     )
 
-    assert assessment["contour_ordering"][
-        "shared_turn_clearance_m_by_side"
-    ] == {"low": 0.0, "high": 0.6}
-    connectors = assessment["contour_connector"]["regions"]
-    assert all(
-        item["shared_turn_clearance_scope"] == "all_classified_regions"
-        for item in connectors
-    )
-    assert all(
-        item["shared_turn_clearance_m_by_side"]
-        == {"low": 0.0, "high": 0.6}
-        for item in connectors
-    )
+    connector = assessment["contour_connector"]
+    assert connector["shared_turn_clearance_m_by_side"] == {
+        "low": 0.0, "high": 0.6
+    }
+    assert assessment["contour_ordering"]["global_line_count"] == 6
 
 
 def test_gap_recovery_interpolates_four_row_lattice_and_ignores_narrow_band():

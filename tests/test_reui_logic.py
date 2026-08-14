@@ -5,8 +5,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import pytest
 from affine import Affine
-from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QWheelEvent
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from pyside6_app.main_window import MainWindow
 from pyside6_app.image_view import MetricScaleBar
@@ -149,6 +150,8 @@ def test_planning_card_fully_expands_in_scroll_area_without_overlap():
     app = QApplication.instance()
     app.processEvents()
     panel = window.task_panel
+    panel.set_route_editing_active(True)
+    app.processEvents()
     card = next(c for c in panel._step_cards if c._title.text().startswith("6."))
     card.set_expanded(True)
     for other in panel._step_cards:
@@ -167,9 +170,34 @@ def test_planning_card_fully_expands_in_scroll_area_without_overlap():
     assert card_bottom > max(tops[i] + rows[i].height() for i in range(len(rows)))
     edit_bottom = panel.route_edit_btn.mapTo(panel, QPoint(0, panel.route_edit_btn.height())).y()
     assert edit_bottom <= card_bottom + 1
+    assert not hasattr(panel, "route_edit_tools")
 
     # 滚动区内容高度应大于视口（出现滚动条），而不是把卡片压扁
     assert panel._scroll.widget().height() > panel._scroll.viewport().height()
+    window.close()
+
+
+def test_edit_mode_does_not_inject_a_duplicate_tool_grid_into_planning_card():
+    """DECISION-019: entering edit mode keeps the compact planning card stable."""
+    window = _window()
+    window.resize(720, 800)
+    window.show()
+    app = QApplication.instance()
+    app.processEvents()
+    panel = window.task_panel
+    card = next(c for c in panel._step_cards if c._title.text().startswith("6."))
+    card.set_expanded(True)
+    for other in panel._step_cards:
+        if other is not card:
+            other.set_expanded(False)
+    app.processEvents()
+    height_before = card.height()
+
+    panel.set_route_editing_active(True)
+    app.processEvents()
+
+    assert card.height() == height_before
+    assert not hasattr(panel, "route_edit_tools")
     window.close()
 
 
@@ -1269,6 +1297,68 @@ def test_cache_restore_reenables_confirmed_parameters_after_processed_mask(monke
     assert row._action_btn.isEnabled()
 
 
+def test_cache_restore_keeps_visible_turn_strategy_equal_to_restored_state(monkeypatch):
+    """DECISION-007: the visible selector must not lie about planning input."""
+    window = _window()
+    assert window.state.turn_strategy == "contour"
+    assert window.task_panel.turn_combo.currentData() == "contour"
+    monkeypatch.setattr(window, "_sync_cache_model_identity", lambda: True)
+    monkeypatch.setattr(window, "_restore_visual_from_state", lambda: None)
+
+    window._restore_cache_payload({
+        "path": "dummy.tif",
+        "saved": {
+            "turn_strategy": "bow",
+            "turn_strategy_user_selected": True,
+            "inference_done": False,
+            "mask_processed": False,
+        },
+        "processed_cache_valid": False,
+        "path_cache_valid": False,
+    })
+
+    assert window.state.turn_strategy == "bow"
+    assert window.task_panel.turn_combo.currentData() == "bow"
+
+
+def test_legacy_unconfirmed_turn_strategy_restores_contour_default(monkeypatch):
+    """DECISION-007: an old wheel-mutated cache cannot replace the contour default."""
+    window = _window()
+    monkeypatch.setattr(window, "_sync_cache_model_identity", lambda: True)
+    monkeypatch.setattr(window, "_restore_visual_from_state", lambda: None)
+
+    window._restore_cache_payload({
+        "path": "dummy.tif",
+        "saved": {
+            "turn_strategy": "bow",
+            "inference_done": False,
+            "mask_processed": False,
+        },
+        "processed_cache_valid": False,
+        "path_cache_valid": False,
+    })
+
+    assert window.state.turn_strategy == "contour"
+    assert window.task_panel.turn_combo.currentData() == "contour"
+
+
+def test_closed_turn_selector_ignores_mouse_wheel():
+    """The turn strategy changes only through an explicitly opened selector."""
+    window = _window()
+    combo = window.task_panel.turn_combo
+    assert combo.currentData() == "contour"
+    event = QWheelEvent(
+        QPointF(5.0, 5.0), QPointF(5.0, 5.0), QPoint(), QPoint(0, -120),
+        Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False,
+    )
+
+    QApplication.sendEvent(combo, event)
+
+    assert combo.currentData() == "contour"
+    assert window.state.turn_strategy == "contour"
+    window.close()
+
+
 def test_undo_redo_buttons_follow_history_stack_state():
     from state import AppState
 
@@ -1444,7 +1534,7 @@ def test_contour_starts_with_the_pair_containing_nearest_entry_row():
 
 
 def test_service_point_references_keep_nearest_safe_entry_row_authoritative():
-    """终点不能覆盖起点；四行时先满足零相邻转弯的不变量。"""
+    """终点不能覆盖起点；四行时起点优先于相邻数最小值。"""
     from path_planner import _connect_work_lines
     from state import AppState
 
@@ -1486,9 +1576,14 @@ def test_service_point_references_keep_nearest_safe_entry_row_authoritative():
     assert second_diagnostics["reference_ordering"]["exit_reference_used"] is True
     assert first_work == second_work
     # Four lines cannot start at the outermost row, visit all four and avoid
-    # every adjacent-row transition.  The nearest safe contour starts at the
-    # second row (1,3,0,2); the optional exit must not alter that choice.
-    assert first_work[0][0] == (0.0, 20.0)
+    # every adjacent-row transition.  The confirmed entry remains the first
+    # priority; the optional exit must not move the route to the second row.
+    assert first_work[0][0] == (0.0, 10.0)
+    contour = first_diagnostics["contour_ordering"]
+    assert contour["entry_priority_overrode_minimum_adjacency"] is True
+    assert contour["minimum_possible_adjacent_transition_count"] == 0
+    assert contour["selected_adjacent_transition_count"] == 1
+    assert contour["entry_nearest_feasible_verified"] is True
     assert first_diagnostics["reference_ordering"]["selected_exit_distance_m"] <= 10.0
     actual_exit_distance_m = float(
         np.hypot(

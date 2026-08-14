@@ -107,7 +107,16 @@ class MainWindow(QMainWindow):
         self._measure_overlay_items = []
         self._measure_complete = False
         self._route_edit_active = False
+        # DECISION-019: manual route editing operates on work-line objects,
+        # while ``path_points/path_status`` remains the single control-route
+        # contract shared with compatibility export.
+        self._route_edit_mode = "select"
+        self._route_new_line_start = None
         self._route_drag_idx = -1
+        self._route_drag_work_index = -1
+        self._route_drag_work_origin = None
+        self._route_drag_work_points = None
+        self._route_edit_dynamic_items = []
         self._show_mask_before = False
         self._service_points_visible = False
         self._service_point_overlay_items = []
@@ -393,6 +402,7 @@ class MainWindow(QMainWindow):
             self._on_recommend_service_points
         )
         tp.route_edit_requested.connect(self._on_route_edit_requested)
+        tp.route_edit_tool_requested.connect(self._on_route_edit_tool_requested)
         tp.step_deleted.connect(self._on_step_deleted)
         t = self.top_toolbar
         t.action_clicked.connect(self._on_toolbar_action)
@@ -403,6 +413,15 @@ class MainWindow(QMainWindow):
         t.theme_toggle.connect(self._toggle_theme)
         self.route_info.segment_selected.connect(self._on_segment_selected)
         self.route_info.service_point_selected.connect(self._on_service_point_selected)
+        self.route_info.edit_segment_selected.connect(
+            self._on_route_list_segment_selected
+        )
+        self.route_info.edit_action_requested.connect(
+            self._on_route_list_edit_action
+        )
+        self.route_info.work_reorder_requested.connect(
+            self._on_route_list_work_reordered
+        )
         # 鼠标事件：田块圈选、起终点与卸粮点布设
         self.event_bridge.double_clicked.connect(self._on_field_double_click)
         vw = self.image_view.viewer
@@ -773,15 +792,35 @@ class MainWindow(QMainWindow):
         turns = len(path_result.get("formal_turns", path_result.get("turns", [])))
         self.lbl_status.setText("路径规划完成")
         self.log_panel.success(self._path_quality_summary(path_result, bands_count, tracks, turns))
-        contour_ordering = (path_result.get("turn_assessment") or {}).get(
-            "contour_ordering", {}
-        ) or {}
-        reference_ordering = contour_ordering.get("reference_ordering") or {}
-        if reference_ordering.get("enabled"):
-            self.log_panel.info(
-                "起点已用于选择最近作业线端点和进入方向；可选终点仅在已确认时参与末段方向选择。"
-                "当前为参考点模式，不会把标记点强行拉接进作业线。"
+        turn_assessment = path_result.get("turn_assessment") or {}
+        service_points = turn_assessment.get("service_points") or {}
+        if service_points.get("entry_reference_used"):
+            distance_m = service_points.get("entry_actual_distance_m")
+            distance_text = (
+                f"，最终首端点距起点标记 {float(distance_m):.1f}m"
+                if isinstance(distance_m, (int, float))
+                and math.isfinite(float(distance_m))
+                else ""
             )
+            if service_points.get("entry_nearest_feasible_verified") is not True:
+                self.log_panel.warn(
+                    "起点参与了规划，但最终路线未通过‘全田最近可行首端点’复核；"
+                    "当前路线仅供检查，不能把起点约束视为已满足。"
+                )
+            elif service_points.get(
+                "entry_side_constrained_by_terminal_short_line"
+            ):
+                self.log_panel.info(
+                    "起点已在‘截短作业线安全收尾’约束下选择全田最近可行首端点"
+                    f"{distance_text}；收尾线被田界阻断，因此进入侧受限。"
+                    "当前为参考点模式，不会把标记点强行拉接进作业线。"
+                )
+            else:
+                self.log_panel.info(
+                    "起点已选择全田最终作业线中的最近首端点和进入方向"
+                    f"{distance_text}；可选终点仅在已确认时参与末段方向选择。"
+                    "当前为参考点模式，不会把标记点强行拉接进作业线。"
+                )
         self._log_turn_strategy_comparison(path_result)
         self._journal.info(f"路径规划完成: {bands_count}条带 {tracks}条作业线 {turns}条转弯线")
         validation = path_result.get("validation", {}) or {}
@@ -904,6 +943,9 @@ class MainWindow(QMainWindow):
         if self._has_background_worker():
             self.log_panel.warn("任务正在运行：当前已有耗时任务正在执行，请等待完成后再打开影像。")
             return
+        path = os.fspath(path)
+        if not os.path.isabs(path):
+            path = os.path.abspath(path)
         self._invalidate_active_inference_runner()
         # Clear the previous image's transform immediately. A CRS-less image
         # must never inherit geographic coordinates from the prior project.
@@ -921,8 +963,20 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_tif_load_done(self, result):
+        # A cancellation is still a terminal worker result: it exists to let
+        # the worker QThread stop, not to mutate the current project.
+        if (
+            result.get("status") == "cancelled"
+            or getattr(self, "_task_cancel_requested", False)
+        ):
+            return
         try:
-            path = result["path"]
+            # Keep the full source identity in visible logs and cache state;
+            # the basename is reserved for compact window labels only.
+            path = os.fspath(result["path"])
+            if not os.path.isabs(path):
+                path = os.path.abspath(path)
+            log_path = os.path.abspath(path)
             rgb = result["rgb"]
             render_rgb = result.get("render_rgb", rgb)
             full_h = int(result["full_h"])
@@ -993,7 +1047,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._log.info(f"scale calculation failed: {e}")
             basename = os.path.basename(path)
-            self.log_panel.success(f"影像加载: {basename} ({full_w}x{full_h})")
+            self.log_panel.success(f"影像加载: {log_path} ({full_w}x{full_h})")
             metadata = dict(result.get("source_metadata") or {})
             if self.geo.is_ready():
                 try:
@@ -1014,7 +1068,7 @@ class MainWindow(QMainWindow):
                     f"当前使用波段 {indexes} 作为 RGB，请确认与模型训练输入一致"
                 )
             self.lbl_status.setText(f"已加载 {basename}")
-            self._journal.info(f"影像加载: {basename}")
+            self._journal.info(f"影像加载: {log_path}")
             self.task_panel.set_task_status("import_img", "done")
             self.task_panel.set_task_action("import_img", "重选")
             self._sync_task_statuses()
@@ -1140,9 +1194,22 @@ class MainWindow(QMainWindow):
             proc_ox = int(payload.get("proc_ox", 0) or 0)
             proc_oy = int(payload.get("proc_oy", 0) or 0)
             processed_layers = payload.get("processed_layers") or {}
+            saved_turn_strategy = str(
+                saved.get("turn_strategy", "contour") or "contour"
+            )
+            turn_strategy_user_selected = (
+                saved.get("turn_strategy_user_selected") is True
+            )
+            legacy_unconfirmed_turn = bool(
+                not turn_strategy_user_selected
+                and saved_turn_strategy != "contour"
+            )
             path_restore = cached_path_restore_plan(
                 saved,
-                path_cache_valid=bool(payload.get("path_cache_valid")),
+                path_cache_valid=(
+                    bool(payload.get("path_cache_valid"))
+                    and not legacy_unconfirmed_turn
+                ),
             )
             restored_state = {
                 k: v for k, v in saved.items()
@@ -1154,7 +1221,7 @@ class MainWindow(QMainWindow):
                     'harvester_param_sources',
                     'harvester_params_confirmed',
                     'inference_done', 'mask_processed', 'simulation_done', 'export_done',
-                    'turn_strategy',
+                    'turn_strategy', 'turn_strategy_user_selected',
                     'source_sha256', 'source_metadata', 'raster_preprocessing',
                     'inference_provenance', 'mask_provenance',
                     'inference_runtime',
@@ -1166,6 +1233,15 @@ class MainWindow(QMainWindow):
             }
             restored_state.update(self._cache_model_identity_updates(saved))
             restored_state.update(path_restore["state_updates"])
+            # Cache schema before this marker could not distinguish a deliberate
+            # popup selection from an accidental wheel mutation. Migrate such a
+            # non-contour value back to the documented default and invalidate
+            # its path so visible state and geometry cannot disagree.
+            restored_state['turn_strategy_user_selected'] = (
+                turn_strategy_user_selected
+            )
+            if not turn_strategy_user_selected:
+                restored_state['turn_strategy'] = "contour"
             restored_state['harvester_params'] = self._effective_harvester_params(
                 saved.get('harvester_params') or {}
             )
@@ -1181,6 +1257,13 @@ class MainWindow(QMainWindow):
                 )
             )
             self.state.safe_update(**restored_state)
+            # DECISION-007: cache restore changes the authoritative
+            # planning input after the widgets were initialised.  Keep both
+            # selectors on that restored value; otherwise the task panel can
+            # display the default ``contour`` while PlanWorker actually reads
+            # a cached ``bow`` value from AppState.
+            self.task_panel.set_turn_strategy(self.state.turn_strategy)
+            self.top_toolbar.set_current_strategy(self.state.turn_strategy)
             if not self._sync_cache_model_identity():
                 self.log_panel.info(
                     "缓存模型仅作为历史记录；可加载任一已注册或已确认信任的模型重新识别，"
@@ -1572,9 +1655,16 @@ class MainWindow(QMainWindow):
                 "machine_executable",
                 "path_candidates",
                 "layout",
+                "manual_route",
             )
             if key in artifact
         }
+        manual_route = metadata.get("manual_route")
+        if isinstance(manual_route, dict):
+            metadata["manual_route_edited"] = True
+            metadata["manual_route_validated"] = bool(
+                validation.get("manual_route_validated") is True
+            )
         return self._normalise_path_result(
             {
                 **metadata,
@@ -1757,16 +1847,131 @@ class MainWindow(QMainWindow):
         path_result = path_result or {}
         work_count = len(path_result.get("tracks") or [])
         turn_items = list(path_result.get("turns") or [])
-        degenerate_count = sum(
+        direct_count = sum(
             1
             for item in turn_items
             if str(item.get("type") or "") in {"turn", "turn_reverse", "turn_aux"}
             and len(item.get("points") or []) <= 2
         )
         detail = f"连续规划｜{work_count}条作业线｜{len(turn_items)}条非作业段"
-        if degenerate_count:
-            detail += f"｜{degenerate_count}条不可行直连"
-        return detail, degenerate_count
+        if direct_count:
+            detail += f"｜含{direct_count}条人工可调直连"
+        return detail, direct_count
+
+    @staticmethod
+    def _split_polyline_by_field_boundary(points, boundary):
+        """Split a displayed polyline into field-inside/outside pieces.
+
+        This is a display-only operation.  It preserves every original route
+        vertex and inserts only the exact intersections with the selected
+        boundary, so an outside curve can be highlighted without changing the
+        canonical path or its validation result.
+        """
+        clean = []
+        for point in points or []:
+            try:
+                value = (float(point[0]), float(point[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not clean or value != clean[-1]:
+                clean.append(value)
+        if len(clean) < 2:
+            return []
+        try:
+            polygon = np.asarray(boundary, dtype=np.float32)
+        except (TypeError, ValueError):
+            return [(clean, True)]
+        if polygon.ndim != 2 or polygon.shape[1] != 2 or len(polygon) < 3:
+            return [(clean, True)]
+
+        def cross(first, second):
+            return float(first[0] * second[1] - first[1] * second[0])
+
+        def subtract(first, second):
+            return (first[0] - second[0], first[1] - second[1])
+
+        def add_scaled(first, direction, scale):
+            return (
+                float(first[0] + direction[0] * scale),
+                float(first[1] + direction[1] * scale),
+            )
+
+        def distance(first, second):
+            return math.hypot(first[0] - second[0], first[1] - second[1])
+
+        def intersection_parameters(start, end, edge_start, edge_end):
+            direction = subtract(end, start)
+            edge = subtract(edge_end, edge_start)
+            offset = subtract(edge_start, start)
+            denominator = cross(direction, edge)
+            epsilon = 1e-9
+            if abs(denominator) > epsilon:
+                line_t = cross(offset, edge) / denominator
+                edge_u = cross(offset, direction) / denominator
+                if -epsilon <= line_t <= 1.0 + epsilon and -epsilon <= edge_u <= 1.0 + epsilon:
+                    return [max(0.0, min(1.0, float(line_t)))]
+                return []
+            if abs(cross(offset, direction)) > epsilon:
+                return []
+            length_sq = direction[0] ** 2 + direction[1] ** 2
+            if length_sq <= epsilon:
+                return []
+            return [
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        float(
+                            ((point[0] - start[0]) * direction[0]
+                             + (point[1] - start[1]) * direction[1])
+                            / length_sq
+                        ),
+                    ),
+                )
+                for point in (edge_start, edge_end)
+            ]
+
+        pieces = []
+        for start, end in zip(clean[:-1], clean[1:]):
+            direction = subtract(end, start)
+            parameters = [0.0, 1.0]
+            for index in range(len(polygon)):
+                edge_start = (
+                    float(polygon[index][0]),
+                    float(polygon[index][1]),
+                )
+                edge_end = (
+                    float(polygon[(index + 1) % len(polygon)][0]),
+                    float(polygon[(index + 1) % len(polygon)][1]),
+                )
+                parameters.extend(
+                    intersection_parameters(start, end, edge_start, edge_end)
+                )
+            parameters = sorted(parameters)
+            unique_parameters = []
+            for value in parameters:
+                if not unique_parameters or abs(value - unique_parameters[-1]) > 1e-7:
+                    unique_parameters.append(value)
+            for left, right in zip(unique_parameters[:-1], unique_parameters[1:]):
+                if right - left <= 1e-7:
+                    continue
+                left_point = add_scaled(start, direction, left)
+                right_point = add_scaled(start, direction, right)
+                middle = add_scaled(start, direction, (left + right) * 0.5)
+                inside = cv2.pointPolygonTest(
+                    polygon,
+                    (float(middle[0]), float(middle[1])),
+                    False,
+                ) >= -1e-6
+                if (
+                    pieces
+                    and pieces[-1][1] is inside
+                    and distance(pieces[-1][0][-1], left_point) <= 1e-6
+                ):
+                    pieces[-1][0].append(right_point)
+                else:
+                    pieces.append(([left_point, right_point], inside))
+        return pieces or [(clean, True)]
 
     def _restore_visual_from_state(self):
         self.top_toolbar.refresh_actions(self.state)
@@ -2056,7 +2261,9 @@ class MainWindow(QMainWindow):
 
     def _on_turn_strategy_changed(self, strategy_key):
         """DECISION-007: a new turn strategy invalidates the planned route."""
+        self.state.turn_strategy_user_selected = True
         if strategy_key == getattr(self.state, 'turn_strategy', None):
+            self.state._persist_history_restore("turn_strategy")
             return
         self._save_system_undo("切换调头方式")
         had_path = bool(getattr(self.state, 'auto_path_planned', False))
@@ -2079,6 +2286,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.log_panel.info(f"调头方式: {labels.get(strategy_key, strategy_key)}")
+        self.state._persist_history_restore("turn_strategy")
 
     def _on_turn_strategy_btn(self):
         strategies = ["自动", "弓形", "半圆", "梨形", "鱼尾", "Alpha", "套圈收割"]
@@ -2148,10 +2356,22 @@ class MainWindow(QMainWindow):
         self.event_bridge.on_mouse_pressed(x, y, button)
 
     def _on_viewer_mouse_released(self, x, y, button):
+        if self._route_edit_active and self._route_drag_work_index >= 0:
+            self._route_drag_work_index = -1
+            self._route_drag_work_origin = None
+            self._route_drag_work_points = None
+            self._sync_auto_path_from_editable_route()
+            self._draw_route_edit_overlay()
+            self._update_route_edit_cursor(x, y)
+            self.log_panel.info(
+                "整条作业线已平移；前后控制端点和相邻转弯已同步更新"
+            )
+            return
         if self._route_edit_active and self._route_drag_idx >= 0:
             self._route_drag_idx = -1
             self._sync_auto_path_from_editable_route()
             self._draw_route_edit_overlay()
+            self._update_route_edit_cursor(x, y)
             self.log_panel.info(
                 "路线端点已更新；相邻作业线与橙色调头弧线已重新衔接"
             )
@@ -2165,9 +2385,36 @@ class MainWindow(QMainWindow):
         return
 
     def _on_viewer_mouse_moved(self, x, y, buttons):
+        if (
+            self._route_edit_active
+            and self._route_drag_work_index >= 0
+            and (buttons & 1)
+            and self._route_drag_work_origin is not None
+            and self._route_drag_work_points is not None
+        ):
+            records = self._route_edit_work_records()
+            if self._route_drag_work_index < len(records):
+                record = records[self._route_drag_work_index]
+                dx = float(x) - float(self._route_drag_work_origin[0])
+                dy = float(y) - float(self._route_drag_work_origin[1])
+                points = list(self._route_drag_work_points)
+                for node_index in range(
+                    record["node_start"], record["node_end"] + 1
+                ):
+                    source = self._route_drag_work_points[node_index]
+                    points[node_index] = (
+                        float(source[0]) + dx,
+                        float(source[1]) + dy,
+                    )
+                self.state.path_points = points
+                self._draw_route_edit_dynamic_overlay(lightweight=True)
+            return
         if self._route_edit_active and self._route_drag_idx >= 0 and (buttons & 1):
             self._route_edit_move_point(self._route_drag_idx, (x, y), save_undo=False)
-            self._draw_route_edit_overlay()
+            self._draw_route_edit_dynamic_overlay(lightweight=True)
+            return
+        if self._route_edit_active and not buttons:
+            self._update_route_edit_cursor(x, y)
             return
         if getattr(self.state, "_drag_entry_exit", None) is not None and (buttons & 1):
             self._move_service_point_drag(x, y)
@@ -2510,7 +2757,10 @@ class MainWindow(QMainWindow):
         # Route editing uses the same direct-capture path as service markers.
         # drawing_mode otherwise treats a left drag as canvas panning.
         if self._route_edit_active:
-            return self._route_edit_nearest_node((x, y)) >= 0
+            if self._route_edit_nearest_node((x, y)) >= 0:
+                return True
+            edge_index = self._route_edit_nearest_edge((x, y))
+            return self._route_edit_work_index_for_edge(edge_index) >= 0
         if (
             self._show_mask_before
             or self._measure_tool
@@ -3334,7 +3584,7 @@ class MainWindow(QMainWindow):
 
     def _verify_scientific_provenance(self, path_result):
         """Verify every cached artifact against current inputs before export."""
-        from inference import INFERENCE_PIPELINE_VERSION
+        from inference import INFERENCE_PIPELINE_VERSION, build_inference_config
         from path_planner import PATH_PLANNING_VERSION
         from provenance import ProvenanceError, file_sha256, verify_stage_record
         from pyside6_app.workers import (
@@ -3369,13 +3619,10 @@ class MainWindow(QMainWindow):
         inference_inputs.update({
             "source_sha256": source_sha256,
             "model_sha256": model_sha256,
-            "inference_config": {
-                "capture_size": int(self.cfg.TILE_CAPTURE_SIZE),
-                "overlap": float(self.cfg.TILE_OVERLAP),
-                "conf": float(self.cfg.MODEL_CONF),
-                "iou": float(self.cfg.MODEL_IOU),
-                "batch_size": 4,
-            },
+            "inference_config": build_inference_config(
+                self.cfg,
+                getattr(self, "model_engine", None),
+            ),
             "preprocessing_config": self.cfg.section("raster_preprocessing"),
         })
         if str(inference_record.get("algorithm_version", "")) != INFERENCE_PIPELINE_VERSION:
@@ -3576,7 +3823,9 @@ class MainWindow(QMainWindow):
         validation = path_result.get("validation", {}) or {}
         manual_compatibility_route = bool(
             not formal
-            and validation.get("route_geometry_source") == "manual_control_edit"
+            and str(validation.get("route_geometry_source") or "").startswith(
+                "manual_control_edit"
+            )
         )
         if validation.get("validation_source") == "cache_snapshot" or not bool(
             validation.get("current_validation_complete", True)
@@ -4871,19 +5120,7 @@ class MainWindow(QMainWindow):
             self.image_view.set_image(self._tif_rgb)
         else:
             viewer.clear_overlays()
-        mask, mask_x, mask_y = self._normalise_mask_for_overlay(mask)
-        mask_result = getattr(self.state, 'mask_result', None) or {}
-        headland = mask_result.get("headland_mask") if isinstance(mask_result, dict) else None
-        if isinstance(headland, np.ndarray):
-            headland, headland_x, headland_y = self._normalise_mask_for_overlay(headland)
-            if headland.shape[:2] == mask.shape[:2]:
-                viewer.draw_mask_overlay(headland, headland_x, headland_y, color=(210, 230, 120))
-        uncertain = mask_result.get("uncertain_residual_mask") if isinstance(mask_result, dict) else None
-        if isinstance(uncertain, np.ndarray):
-            uncertain, uncertain_x, uncertain_y = self._normalise_mask_for_overlay(uncertain)
-            if uncertain.shape[:2] == mask.shape[:2]:
-                viewer.draw_mask_overlay(uncertain, uncertain_x, uncertain_y, color=(170, 170, 190))
-        viewer.draw_mask_overlay(mask, mask_x, mask_y)
+        self._draw_mask_evidence_layers(viewer, mask)
         boundary = getattr(self.state, 'field_boundary', [])
         if boundary and len(boundary) >= 3:
             for i in range(len(boundary)):
@@ -4892,6 +5129,41 @@ class MainWindow(QMainWindow):
                 viewer.draw_line(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]), color=FIELD_BOUNDARY_COLOR_BGR, width=2)
         self._draw_forbidden_regions(clear_first=False)
         self._draw_service_points_overlay(clear_first=False)
+
+    def _draw_mask_evidence_layers(self, viewer, mask=None):
+        """Draw current processed mask evidence without clearing other overlays."""
+        mask_result = getattr(self.state, "mask_result", None)
+        if mask is None and isinstance(mask_result, dict):
+            mask = mask_result.get("processed_mask")
+        if mask is None:
+            mask = getattr(self.state, "mask_raw", None)
+        if not isinstance(mask, np.ndarray):
+            return False
+        mask, mask_x, mask_y = self._normalise_mask_for_overlay(mask)
+        if isinstance(mask_result, dict):
+            headland = mask_result.get("headland_mask")
+            if isinstance(headland, np.ndarray):
+                headland, headland_x, headland_y = self._normalise_mask_for_overlay(
+                    headland
+                )
+                if headland.shape[:2] == mask.shape[:2]:
+                    viewer.draw_mask_overlay(
+                        headland, headland_x, headland_y, color=(210, 230, 120)
+                    )
+            uncertain = mask_result.get("uncertain_residual_mask")
+            if isinstance(uncertain, np.ndarray):
+                uncertain, uncertain_x, uncertain_y = self._normalise_mask_for_overlay(
+                    uncertain
+                )
+                if uncertain.shape[:2] == mask.shape[:2]:
+                    viewer.draw_mask_overlay(
+                        uncertain,
+                        uncertain_x,
+                        uncertain_y,
+                        color=(170, 170, 190),
+                    )
+        viewer.draw_mask_overlay(mask, mask_x, mask_y)
+        return True
 
     def _show_path(self, pr, stale_preview=False, route_projection=False):
         if self._tif_rgb is None:
@@ -4914,7 +5186,8 @@ class MainWindow(QMainWindow):
                 route_info,
                 tooltip=(
                     "连续规划轨迹用于模拟和理论评价，不是实测 GNSS 轨迹。"
-                    "红色虚线表示规划器没有得到满足运动学的曲线，不能伪装为正常弧线。"
+                    "未形成曲线的转弯先按端点直连显示，可进入路线编辑人工调整；"
+                    "红色段表示路径超出已确认田块边界；重新验证前不得作为机器执行路径。"
                 ),
             )
         self.image_view.set_image(self._tif_rgb)
@@ -4923,18 +5196,7 @@ class MainWindow(QMainWindow):
         mask_result = getattr(self.state, 'mask_result', None)
         disp_mask = mask_result.get("processed_mask", mask) if mask_result else mask
         if disp_mask is not None:
-            disp_mask, mask_x, mask_y = self._normalise_mask_for_overlay(disp_mask)
-            headland = mask_result.get("headland_mask") if isinstance(mask_result, dict) else None
-            if isinstance(headland, np.ndarray):
-                headland, headland_x, headland_y = self._normalise_mask_for_overlay(headland)
-                if headland.shape[:2] == disp_mask.shape[:2]:
-                    viewer.draw_mask_overlay(headland, headland_x, headland_y, color=(210, 230, 120))
-            uncertain = mask_result.get("uncertain_residual_mask") if isinstance(mask_result, dict) else None
-            if isinstance(uncertain, np.ndarray):
-                uncertain, uncertain_x, uncertain_y = self._normalise_mask_for_overlay(uncertain)
-                if uncertain.shape[:2] == disp_mask.shape[:2]:
-                    viewer.draw_mask_overlay(uncertain, uncertain_x, uncertain_y, color=(170, 170, 190))
-            viewer.draw_mask_overlay(disp_mask, mask_x, mask_y)
+            self._draw_mask_evidence_layers(viewer, disp_mask)
         boundary = getattr(self.state, 'field_boundary', [])
         if boundary and len(boundary) >= 3:
             for i in range(len(boundary)):
@@ -4946,40 +5208,31 @@ class MainWindow(QMainWindow):
         route_style = Qt.DashLine if stale_preview else Qt.SolidLine
         track_color = (150, 160, 170) if stale_preview else (0, 255, 70)
         turn_color = (190, 150, 90) if stale_preview else (70, 120, 255)
+        outside_field_color = (40, 40, 255)
+        display_boundary = boundary if len(boundary or []) >= 3 else None
         for t in pr.get("tracks", []):
             pts = self._coerce_points(t.get("points", []))
             if len(pts) > 1:
                 viewer.draw_polyline(
                     pts, color=track_color, width=4, style=route_style
                 )
-        invalid_straight_turns = []
         for t in pr.get("turns", []):
             pts = self._coerce_points(t.get("points", []))
             if len(pts) > 1:
-                is_invalid_straight = bool(
-                    not route_projection
-                    and not stale_preview
-                    and str(t.get("type") or "")
-                    in {"turn", "turn_reverse", "turn_aux"}
-                    and len(pts) <= 2
-                )
-                viewer.draw_polyline(
-                    pts,
-                    color=(40, 40, 255) if is_invalid_straight else turn_color,
-                    width=4 if is_invalid_straight else 3,
-                    style=Qt.DashLine if is_invalid_straight else route_style,
-                )
-                if is_invalid_straight:
-                    invalid_straight_turns.append(pts)
-        for points in invalid_straight_turns:
-            middle = points[len(points) // 2]
-            viewer.draw_text(
-                float(middle[0]) + 8.0,
-                float(middle[1]) + 8.0,
-                "不可行直连",
-                color=(40, 40, 255),
-                size=10,
-            )
+                # DECISION-010/012: the planner keeps the two-point fallback
+                # as an explicitly unverified direct connector.  Render that
+                # geometry as a solid, editable connection instead of a red
+                # dashed pseudo-error; its audit flag and export gate remain
+                # unchanged until the user adjusts and revalidates the route.
+                for piece, inside_field in self._split_polyline_by_field_boundary(
+                    pts, display_boundary
+                ):
+                    viewer.draw_polyline(
+                        piece,
+                        color=turn_color if inside_field else outside_field_color,
+                        width=3,
+                        style=route_style,
+                    )
         if stale_preview:
             label_point = None
             for item in pr.get("tracks", []) + pr.get("turns", []):
@@ -6043,29 +6296,267 @@ class MainWindow(QMainWindow):
     def _on_route_edit_requested(self):
         if self._route_edit_active:
             self._route_edit_active = False
+            self._route_edit_mode = "select"
+            self._route_new_line_start = None
             self._route_drag_idx = -1
+            self._route_drag_work_index = -1
             self._sync_drawing_mode()
             self._save_system_undo("退出路线编辑")
             self._sync_auto_path_from_editable_route()
             self._show_path((self._pipeline_result or {}).get("path", {}))
+            self.task_panel.set_route_editing_active(False)
             self.log_panel.info("已退出路线编辑")
             return
-        if not getattr(self.state, 'auto_path', None) and len(getattr(self.state, 'path_points', [])) < 2:
-            self.log_panel.info("尚无路线：可用 Alt+左键创建路线控制点。")
+        has_route = bool(
+            getattr(self.state, 'auto_path', None)
+            or len(getattr(self.state, 'path_points', [])) >= 2
+        )
+        if not has_route:
+            self.log_panel.info("尚无路线：请在画布依次点击第一条作业线的起点和终点。")
         if getattr(self.state, 'auto_path', None):
             self._prepare_route_editing()
         self._route_edit_active = True
+        self._route_edit_mode = "select" if has_route else "add_work"
+        self._route_new_line_start = None
         self._route_drag_idx = -1
+        self._route_drag_work_index = -1
         self.state.selected_type = None
         self.state.selected_idx = -1
         self.state.entry_exit_mode = False
         self._field_drawing = False
         self._sync_drawing_mode()
+        self.task_panel.set_route_editing_active(True)
+        self._refresh_route_edit_info_panel()
         self._draw_route_edit_overlay()
         self.log_panel.info(
-            "路线编辑：拖动橙色端点可修正缺失位置，相邻作业线与调头弧线会实时衔接；"
-            "Alt+左键在线段插点，Backspace 删除选中点"
+            "人工路线编辑已开启：画布点线会改变光标并可直接拖动；"
+            "下方路径结果可单击联动、右击编辑/验证并拖动作业线排序"
         )
+
+    def _on_route_edit_tool_requested(self, action):
+        """DECISION-019: dispatch visible work-line editing operations."""
+        action = str(action or "select")
+        if action in {"select", "add_work", "add_point"}:
+            self._route_edit_mode = action
+            self._route_new_line_start = None
+            self.task_panel.set_route_edit_mode(action)
+            labels = {
+                "select": "选择/拖动：点击端点自由移动，点击线段选择",
+                "add_work": "新增作业线：依次点击作业线起点和终点",
+                "add_point": "添加控制点：先选任意线段，再点击新控制点位置",
+            }
+            self.lbl_status.setText(labels[action])
+            self._draw_route_edit_overlay()
+            return
+
+        work_index = self._route_edit_selected_work_index()
+        edge_index = (
+            int(getattr(self.state, "selected_idx", -1))
+            if getattr(self.state, "selected_type", None) == "edge"
+            else -1
+        )
+        changed = False
+        if action == "delete_work":
+            changed = self._route_edit_delete_work_line(work_index)
+        elif action == "delete_point":
+            selected_node = (
+                int(getattr(self.state, "selected_idx", -1))
+                if getattr(self.state, "selected_type", None) == "node"
+                else -1
+            )
+            changed = self._route_edit_delete_point(selected_node)
+            if changed:
+                self._sync_auto_path_from_editable_route()
+        elif action == "move_earlier":
+            changed = self._route_edit_reorder_work_line(work_index, -1) != work_index
+        elif action == "move_later":
+            changed = self._route_edit_reorder_work_line(work_index, 1) != work_index
+        elif action == "reverse":
+            changed = self._route_edit_reverse_work_line(work_index)
+        elif action == "set_work":
+            changed = self._route_edit_set_edge_status(edge_index, 1)
+        elif action == "set_turn":
+            changed = self._route_edit_set_edge_status(edge_index, 0)
+        elif action == "toggle_status":
+            statuses = list(getattr(self.state, "path_status", []) or [])
+            if 0 <= edge_index < len(statuses):
+                selected_record = next(
+                    (
+                        record for record in self._route_edit_segment_records()
+                        if int(record["edge_start"]) <= edge_index
+                        <= int(record["edge_end"])
+                    ),
+                    None,
+                )
+                if selected_record is not None:
+                    changed = self._route_edit_set_segment_status(
+                        selected_record["edge_start"],
+                        selected_record["edge_end"],
+                        0 if int(statuses[edge_index]) == 1 else 1,
+                    )
+        elif action == "undo":
+            changed = bool(self.state.undo())
+            if changed:
+                self._sync_auto_path_from_editable_route()
+        elif action == "redo":
+            changed = bool(self.state.redo())
+            if changed:
+                self._sync_auto_path_from_editable_route()
+        elif action == "validate":
+            try:
+                validation = self._validate_manual_route()
+            except (TypeError, ValueError, RuntimeError) as exc:
+                self.log_panel.error(f"人工路线验证失败：{exc}")
+                self.lbl_status.setText("人工路线验证失败")
+            else:
+                issues = list(validation.get("issues") or [])
+                if validation.get("valid") is True:
+                    self.log_panel.success(
+                        "人工路线几何验证通过；正式科研导出仍保留人工来源标记"
+                    )
+                    self.lbl_status.setText("人工路线几何验证通过")
+                else:
+                    self.log_panel.error(
+                        "人工路线未通过验证：" + ("；".join(issues[:3]) or "未知原因")
+                    )
+                    self.lbl_status.setText("人工路线未通过验证")
+            self._draw_route_edit_overlay()
+            return
+
+        if changed:
+            self.log_panel.info("人工路线结构已更新，相邻转弯已重新衔接")
+        else:
+            self.log_panel.info("请先点击一条作业线或控制边")
+        self._draw_route_edit_overlay()
+
+    def _on_route_list_segment_selected(self, edge_start, edge_end):
+        """DECISION-019: list and canvas share the same selected route edge."""
+        if not self._route_edit_active:
+            return
+        points = list(getattr(self.state, "path_points", []) or [])
+        edge_start = int(edge_start)
+        if not 0 <= edge_start < len(points) - 1:
+            return
+        self.state.selected_type = "edge"
+        self.state.selected_idx = edge_start
+        self._route_edit_mode = "select"
+        self.task_panel.set_route_edit_mode("select")
+        self._draw_route_edit_overlay()
+        self.lbl_status.setText(
+            f"已从路径结果选中线段 {edge_start + 1}–{int(edge_end) + 1}"
+        )
+
+    def _route_edit_set_segment_status(self, edge_start, edge_end, status):
+        points = list(getattr(self.state, "path_points", []) or [])
+        edge_count = max(0, len(points) - 1)
+        first = max(0, int(edge_start))
+        last = min(edge_count - 1, int(edge_end))
+        if first > last:
+            return False
+        statuses = list(getattr(self.state, "path_status", []) or [])[:edge_count]
+        if len(statuses) < edge_count:
+            statuses.extend([1] * (edge_count - len(statuses)))
+        target = 1 if int(status) == 1 else 0
+        if all(int(statuses[index]) == target for index in range(first, last + 1)):
+            return False
+        self.state.save_route_undo(
+            "整段设为作业" if target == 1 else "整段设为转弯"
+        )
+        for index in range(first, last + 1):
+            statuses[index] = target
+        self.state.path_status = statuses
+        self.state.selected_type = "edge"
+        self.state.selected_idx = first
+        self._sync_auto_path_from_editable_route()
+        return True
+
+    def _on_route_list_edit_action(self, action, first, last):
+        """Apply a result-card edit to the authoritative control polyline."""
+        if not self._route_edit_active:
+            self.lbl_status.setText("请先点击“编辑路线”再修改路径结果")
+            return
+        action = str(action or "")
+        first, last = int(first), int(last)
+        changed = False
+        message = ""
+        if action == "validate_route":
+            self._on_route_edit_tool_requested("validate")
+            return
+        if action == "toggle_segment":
+            statuses = list(getattr(self.state, "path_status", []) or [])
+            if 0 <= first < len(statuses):
+                target = 0 if int(statuses[first]) == 1 else 1
+                changed = self._route_edit_set_segment_status(first, last, target)
+                message = "线段已切换为作业" if target == 1 else "线段已切换为转弯"
+        elif action == "add_waypoint":
+            points = list(getattr(self.state, "path_points", []) or [])
+            candidates = [
+                index for index in range(max(0, first), min(last, len(points) - 2) + 1)
+            ]
+            if candidates:
+                edge_index = max(
+                    candidates,
+                    key=lambda index: math.hypot(
+                        float(points[index + 1][0]) - float(points[index][0]),
+                        float(points[index + 1][1]) - float(points[index][1]),
+                    ),
+                )
+                midpoint = (
+                    0.5 * (float(points[edge_index][0]) + float(points[edge_index + 1][0])),
+                    0.5 * (float(points[edge_index][1]) + float(points[edge_index + 1][1])),
+                )
+                node_index = self._route_edit_insert_point(
+                    midpoint, preserve_position=True, edge_index=edge_index
+                )
+                self.state.selected_type = "node"
+                self.state.selected_idx = node_index
+                self._sync_auto_path_from_editable_route()
+                changed = True
+                message = f"已在线段中点添加航点 {node_index + 1}"
+        elif action == "delete_waypoint":
+            changed = self._route_edit_delete_point(first)
+            if changed:
+                self._sync_auto_path_from_editable_route()
+                message = f"已删除航点 {first + 1}"
+        elif action == "add_work_after":
+            work_index = self._route_edit_work_index_for_edge(first)
+            if work_index >= 0:
+                self.state.selected_type = "edge"
+                self.state.selected_idx = first
+                self._on_route_edit_tool_requested("add_work")
+                self.lbl_status.setText(
+                    f"将在第 {work_index + 1} 条作业线后新增：请在画布依次点击起点和终点"
+                )
+            return
+        elif action == "delete_work":
+            work_index = self._route_edit_work_index_for_edge(first)
+            changed = self._route_edit_delete_work_line(work_index)
+            if changed:
+                message = f"已删除第 {work_index + 1} 条作业线"
+        elif action == "reverse_work":
+            work_index = self._route_edit_work_index_for_edge(first)
+            changed = self._route_edit_reverse_work_line(work_index)
+            if changed:
+                message = f"已反向第 {work_index + 1} 条作业线"
+        if changed:
+            self._draw_route_edit_overlay()
+            self.lbl_status.setText(message)
+            self.log_panel.info(message + "；路径验证与导出证据已失效")
+        else:
+            self.lbl_status.setText("当前卡片操作无法执行")
+
+    def _on_route_list_work_reordered(self, source_work_index, target_work_index):
+        if not self._route_edit_active:
+            return
+        source = int(source_work_index)
+        target = int(target_work_index)
+        new_index = self._route_edit_reorder_work_line(source, target - source)
+        if new_index == target and source != target:
+            self._draw_route_edit_overlay()
+            self.lbl_status.setText(
+                f"作业线已从第 {source + 1} 位移动到第 {target + 1} 位"
+            )
+            self.log_panel.info("已按卡片拖拽顺序重建相邻转弯连接")
 
     def _build_route_control_polyline(self, segments):
         """Build the single compact polyline shared by editing and compat export.
@@ -6098,6 +6589,12 @@ class MainWindow(QMainWindow):
                 statuses.append(int(status))
             points.append(point)
 
+        def same_point(first, second):
+            return math.hypot(
+                float(first[0]) - float(second[0]),
+                float(first[1]) - float(second[1]),
+            ) <= 1e-5
+
         index = 0
         while index < len(route_segments):
             segment = route_segments[index]
@@ -6111,6 +6608,54 @@ class MainWindow(QMainWindow):
                 for point in simplify_work(source_points):
                     append_control_point(point, 1)
                 index += 1
+                continue
+
+            # DECISION-016/017: preserve a topology-critical full retrace of
+            # the immediately preceding harvested pass.  Collapsing this
+            # turn_reverse together with the following turn_aux would recreate
+            # an opposite-headland diagonal in the editor and machine file.
+            previous_work_points = []
+            if index > 0:
+                previous_segment = route_segments[index - 1]
+                previous_type = str(
+                    getattr(previous_segment, "segment_type", "") or "work"
+                )
+                if previous_type == "work":
+                    previous_work_points = simplify_work(
+                        self._coerce_points(
+                            getattr(previous_segment, "points", [])
+                        )
+                    )
+            current_points = self._coerce_points(
+                getattr(segment, "points", [])
+            )
+            preserves_harvested_retrace = bool(
+                segment_type == "turn_reverse"
+                and len(previous_work_points) >= 2
+                and len(current_points) >= 2
+                and same_point(current_points[0], previous_work_points[-1])
+                and same_point(current_points[-1], previous_work_points[0])
+            )
+            if preserves_harvested_retrace:
+                append_control_point(current_points[0], 0)
+                append_control_point(current_points[-1], 0)
+                index += 1
+                run_end = None
+                while index < len(route_segments):
+                    candidate = route_segments[index]
+                    candidate_type = str(
+                        getattr(candidate, "segment_type", "") or "work"
+                    )
+                    if candidate_type == "work":
+                        break
+                    candidate_points = self._coerce_points(
+                        getattr(candidate, "points", [])
+                    )
+                    if candidate_points:
+                        run_end = candidate_points[-1]
+                    index += 1
+                if run_end is not None:
+                    append_control_point(run_end, 0)
                 continue
 
             # Collapse turn/entry/exit/reverse runs as one compatibility chord.
@@ -6243,6 +6788,68 @@ class MainWindow(QMainWindow):
             st.selected_type = None
             st.selected_idx = -1
 
+    def _route_edit_segment_records(self):
+        """Describe status runs without creating a second route model."""
+        points = [
+            tuple(map(float, point))
+            for point in (getattr(self.state, "path_points", []) or [])
+        ]
+        control_segments, statuses = self._control_route_segments(
+            points, getattr(self.state, "path_status", [])
+        )
+        if not statuses:
+            return []
+        records = []
+        work_index = 0
+        turn_index = 0
+        edge_start = 0
+        current_status = int(statuses[0])
+        for edge_index in range(1, len(statuses) + 1):
+            run_finished = (
+                edge_index == len(statuses)
+                or int(statuses[edge_index]) != current_status
+            )
+            if not run_finished:
+                continue
+            segment_index = len(records)
+            edge_end = edge_index - 1
+            record_work_index = work_index if current_status == 1 else -1
+            if current_status == 1:
+                work_index += 1
+                display_number = work_index
+            else:
+                turn_index += 1
+                display_number = turn_index
+            length_m = (
+                float(control_segments[segment_index].length_m)
+                if segment_index < len(control_segments)
+                else 0.0
+            )
+            records.append({
+                "segment_index": segment_index,
+                "type": "work" if current_status == 1 else "turn",
+                "status": current_status,
+                "edge_start": edge_start,
+                "edge_end": edge_end,
+                "node_start": edge_start,
+                "node_end": edge_index,
+                "work_index": record_work_index,
+                "display_number": display_number,
+                "length_m": length_m,
+                "point_count": edge_index - edge_start + 1,
+            })
+            if edge_index < len(statuses):
+                edge_start = edge_index
+                current_status = int(statuses[edge_index])
+        return records
+
+    def _refresh_route_edit_info_panel(self):
+        self.route_info.update_editable_route(self._route_edit_segment_records())
+        self.route_info.set_edit_selection(
+            getattr(self.state, "selected_type", None),
+            getattr(self.state, "selected_idx", -1),
+        )
+
     def _simulation_segments_from_control_route(self, control_segments):
         """Expand compact turn chords for the virtual-machine preview only.
 
@@ -6321,6 +6928,13 @@ class MainWindow(QMainWindow):
             if segment_type != "turn" or len(points) < 2:
                 result.append(segment)
                 continue
+            if len(points) > 2:
+                # DECISION-019: a turn with explicit intermediate control
+                # points is operator-authored canonical geometry.  Only a
+                # two-endpoint status-0 chord requests automatic turn-curve
+                # reconstruction; never discard the operator's waypoints.
+                result.append(segment)
+                continue
 
             start = point_value(points[0])
             end = point_value(points[-1])
@@ -6386,6 +7000,10 @@ class MainWindow(QMainWindow):
             st.auto_path_segments = []
             st.auto_path_geo = []
             st.auto_path_planned = False
+            if self._route_edit_active:
+                self._refresh_route_edit_info_panel()
+            else:
+                self.route_info.update_from_auto_path([])
             return
         segments, statuses = self._control_route_segments(
             points, getattr(st, "path_status", [])
@@ -6461,14 +7079,405 @@ class MainWindow(QMainWindow):
             "control_segment_types": control_segment_types,
             "control_geo_points": control_geo_points,
         }
-        self._pipeline_result = {"path": self._normalise_path_result(path_result)}
+        pipeline_result = dict(self._pipeline_result or {})
+        pipeline_result["path"] = self._normalise_path_result(path_result)
+        self._pipeline_result = pipeline_result
+        if self._route_edit_active:
+            self._refresh_route_edit_info_panel()
+        else:
+            self.route_info.update_from_auto_path(st.auto_path)
+
+    def _validate_manual_route(self):
+        """DECISION-019: formally recompute metrics for current manual geometry.
+
+        Manual validation uses the same footprint/path validator and semantic
+        masks as automatic planning.  It certifies the current geometry only;
+        automatic planning provenance remains cleared and the manual source is
+        explicit in validation and manifest data.
+        """
+        self._sync_auto_path_from_editable_route()
+        st = self.state
+        mask_result = getattr(st, "mask_result", None)
+        if not isinstance(mask_result, dict):
+            raise ValueError("缺少当前掩膜处理结果，不能验证人工路线")
+        processed_mask = mask_result.get("processed_mask")
+        if not isinstance(processed_mask, np.ndarray):
+            raise ValueError("缺少处理后作物掩膜，不能验证人工路线")
+        if not self.geo.is_ready():
+            raise ValueError("当前影像没有可靠地理配准，不能进行米制路线验证")
+        simulation_segments = list(getattr(st, "auto_path", []) or [])
+        if not simulation_segments:
+            raise ValueError("当前没有人工路线")
+
+        offset_x = float(getattr(st, "mask_offset_x", 0) or 0)
+        offset_y = float(getattr(st, "mask_offset_y", 0) or 0)
+        local_path = [
+            [
+                (
+                    float(point.pixel_x) - offset_x,
+                    float(point.pixel_y) - offset_y,
+                )
+                for point in list(getattr(segment, "points", []) or [])
+            ]
+            for segment in simulation_segments
+        ]
+        segment_types = [
+            str(getattr(segment, "segment_type", "") or "work")
+            for segment in simulation_segments
+        ]
+        if any(len(segment) < 2 for segment in local_path):
+            raise ValueError("人工路线包含少于两个点的退化路径段")
+
+        from path_planner import build_band_mask, validate_path
+        from pyside6_app.workers import (
+            path_planning_config_snapshot,
+            planning_config_with_mask_evidence,
+        )
+
+        config = path_planning_config_snapshot()
+        config = planning_config_with_mask_evidence(
+            config, mask_result, st, processed_mask.shape
+        )
+        wide_bands = list(mask_result.get("wide_bands") or [])
+        planned_mask = build_band_mask(processed_mask.shape, wide_bands)
+        detected_mask = (
+            getattr(st, "inference_original_mask", None)
+            if isinstance(getattr(st, "inference_original_mask", None), np.ndarray)
+            else getattr(st, "mask_raw", None)
+        )
+        min_turn_radius_m = float(
+            self._effective_harvester_params(
+                getattr(st, "harvester_params", {}) or {}
+            ).get("turn_radius_m", self.cfg.TURN_RADIUS_M)
+        )
+        validation = validate_path(
+            local_path,
+            processed_mask,
+            float(mask_result.get("main_angle", 0.0) or 0.0),
+            geo=self.geo,
+            state=st,
+            min_turn_radius_m=min_turn_radius_m,
+            config=config,
+            segment_types=segment_types,
+            detected_mask=detected_mask,
+            planned_mask=planned_mask,
+        )
+        minimum_observed_radius_m = self._manual_route_minimum_turn_radius_m(
+            local_path, segment_types, processed_mask
+        )
+        validation["manual_minimum_observed_turn_radius_m"] = (
+            minimum_observed_radius_m
+        )
+        validation["manual_required_turn_radius_m"] = min_turn_radius_m
+        if (
+            minimum_observed_radius_m is not None
+            and minimum_observed_radius_m + 0.05 < min_turn_radius_m
+        ):
+            issues = list(validation.get("issues") or [])
+            issues.append(
+                "人工转弯局部曲率半径 "
+                f"{minimum_observed_radius_m:.2f}m < {min_turn_radius_m:.2f}m"
+            )
+            validation["issues"] = issues
+            validation["valid"] = False
+        validation.update({
+            "route_geometry_source": "manual_control_edit_validated",
+            "manual_route_validated": True,
+            "automatic_planning_provenance_valid": False,
+            "current_validation_complete": True,
+        })
+        st.auto_path_valid = bool(validation.get("valid") is True)
+        st.path_validation = dict(validation)
+        st.auto_path_desc = (
+            "人工路线已按当前掩膜、农机、田界和禁行区完成几何验证"
+            if st.auto_path_valid
+            else "人工路线已验证，但存在需要处理的几何或安全问题"
+        )
+        st.path_provenance = {}
+        st.path_runtime = {
+            "route_geometry_source": "manual_control_edit_validated"
+        }
+        st.path_artifact = {
+            "manual_route": {
+                "schema": "reui.manual-route.v1",
+                "work_line_count": len(self._route_edit_work_records()),
+                "control_point_count": len(getattr(st, "path_points", []) or []),
+                "control_status": list(getattr(st, "path_status", []) or []),
+                "automatic_planning_provenance_valid": False,
+            }
+        }
+        metric_state_fields = {
+            "last_rolling_rate": "rolling_canopy_pct",
+            "last_crop_mask_geometric_coverage_pct": "crop_mask_geometric_coverage_pct",
+            "last_planned_target_geometric_coverage_pct": "planned_target_geometric_coverage_pct",
+            "last_detected_mask_geometric_coverage_pct": "detected_mask_geometric_coverage_pct",
+            "last_field_efficiency": "field_efficiency_pct",
+            "last_total_path_m": "total_length_m",
+            "last_work_path_m": "work_length_m",
+            "last_turn_path_m": "turn_length_m",
+            "last_entry_exit_path_m": "entry_exit_length_m",
+        }
+        for state_name, metric_name in metric_state_fields.items():
+            value = validation.get(metric_name)
+            if value is not None and math.isfinite(float(value)):
+                setattr(st, state_name, float(value))
+
+        path_result = dict((self._pipeline_result or {}).get("path") or {})
+        path_result.update({
+            "validation": dict(validation),
+            "is_valid": bool(validation.get("valid") is True),
+            "description": st.auto_path_desc,
+            "manual_route_edited": True,
+            "manual_route_validated": True,
+            "manual_route": dict(st.path_artifact["manual_route"]),
+        })
+        pipeline_result = dict(self._pipeline_result or {})
+        pipeline_result["path"] = self._normalise_path_result(path_result)
+        self._pipeline_result = pipeline_result
         self.route_info.update_from_auto_path(st.auto_path)
+        return validation
+
+    def _manual_route_minimum_turn_radius_m(self, full_path, segment_types,
+                                            processed_mask):
+        """Estimate the smallest circumradius across manual turn geometry."""
+        try:
+            from row_geometry import meters_per_pixel
+            mpp = float(meters_per_pixel(processed_mask, self.geo, self.state))
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        if not math.isfinite(mpp) or mpp <= 0.0:
+            return None
+
+        radii = []
+        for index, (segment, segment_type) in enumerate(
+            zip(full_path or [], segment_types or [])
+        ):
+            if not str(segment_type).startswith("turn") or len(segment) < 2:
+                continue
+            points = [tuple(map(float, point)) for point in segment]
+            if index > 0 and len(full_path[index - 1]) >= 2:
+                points.insert(0, tuple(map(float, full_path[index - 1][-2])))
+            if index + 1 < len(full_path) and len(full_path[index + 1]) >= 2:
+                points.append(tuple(map(float, full_path[index + 1][1])))
+            compact = []
+            for point in points:
+                if not compact or math.hypot(
+                    point[0] - compact[-1][0], point[1] - compact[-1][1]
+                ) > 1e-7:
+                    compact.append(point)
+            for first, middle, last in zip(
+                compact, compact[1:], compact[2:]
+            ):
+                a = math.hypot(
+                    middle[0] - first[0], middle[1] - first[1]
+                )
+                b = math.hypot(last[0] - middle[0], last[1] - middle[1])
+                c = math.hypot(last[0] - first[0], last[1] - first[1])
+                double_area = abs(
+                    (middle[0] - first[0]) * (last[1] - first[1])
+                    - (middle[1] - first[1]) * (last[0] - first[0])
+                )
+                if min(a, b, c) <= 1e-7 or double_area <= 1e-9:
+                    continue
+                radius_px = (a * b * c) / (2.0 * double_area)
+                if math.isfinite(radius_px) and radius_px > 0.0:
+                    radii.append(radius_px * mpp)
+        return float(min(radii)) if radii else None
 
     def _route_segment_from_points(self, points, status, status_to_type):
         segment = AutoPathSegment(status=int(status), segment_type=status_to_type.get(int(status), "work"))
         segment.points = [PathPoint(float(x), float(y)) for x, y in points]
         segment.length_m = sum(self.geo.pixel_distance_m(points[index - 1], points[index]) if self.geo.is_ready() else math.hypot(points[index][0] - points[index - 1][0], points[index][1] - points[index - 1][1]) for index in range(1, len(points)))
         return segment
+
+    def _route_edit_work_records(self):
+        """Return work-line objects derived from the shared 0/1 control route.
+
+        DECISION-019 keeps one authoritative serialized control route, but the
+        editor presents contiguous status-1 runs as first-class work lines.
+        Edge and node indexes are retained so endpoint and whole-line edits can
+        update the flat contract without maintaining a second hidden route.
+        """
+        points = [
+            tuple(map(float, point))
+            for point in (getattr(self.state, "path_points", []) or [])
+        ]
+        edge_count = max(0, len(points) - 1)
+        statuses = []
+        for value in list(getattr(self.state, "path_status", []) or [])[:edge_count]:
+            try:
+                statuses.append(1 if int(value) == 1 else 0)
+            except (TypeError, ValueError):
+                statuses.append(0)
+        if len(statuses) < edge_count:
+            statuses.extend([1] * (edge_count - len(statuses)))
+
+        records = []
+        edge_index = 0
+        while edge_index < edge_count:
+            if statuses[edge_index] != 1:
+                edge_index += 1
+                continue
+            start_edge = edge_index
+            work_points = [points[edge_index]]
+            while edge_index < edge_count and statuses[edge_index] == 1:
+                work_points.append(points[edge_index + 1])
+                edge_index += 1
+            records.append({
+                "work_index": len(records),
+                "edge_start": start_edge,
+                "edge_end": edge_index - 1,
+                "node_start": start_edge,
+                "node_end": edge_index,
+                "points": work_points,
+            })
+        return records
+
+    def _route_edit_work_index_for_edge(self, edge_index):
+        for record in self._route_edit_work_records():
+            if record["edge_start"] <= edge_index <= record["edge_end"]:
+                return int(record["work_index"])
+        return -1
+
+    def _route_edit_selected_work_index(self):
+        selected_type = getattr(self.state, "selected_type", None)
+        selected_raw = getattr(self.state, "selected_idx", -1)
+        try:
+            selected_index = int(selected_raw)
+        except (TypeError, ValueError):
+            selected_index = -1
+        if selected_type == "edge":
+            return self._route_edit_work_index_for_edge(selected_index)
+        if selected_type == "node":
+            records = self._route_edit_work_records()
+            for record in records:
+                if record["node_start"] <= selected_index <= record["node_end"]:
+                    return int(record["work_index"])
+        return -1
+
+    def _route_edit_replace_work_lines(self, work_lines, selected_work_index=-1):
+        """Replace route topology from ordered work lines and local turn chords."""
+        points = []
+        statuses = []
+        for line in work_lines or []:
+            line_points = [tuple(map(float, point)) for point in line or []]
+            if len(line_points) < 2:
+                continue
+            if not points:
+                points.extend(line_points)
+                statuses.extend([1] * (len(line_points) - 1))
+                continue
+            # A structural order change deliberately regenerates only the
+            # local connector between consecutive work lines.  The two-point
+            # status-0 chord is expanded to a physical curve for the canvas.
+            points.append(line_points[0])
+            statuses.append(0)
+            for point in line_points[1:]:
+                points.append(point)
+                statuses.append(1)
+        self.state.path_points = points
+        self.state.path_status = statuses[: max(0, len(points) - 1)]
+        self.state.selected_type = None
+        self.state.selected_idx = -1
+        records = self._route_edit_work_records()
+        if 0 <= selected_work_index < len(records):
+            record = records[selected_work_index]
+            self.state.selected_type = "edge"
+            self.state.selected_idx = int(record["edge_start"])
+        self._sync_auto_path_from_editable_route()
+
+    def _route_edit_add_work_line(self, start, end, after_work_index=None,
+                                  save_undo=True):
+        start = (float(start[0]), float(start[1]))
+        end = (float(end[0]), float(end[1]))
+        if math.hypot(end[0] - start[0], end[1] - start[1]) <= 1e-6:
+            return -1
+        records = self._route_edit_work_records()
+        lines = [list(record["points"]) for record in records]
+        if after_work_index is None:
+            selected = self._route_edit_selected_work_index()
+            after_work_index = selected if selected >= 0 else len(lines) - 1
+        insert_index = max(0, min(len(lines), int(after_work_index) + 1))
+        if save_undo:
+            self.state.save_route_undo("新增作业线")
+        lines.insert(insert_index, [start, end])
+        self._route_edit_replace_work_lines(lines, insert_index)
+        return insert_index
+
+    def _route_edit_delete_work_line(self, work_index, save_undo=True):
+        records = self._route_edit_work_records()
+        if not (0 <= int(work_index) < len(records)):
+            return False
+        if save_undo:
+            self.state.save_route_undo("删除作业线")
+        lines = [list(record["points"]) for record in records]
+        lines.pop(int(work_index))
+        selected = min(int(work_index), len(lines) - 1)
+        self._route_edit_replace_work_lines(lines, selected)
+        return True
+
+    def _route_edit_translate_work_line(self, work_index, delta,
+                                        save_undo=True):
+        records = self._route_edit_work_records()
+        if not (0 <= int(work_index) < len(records)):
+            return False
+        if save_undo:
+            self.state.save_route_undo("整条作业线平移")
+        dx, dy = float(delta[0]), float(delta[1])
+        points = list(getattr(self.state, "path_points", []) or [])
+        record = records[int(work_index)]
+        for node_index in range(record["node_start"], record["node_end"] + 1):
+            point = points[node_index]
+            points[node_index] = (float(point[0]) + dx, float(point[1]) + dy)
+        self.state.path_points = points
+        self.state.selected_type = "edge"
+        self.state.selected_idx = int(record["edge_start"])
+        if save_undo:
+            self._sync_auto_path_from_editable_route()
+        return True
+
+    def _route_edit_reverse_work_line(self, work_index, save_undo=True):
+        records = self._route_edit_work_records()
+        if not (0 <= int(work_index) < len(records)):
+            return False
+        if save_undo:
+            self.state.save_route_undo("作业线反向")
+        lines = [list(record["points"]) for record in records]
+        lines[int(work_index)] = list(reversed(lines[int(work_index)]))
+        self._route_edit_replace_work_lines(lines, int(work_index))
+        return True
+
+    def _route_edit_reorder_work_line(self, work_index, offset, save_undo=True):
+        records = self._route_edit_work_records()
+        source = int(work_index)
+        target = source + int(offset)
+        if not (0 <= source < len(records) and 0 <= target < len(records)):
+            return source if 0 <= source < len(records) else -1
+        if save_undo:
+            self.state.save_route_undo("调整作业顺序")
+        lines = [list(record["points"]) for record in records]
+        line = lines.pop(source)
+        lines.insert(target, line)
+        self._route_edit_replace_work_lines(lines, target)
+        return target
+
+    def _route_edit_set_edge_status(self, edge_index, status, save_undo=True):
+        points = list(getattr(self.state, "path_points", []) or [])
+        if not (0 <= int(edge_index) < len(points) - 1):
+            return False
+        if save_undo:
+            self.state.save_route_undo(
+                "设为作业边" if int(status) == 1 else "设为转弯边"
+            )
+        statuses = list(getattr(self.state, "path_status", []) or [])
+        if len(statuses) < len(points) - 1:
+            statuses.extend([1] * (len(points) - 1 - len(statuses)))
+        statuses[int(edge_index)] = 1 if int(status) == 1 else 0
+        self.state.path_status = statuses[: len(points) - 1]
+        self.state.selected_type = "edge"
+        self.state.selected_idx = int(edge_index)
+        self._sync_auto_path_from_editable_route()
+        return True
 
     def _route_edit_nearest_node(self, point, threshold=12.0):
         # Mouse coordinates arrive in scene/image units.  Convert the desired
@@ -6492,7 +7501,34 @@ class MainWindow(QMainWindow):
                 best_dist = dist
         return best_idx if best_dist <= threshold else -1
 
-    def _route_edit_insert_point(self, point, save_undo=True):
+    def _route_edit_nearest_edge(self, point, threshold=10.0):
+        try:
+            transform = self.image_view.viewer.transform()
+            view_scale = math.hypot(
+                float(transform.m11()), float(transform.m12())
+            )
+            if math.isfinite(view_scale) and view_scale > 1e-6:
+                threshold = float(threshold) / view_scale
+        except (AttributeError, TypeError, ValueError):
+            threshold = float(threshold)
+        points = list(getattr(self.state, "path_points", []) or [])
+        best_index = -1
+        best_distance = float("inf")
+        for index in range(len(points) - 1):
+            projected = self._project_point_to_segment(
+                point, points[index], points[index + 1]
+            )
+            distance = math.hypot(
+                float(point[0]) - projected[0],
+                float(point[1]) - projected[1],
+            )
+            if distance < best_distance:
+                best_index = index
+                best_distance = distance
+        return best_index if best_distance <= threshold else -1
+
+    def _route_edit_insert_point(self, point, save_undo=True,
+                                 preserve_position=False, edge_index=None):
         points = list(getattr(self.state, 'path_points', []) or [])
         if save_undo:
             self.state.save_route_undo("路线插点")
@@ -6506,7 +7542,10 @@ class MainWindow(QMainWindow):
         best_index = 0
         best_distance = float("inf")
         best_point = point
-        for index in range(len(points) - 1):
+        candidate_indices = range(len(points) - 1)
+        if edge_index is not None and 0 <= int(edge_index) < len(points) - 1:
+            candidate_indices = [int(edge_index)]
+        for index in candidate_indices:
             projected = self._project_point_to_segment(point, points[index], points[index + 1])
             distance = math.hypot(point[0] - projected[0], point[1] - projected[1])
             if distance < best_distance:
@@ -6514,7 +7553,7 @@ class MainWindow(QMainWindow):
                 best_distance = distance
                 best_point = projected
         insert_at = best_index + 1
-        points.insert(insert_at, best_point)
+        points.insert(insert_at, point if preserve_position else best_point)
         statuses = list(getattr(self.state, 'path_status', []) or [])
         edge_status = statuses[best_index] if best_index < len(statuses) else 1
         statuses.insert(insert_at, edge_status)
@@ -6565,17 +7604,87 @@ class MainWindow(QMainWindow):
         return ax + t * dx, ay + t * dy
 
     def _handle_route_edit_press(self, x, y, button):
+        if button == 2:
+            self._route_new_line_start = None
+            self._route_drag_work_index = -1
+            self._draw_route_edit_overlay()
+            self.lbl_status.setText("已取消当前人工绘制操作")
+            return True
         if button != 1:
             return False
         point = (float(x), float(y))
         modifiers = QGuiApplication.keyboardModifiers()
+        if self._route_edit_mode == "add_work":
+            if self._route_new_line_start is None:
+                self._route_new_line_start = point
+                self.lbl_status.setText("已确定作业线起点，请点击终点；右键取消")
+            else:
+                inserted = self._route_edit_add_work_line(
+                    self._route_new_line_start, point
+                )
+                self._route_new_line_start = None
+                if inserted >= 0:
+                    self.lbl_status.setText(
+                        f"已新增第 {inserted + 1} 条作业线，可继续绘制下一条"
+                    )
+                else:
+                    self.lbl_status.setText("作业线过短，请重新点击起点和终点")
+            self._draw_route_edit_overlay()
+            return True
+        if self._route_edit_mode == "add_point":
+            statuses = list(getattr(self.state, "path_status", []) or [])
+            selected_edge = (
+                int(getattr(self.state, "selected_idx", -1))
+                if getattr(self.state, "selected_type", None) == "edge"
+                else -1
+            )
+            nearest_edge = self._route_edit_nearest_edge(point)
+            target_edge = (
+                selected_edge
+                if 0 <= selected_edge < len(statuses)
+                else nearest_edge
+            )
+            if not 0 <= target_edge < len(statuses):
+                self.lbl_status.setText("请先点击选择一条作业或转弯线段")
+                return True
+            index = self._route_edit_insert_point(
+                point, preserve_position=True, edge_index=target_edge
+            )
+            self.state.selected_type = "node"
+            self.state.selected_idx = index
+            self._sync_auto_path_from_editable_route()
+            self._draw_route_edit_overlay()
+            self.lbl_status.setText("已按点击位置添加控制点，线段模式保持不变")
+            return True
         if modifiers & Qt.AltModifier:
-            index = self._route_edit_insert_point(point)
+            nearest_edge = self._route_edit_nearest_edge(point)
+            statuses = list(getattr(self.state, "path_status", []) or [])
+            selected_edge = (
+                int(getattr(self.state, "selected_idx", -1))
+                if getattr(self.state, "selected_type", None) == "edge"
+                else -1
+            )
+            target_edge = (
+                selected_edge
+                if 0 <= selected_edge < len(statuses)
+                and int(statuses[selected_edge]) == 0
+                else nearest_edge
+            )
+            preserve_position = bool(
+                0 <= target_edge < len(statuses)
+                and int(statuses[target_edge]) == 0
+            )
+            index = self._route_edit_insert_point(
+                point,
+                preserve_position=preserve_position,
+                edge_index=target_edge if preserve_position else None,
+            )
             self.state.selected_type = 'node'
             self.state.selected_idx = index
             self._sync_auto_path_from_editable_route()
             self._draw_route_edit_overlay()
             return True
+        edge_index = self._route_edit_nearest_edge(point)
         idx = self._route_edit_nearest_node(point)
         if idx >= 0:
             self.state.save_route_undo("移动路线点")
@@ -6583,13 +7692,54 @@ class MainWindow(QMainWindow):
             self.state.selected_type = 'node'
             self.state.selected_idx = idx
             return True
+        work_index = self._route_edit_work_index_for_edge(edge_index)
+        if work_index >= 0:
+            self.state.save_route_undo("整条作业线平移")
+            self._route_drag_work_index = work_index
+            self._route_drag_work_origin = point
+            self._route_drag_work_points = list(
+                getattr(self.state, "path_points", []) or []
+            )
+            record = self._route_edit_work_records()[work_index]
+            self.state.selected_type = "edge"
+            self.state.selected_idx = int(record["edge_start"])
+            return True
+        if edge_index >= 0:
+            self.state.selected_type = "edge"
+            self.state.selected_idx = int(edge_index)
+            self._draw_route_edit_overlay()
+            return True
         return False
 
     def _draw_route_edit_overlay(self):
         viewer = self.image_view.viewer
         viewer.clear_overlays()
+        self._route_edit_dynamic_items = []
+        self._service_point_overlay_items = []
         if self._tif_rgb is not None and getattr(viewer, "_pixmap", None) is None:
             self.image_view.set_image(self._tif_rgb)
+        # DECISION-019: route editing is an additive view over the completed
+        # processing evidence. Never clear the body/headland/uncertain masks,
+        # field boundary or forbidden regions just because edit controls open.
+        self._draw_mask_evidence_layers(viewer)
+        boundary = getattr(self.state, "field_boundary", []) or []
+        if len(boundary) >= 3:
+            for index, first in enumerate(boundary):
+                second = boundary[(index + 1) % len(boundary)]
+                viewer.draw_line(
+                    first[0], first[1], second[0], second[1],
+                    color=FIELD_BOUNDARY_COLOR_BGR, width=4,
+                )
+        self._draw_forbidden_regions(clear_first=False)
+        self._draw_service_points_overlay(clear_first=False)
+        self._draw_route_edit_dynamic_overlay(lightweight=False)
+
+    def _draw_route_edit_dynamic_overlay(self, *, lightweight=False):
+        """Replace only the route graphics while a control point is dragged."""
+        viewer = self.image_view.viewer
+        viewer.remove_overlays(self._route_edit_dynamic_items)
+        self._route_edit_dynamic_items = []
+        overlay_start = len(viewer._overlay_group)
         points = list(getattr(self.state, 'path_points', []) or [])
         statuses = list(getattr(self.state, 'path_status', []) or [])
         control_segments, _normalised_statuses = self._control_route_segments(
@@ -6613,12 +7763,89 @@ class MainWindow(QMainWindow):
                 color=(0, 255, 70) if is_work else (70, 120, 255),
                 width=4 if is_work else 3,
             )
+        selected_work_index = self._route_edit_selected_work_index()
+        work_records = self._route_edit_work_records()
+        if 0 <= selected_work_index < len(work_records):
+            selected_points = work_records[selected_work_index]["points"]
+            viewer.draw_polyline(
+                selected_points,
+                color=(255, 255, 255),
+                width=7,
+            )
+        elif getattr(self.state, "selected_type", None) == "edge":
+            edge_index = int(getattr(self.state, "selected_idx", -1))
+            selected_record = next(
+                (
+                    record for record in self._route_edit_segment_records()
+                    if int(record["edge_start"]) <= edge_index
+                    <= int(record["edge_end"])
+                ),
+                None,
+            )
+            if selected_record is not None:
+                node_start = int(selected_record["node_start"])
+                node_end = int(selected_record["node_end"])
+                viewer.draw_polyline(
+                    points[node_start:node_end + 1],
+                    color=(255, 255, 255),
+                    width=6,
+                )
+        if not lightweight and len(work_records) <= 30:
+            for record in work_records:
+                start, end = record["points"][0], record["points"][-1]
+                midpoint = (
+                    0.5 * (float(start[0]) + float(end[0])),
+                    0.5 * (float(start[1]) + float(end[1])),
+                )
+                viewer.draw_text(
+                    midpoint[0] + 6,
+                    midpoint[1] - 6,
+                    f"作业{record['work_index'] + 1}",
+                    color=(255, 255, 255),
+                    size=10,
+                )
         for index, point in enumerate(points):
             selected = getattr(self.state, 'selected_type', None) == 'node' and getattr(self.state, 'selected_idx', -1) == index
             viewer.draw_circle(point[0], point[1], radius=8 if selected else 6, color=(255, 255, 255) if selected else (255, 120, 0))
-            if len(points) <= 30:
+            if not lightweight and len(points) <= 30:
                 viewer.draw_text(point[0] + 8, point[1] - 8, str(index + 1), color=(245, 245, 245), size=10)
-        self._draw_service_points_overlay(clear_first=False)
+        if not lightweight:
+            self.route_info.set_edit_selection(
+                getattr(self.state, "selected_type", None),
+                getattr(self.state, "selected_idx", -1),
+            )
+        if self._route_new_line_start is not None:
+            viewer.draw_circle(
+                self._route_new_line_start[0],
+                self._route_new_line_start[1],
+                radius=9,
+                color=(0, 255, 255),
+            )
+            viewer.draw_text(
+                self._route_new_line_start[0] + 10,
+                self._route_new_line_start[1] - 10,
+                "新作业线起点",
+                color=(0, 255, 255),
+                size=10,
+            )
+        self._route_edit_dynamic_items = list(
+            viewer._overlay_group[overlay_start:]
+        )
+
+    def _update_route_edit_cursor(self, x, y):
+        if not self._route_edit_active:
+            return
+        viewer = self.image_view.viewer
+        if self._route_drag_idx >= 0 or self._route_drag_work_index >= 0:
+            viewer.setCursor(Qt.ClosedHandCursor)
+        elif self._route_edit_mode in {"add_work", "add_point"}:
+            viewer.setCursor(Qt.CrossCursor)
+        elif self._route_edit_nearest_node((x, y)) >= 0:
+            viewer.setCursor(Qt.SizeAllCursor)
+        elif self._route_edit_nearest_edge((x, y)) >= 0:
+            viewer.setCursor(Qt.PointingHandCursor)
+        else:
+            viewer.setCursor(Qt.ArrowCursor)
 
     def _sync_drawing_mode(self):
         active = (
@@ -6629,7 +7856,18 @@ class MainWindow(QMainWindow):
             or self._route_edit_active
         )
         self.image_view.viewer.drawing_mode = active
-        self.image_view.viewer.setCursor(Qt.CrossCursor if active else Qt.ArrowCursor)
+        if self._route_edit_active and not (
+            self._field_drawing or self._forbidden_drawing or self._measure_tool
+            or getattr(self.state, 'entry_exit_mode', False)
+        ):
+            cursor = (
+                Qt.CrossCursor
+                if self._route_edit_mode in {"add_work", "add_point"}
+                else Qt.ArrowCursor
+            )
+        else:
+            cursor = Qt.CrossCursor if active else Qt.ArrowCursor
+        self.image_view.viewer.setCursor(cursor)
         if self._field_drawing:
             self.lbl_status.setText("请先完成影像导入和田块圈选")
         elif self._forbidden_drawing:
@@ -6643,8 +7881,13 @@ class MainWindow(QMainWindow):
         elif getattr(self.state, 'entry_exit_mode', False):
             self.lbl_status.setText("服务点编辑：起点必选，终点与卸粮点可选")
         elif self._route_edit_active:
+            labels = {
+                "select": "路线编辑：选择线段或拖动端点；Shift+拖动作业线可整线平移",
+                "add_work": "新增作业线：依次点击起点和终点；右键取消当前起点",
+                "add_point": "添加控制点：先选择任意线段，再点击新的控制点位置",
+            }
             self.lbl_status.setText(
-                "路线编辑：拖动橙色端点，调头弧线实时衔接；Alt+左键插点，Backspace 删除"
+                labels.get(self._route_edit_mode, labels["select"])
             )
         else:
             self.lbl_status.setText("就绪")
@@ -6699,13 +7942,54 @@ class MainWindow(QMainWindow):
             self.event_bridge.handle_pending_action()
 
     def keyPressEvent(self, event):
+        if self._route_edit_active:
+            modifiers = event.modifiers()
+            key = event.key()
+            if modifiers & Qt.ControlModifier and key in (Qt.Key_Z, Qt.Key_Y):
+                self._on_route_edit_tool_requested("undo" if key == Qt.Key_Z else "redo")
+                event.accept()
+                return
+            if modifiers & Qt.ControlModifier and key in (Qt.Key_Up, Qt.Key_Down):
+                self._on_route_edit_tool_requested(
+                    "move_earlier" if key == Qt.Key_Up else "move_later"
+                )
+                event.accept()
+                return
+            if not (modifiers & Qt.ControlModifier) and key == Qt.Key_R:
+                self._on_route_edit_tool_requested("reverse")
+                event.accept()
+                return
         if self._route_edit_active and event.key() in (Qt.Key_Backspace, Qt.Key_Delete):
             idx = getattr(self.state, 'selected_idx', -1)
-            if getattr(self.state, 'selected_type', None) == 'node' and self._route_edit_delete_point(idx):
+            selected_type = getattr(self.state, 'selected_type', None)
+            deleted = False
+            if selected_type == "edge":
+                deleted = self._route_edit_delete_work_line(
+                    self._route_edit_selected_work_index()
+                )
+            elif selected_type == 'node':
+                deleted = self._route_edit_delete_point(idx)
+            if deleted:
                 self._sync_auto_path_from_editable_route()
                 self._draw_route_edit_overlay()
                 event.accept()
                 return
+        if self._route_edit_active and event.key() == Qt.Key_Escape:
+            self._route_new_line_start = None
+            self._route_edit_mode = "select"
+            self.task_panel.set_route_edit_mode("select")
+            self._draw_route_edit_overlay()
+            event.accept()
+            return
+        if self._route_edit_active and event.key() in (Qt.Key_0, Qt.Key_1):
+            if getattr(self.state, "selected_type", None) == "edge":
+                status = 1 if event.key() == Qt.Key_1 else 0
+                if self._route_edit_set_edge_status(
+                    getattr(self.state, "selected_idx", -1), status
+                ):
+                    self._draw_route_edit_overlay()
+                    event.accept()
+                    return
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
@@ -6719,6 +8003,10 @@ class MainWindow(QMainWindow):
                 self._close_cancel_started_at = time.time()
                 self._close_cancel_warning_shown = False
                 QTimer.singleShot(10000, self._warn_close_cancel_still_running)
+                # Keep the worker alive long enough to release GDAL/PyTorch
+                # resources safely, while making the close action immediately
+                # visible. Worker cleanup closes this hidden window for good.
+                self.hide()
             if not getattr(self, '_task_cancel_requested', False):
                 self._cancel_background_worker()
             elif (

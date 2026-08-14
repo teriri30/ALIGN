@@ -278,7 +278,10 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "harvester_params_confirmed": bool(
             getattr(state, "harvester_params_confirmed", False)
         ),
-        "turn_strategy": str(getattr(state, "turn_strategy", "bow") or "bow"),
+        "turn_strategy": str(getattr(state, "turn_strategy", "contour") or "contour"),
+        "turn_strategy_user_selected": bool(
+            getattr(state, "turn_strategy_user_selected", False)
+        ),
         "entry_point": _jsonable(getattr(state, "entry_point", None)),
         "exit_point": _jsonable(getattr(state, "exit_point", None)),
         "unload_points": _jsonable(getattr(state, "unload_points", [])),

@@ -17,7 +17,7 @@ def test_field_support_uses_field_boundary_not_convex_hull():
     assert support[40, 40] == 255
 
 
-def test_connect_work_lines_turn_points_stay_inside_field_boundary_when_outward_arc_would_leave():
+def test_outward_turn_keeps_curve_visible_and_fails_boundary_validation():
     from path_planner import _connect_work_lines
     from state import AppState
 
@@ -45,10 +45,12 @@ def test_connect_work_lines_turn_points_stay_inside_field_boundary_when_outward_
     )
 
     turn = full_path[segment_types.index("turn")]
-    assert min(x for x, _ in turn) >= 10.0
-    assert max(y for _, y in turn) <= 110.0
+    assert len(turn) > 2
+    assert min(x for x, _ in turn) < 10.0
     assert diagnostics["boundary_constraints"]["field_boundary_present"] is True
     assert diagnostics["boundary_constraints"]["turns_adjusted"] >= 1
+    assert diagnostics["boundary_constraints"]["non_work_violations"]
+    assert diagnostics["machine_executable"] is False
 
 
 def test_reverse_turns_do_not_bypass_field_boundary_constraint():
@@ -89,7 +91,7 @@ def test_reverse_turns_do_not_bypass_field_boundary_constraint():
 
 
 @pytest.mark.parametrize("strategy", ["bow", "pear", "semicircle", "alpha", "fishtail", "contour", "auto"])
-def test_all_turn_strategies_keep_non_work_segments_inside_field_boundary(strategy):
+def test_all_turn_strategies_either_stay_inside_or_expose_failed_curve(strategy):
     from path_planner import _connect_work_lines
     from state import AppState
 
@@ -117,13 +119,27 @@ def test_all_turn_strategies_keep_non_work_segments_inside_field_boundary(strate
     )
 
     assert diagnostics["boundary_constraints"]["field_boundary_present"] is True
-    for segment_type, segment in zip(segment_types, full_path):
+    outside_segments = []
+    for segment_index, (segment_type, segment) in enumerate(zip(segment_types, full_path)):
         if segment_type == "work":
             continue
-        assert min(x for x, _ in segment) >= 10.0
-        assert max(x for x, _ in segment) <= 130.0
-        assert min(y for _, y in segment) >= 10.0
-        assert max(y for _, y in segment) <= 88.0
+        inside = (
+            min(x for x, _ in segment) >= 10.0
+            and max(x for x, _ in segment) <= 130.0
+            and min(y for _, y in segment) >= 10.0
+            and max(y for _, y in segment) <= 88.0
+        )
+        if not inside:
+            outside_segments.append(segment_index)
+            assert len(segment) > 2
+    if outside_segments:
+        assert strategy in {"bow", "pear", "semicircle", "auto"}
+        reported = {
+            item["segment_index"]
+            for item in diagnostics["boundary_constraints"]["non_work_violations"]
+        }
+        assert set(outside_segments) <= reported
+        assert diagnostics["machine_executable"] is False
 
 
 def test_entry_exit_and_unload_segments_report_field_boundary_violations():

@@ -118,7 +118,7 @@ def test_entry_rotation_does_not_expose_an_adjacent_centre_seam():
     )
 
     assert selected[0] == lines[4]
-    assert diagnostics["algorithm_version"] == "contour-order-v6"
+    assert diagnostics["algorithm_version"] == "contour-order-v8"
     assert diagnostics["adjacent_transition_count"] == 0
     assert diagnostics["final_order_validated"] is True
     assert all(
@@ -359,8 +359,8 @@ def test_contour_connection_failure_is_reported_in_final_diagnostics():
     )
 
 
-def test_boundary_truncated_pass_finishes_route_without_diagonal_connector():
-    """DECISION-016 v11: a blocked long shortfall is a terminal work endpoint."""
+def test_boundary_truncated_pass_stays_last_without_overriding_entry():
+    """DECISION-016 v17: blocked endpoint is handled by the local final turn."""
     from path_planner import _connect_work_lines
 
     class _Geo:
@@ -422,11 +422,20 @@ def test_boundary_truncated_pass_finishes_route_without_diagonal_connector():
     ]
     assert len(work_segments) == len(lines)
     assert segment_types[-1] == "work"
-    assert work_segments[-1][-1] == pytest.approx(short_endpoint)
+    assert work_segments[0][0] == pytest.approx(_State.entry_point)
+    assert work_segments[-1][0] == pytest.approx(short_endpoint)
     ordering = diagnostics["contour_ordering"]
     assert ordering["terminal_constraint_applied"] is True
+    assert ordering["terminal_blocked_endpoint_role"] == "start"
+    assert ordering["terminal_blocked_endpoint_is_route_finish"] is False
+    assert ordering["terminal_local_incoming_turn_required"] is True
+    assert ordering["terminal_finish_orientation_forced"] is False
+    assert ordering["entry_nearest_feasible_verified"] is True
     assert ordering["adjacent_transition_count"] == 0
-    assert diagnostics["contour_connector"]["terminal_unaligned_finish"] is True
+    assert diagnostics["contour_connector"][
+        "terminal_unaligned_endpoint"
+    ] == "start"
+    assert diagnostics["display_only_connectors"] == []
 
 
 def test_contour_route_reuses_headland_lines_and_keeps_center_single():

@@ -29,32 +29,32 @@ _PACKAGED_MODEL_SPECS = (
     {
         "name": "YOLO11s-seg（插秧期12m）",
         "filename": "yolo11s_seg_transplant_12m_best.pt",
-        "sha256": "9df14dfb7c8800504737dcd34d42389684c9d52eb7e88c51ea4c514da48cf9a9",
+        "sha256": "51332c00d13b5414c81761d3ddb13c95f90e074c2c3a621fa37a3d9b6e22eb5a",
     },
     {
         "name": "YOLO11s-seg（返青期12m）",
         "filename": "yolo11s_seg_greenup_12m_best.pt",
-        "sha256": "234ddd2a7681c807bec34399118c3cc9f8619dcd8566b9003b058ed1ce804798",
+        "sha256": "064132e1b041e4d4fcc7d7fb277a56947f0c50a0d03c58233ca8ad59dfadc76a",
     },
     {
         "name": "YOLO11s-seg（返青期30m）",
         "filename": "yolo11s_seg_greenup_30m_best.pt",
-        "sha256": "4034f5dfd41e228c1dd599eccfb26746ef9a696b0336c3c075fcb545628ffbc6",
+        "sha256": "8d1edeb5a7c39164307615a456048ccb3952be9308d453abf35c8e7d259dcc5d",
     },
     {
         "name": "YOLO11s-seg（返青期50m）",
         "filename": "yolo11s_seg_greenup_50m_best.pt",
-        "sha256": "21bf9f4d065454bdb001a7a14c9ebd6fedc2d264b9f1872ddc9ae8badf0b5be4",
+        "sha256": "e51d3d70cbf29cb4b6dc48b247188a62f339ce3ee0aeebab8377f05324a6959f",
     },
     {
         "name": "YOLO11s-seg（分蘖期12m）",
         "filename": "yolo11s_seg_tiller_12m_best.pt",
-        "sha256": "98c5ea6bbc05243c164b72f9b9e6cb4442832051b4e06b3bb96047dc122816b5",
+        "sha256": "23a85f02d25583005d0ab5cd76274646d536043833086921a8d63319caf5aaf3",
     },
     {
         "name": "YOLO11s-seg（分蘖期30m）",
         "filename": "yolo11s_seg_tiller_30m_best.pt",
-        "sha256": "5941c8e8a804b680f964bc519818a4d1d6ed97a84522970112a03b3d5d79e188",
+        "sha256": "cf2bad28daf3c9512182a1a2a7a456d6b06e8c3e4e208ae476f42bf5c6922769",
     },
 )
 

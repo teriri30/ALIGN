@@ -28,7 +28,7 @@ def _real_geo():
 
 def _window_with_path():
     import numpy as np
-    from inference import INFERENCE_PIPELINE_VERSION
+    from inference import INFERENCE_PIPELINE_VERSION, build_inference_config
     from path_planner import PATH_PLANNING_VERSION
     from provenance import file_sha256, make_stage_record
     from pyside6_app.workers import (
@@ -54,13 +54,7 @@ def _window_with_path():
     inference_inputs = {
         "source_sha256": "test-source-sha256",
         "model_sha256": model_sha256,
-        "inference_config": {
-            "capture_size": int(window.cfg.TILE_CAPTURE_SIZE),
-            "overlap": float(window.cfg.TILE_OVERLAP),
-            "conf": float(window.cfg.MODEL_CONF),
-            "iou": float(window.cfg.MODEL_IOU),
-            "batch_size": 4,
-        },
+        "inference_config": build_inference_config(window.cfg),
         "preprocessing_config": window.cfg.section("raster_preprocessing"),
     }
     inference_record = make_stage_record(
@@ -380,6 +374,8 @@ def test_loading_unreferenced_image_clears_previous_georeference(tmp_path, monke
     source = tmp_path / "unreferenced.tif"
     source.write_bytes(b"not used by raster reader in this unit test")
     monkeypatch.setattr(window, "_start_cache_restore", lambda _path: None)
+    load_messages = []
+    monkeypatch.setattr(window.log_panel, "success", load_messages.append)
 
     window._on_tif_load_done({
         "path": str(source),
@@ -396,6 +392,7 @@ def test_loading_unreferenced_image_clears_previous_georeference(tmp_path, monke
     })
 
     assert not window.geo.is_ready()
+    assert any(str(source.resolve()) in message for message in load_messages)
 
 
 def test_export_payload_recomputes_stale_coordinates_from_display_path():

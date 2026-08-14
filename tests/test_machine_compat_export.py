@@ -158,6 +158,61 @@ def test_machine_compatibility_treats_reverse_tag_as_one_straight_turn():
     assert diagnostics["turn_run_count"] == 1
 
 
+def test_machine_compatibility_preserves_full_harvested_retrace_before_handoff():
+    """DECISION-016/017: a full-pass retrace must not collapse to a diagonal."""
+    from path_planner import prepare_machine_compatibility_points
+
+    route = [
+        _point(120.0000, 30.0000, 0, "work", 0, 0),
+        _point(120.0010, 30.0000, 0, "work", 10, 0),
+        _point(120.0010, 30.0000, 1, "turn_reverse", 10, 0),
+        _point(120.0000, 30.0000, 1, "turn_reverse", 0, 0),
+        _point(120.0000, 30.0000, 2, "turn_aux", 0, 0),
+        _point(120.0000, 30.0010, 2, "turn_aux", 0, 10),
+        _point(120.0000, 30.0010, 3, "work", 0, 10),
+        _point(120.0010, 30.0010, 3, "work", 10, 10),
+    ]
+
+    points, diagnostics = prepare_machine_compatibility_points(route)
+
+    assert [(round(p["pixel_x"]), round(p["pixel_y"])) for p in points] == [
+        (0, 0),
+        (10, 0),
+        (0, 0),
+        (0, 10),
+        (10, 10),
+    ]
+    assert [p["status"] for p in points] == [1, 0, 0, 1, 0]
+    assert diagnostics["preserved_harvested_retrace_count"] == 1
+
+
+def test_machine_compatibility_preserves_retrace_vertex_from_shared_control_route():
+    """The editor's contiguous status-0 group keeps the same retrace topology."""
+    from path_planner import prepare_machine_compatibility_points
+
+    route = [
+        _point(120.0000, 30.0000, 0, "work", 0, 0),
+        _point(120.0010, 30.0000, 0, "work", 10, 0),
+        _point(120.0010, 30.0000, 1, "turn", 10, 0),
+        _point(120.0000, 30.0000, 1, "turn", 0, 0),
+        _point(120.0000, 30.0010, 1, "turn", 0, 10),
+        _point(120.0000, 30.0010, 2, "work", 0, 10),
+        _point(120.0010, 30.0010, 2, "work", 10, 10),
+    ]
+
+    points, diagnostics = prepare_machine_compatibility_points(route)
+
+    assert [(round(p["pixel_x"]), round(p["pixel_y"])) for p in points] == [
+        (0, 0),
+        (10, 0),
+        (0, 0),
+        (0, 10),
+        (10, 10),
+    ]
+    assert [p["status"] for p in points] == [1, 0, 0, 1, 0]
+    assert diagnostics["preserved_harvested_retrace_count"] == 1
+
+
 def test_machine_compatibility_requires_a_work_segment():
     from path_planner import prepare_machine_compatibility_points
 

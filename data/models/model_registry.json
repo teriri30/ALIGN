@@ -58,18 +58,18 @@
     {
       "name": "yolo11s_seg_transplant_12m_best.pt",
       "display_name": "YOLO11s-seg（插秧期12m）",
-      "sha256": "9df14dfb7c8800504737dcd34d42389684c9d52eb7e88c51ea4c514da48cf9a9",
+      "sha256": "51332c00d13b5414c81761d3ddb13c95f90e074c2c3a621fa37a3d9b6e22eb5a",
       "framework": "ultralytics",
       "architecture": "yolo11s-seg",
       "task": "instance_segmentation",
       "reported_metrics": {
-        "mask_mAP50": 0.9680237982798596,
-        "mask_mAP50_95": 0.7829040670232211,
-        "precision": 0.97880877263013,
-        "recall": 0.9173042966450854
+        "mask_mAP50": 0.9599505491786623,
+        "mask_mAP50_95": 0.7629190793641943,
+        "precision": 0.9766970013542309,
+        "recall": 0.9061212477928193
       },
       "metadata_status": "complete",
-      "training_dataset_version": "stage-height-yolo-seg-20260805",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-strongaug",
       "class_mapping": {
         "0": "rice"
       },
@@ -79,7 +79,7 @@
         "overlap": 0.4,
         "augmentation_scope": "train_only_online"
       },
-      "source_context": "插秧期12m",
+      "source_context": "插秧期12m（强增强版，对齐yoloduibi配方）",
       "stage": "插秧期",
       "height_m": 12,
       "source_groups": [
@@ -96,18 +96,18 @@
     {
       "name": "yolo11s_seg_greenup_12m_best.pt",
       "display_name": "YOLO11s-seg（返青期12m）",
-      "sha256": "234ddd2a7681c807bec34399118c3cc9f8619dcd8566b9003b058ed1ce804798",
+      "sha256": "064132e1b041e4d4fcc7d7fb277a56947f0c50a0d03c58233ca8ad59dfadc76a",
       "framework": "ultralytics",
       "architecture": "yolo11s-seg",
       "task": "instance_segmentation",
       "reported_metrics": {
-        "mask_mAP50": 0.9174291168006979,
-        "mask_mAP50_95": 0.7157645772282359,
-        "precision": 0.9427687852614353,
-        "recall": 0.8791477471184073
+        "mask_mAP50": 0.9143477991661388,
+        "mask_mAP50_95": 0.7043909726313535,
+        "precision": 0.9453718081783606,
+        "recall": 0.8864827104435906
       },
       "metadata_status": "complete",
-      "training_dataset_version": "stage-height-yolo-seg-20260805",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-strongaug",
       "class_mapping": {
         "0": "rice"
       },
@@ -117,7 +117,7 @@
         "overlap": 0.4,
         "augmentation_scope": "train_only_online"
       },
-      "source_context": "返青期12m",
+      "source_context": "返青期12m（强增强版，对齐yoloduibi配方）",
       "stage": "返青期",
       "height_m": 12,
       "source_groups": [
@@ -134,18 +134,18 @@
     {
       "name": "yolo11s_seg_greenup_30m_best.pt",
       "display_name": "YOLO11s-seg（返青期30m）",
-      "sha256": "4034f5dfd41e228c1dd599eccfb26746ef9a696b0336c3c075fcb545628ffbc6",
+      "sha256": "8d1edeb5a7c39164307615a456048ccb3952be9308d453abf35c8e7d259dcc5d",
       "framework": "ultralytics",
       "architecture": "yolo11s-seg",
       "task": "instance_segmentation",
       "reported_metrics": {
-        "mask_mAP50": 0.9439347306571716,
-        "mask_mAP50_95": 0.7749159153821987,
-        "precision": 0.9477068569391112,
-        "recall": 0.902804788183017
+        "mask_mAP50": 0.9398213578713882,
+        "mask_mAP50_95": 0.7502441550675416,
+        "precision": 0.9173740223514729,
+        "recall": 0.911571211432835
       },
       "metadata_status": "complete",
-      "training_dataset_version": "stage-height-yolo-seg-20260805",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-strongaug",
       "class_mapping": {
         "0": "rice"
       },
@@ -155,7 +155,7 @@
         "overlap": 0.4,
         "augmentation_scope": "train_only_online"
       },
-      "source_context": "返青期30m",
+      "source_context": "返青期30m（强增强版，对齐yoloduibi配方）",
       "stage": "返青期",
       "height_m": 30,
       "source_groups": [
@@ -166,25 +166,24 @@
       "val_tiles": 275,
       "compatibility": {
         "requires_manual_confirmation": false,
-        "reason": "training metadata, class mapping, preprocessing and validation metrics are recorded",
-        "deployment_warning": "小样本高度专用模型，需在对应高度完整影像上复核"
+        "reason": "training metadata, class mapping, preprocessing and validation metrics are recorded"
       }
     },
     {
       "name": "yolo11s_seg_greenup_50m_best.pt",
       "display_name": "YOLO11s-seg（返青期50m）",
-      "sha256": "21bf9f4d065454bdb001a7a14c9ebd6fedc2d264b9f1872ddc9ae8badf0b5be4",
+      "sha256": "e51d3d70cbf29cb4b6dc48b247188a62f339ce3ee0aeebab8377f05324a6959f",
       "framework": "ultralytics",
       "architecture": "yolo11s-seg",
       "task": "instance_segmentation",
       "reported_metrics": {
-        "mask_mAP50": 0.9625754628523708,
-        "mask_mAP50_95": 0.8298466544318929,
-        "precision": 0.9495876250434511,
-        "recall": 0.9388882652122528
+        "mask_mAP50": 0.9189960700010154,
+        "mask_mAP50_95": 0.7389037667944235,
+        "precision": 0.942785508005208,
+        "recall": 0.8213403203595888
       },
       "metadata_status": "complete",
-      "training_dataset_version": "stage-height-yolo-seg-20260805",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-strongaug",
       "class_mapping": {
         "0": "rice"
       },
@@ -194,7 +193,7 @@
         "overlap": 0.4,
         "augmentation_scope": "train_only_online"
       },
-      "source_context": "返青期50m",
+      "source_context": "返青期50m（强增强版，对齐yoloduibi配方）",
       "stage": "返青期",
       "height_m": 50,
       "source_groups": [
@@ -205,25 +204,24 @@
       "val_tiles": 60,
       "compatibility": {
         "requires_manual_confirmation": false,
-        "reason": "training metadata, class mapping, preprocessing and validation metrics are recorded",
-        "deployment_warning": "小样本高度专用模型，需在对应高度完整影像上复核"
+        "reason": "training metadata, class mapping, preprocessing and validation metrics are recorded"
       }
     },
     {
       "name": "yolo11s_seg_tiller_12m_best.pt",
       "display_name": "YOLO11s-seg（分蘖期12m）",
-      "sha256": "98c5ea6bbc05243c164b72f9b9e6cb4442832051b4e06b3bb96047dc122816b5",
+      "sha256": "23a85f02d25583005d0ab5cd76274646d536043833086921a8d63319caf5aaf3",
       "framework": "ultralytics",
       "architecture": "yolo11s-seg",
       "task": "instance_segmentation",
       "reported_metrics": {
-        "mask_mAP50": 0.9482353549558535,
-        "mask_mAP50_95": 0.841796580144648,
-        "precision": 0.9410528207740032,
-        "recall": 0.9224464060529635
+        "mask_mAP50": 0.9478053790418988,
+        "mask_mAP50_95": 0.826837965712181,
+        "precision": 0.9478159102527016,
+        "recall": 0.9227068899200047
       },
       "metadata_status": "complete",
-      "training_dataset_version": "stage-height-yolo-seg-20260805",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-strongaug",
       "class_mapping": {
         "0": "rice"
       },
@@ -233,7 +231,7 @@
         "overlap": 0.4,
         "augmentation_scope": "train_only_online"
       },
-      "source_context": "分蘖期12m",
+      "source_context": "分蘖期12m（强增强版，对齐yoloduibi配方）",
       "stage": "分蘖期",
       "height_m": 12,
       "source_groups": [
@@ -252,18 +250,18 @@
     {
       "name": "yolo11s_seg_tiller_30m_best.pt",
       "display_name": "YOLO11s-seg（分蘖期30m）",
-      "sha256": "5941c8e8a804b680f964bc519818a4d1d6ed97a84522970112a03b3d5d79e188",
+      "sha256": "cf2bad28daf3c9512182a1a2a7a456d6b06e8c3e4e208ae476f42bf5c6922769",
       "framework": "ultralytics",
       "architecture": "yolo11s-seg",
       "task": "instance_segmentation",
       "reported_metrics": {
-        "mask_mAP50": 0.7064374846279948,
-        "mask_mAP50_95": 0.49689921552108407,
-        "precision": 0.8032217032450101,
-        "recall": 0.6572398190045249
+        "mask_mAP50": 0.9416651598503675,
+        "mask_mAP50_95": 0.7119232779747511,
+        "precision": 0.9543227418152208,
+        "recall": 0.8981039863392805
       },
       "metadata_status": "complete",
-      "training_dataset_version": "stage-height-yolo-seg-20260805",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-strongaug",
       "class_mapping": {
         "0": "rice"
       },
@@ -273,7 +271,7 @@
         "overlap": 0.4,
         "augmentation_scope": "train_only_online"
       },
-      "source_context": "分蘖期30m",
+      "source_context": "分蘖期30m（强增强版，对齐yoloduibi配方）",
       "stage": "分蘖期",
       "height_m": 30,
       "source_groups": [
@@ -284,8 +282,7 @@
       "val_tiles": 191,
       "compatibility": {
         "requires_manual_confirmation": false,
-        "reason": "training metadata, class mapping, preprocessing and validation metrics are recorded",
-        "deployment_warning": "小样本高度专用模型，需在对应高度完整影像上复核"
+        "reason": "training metadata, class mapping, preprocessing and validation metrics are recorded"
       }
     }
   ]
