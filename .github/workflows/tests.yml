@@ -43,9 +43,48 @@ jobs:
             --basetemp "$base_temp" `
             --cov=. --cov-report=term --cov-report=xml:coverage.xml `
             --junitxml=test-results.xml --cov-fail-under=35
+      - name: Summarize test failures
+        if: always()
+        shell: pwsh
+        run: |
+          $summary_script = @'
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          report = Path("test-results.xml")
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("## Pytest failure summary\n\n")
+              if not report.is_file():
+                  handle.write("JUnit report was not produced.\n")
+              else:
+                  root = ElementTree.parse(report).getroot()
+                  failures = []
+                  for case in root.iter("testcase"):
+                      node = case.find("failure")
+                      if node is None:
+                          node = case.find("error")
+                      if node is None:
+                          continue
+                      name = ".".join(
+                          part for part in (case.get("classname"), case.get("name"))
+                          if part
+                      )
+                      details = (node.text or node.get("message") or "").strip()
+                      failures.append((name or "unknown test", details))
+                  if not failures:
+                      handle.write("No failed testcase was recorded in the JUnit report.\n")
+                  else:
+                      handle.write(f"Failed tests: {len(failures)}\n\n")
+                      for name, details in failures:
+                          safe_details = details.replace("```", "[triple-backtick]")[:8000]
+                          handle.write(f"### `{name}`\n\n```text\n{safe_details}\n```\n\n")
+          '@
+          $summary_script | python -
       - name: Upload test diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tests-diagnostics-${{ github.run_id }}
           if-no-files-found: ignore
