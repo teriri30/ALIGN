@@ -11,8 +11,10 @@ jobs:
       QT_QPA_PLATFORM: offscreen
       REUI_DISABLE_AUTO_START: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
           cache: pip
@@ -27,10 +29,27 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "PROJ_DATA=$proj_data"
           Write-Host "PROJ paths set to: $proj_data"
       - name: Static checks
-        run: ruff check --select E9,F63,F7,F82 .
+        run: python -m ruff check --select E9,F63,F7,F82 .
       - name: Compile source
         run: python -m compileall -q .
       - name: Run tests with coverage
+        shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q --cov=. --cov-report=term --cov-fail-under=35
+        run: |
+          $base_temp = Join-Path $env:RUNNER_TEMP "reui-pytest"
+          New-Item -ItemType Directory -Force -Path $base_temp | Out-Null
+          python -m pytest -q `
+            --basetemp "$base_temp" `
+            --cov=. --cov-report=term --cov-report=xml:coverage.xml `
+            --junitxml=test-results.xml --cov-fail-under=35
+      - name: Upload test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-diagnostics-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            coverage.xml
+            test-results.xml
+            .pytest_cache
