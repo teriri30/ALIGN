@@ -38,6 +38,56 @@ class _FixedMetricState:
     field_boundary = []
 
 
+def test_task_export_action_routes_to_numbered_machine_txt(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        MainWindow,
+        "_on_export_machine_compatibility_path",
+        lambda self: calls.append("compatibility"),
+    )
+    window = _window()
+
+    window.task_panel.export_machine_compatibility_requested.emit()
+
+    assert calls == ["compatibility"]
+
+
+def test_inference_runner_participates_in_background_task_exclusion():
+    window = _window()
+    window.state.inference_running = True
+
+    assert window._has_background_worker() is True
+
+    window.state.inference_running = False
+    assert window._has_background_worker() is False
+
+
+def test_segment_does_not_start_while_mask_or_plan_thread_is_running():
+    window = _window()
+    messages = []
+
+    class RunningThread:
+        def isRunning(self):
+            return True
+
+    window._worker_thread = RunningThread()
+    window.log_panel.warn = messages.append
+
+    window._on_segment()
+
+    assert messages == ["已有后台任务正在运行，请等待完成后再开始识别"]
+
+
+def test_task_error_dialog_keeps_raw_traceback_in_log_only():
+    window = _window()
+
+    title, message = window._task_error_message("Traceback: SECRET_INTERNAL_DETAIL")
+
+    assert title == "任务失败"
+    assert "SECRET_INTERNAL_DETAIL" not in message
+    assert "项目日志" in message
+
+
 def test_path_result_is_normalised_and_stored_for_current_ui():
     window = _window()
     path_result = {
@@ -312,7 +362,7 @@ def test_mask_processing_start_prompt_defers_service_points_to_path_planning(mon
     window._on_mask_process()
 
     assert messages == [
-        "掩膜处理已开始，完成后请进入“路径规划”确认起点；终点和卸粮点可选。"
+        "掩膜处理已开始，完成后请进入“路径规划”确认起点；终点将沿最终作业段自动延伸。"
     ]
 
 def test_pending_segment_completion_enables_mask_process_action():
@@ -716,17 +766,20 @@ def test_source_tif_inference_rejects_crop_with_only_nodata_tiles(monkeypatch):
         )
 
 
-def test_default_harvester_params_use_1_35m_cutter_offset():
+def test_default_harvester_params_match_the_research_machine_geometry():
+    from config import DEFAULT_HARVESTER_PARAMS
+
     window = _window()
     window.state.harvester_params = {}
     window.cfg._raw.setdefault("harvester", {})["cutter_forward_offset_m"] = None
 
     params = window._effective_harvester_params()
 
-    assert params["cutter_width_m"] > 0
-    assert params["track_width_m"] > 0
-    assert params["track_gauge_m"] > 0
-    assert params["turn_radius_m"] > 0
+    assert DEFAULT_HARVESTER_PARAMS["cutter_width_m"] == pytest.approx(2.15)
+    assert DEFAULT_HARVESTER_PARAMS["track_width_m"] == pytest.approx(0.40)
+    assert DEFAULT_HARVESTER_PARAMS["track_gauge_m"] == pytest.approx(1.60)
+    assert DEFAULT_HARVESTER_PARAMS["wheelbase_m"] == pytest.approx(1.80)
+    assert DEFAULT_HARVESTER_PARAMS["turn_radius_m"] == pytest.approx(0.90)
     assert params["cutter_forward_offset_m"] == pytest.approx(1.35)
 
 
@@ -1054,7 +1107,7 @@ def test_path_planning_unlocks_after_parameters_and_start_are_confirmed():
     assert statuses["params"].status == "done"
     assert statuses["entry"].status == "done"
     assert statuses["exit"].status == "done"
-    assert statuses["exit"].text == "可选未设置"
+    assert statuses["exit"].text == "自动延伸"
     assert statuses["plan"].status == "available"
 
 
@@ -1472,6 +1525,50 @@ def test_missing_optional_exit_finishes_on_last_work_line_without_return():
     assert diagnostics["service_points"]["exit_present"] is False
 
 
+def test_desktop_route_uses_adjacent_snake_order_and_writes_finish_extension():
+    """The implementation route visits neighbouring rows and has a concrete finish."""
+    from path_planner import _connect_work_lines
+    from state import AppState
+
+    state = AppState()
+    state.mask_raw = np.zeros((120, 160), dtype=np.uint8)
+    state.entry_point = (0.0, 10.0)
+    lines = [
+        [(0.0, 10.0), (100.0, 10.0)],
+        [(0.0, 20.0), (100.0, 20.0)],
+        [(0.0, 30.0), (100.0, 30.0)],
+        [(0.0, 40.0), (100.0, 40.0)],
+    ]
+
+    full_path, segment_types, diagnostics = _connect_work_lines(
+        lines,
+        state=state,
+        geo=_FixedMetricGeo(),
+        min_turn_radius_m=1.0,
+        turn_strategy="contour",
+        global_main_angle=0.0,
+        config={
+            "route_order": "adjacent_snake",
+            "include_route_finish_extension": True,
+            "route_finish_extension_m": 2.0,
+        },
+        return_diagnostics=True,
+    )
+
+    work_lines = [
+        segment for segment, kind in zip(full_path, segment_types)
+        if kind == "work"
+    ]
+    assert [line[0][1] for line in work_lines] == [10.0, 20.0, 30.0, 40.0]
+    assert segment_types[-1] == "exit"
+    assert full_path[-1][0] == work_lines[-1][-1]
+    assert full_path[-1][-1] != full_path[-1][0]
+    assert np.linalg.norm(
+        np.asarray(full_path[-1][-1]) - np.asarray(full_path[-1][0])
+    ) > 0.0
+    assert diagnostics["contour_ordering"]["ordering"] == "adjacent_snake"
+
+
 def test_service_points_can_explicitly_remain_reference_only():
     from path_planner import _connect_work_lines
     from state import AppState
@@ -1722,49 +1819,10 @@ def test_planning_factor_report_records_core_decision_inputs():
     assert report["decision_chain"][0] == "processed_mask_and_field_support"
 
 
-def test_candidate_scoring_prefers_safe_route_over_short_invalid_route():
-    from path_planner import _rank_path_candidates
-
-    candidates = [
-        {
-            "strategy": "bow",
-            "validation": {
-                "valid": False,
-                "total_length_m": 80.0,
-                "track_core_overlap_pct": 12.0,
-                "track_outside_field_pct": 4.0,
-                "crop_mask_geometric_coverage_pct": 96.0,
-            },
-            "turn_assessment": {"hard_reasons": ["越界"], "turn_self_crossing_count": 1},
-            "segment_types": ["work", "turn", "work"],
-        },
-        {
-            "strategy": "fishtail",
-            "validation": {
-                "valid": True,
-                "total_length_m": 95.0,
-                "track_core_overlap_pct": 1.0,
-                "track_outside_field_pct": 0.2,
-                "crop_mask_geometric_coverage_pct": 93.0,
-            },
-            "turn_assessment": {"hard_reasons": [], "turn_self_crossing_count": 0},
-            "segment_types": ["work", "turn_reverse", "turn_aux", "work", "unload", "exit"],
-        },
-    ]
-
-    ranked = _rank_path_candidates(candidates)
-
-    assert ranked[0]["strategy"] == "fishtail"
-    assert ranked[0]["candidate_score"] < ranked[1]["candidate_score"]
-    assert ranked[0]["candidate_metrics"]["unload_visits"] == 1
-
-
-def test_auto_candidate_strategy_list_is_expanded_for_multi_strategy_planning():
+def test_auto_strategy_request_runs_one_deterministic_turn_implementation():
     from path_planner import _candidate_strategies_for_request
 
-    assert _candidate_strategies_for_request("auto") == [
-        "contour", "semicircle", "bow", "pear", "fishtail", "alpha"
-    ]
+    assert _candidate_strategies_for_request("auto") == ["auto"]
     assert _candidate_strategies_for_request("bow") == ["bow"]
 
 
@@ -1921,30 +1979,6 @@ def test_field_trial_profile_turns_support_metric_into_a_hard_constraint():
     assert result["validation_profile"] == "field_trial"
     assert result["validation_limits_pct"]["track_outside_support"] == 5.0
     assert any("离开语义支撑区" in issue for issue in result["issues"])
-
-
-def test_candidate_ranking_prefers_lower_semantic_risk_when_both_are_valid():
-    from path_planner import _rank_path_candidates
-
-    base = {
-        "valid": True,
-        "validation_profile": "field_trial",
-        "track_core_overlap_pct": 1.0,
-        "track_outside_field_pct": 0.0,
-        "track_forbidden_overlap_pct": 0.0,
-        "crop_mask_geometric_coverage_pct": 96.0,
-        "total_length_m": 100.0,
-    }
-    safer = dict(base, track_outside_support_pct=0.5, track_uncertain_overlap_pct=1.0)
-    riskier = dict(base, track_outside_support_pct=4.0, track_uncertain_overlap_pct=8.0)
-
-    ranked = _rank_path_candidates([
-        {"strategy": "pear", "validation": riskier, "turn_assessment": {}, "segment_types": []},
-        {"strategy": "bow", "validation": safer, "turn_assessment": {}, "segment_types": []},
-    ])
-
-    assert ranked[0]["strategy"] == "bow"
-    assert ranked[0]["candidate_metrics"]["track_uncertain_overlap_pct"] == 1.0
 
 
 def test_field_trial_preflight_can_explicitly_confirm_no_forbidden_area(monkeypatch):

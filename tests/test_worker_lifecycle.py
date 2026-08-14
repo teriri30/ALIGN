@@ -76,7 +76,7 @@ def test_cancelled_tif_loader_emits_terminal_result(tmp_path):
     assert results == [{"status": "cancelled", "path": str(tif_path)}]
 
 
-def test_close_hides_window_immediately_while_worker_cancels():
+def test_close_keeps_window_visible_while_worker_cancels():
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     worker = _CancellableProbe()
@@ -91,7 +91,7 @@ def test_close_hides_window_immediately_while_worker_cancels():
 
     assert worker.cancelled is True
     assert window._close_after_worker_cancel is True
-    assert window.isVisible() is False
+    assert window.isVisible() is True
 
     window._worker_thread = None
     window._worker = None
@@ -213,7 +213,7 @@ def test_plan_completion_defers_validation_warning_until_worker_cleanup(monkeypa
     monkeypatch.setattr(window.route_info, "update_route", lambda *args: calls.append("panel"))
     monkeypatch.setattr(window, "_sync_task_statuses", lambda: None)
     monkeypatch.setattr(window, "_path_quality_summary", lambda *args: "summary")
-    monkeypatch.setattr(window, "_log_turn_strategy_comparison", lambda path: None)
+    monkeypatch.setattr(window, "_log_turn_strategy_result", lambda path: None)
     monkeypatch.setattr(window, "_show_validation_report", lambda *args: calls.append("report"))
     monkeypatch.setattr(window, "_warn_path_validation_issues", lambda path: calls.append("warning"))
 

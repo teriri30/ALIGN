@@ -2,13 +2,6 @@ import numpy as np
 import pytest
 
 
-def test_headland_turn_config_rejects_non_boolean_switch():
-    from config import ConfigValidationError, validate_config
-
-    with pytest.raises(ConfigValidationError, match="headland_turn_optimization_enabled"):
-        validate_config({"path_planning": {"headland_turn_optimization_enabled": "yes"}})
-
-
 def test_connect_work_lines_reports_missing_headland_evidence_without_changing_turn():
     import path_planner
 
@@ -38,18 +31,18 @@ def test_connect_work_lines_reports_missing_headland_evidence_without_changing_t
     before, before_types = path_planner._connect_work_lines(
         [[(20.0, 25.0), (80.0, 25.0)], [(20.0, 55.0), (80.0, 55.0)]],
         geo=Geo(), state=State(), min_turn_radius_m=1.0, turn_strategy="bow",
-        config={"headland_turn_optimization_enabled": False}, processed_mask=mask,
+        config={}, processed_mask=mask,
     )
     after, after_types, diagnostics = path_planner._connect_work_lines(
         [[(20.0, 25.0), (80.0, 25.0)], [(20.0, 55.0), (80.0, 55.0)]],
         geo=Geo(), state=State(), min_turn_radius_m=1.0, turn_strategy="bow",
-        config={"headland_turn_optimization_enabled": True}, processed_mask=mask,
+        config={}, processed_mask=mask,
         return_diagnostics=True,
     )
 
-    optimization = diagnostics["turn_decisions"][0]["headland_turn_optimization"]
-    assert optimization["optimization_applied"] is False
-    assert optimization["fallback_reason"] == "headland_mask_missing"
+    turn_validation = diagnostics["turn_decisions"][0]["headland_turn_validation"]
+    assert turn_validation["validation_passed"] is False
+    assert turn_validation["fallback_reason"] == "headland_mask_missing"
     assert after == before
     assert after_types == before_types
 
@@ -101,7 +94,6 @@ def test_headland_turn_candidates_reject_forbidden_and_outside_field(monkeypatch
         [[(20.0, 25.0), (80.0, 25.0)], [(20.0, 55.0), (80.0, 55.0)]],
         geo=Geo(), state=State(), min_turn_radius_m=1.0, turn_strategy="bow",
         config={
-            "headland_turn_optimization_enabled": True,
             "headland_mask": headland,
             "planning_support_mask": mask,
             "uncertain_mask": np.zeros_like(mask),
@@ -110,10 +102,10 @@ def test_headland_turn_candidates_reject_forbidden_and_outside_field(monkeypatch
         processed_mask=mask, return_diagnostics=True, global_main_angle=0.0,
     )
 
-    optimization = diagnostics["turn_decisions"][0]["headland_turn_optimization"]
-    assert optimization["optimization_applied"] is False
-    assert optimization["fallback_reason"] == "no_safe_turn_candidate"
-    assert optimization["rejected_candidate_count"] >= 1
+    turn_validation = diagnostics["turn_decisions"][0]["headland_turn_validation"]
+    assert turn_validation["validation_passed"] is False
+    assert turn_validation["fallback_reason"] == "fixed_turn_validation_failed"
+    assert turn_validation["rejected_candidate_count"] >= 1
 
 
 # DECISION-015: turn fallback and hard-constraint behavior are invariant-tested.
@@ -172,7 +164,6 @@ def test_headland_turn_candidates_reject_invalid_formal_validation(monkeypatch):
         [[(20.0, 25.0), (80.0, 25.0)], [(20.0, 55.0), (80.0, 55.0)]],
         geo=Geo(), state=State(), min_turn_radius_m=1.0, turn_strategy="bow",
         config={
-            "headland_turn_optimization_enabled": True,
             "headland_mask": headland,
             "planning_support_mask": mask,
             "uncertain_mask": np.zeros_like(mask),
@@ -182,18 +173,18 @@ def test_headland_turn_candidates_reject_invalid_formal_validation(monkeypatch):
         processed_mask=mask, return_diagnostics=True, global_main_angle=0.0,
     )
 
-    optimization = diagnostics["turn_decisions"][0]["headland_turn_optimization"]
-    assert optimization["optimization_applied"] is False
-    assert optimization["fallback_reason"] == "no_safe_turn_candidate"
-    assert optimization["rejected_candidate_count"] >= 1
+    turn_validation = diagnostics["turn_decisions"][0]["headland_turn_validation"]
+    assert turn_validation["validation_passed"] is False
+    assert turn_validation["fallback_reason"] == "fixed_turn_validation_failed"
+    assert turn_validation["rejected_candidate_count"] >= 1
     assert any(
         "validation_invalid" in reason
-        for item in optimization["rejected_candidates"]
+        for item in turn_validation["rejected_candidates"]
         for reason in item["hard_reasons"]
     )
     assert any(
         "formal coverage gate failed" in issue
-        for item in optimization["rejected_candidates"]
+        for item in turn_validation["rejected_candidates"]
         for issue in item.get("validation_issues", [])
     )
 def test_headland_turn_candidate_missing_core_metric_fails_closed(monkeypatch):
@@ -248,7 +239,6 @@ def test_headland_turn_candidate_missing_core_metric_fails_closed(monkeypatch):
         [[(20.0, 25.0), (80.0, 25.0)], [(20.0, 55.0), (80.0, 55.0)]],
         geo=Geo(), state=State(), min_turn_radius_m=1.0, turn_strategy="bow",
         config={
-            "headland_turn_optimization_enabled": True,
             "headland_mask": headland,
             "planning_support_mask": mask,
             "uncertain_mask": np.zeros_like(mask),
@@ -258,11 +248,11 @@ def test_headland_turn_candidate_missing_core_metric_fails_closed(monkeypatch):
         processed_mask=mask, return_diagnostics=True, global_main_angle=0.0,
     )
 
-    optimization = diagnostics["turn_decisions"][0]["headland_turn_optimization"]
-    assert optimization["optimization_applied"] is False
+    turn_validation = diagnostics["turn_decisions"][0]["headland_turn_validation"]
+    assert turn_validation["validation_passed"] is False
     assert any(
         "validation_metric_missing:track_core_overlap_pct" in item["hard_reasons"]
-        for item in optimization["rejected_candidates"]
+        for item in turn_validation["rejected_candidates"]
     )
 
 

@@ -97,7 +97,7 @@ def test_research_export_records_parameter_and_recovery_risks_without_blocking(
     window.close()
 
 
-def test_route_info_lists_unverified_parameter_names_in_ui():
+def test_route_info_keeps_parameter_provenance_out_of_default_status_ui():
     from pyside6_app.panels import RouteInfoPanel
 
     QApplication.instance() or QApplication([])
@@ -112,5 +112,6 @@ def test_route_info_lists_unverified_parameter_names_in_ui():
         }
     )
 
-    assert "履带宽度" in panel._safety.toolTip()
-    assert "默认值" in panel._safety.toolTip()
+    assert panel._safety.toolTip() == "尚未获得有效的路径校验结果"
+    assert "履带宽度" not in panel._safety.toolTip()
+    assert "默认值" not in panel._safety.toolTip()

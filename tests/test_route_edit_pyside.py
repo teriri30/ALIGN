@@ -6,6 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
 
 import numpy as np
+import pytest
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication, QPushButton
@@ -270,6 +271,70 @@ def test_continuous_display_highlights_only_outside_turn_parts(monkeypatch):
     assert turn_draws[0][1]["color"] == (70, 120, 255)
     assert turn_draws[1][0] == [(10.0, 5.0), (12.0, 5.0), (14.0, 5.0)]
     assert turn_draws[1][1]["color"] == (40, 40, 255)
+    window.close()
+
+
+def test_route_display_marks_finish_when_no_exit_point_was_set(monkeypatch):
+    """DECISION-007: show the generated finish without inventing an exit input."""
+    window = _window()
+    window._tif_rgb = np.zeros((40, 60, 3), dtype=np.uint8)
+    circles = []
+    labels = []
+    monkeypatch.setattr(
+        window.image_view.viewer,
+        "draw_circle",
+        lambda x, y, **kwargs: circles.append(((float(x), float(y)), kwargs)),
+    )
+    monkeypatch.setattr(
+        window.image_view.viewer,
+        "draw_text",
+        lambda x, y, text, **kwargs: labels.append(((float(x), float(y)), text, kwargs)),
+    )
+
+    window._show_path(window._normalise_path_result({
+        "full_path": [[(0.0, 0.0), (20.0, 5.0)], [(20.0, 5.0), (45.0, 30.0)]],
+        "segment_types": ["work", "turn"],
+    }))
+
+    assert window.state.exit_point is None
+    assert ((45.0, 30.0), {"radius": 9, "color": (255, 80, 80)}) in circles
+    assert any(text == "终点" for _position, text, _kwargs in labels)
+    window.close()
+
+
+def test_generated_finish_is_visible_and_draggable_as_exit_reference():
+    window = _window()
+    window._service_points_visible = True
+    window.state.auto_path_planned = True
+    window.state.entry_point = (0.0, 0.0)
+    window._pipeline_result = {
+        "path": window._normalise_path_result({
+            "full_path": [[(0.0, 0.0), (20.0, 0.0)], [(20.0, 0.0), (30.0, 0.0)]],
+            "segment_types": ["work", "exit"],
+        })
+    }
+
+    assert window.state.exit_point is None
+    assert window._service_point_value(("exit", 0)) == (30.0, 0.0)
+    assert window._service_point_hit_test(30.0, 0.0) == ("exit", 0)
+
+    window._set_service_point_value(("exit", 0), (31.0, 1.0))
+    assert window.state.exit_point == (31.0, 1.0)
+    window.close()
+
+
+def test_control_route_projection_includes_entry_connector_for_txt_export():
+    window = _window()
+    window.state.entry_point = (-5.0, 0.0)
+    segments = [
+        window._route_segment_from_points(
+            [(0.0, 0.0), (20.0, 0.0)], 1, {0: "turn", 1: "work"}
+        )
+    ]
+    points, statuses = window._build_route_control_polyline(segments)
+
+    assert points[:2] == [(-5.0, 0.0), (0.0, 0.0)]
+    assert statuses[:2] == [0, 1]
     window.close()
 
 
@@ -647,6 +712,256 @@ def test_manual_turn_point_insertion_keeps_exact_clicked_geometry():
     assert [(point.pixel_x, point.pixel_y) for point in turn.points] == [
         (100.0, 0.0), (118.0, 12.0), (100.0, 30.0)
     ]
+    window.close()
+
+
+def test_route_edit_keeps_inserted_work_waypoint_after_exit_and_reopen():
+    """DECISION-007/019: exiting the editor must not rebuild the route from the old plan."""
+    window = _window()
+    window.state.path_points = [
+        (0.0, 0.0), (100.0, 0.0), (100.0, 30.0), (0.0, 30.0)
+    ]
+    window.state.path_status = [1, 0, 1]
+    window._sync_auto_path_from_editable_route()
+
+    window._on_route_edit_requested()
+    inserted = window._route_edit_insert_point(
+        (50.0, 12.0), preserve_position=True, edge_index=0
+    )
+    window.state.selected_type = "node"
+    window.state.selected_idx = inserted
+    window._sync_auto_path_from_editable_route()
+    edited_points = list(window.state.path_points)
+
+    window._on_route_edit_requested()
+    assert window._route_edit_active is False
+    assert window.state.path_points == edited_points
+
+    window._on_route_edit_requested()
+    assert window._route_edit_active is True
+    assert window.state.path_points == edited_points
+    assert (50.0, 12.0) in window.state.path_points
+    window.close()
+
+
+def test_route_edit_control_points_follow_segment_colors_and_alt_insert_does_not_whiten_line(monkeypatch):
+    """DECISION-019: node colors follow outgoing status and node selection is local."""
+    assert MainWindow._route_edit_control_point_color([1, 0, 1], 0) == (0, 255, 70)
+    # The work/turn junction takes the color of the following turn edge.
+    assert MainWindow._route_edit_control_point_color([1, 0, 1], 1) == (70, 120, 255)
+    assert MainWindow._route_edit_control_point_color([1, 0, 1], 2) == (0, 255, 70)
+    # The final node has no outgoing edge and inherits the preceding edge.
+    assert MainWindow._route_edit_control_point_color([1, 0, 1], 3) == (0, 255, 70)
+
+    window = _window()
+    window._route_edit_active = True
+    window._route_edit_mode = "select"
+    window.state.path_points = [
+        (0.0, 0.0), (100.0, 0.0), (100.0, 30.0), (0.0, 30.0)
+    ]
+    window.state.path_status = [1, 0, 1]
+    line_calls = []
+    circle_calls = []
+    text_calls = []
+    monkeypatch.setattr(
+        window.image_view.viewer,
+        "draw_polyline",
+        lambda points, **kwargs: line_calls.append((list(points), kwargs)),
+    )
+    monkeypatch.setattr(
+        window.image_view.viewer,
+        "draw_circle",
+        lambda x, y, **kwargs: circle_calls.append(((x, y), kwargs)),
+    )
+    monkeypatch.setattr(
+        window.image_view.viewer,
+        "draw_text",
+        lambda *args, **kwargs: text_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "pyside6_app.main_window.QGuiApplication.keyboardModifiers",
+        lambda: Qt.AltModifier,
+    )
+
+    # Alt-clicking the work segment inserts at its nearest point on the line.
+    assert window._handle_route_edit_press(50.0, 0.0, 1) is True
+    assert window.state.selected_type == "node"
+    assert window.state.path_points[1] == (50.0, 0.0)
+    assert not any(kwargs.get("color") == (255, 255, 255) for _points, kwargs in line_calls)
+    assert any(kwargs.get("color") == (255, 255, 255) for _point, kwargs in circle_calls)
+    assert not any(
+        len(args) > 2 and str(args[2]).startswith("作业")
+        for args, _kwargs in text_calls
+    )
+    window.close()
+
+
+def test_service_endpoint_markers_share_control_point_style_and_follow_deleted_endpoints(
+    monkeypatch,
+):
+    """DECISION-007/019: endpoint markers are shared control-node references."""
+    window = _window()
+    window._route_edit_active = True
+    window._service_points_visible = True
+    window.state.path_points = [
+        (10.0, 10.0), (30.0, 10.0), (30.0, 30.0), (50.0, 30.0)
+    ]
+    window.state.path_status = [1, 0, 0]
+    window.state.entry_point = (10.0, 10.0)
+    window.state.exit_point = (50.0, 30.0)
+    window.state.entry_point_locked = True
+    window.state.exit_point_locked = True
+
+    assert window._service_point_state_value(("entry", 0)) == (10.0, 10.0)
+    assert window._service_point_state_value(("exit", 0)) == (50.0, 30.0)
+    assert window._service_point_control_style(("entry", 0))[0] == (0, 255, 70)
+    assert window._service_point_control_style(("exit", 0))[0] == (70, 120, 255)
+
+    circles = []
+    monkeypatch.setattr(window.image_view.viewer, "clear_overlays", lambda: None)
+    monkeypatch.setattr(
+        window.image_view.viewer,
+        "remove_overlays",
+        lambda _items: None,
+    )
+    monkeypatch.setattr(
+        window.image_view.viewer,
+        "draw_circle",
+        lambda x, y, **kwargs: circles.append(((float(x), float(y)), kwargs)),
+    )
+    monkeypatch.setattr(window.image_view.viewer, "draw_text", lambda *args, **kwargs: None)
+    window._draw_service_points_overlay(clear_first=True)
+
+    endpoint_circles = [
+        item for item in circles
+        if item[0] in {(10.0, 10.0), (50.0, 30.0)}
+    ]
+    assert endpoint_circles == [
+        ((10.0, 10.0), {"radius": 6, "color": (0, 255, 70)}),
+        ((50.0, 30.0), {"radius": 6, "color": (70, 120, 255)}),
+    ]
+
+    window._route_edit_delete_point(0)
+    assert window.state.entry_point == (30.0, 10.0)
+    window._route_edit_delete_point(len(window.state.path_points) - 1)
+    assert window.state.exit_point == (30.0, 30.0)
+    window.close()
+
+
+def test_route_endpoint_delete_undo_restores_endpoint_references():
+    """Endpoint fallback is part of the same route-edit undo transaction."""
+    window = _window()
+    window._route_edit_active = True
+    window.state.path_points = [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)]
+    window.state.path_status = [1, 0]
+    window.state.entry_point = (0.0, 0.0)
+    window.state.exit_point = (20.0, 0.0)
+    window.state.entry_point_locked = True
+    window.state.exit_point_locked = True
+
+    window._route_edit_delete_point(0)
+    assert window.state.entry_point == (10.0, 0.0)
+    window._on_undo()
+
+    assert window.state.path_points == [
+        (0.0, 0.0), (10.0, 0.0), (20.0, 0.0)
+    ]
+    assert window.state.entry_point == (0.0, 0.0)
+    assert window.state.exit_point == (20.0, 0.0)
+    window.close()
+
+
+def test_deleted_final_control_node_keeps_automatic_finish_on_new_last_node():
+    """An unset exit remains automatic while following the edited last node."""
+    window = _window()
+    window._route_edit_active = True
+    window._service_points_visible = True
+    window.state.path_points = [
+        (0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (30.0, 0.0)
+    ]
+    window.state.path_status = [1, 0, 1]
+    window.state.entry_point = (0.0, 0.0)
+    window.state.entry_point_locked = True
+    window.state.exit_point = None
+    window.state.auto_path_planned = True
+
+    window._route_edit_delete_point(3)
+
+    assert window.state.exit_point is None
+    assert window._service_point_state_value(("exit", 0)) == (20.0, 0.0)
+    window.close()
+
+
+def test_route_redraw_undo_preserves_canvas_zoom_and_center():
+    """DECISION-004: route redraws during undo keep the user's current view."""
+    window = _window()
+    window._tif_rgb = np.zeros((300, 400, 3), dtype=np.uint8)
+    window.image_view.set_image(window._tif_rgb)
+    viewer = window.image_view.viewer
+    viewer.resetTransform()
+    viewer.scale(3.5, 3.5)
+    viewer.centerOn(180.0, 120.0)
+    before_scale = viewer.get_view_scale()
+    before_center = viewer.mapToScene(viewer.viewport().rect().center())
+
+    window.state.path_points = [(0.0, 0.0), (100.0, 0.0)]
+    window.state.path_status = [1]
+    window._sync_auto_path_from_editable_route()
+    window.state.save_route_undo("缩放回归")
+    window.state.path_points = [(0.0, 0.0), (80.0, 20.0)]
+    window._sync_auto_path_from_editable_route()
+
+    window._on_undo()
+
+    after_center = viewer.mapToScene(viewer.viewport().rect().center())
+    assert viewer.get_view_scale() == pytest.approx(before_scale, rel=1e-6)
+    assert after_center.x() == pytest.approx(before_center.x(), abs=0.5)
+    assert after_center.y() == pytest.approx(before_center.y(), abs=0.5)
+    window.close()
+
+
+def test_route_edit_blank_click_clears_node_or_edge_selection(monkeypatch):
+    """DECISION-019: empty canvas clicks cancel the active route selection."""
+    window = _window()
+    window._route_edit_active = True
+    window._route_edit_mode = "select"
+    window.state.path_points = [(10.0, 10.0), (100.0, 10.0)]
+    window.state.path_status = [1]
+    window.state.selected_type = "edge"
+    window.state.selected_idx = 0
+    redraws = []
+    monkeypatch.setattr(window, "_draw_route_edit_overlay", lambda: redraws.append(True))
+
+    assert window._handle_route_edit_press(300.0, 300.0, 1) is True
+    assert window.state.selected_type is None
+    assert window.state.selected_idx == -1
+    assert redraws == [True]
+    window.close()
+
+
+def test_research_path_export_always_uses_txt_extension(monkeypatch, tmp_path):
+    """The user-facing research PATH export is always a .txt file."""
+    window = _window()
+    calls = {}
+
+    def fake_dialog(_parent, title, default, file_filter):
+        calls.update(title=title, default=default, file_filter=file_filter)
+        return str(tmp_path / "route.path"), "PATH (*.path)"
+
+    monkeypatch.setattr(
+        "pyside6_app.main_window.QFileDialog.getSaveFileName",
+        fake_dialog,
+    )
+    monkeypatch.setattr(
+        window,
+        "_export_candidate_path",
+        lambda path: calls.update(exported_path=path),
+    )
+
+    window._on_export_path_format()
+
+    assert calls["file_filter"] == "Text (*.txt)"
+    assert calls["exported_path"].endswith("route.txt")
     window.close()
 
 

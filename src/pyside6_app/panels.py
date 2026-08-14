@@ -39,11 +39,23 @@ TASK_DEFS = [
     {"id": "process", "label": "掩膜处理", "hint": "优化 AI 识别掩膜并提取作物行带。", "color": "#648C82", "action": "处理"},
     {"id": "params", "label": "农机参数", "hint": "设置农机参数。", "color": "#AC7E56", "action": "设置"},
     {"id": "entry", "label": "起点（必选）", "hint": "可自由布设或拖动；规划必须从离起点最近的作业线端点开始。", "color": "#589C94", "action": "布设"},
-    {"id": "exit", "label": "终点（可选）", "hint": "不设置时完成最后一条作业线即结束；设置后仅用于末段方向参考。", "color": "#C76B6B", "action": "布设"},
+    {
+        "id": "exit",
+        "label": "终点",
+        "hint": "默认沿最终作业段延伸并写入 TXT；可在画布上拖动调整。",
+        "color": "#C76B6B",
+        "action": "调整",
+    },
     {"id": "unload", "label": "卸粮点", "hint": "按需要添加一个或多个卸粮点，可为空。", "color": "#C9A64A", "action": "布设"},
     {"id": "plan", "label": "路径规划", "hint": "生成作业路线。", "color": "#589862", "action": "生成"},
     {"id": "simulate", "label": "模拟演示", "hint": "沿规划路径模拟农机运动。", "color": "#4C8C7C", "action": "演示"},
-    {"id": "export", "label": "路径导出", "hint": "导出路径结果。", "color": "#4484BE", "action": "导出"},
+    {
+        "id": "export",
+        "label": "TXT路径",
+        "hint": "按终端 $PATH 格式导出 001.txt、002.txt；GeoJSON 在文件菜单单独导出。",
+        "color": "#4484BE",
+        "action": "导出",
+    },
 ]
 
 STEP_GROUPS = [
@@ -54,7 +66,7 @@ STEP_GROUPS = [
     {"label": "参数配置", "tasks": ["params"]},
     {"label": "路径规划", "tasks": ["entry", "exit", "unload", "plan"]},
     {"label": "模拟演示", "tasks": ["simulate"]},
-    {"label": "路径导出", "tasks": ["export"]},
+    {"label": "TXT路径导出", "tasks": ["export"]},
 ]
 
 
@@ -304,6 +316,7 @@ class TaskPanel(QWidget):
     simulate_requested = Signal()
     params_requested = Signal()
     entry_exit_toggle = Signal(str)
+    export_machine_compatibility_requested = Signal()
     export_geojson_requested = Signal()
     export_csv_requested = Signal()
     export_img_requested = Signal()
@@ -481,7 +494,11 @@ class TaskPanel(QWidget):
             "unload": self.entry_exit_toggle,
             "plan": self.plan_requested,
             "simulate": self.simulate_requested,
-            "export": self.export_geojson_requested,
+            # The task-panel export is the terminal-facing numbered TXT
+            # workflow.  GeoJSON remains an explicit record export in the
+            # File menu so clicking the main workflow cannot silently produce
+            # a different artifact than the operator requested.
+            "export": self.export_machine_compatibility_requested,
         }
         sig = mapping.get(tid)
         if sig:

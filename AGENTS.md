@@ -27,7 +27,7 @@ Git Bash / Hermes 环境使用 `bash scripts/test.sh -q`，脚本会清理继承
 - `mask_processor.py`：PCA+FFT 两阶段方向检测与掩膜正则化，处理碎片聚合、黏连切割和断裂修复。
 - `row_geometry.py`：`BandInstance`/`Corridor` 及行带排序配对、宽/窄行分类、中心线平滑和通行宽度建模。
 - `footprint_planner.py`：履带足迹几何模型参数为 `track_width=0.40m`、`track_gauge=1.60m`、`cutter_width=2.15m`、`wheelbase=1.80m`、`turn_radius=0.90m`；模型名为 `planar_rigid_footprint_v2`。
-- `path_planner.py`：Bow、Semicircle、Pear、Fishtail 四类转弯策略，Gaussian kernel 路径平滑，使用 `pyproj` 导出 WGS84；`planning.py` 处理田块边界/田头通行廊道，`model.py` 使用 YOLO11 + SAHI。
+- `path_planner.py`：Bow、Semicircle、Pear、Fishtail 四类转弯策略，Gaussian kernel 路径平滑，使用 `pyproj` 导出 WGS84；`path_planner.py` 同时处理田块边界/田头通行廊道，`inference.py` 使用 YOLO11 + SAHI。
 - 履带碾压评价是基于足迹几何模型的理论估算，包括理论碾压率、重复碾压率和田头转弯碾压面积；没有真实田间记录时，不得表述为实测作物损伤、产量影响或已完成田间验证。
 
 # 路径规划不变量

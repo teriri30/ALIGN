@@ -6,57 +6,8 @@
     "title": "智能农机规划系统"
   },
   "model": {
-    "default_path": "data/models/yolov8s_seg_best.pt",
-    "model_list": [
-      {
-        "path": "data/models/yolo11m_seg_best.pt",
-        "name": "yolo11m_seg_best.pt",
-        "score": "mAP50=0.9355"
-      },
-      {
-        "path": "data/models/yolo11s_seg_best.pt",
-        "name": "yolo11s_seg_best.pt",
-        "score": "mAP50=0.9416"
-      },
-      {
-        "path": "data/models/yolov8s_seg_best.pt",
-        "name": "yolov8s_seg_best.pt",
-        "score": "mAP50=0.9396"
-      },
-      {
-        "path": "data/models/yolo11s_seg_transplant_12m_best.pt",
-        "name": "YOLO11s-seg（插秧期12m）",
-        "score": "Mask mAP50-95=0.7629（强增强版）"
-      },
-      {
-        "path": "data/models/yolo11s_seg_greenup_12m_best.pt",
-        "name": "YOLO11s-seg（返青期12m）",
-        "score": "Mask mAP50-95=0.7044（强增强版）"
-      },
-      {
-        "path": "data/models/yolo11s_seg_greenup_30m_best.pt",
-        "name": "YOLO11s-seg（返青期30m）",
-        "score": "Mask mAP50-95=0.7502（强增强版）"
-      },
-      {
-        "path": "data/models/yolo11s_seg_greenup_50m_best.pt",
-        "name": "YOLO11s-seg（返青期50m）",
-        "score": "Mask mAP50-95=0.7389（强增强版）"
-      },
-      {
-        "path": "data/models/yolo11s_seg_tiller_12m_best.pt",
-        "name": "YOLO11s-seg（分蘖期12m）",
-        "score": "Mask mAP50-95=0.8268（强增强版）"
-      },
-      {
-        "path": "data/models/yolo11s_seg_tiller_30m_best.pt",
-        "name": "YOLO11s-seg（分蘖期30m）",
-        "score": "Mask mAP50-95=0.7119（强增强版）"
-      }
-    ],
     "conf_threshold": 0.25,
     "iou_threshold": 0.45,
-    "tile_size": 640,
     "tile_overlap": 0.4,
     "tile_capture_size": 640,
     "orthomosaic_recovery_conf_threshold": 0.1,
@@ -72,7 +23,6 @@
     "inference_device": "cuda:0",
     "inference_precision": "fp32",
     "eval_batch_size": 8,
-    "inference_strategy": "sahi",
     "max_source_crop_pixels": 36000000
   },
   "harvester": {
@@ -112,6 +62,13 @@
     "endpoint_outlier_mad_scale": 3.0,
     "footprint_pose_step_m": 0.08,
     "pose_heading_window_m": 0.3,
+    "lateral_search_m": 0.25,
+    "lateral_step_m": 0.025,
+    "lateral_smooth_penalty": 0.12,
+    "lateral_uncertain_penalty": 40.0,
+    "station_interval_m": 0.25,
+    "station_window_m": 0.16,
+    "path_smooth_m": 0.75,
     "footprint_metric_policy": "report_only",
     "track_core_overlap_policy": "report_only",
     "max_track_core_overlap_pct": 8.0,
@@ -177,6 +134,7 @@
     "headland_terminal_separator_support_m": 0.15,
     "headland_terminal_separator_endpoint_tolerance_m": 0.6,
     "headland_terminal_separator_occupancy_ratio": 0.82,
+    "headland_terminal_separator_max_occupancy": 0.82,
     "residual_body_attach_m": 0.12,
     "residual_body_min_attach_ratio": 0.02,
     "residual_body_max_angle_deg": 22.5,
@@ -193,7 +151,6 @@
     "max_gsd_variation_ratio": 0.1
   },
   "ui": {
-    "language": "zh",
     "mask_opacity": 0.3
   },
   "export": {

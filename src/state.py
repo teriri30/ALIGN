@@ -324,6 +324,8 @@ class AppState:
             "path_points", "path_status", "auto_path", "auto_path_planned",
             "auto_path_segments", "auto_path_geo", "auto_path_valid",
             "auto_path_desc", "simulation_done", "export_done",
+            "entry_point", "exit_point", "entry_point_locked",
+            "exit_point_locked",
             "last_rolling_rate", "last_crop_mask_geometric_coverage_pct",
             "last_planned_target_geometric_coverage_pct",
             "last_detected_mask_geometric_coverage_pct",

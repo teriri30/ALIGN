@@ -293,13 +293,13 @@ class MainWindow(QMainWindow):
         fm.addSeparator()
         self._add_action(
             fm,
-            "导出农机兼容测试文件（$PATH，转弯直线）...",
+            "导出编号 TXT 路径（001.txt、002.txt）...",
             None,
             self._on_export_machine_compatibility_path,
         )
         self._add_action(
             fm,
-            "导出科研路径（$PATH）...",
+            "导出科研单文件 TXT（$PATH）...",
             None,
             self._on_export_path_format,
         )
@@ -389,7 +389,9 @@ class MainWindow(QMainWindow):
         tp.simulate_requested.connect(self._on_simulate_task_action)
         tp.params_requested.connect(self._on_params_dialog)
         tp.entry_exit_toggle.connect(self._on_toggle_entry_exit)
-        tp.export_geojson_requested.connect(self._on_export_geojson)
+        tp.export_machine_compatibility_requested.connect(
+            self._on_export_machine_compatibility_path
+        )
         tp.export_csv_requested.connect(self._on_export_csv_geo)
         tp.export_img_requested.connect(self._on_export_img)
         tp.field_drawing_requested.connect(self._on_toggle_field_drawing)
@@ -464,7 +466,8 @@ class MainWindow(QMainWindow):
 
     def _has_background_worker(self):
         thread_running = bool(
-            self._worker_thread and self._worker_thread.isRunning()
+            getattr(self, "_worker_thread", None)
+            and self._worker_thread.isRunning()
         )
         return thread_running or getattr(self.state, "inference_running", False) is True
 
@@ -619,7 +622,7 @@ class MainWindow(QMainWindow):
              "请重新圈选田块，或重新执行 AI识别与掩膜处理；必要时降低最小行带长度/面积阈值。"),
             ("起点缺失", ["entry_point", "起点", "缺少起点"],
              "路径规划缺少已确认的起点。",
-             "请确认系统推荐起点，或在影像上手动布设起点。终点和卸粮点均为可选项。"),
+             "请确认系统推荐起点，或在影像上手动布设起点。终点会沿最终作业段自动延伸，卸粮点按需添加。"),
             ("农机参数不完整", ["harvester", "cutter_width", "turn_radius_m", "农机参数", "割台", "履带", "参数不完整"],
              "农机几何参数不完整，无法判断作物掩膜几何覆盖和履带足迹。",
              "请打开“农机参数”，检查有效割幅、割刀前置距离、履带尺寸和最小转弯半径。"),
@@ -642,8 +645,10 @@ class MainWindow(QMainWindow):
 
     def _task_error_message(self, msg):
         info = self._classify_task_error(msg)
-        detail = info["raw"][:500]
-        return info["title"], f"{info['what']}\n\n建议：{info['action']}\n\n详细信息：\n{detail}"
+        return info["title"], (
+            f"{info['what']}\n\n建议：{info['action']}\n\n"
+            "详细异常已写入项目日志。"
+        )
 
     @Slot(str)
     def _on_worker_error(self, msg):
@@ -824,7 +829,7 @@ class MainWindow(QMainWindow):
                     f"{distance_text}；可选终点仅在已确认时参与末段方向选择。"
                     "当前为参考点模式，不会把标记点强行拉接进作业线。"
                 )
-        self._log_turn_strategy_comparison(path_result)
+        self._log_turn_strategy_result(path_result)
         self._journal.info(f"路径规划完成: {bands_count}条带 {tracks}条作业线 {turns}条转弯线")
         validation = path_result.get("validation", {}) or {}
         if validation:
@@ -1583,7 +1588,11 @@ class MainWindow(QMainWindow):
             "TURN_STRATEGY": self._on_turn_strategy_btn,
             "PLAN": self._on_plan,
             "PLAY": self._on_toggle_animation,
-            "EXPORT": self._on_export_path_format,
+            # The primary workflow export is the terminal-facing numbered
+            # TXT projection (001.txt, 002.txt, ...).  Research single-file
+            # TXT and GeoJSON remain available through their explicit File
+            # menu actions.
+            "EXPORT": self._on_export_machine_compatibility_path,
             "SETTINGS": self._on_settings_dialog,
             "UNDO": self._on_undo,
             "REDO": self._on_redo,
@@ -2003,7 +2012,17 @@ class MainWindow(QMainWindow):
             self._show_mask_overlay(raw)
             return
         if self._tif_rgb is not None:
+            # DECISION-004: even the empty-state redraw used by undo/redo is
+            # a layer refresh, not a navigation command.
+            viewer = self.image_view.viewer
+            view_state = (
+                viewer.capture_view_state()
+                if getattr(viewer, "_pixmap", None) is not None
+                else None
+            )
             self.image_view.set_image(self._tif_rgb)
+            if view_state is not None:
+                viewer.restore_view_state(view_state)
         self._redraw_field_if_any()
 
     @Slot(str)
@@ -2248,7 +2267,7 @@ class MainWindow(QMainWindow):
             # The default desktop route follows the extracted four-row
             # centerlines and reports the final footprint metric.  Lateral
             # footprint optimization remains an explicit low-level mode, not
-            # a hidden comparison applied to every field-trial route.
+            # an implicit step in the default field-trial route.
             "work_line_mode": "band_centerline_with_footprint_validation",
             "validation_profile": "field_trial",
             "footprint_metric_policy": "report_only",
@@ -2686,11 +2705,110 @@ class MainWindow(QMainWindow):
     def _service_point_state_value(self, target):
         kind, index = target
         if kind == "entry":
+            # DECISION-019: while the route editor is active, the start marker
+            # is the first shared control node rather than a second service
+            # point drawn at an unrelated coordinate.  This also makes the
+            # marker follow the node during a live endpoint drag.
+            if self._route_edit_active:
+                endpoint = self._route_control_endpoint("entry")
+                if endpoint is not None:
+                    return endpoint
             return getattr(self.state, "entry_point", None)
         if kind == "exit":
-            return getattr(self.state, "exit_point", None)
+            if self._route_edit_active:
+                endpoint = self._route_control_endpoint("exit")
+                if endpoint is not None:
+                    return endpoint
+            explicit = getattr(self.state, "exit_point", None)
+            if explicit is not None:
+                return explicit
+            # A generated route always has a concrete final extension.  Treat
+            # that endpoint as the draggable end marker until the operator
+            # moves it, at which point it becomes an explicit exit input.
+            if getattr(self.state, "auto_path_planned", False):
+                return self._route_finish_point_from_result()
+            return None
         points = list(getattr(self.state, "unload_points", []) or [])
         return points[index] if 0 <= index < len(points) else None
+
+    def _route_control_endpoint(self, kind, points=None):
+        """Return the endpoint node shared by the route editor and markers."""
+        values = list(
+            points
+            if points is not None
+            else (getattr(self.state, "path_points", []) or [])
+        )
+        if not values:
+            return None
+        if kind == "entry":
+            point = values[0]
+        elif kind == "exit":
+            point = values[-1]
+        else:
+            return None
+        return (float(point[0]), float(point[1]))
+
+    def _service_point_control_style(self, target, point=None):
+        """Use the same status colour and node size as route control points."""
+        kind, _index = target
+        marker = point or self._service_point_state_value(target)
+        points = list(getattr(self.state, "path_points", []) or [])
+        statuses = list(getattr(self.state, "path_status", []) or [])
+        node_index = None
+        if marker is not None and points:
+            endpoint = self._route_control_endpoint(kind, points)
+            if endpoint is not None and math.hypot(
+                float(marker[0]) - endpoint[0],
+                float(marker[1]) - endpoint[1],
+            ) <= 1e-5:
+                node_index = 0 if kind == "entry" else len(points) - 1
+        if node_index is None:
+            # Before a route exists, entry and finish connectors are both
+            # status-0 references.  Once a control route exists, the endpoint
+            # branch above uses its actual outgoing/inherited status.
+            color = self._route_edit_control_point_color([0], 0)
+        else:
+            color = self._route_edit_control_point_color(statuses, node_index)
+        return color, node_index
+
+    def _sync_service_points_to_route_control_endpoints(self, points=None):
+        """Keep endpoint service references attached to shared control nodes.
+
+        Manual route editing owns ``path_points``.  If its first or final node
+        is removed/replaced, the visible start/end reference follows the new
+        endpoint instead of remaining as a detached marker.  An unset end is
+        intentionally kept unset so the planner can continue to generate its
+        automatic final extension; the display still resolves it from the
+        final control node.
+        """
+        values = list(
+            points
+            if points is not None
+            else (getattr(self.state, "path_points", []) or [])
+        )
+        if len(values) < 2:
+            return False
+        first = self._route_control_endpoint("entry", values)
+        last = self._route_control_endpoint("exit", values)
+        changed = False
+        if (
+            getattr(self.state, "entry_point", None) is not None
+            or self._route_edit_active
+        ):
+            if getattr(self.state, "entry_point", None) != first:
+                self.state.entry_point = first
+                changed = True
+            if not getattr(self.state, "entry_point_locked", False):
+                self.state.entry_point_locked = True
+                changed = True
+        if getattr(self.state, "exit_point", None) is not None:
+            if getattr(self.state, "exit_point", None) != last:
+                self.state.exit_point = last
+                changed = True
+            if not getattr(self.state, "exit_point_locked", False):
+                self.state.exit_point_locked = True
+                changed = True
+        return changed
 
     def _draw_service_points_overlay(self, clear_first=False):
         viewer = self.image_view.viewer
@@ -2713,12 +2831,60 @@ class MainWindow(QMainWindow):
             points.append((point, f"卸粮点{index}", (255, 210, 40)))
         for point, label, color in points:
             x, y = float(point[0]), float(point[1])
+            kind = "entry" if label == "起点" else (
+                "exit" if label == "终点" else "unload"
+            )
+            if kind in {"entry", "exit"}:
+                color, _node_index = self._service_point_control_style(
+                    (kind, 0), point
+                )
+                radius = 6
+            else:
+                radius = 8
             self._service_point_overlay_items.append(
-                viewer.draw_circle(x, y, radius=8, color=color)
+                viewer.draw_circle(x, y, radius=radius, color=color)
             )
             self._service_point_overlay_items.append(
-                viewer.draw_text(x + 12, y - 16, label, color=color, size=12)
+                viewer.draw_text(x + 8, y - 10, label, color=color, size=10)
             )
+
+    def _route_finish_point_from_result(self, path_result=None):
+        """Return the last canonical route vertex for display-only marking."""
+        result = path_result if isinstance(path_result, dict) else None
+        if result is None:
+            pipeline = getattr(self, "_pipeline_result", None)
+            result = pipeline.get("path") if isinstance(pipeline, dict) else None
+        result = result if isinstance(result, dict) else {}
+        for key in ("full_path", "turns", "tracks"):
+            for item in reversed(list(result.get(key) or [])):
+                raw_points = item.get("points", []) if isinstance(item, dict) else item
+                points = self._coerce_points(raw_points)
+                if points:
+                    return points[-1]
+        segments = list(getattr(self.state, "auto_path_segments", []) or [])
+        if not segments:
+            segments = list(getattr(self.state, "auto_path", []) or [])
+        for segment in reversed(segments):
+            points = self._coerce_points(getattr(segment, "points", []))
+            if points:
+                return points[-1]
+        return None
+
+    def _draw_route_finish_overlay(self, path_result=None, *, stale_preview=False):
+        """Fallback finish marker when service-point labels are hidden."""
+        if (
+            stale_preview
+            or getattr(self.state, "exit_point", None) is not None
+            or self._service_points_should_show()
+        ):
+            return
+        finish = self._route_finish_point_from_result(path_result)
+        if finish is None:
+            return
+        viewer = self.image_view.viewer
+        x, y = float(finish[0]), float(finish[1])
+        viewer.draw_circle(x, y, radius=9, color=(255, 80, 80))
+        viewer.draw_text(x + 12, y - 16, "终点", color=(255, 80, 80), size=12)
 
     def _service_point_hit_radius(self):
         """Return a screen-stable hit radius expressed in image coordinates."""
@@ -3132,7 +3298,10 @@ class MainWindow(QMainWindow):
         self._refresh_service_points_panel()
         self._sync_task_statuses()
         if entry != before:
-            self.log_panel.success("已智能推荐起点；请确认或直接拖动调整。终点可不设置")
+            self.log_panel.success(
+                "已智能推荐起点；请确认或直接拖动调整。终点会沿最终作业段自动延伸，"
+                "也可在画布上拖动调整"
+            )
         else:
             self.log_panel.info("已保留当前起点；锁定的人工设置不会被覆盖")
         return True
@@ -3183,7 +3352,10 @@ class MainWindow(QMainWindow):
                 self._restore_visual_from_state()
             self._refresh_service_points_panel()
             self._sync_task_statuses()
-            self.log_panel.info("系统只智能推荐必选起点；点击地图重新布设起点，终点和卸粮点请按需单独设置")
+            self.log_panel.info(
+                "系统智能推荐起点；终点默认沿最终作业段延伸，点击地图可重新设置，"
+                "卸粮点按需添加"
+            )
         else:
             self._restore_visual_from_state()
         self.top_toolbar.set_action_active("ENTRY_EXIT", self.state.entry_exit_mode)
@@ -3226,11 +3398,16 @@ class MainWindow(QMainWindow):
             self._sync_drawing_mode()
             self.top_toolbar.set_action_active("ENTRY_EXIT", False)
             if idx == 0:
-                self.log_panel.info("起点已确认；终点为可选项，可直接生成路径")
+                self.log_panel.info(
+                    "起点已确认；终点会沿最终作业段自动延伸，可直接生成路径或拖动调整"
+                )
         else:
             self._entry_exit_click_idx += 1
 
     def _on_segment(self):
+        if self._has_background_worker():
+            self.log_panel.warn("已有后台任务正在运行，请等待完成后再开始识别")
+            return
         if self._tif_rgb is not None and not self.model_engine.is_loaded() and not self._ensure_model_loaded():
             self.log_panel.warn("未找到内置模型，请检查 data/models")
             return
@@ -3335,7 +3512,9 @@ class MainWindow(QMainWindow):
         ep = getattr(self.state, 'entry_point', None)
         xp = getattr(self.state, 'exit_point', None)
         if not ep or not getattr(self.state, 'entry_point_locked', False):
-            self.log_panel.warn("请先设置并确认起点；终点和卸粮点都是可选项。")
+            self.log_panel.warn(
+                "请先设置并确认起点；终点会沿最终作业段自动延伸，卸粮点按需添加。"
+            )
             return
         if xp and not getattr(self.state, 'exit_point_locked', False):
             # Ignore stale auto-recommended end points restored from older
@@ -3378,7 +3557,13 @@ class MainWindow(QMainWindow):
         path_config = {
             "min_turn_radius_m": hp.get("turn_radius_m", 1.0),
             "turn_strategy": getattr(self.state, 'turn_strategy', 'auto'),
+            # The current product scope is route implementation, not a
+            # contour-order optimisation study.  Visit neighbouring generated
+            # rows in a simple snake order so the first pass does not jump to
+            # the opposite side of the field.
+            "route_order": "adjacent_snake",
             "service_point_mode": "reference_only",
+            "include_route_finish_extension": True,
             "forbidden_mask_confirmed": bool(
                 getattr(self.state, "forbidden_regions_confirmed", False)
             ),
@@ -3980,7 +4165,7 @@ class MainWindow(QMainWindow):
         message = (
             f"{label} 导出已停止。\n\n"
             f"{error}\n\n"
-            "为避免田间试验使用错误坐标，请重新生成路径，或检查 GeoTIFF 坐标系后再导出。"
+            "请检查当前路径和 GeoTIFF 坐标信息后重试。"
         )
         self.log_panel.error(message.replace("\n", " "))
         QMessageBox.warning(self, f"{label} 导出失败", message)
@@ -4486,7 +4671,7 @@ class MainWindow(QMainWindow):
         key = assessment.get("strategy") or path_result.get("requested_strategy") or getattr(self.state, 'turn_strategy', 'auto')
         return assessment.get("label") or self.TURN_STRATEGY_LABELS.get(str(key), str(key))
 
-    def _log_turn_strategy_comparison(self, path_result):
+    def _log_turn_strategy_result(self, path_result):
         validation = (path_result or {}).get("validation", {}) or {}
         label = self._turn_strategy_label(path_result)
         total = validation.get("total_length_m")
@@ -4619,7 +4804,7 @@ class MainWindow(QMainWindow):
         turns = len(pr.get("formal_turns", pr.get("turns", [])))
         bands = len(result.get("bands", []))
         self.log_panel.success(self._path_quality_summary(pr, bands, tracks, turns))
-        self._log_turn_strategy_comparison(pr)
+        self._log_turn_strategy_result(pr)
         self.route_info.update_route(pr, pr.get("validation", {}))
         self._journal.info(f"路径: {bands}条带 {tracks}作业线 {turns}转弯线")
         validation = pr.get("validation", {})
@@ -4822,7 +5007,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(5)
         self.task_panel.set_task_status("process", "in_progress", 5)
         self.lbl_status.setText("掩膜处理中...")
-        if not self._start_background_worker(worker, "掩膜处理已开始，完成后请进入“路径规划”确认起点；终点和卸粮点可选。"):
+        if not self._start_background_worker(worker, "掩膜处理已开始，完成后请进入“路径规划”确认起点；终点将沿最终作业段自动延伸。"):
             self.state.mask_processing_running = False
             self.state.mask_processing_progress = 0.0
             self.progress_bar.hide()
@@ -5193,8 +5378,17 @@ class MainWindow(QMainWindow):
                     "红色段表示路径超出已确认田块边界；重新验证前不得作为机器执行路径。"
                 ),
             )
-        self.image_view.set_image(self._tif_rgb)
+        # DECISION-004: route redraws replace the pixmap only; they must not
+        # turn a user's current crop/zoom/rotation back into fit-to-window.
         viewer = self.image_view.viewer
+        view_state = (
+            viewer.capture_view_state()
+            if getattr(viewer, "_pixmap", None) is not None
+            else None
+        )
+        self.image_view.set_image(self._tif_rgb)
+        if view_state is not None:
+            viewer.restore_view_state(view_state)
         mask = getattr(self.state, 'mask_raw', None)
         mask_result = getattr(self.state, 'mask_result', None)
         disp_mask = mask_result.get("processed_mask", mask) if mask_result else mask
@@ -5236,6 +5430,7 @@ class MainWindow(QMainWindow):
                         width=3,
                         style=route_style,
                     )
+        self._draw_route_finish_overlay(pr, stale_preview=stale_preview)
         if stale_preview:
             label_point = None
             for item in pr.get("tracks", []) + pr.get("turns", []):
@@ -5658,7 +5853,7 @@ class MainWindow(QMainWindow):
                 path, "GeoJSON", path_result, geo_points
             )
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 GeoJSON：{os.path.basename(path)}；试验记录已保存")
+            self.log_panel.success(f"已导出 GeoJSON：{os.path.basename(path)}；校验记录已保存")
         except Exception as e:
             self._show_geo_export_error("GeoJSON", e)
 
@@ -5672,7 +5867,7 @@ class MainWindow(QMainWindow):
             export_csv(geo_points, path)
             manifest = self._write_export_manifest(path, "CSV", _path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 CSV：{os.path.basename(path)}；试验记录已保存")
+            self.log_panel.success(f"已导出 CSV：{os.path.basename(path)}；校验记录已保存")
         except Exception as e:
             self._show_geo_export_error("CSV", e)
 
@@ -5686,7 +5881,7 @@ class MainWindow(QMainWindow):
             export_kml(geo_points, path)
             manifest = self._write_export_manifest(path, "KML", _path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 KML：{os.path.basename(path)}；试验记录已保存")
+            self.log_panel.success(f"已导出 KML：{os.path.basename(path)}；校验记录已保存")
         except Exception as e:
             self._show_geo_export_error("KML", e)
 
@@ -5700,7 +5895,7 @@ class MainWindow(QMainWindow):
             export_json(geo_points, path_result.get("validation", {}), path)
             manifest = self._write_export_manifest(path, "JSON", path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 JSON：{os.path.basename(path)}；试验记录已保存")
+            self.log_panel.success(f"已导出 JSON：{os.path.basename(path)}；校验记录已保存")
         except Exception as e:
             self._show_geo_export_error("JSON", e)
 
@@ -5713,10 +5908,11 @@ class MainWindow(QMainWindow):
         try:
             path, _ = QFileDialog.getSaveFileName(
                 self, "导出科研路径", "research_path.txt",
-                "Text (*.txt);;PATH (*.path)",
+                "Text (*.txt)",
             )
             if not path:
                 return
+            path = self._ensure_txt_output_path(path)
             self._export_candidate_path(path)
             message = (
                 f"已导出科研路径：{os.path.basename(path)}；"
@@ -5730,11 +5926,19 @@ class MainWindow(QMainWindow):
                 QApplication.restoreOverrideCursor()
             self._show_geo_export_error("$PATH", e)
 
+    @staticmethod
+    def _ensure_txt_output_path(path):
+        """Keep user-facing PATH exports as UTF-8 ``.txt`` files."""
+        path = os.path.abspath(os.fspath(path))
+        stem, suffix = os.path.splitext(path)
+        return path if suffix.lower() == ".txt" else f"{stem}.txt" if suffix else f"{path}.txt"
+
     def _on_export_machine_compatibility_path(self):
         """Export the terminal-specific 0/1 PATH projection as numbered files."""
         try:
             path = QFileDialog.getExistingDirectory(
                 self,
+                "选择农机兼容测试文件保存目录",
             )
             if not path:
                 return
@@ -5748,9 +5952,9 @@ class MainWindow(QMainWindow):
                     "machine_file", emit=True
                 )
             message = (
-                f"已导出农机兼容测试文件：{os.path.dirname(route_path)}，首份为 {os.path.basename(route_path)}；"
+                f"已导出编号 TXT 路径：{os.path.dirname(route_path)}，首份为 {os.path.basename(route_path)}；"
                 "转弯已压缩为端点直线，状态码仅使用 0/1；"
-                "画布已切换到“农机文件”视图；该文件不代表正式机器执行就绪"
+                "画布已切换到“TXT 路径”视图"
             )
             self.log_panel.success(message)
             self.lbl_status.setText("农机兼容测试文件导出完成")
@@ -5933,7 +6137,7 @@ class MainWindow(QMainWindow):
             )
             os.replace(staging_dir, final_dir)
             moved = True
-            route_path = os.path.join(final_dir, "mission_field_trial.path")
+            route_path = os.path.join(final_dir, "mission_field_trial.txt")
             route_path, manifest_path = self._export_candidate_path(
                 route_path, path_result, geo_points
             )
@@ -6138,7 +6342,7 @@ class MainWindow(QMainWindow):
         )
         if source_key != "user_measured":
             self.log_panel.warn(
-                f"参数来源仍为{source_label}；田间试验/机器候选正式导出需要逐项用户实测记录"
+                f"参数来源仍为{source_label}；当前参数建议用于几何规划，请按实际机具补充测量"
             )
         if not cutter_offset:
             self.log_panel.warn("割刀前置距离未设置；路径规划前仍需按实际收获机测量填写")
@@ -6250,9 +6454,12 @@ class MainWindow(QMainWindow):
             self._route_drag_idx = -1
             self._route_drag_work_index = -1
             self._sync_drawing_mode()
-            self._save_system_undo("退出路线编辑")
+            # DECISION-007/019: leaving the editor must keep the edited
+            # control route as the current route.  The old pipeline snapshot
+            # is only provenance for the automatically planned route and
+            # must not overwrite the user's edits on exit.
             self._sync_auto_path_from_editable_route()
-            self._show_path((self._pipeline_result or {}).get("path", {}))
+            self._restore_visual_from_state()
             self.task_panel.set_route_editing_active(False)
             self.log_panel.info("已退出路线编辑")
             return
@@ -6262,7 +6469,14 @@ class MainWindow(QMainWindow):
         )
         if not has_route:
             self.log_panel.info("尚无路线：请在画布依次点击第一条作业线的起点和终点。")
-        if getattr(self.state, 'auto_path', None):
+        # ``path_points/path_status`` is the editor's canonical control route.
+        # Rebuilding it from ``auto_path`` here would collapse user-inserted
+        # work-line waypoints back to the original endpoints every time the
+        # editor is reopened.  Only bootstrap it when no control route exists.
+        if (
+            getattr(self.state, 'auto_path', None)
+            and len(getattr(self.state, "path_points", []) or []) < 2
+        ):
             self._prepare_route_editing()
         self._route_edit_active = True
         self._route_edit_mode = "select" if has_route else "add_work"
@@ -6543,6 +6757,42 @@ class MainWindow(QMainWindow):
                 float(first[0]) - float(second[0]),
                 float(first[1]) - float(second[1]),
             ) <= 1e-5
+
+        # The terminal-facing sample starts with the user-selected entry
+        # point and then enters the first work line.  Reference-only planning
+        # keeps that approach out of the scientific ``auto_path``; add it to
+        # the shared control projection so the numbered TXT file contains the
+        # actual route start without changing the continuous validation path.
+        entry_point = getattr(self.state, "entry_point", None)
+        first_work_start = None
+        first_segment_type = ""
+        for candidate in route_segments:
+            candidate_type = str(
+                getattr(candidate, "segment_type", "") or "work"
+            )
+            candidate_points = self._coerce_points(
+                getattr(candidate, "points", [])
+            )
+            if candidate_type == "work" and len(candidate_points) >= 2:
+                first_work_start = candidate_points[0]
+                first_segment_type = candidate_type
+                break
+            if candidate_points:
+                first_segment_type = candidate_type
+        has_explicit_entry_segment = bool(route_segments) and str(
+            getattr(route_segments[0], "segment_type", "") or ""
+        ) == "entry"
+        if (
+            entry_point
+            and first_work_start is not None
+            and not has_explicit_entry_segment
+            and not same_point(entry_point, first_work_start)
+        ):
+            append_control_point(entry_point, 0)
+            # The status is attached to the outgoing edge.  The edge from the
+            # entry marker to the first work endpoint is therefore 0; the
+            # following edge becomes 1 when the work segment is appended.
+            append_control_point(first_work_start, 0)
 
         index = 0
         while index < len(route_segments):
@@ -6944,6 +7194,10 @@ class MainWindow(QMainWindow):
         self._clear_machine_route_preview()
         st = self.state
         points = [tuple(map(float, point)) for point in getattr(st, 'path_points', [])]
+        # DECISION-007/019: service markers are references to the shared route
+        # endpoints after a manual edit.  Do this before rebuilding the
+        # derived segments so redraw, panel state and later export agree.
+        self._sync_service_points_to_route_control_endpoints(points)
         if len(points) < 2:
             st.auto_path = []
             st.auto_path_segments = []
@@ -7304,6 +7558,29 @@ class MainWindow(QMainWindow):
                     return int(record["work_index"])
         return -1
 
+    @staticmethod
+    def _route_edit_control_point_color(statuses, index):
+        """Return a control-point color from the outgoing edge status.
+
+        A junction belongs visually to the segment that follows it, so a
+        work/turn boundary uses the color of the next edge.  The final node
+        has no outgoing edge and therefore inherits the preceding edge color.
+        Colors use the same BGR tuples as the route polylines.
+        """
+        work_color = (0, 255, 70)
+        turn_color = (70, 120, 255)
+        values = list(statuses or [])
+        if not values:
+            return work_color
+        edge_index = int(index)
+        if edge_index >= len(values):
+            edge_index = len(values) - 1
+        try:
+            status = int(values[max(0, edge_index)])
+        except (TypeError, ValueError):
+            status = 1
+        return work_color if status == 1 else turn_color
+
     def _route_edit_replace_work_lines(self, work_lines, selected_work_index=-1):
         """Replace route topology from ordered work lines and local turn chords."""
         points = []
@@ -7524,6 +7801,10 @@ class MainWindow(QMainWindow):
             statuses.pop()
         self.state.path_points = points
         self.state.path_status = statuses[:len(points) - 1]
+        # Deleting the first/final shared node moves the corresponding service
+        # reference to the new first/final node; it must not remain detached
+        # from the edited route.
+        self._sync_service_points_to_route_control_endpoints(points)
         self.state.selected_type = None
         self.state.selected_idx = -1
         return True
@@ -7607,6 +7888,16 @@ class MainWindow(QMainWindow):
             return True
         if modifiers & Qt.AltModifier:
             nearest_edge = self._route_edit_nearest_edge(point)
+            if nearest_edge < 0:
+                # DECISION-019: an empty canvas click is a selection command,
+                # not an implicit route insertion at the first edge.
+                self.state.selected_type = None
+                self.state.selected_idx = -1
+                self._route_drag_idx = -1
+                self._route_drag_work_index = -1
+                self._draw_route_edit_overlay()
+                self.lbl_status.setText("已取消当前选择")
+                return True
             statuses = list(getattr(self.state, "path_status", []) or [])
             selected_edge = (
                 int(getattr(self.state, "selected_idx", -1))
@@ -7658,7 +7949,15 @@ class MainWindow(QMainWindow):
             self.state.selected_idx = int(edge_index)
             self._draw_route_edit_overlay()
             return True
-        return False
+        # A left click on empty canvas clears the current node/edge selection;
+        # it must not leave the previous line highlighted indefinitely.
+        self.state.selected_type = None
+        self.state.selected_idx = -1
+        self._route_drag_idx = -1
+        self._route_drag_work_index = -1
+        self._draw_route_edit_overlay()
+        self.lbl_status.setText("已取消当前选择")
+        return True
 
     def _draw_route_edit_overlay(self):
         viewer = self.image_view.viewer
@@ -7712,16 +8011,17 @@ class MainWindow(QMainWindow):
                 color=(0, 255, 70) if is_work else (70, 120, 255),
                 width=4 if is_work else 3,
             )
+        selected_type = getattr(self.state, "selected_type", None)
         selected_work_index = self._route_edit_selected_work_index()
         work_records = self._route_edit_work_records()
-        if 0 <= selected_work_index < len(work_records):
+        if selected_type == "edge" and 0 <= selected_work_index < len(work_records):
             selected_points = work_records[selected_work_index]["points"]
             viewer.draw_polyline(
                 selected_points,
                 color=(255, 255, 255),
                 width=7,
             )
-        elif getattr(self.state, "selected_type", None) == "edge":
+        elif selected_type == "edge":
             edge_index = int(getattr(self.state, "selected_idx", -1))
             selected_record = next(
                 (
@@ -7739,23 +8039,28 @@ class MainWindow(QMainWindow):
                     color=(255, 255, 255),
                     width=6,
                 )
-        if not lightweight and len(work_records) <= 30:
-            for record in work_records:
-                start, end = record["points"][0], record["points"][-1]
-                midpoint = (
-                    0.5 * (float(start[0]) + float(end[0])),
-                    0.5 * (float(start[1]) + float(end[1])),
-                )
-                viewer.draw_text(
-                    midpoint[0] + 6,
-                    midpoint[1] - 6,
-                    f"作业{record['work_index'] + 1}",
-                    color=(255, 255, 255),
-                    size=10,
-                )
+        # Work-line labels such as “作业1/作业2” obscure the crop evidence on
+        # dense fields.  The segment list already carries the work-line index;
+        # keep the canvas focused on geometry and control points.
         for index, point in enumerate(points):
-            selected = getattr(self.state, 'selected_type', None) == 'node' and getattr(self.state, 'selected_idx', -1) == index
-            viewer.draw_circle(point[0], point[1], radius=8 if selected else 6, color=(255, 255, 255) if selected else (255, 120, 0))
+            selected = selected_type == "node" and getattr(
+                self.state, "selected_idx", -1
+            ) == index
+            point_color = self._route_edit_control_point_color(statuses, index)
+            if selected:
+                # Keep the segment color visible while using a white halo to
+                # distinguish the active node.  Selecting/inserting a node no
+                # longer turns its entire parent work line white.
+                viewer.draw_circle(
+                    point[0], point[1], radius=9, color=(255, 255, 255)
+                )
+                viewer.draw_circle(
+                    point[0], point[1], radius=6, color=point_color
+                )
+            else:
+                viewer.draw_circle(
+                    point[0], point[1], radius=6, color=point_color
+                )
             if not lightweight and len(points) <= 30:
                 viewer.draw_text(point[0] + 8, point[1] - 8, str(index + 1), color=(245, 245, 245), size=10)
         if not lightweight:
@@ -7828,7 +8133,7 @@ class MainWindow(QMainWindow):
         elif self._measure_tool == "area":
             self.lbl_status.setText("测面积：左键添加顶点，右键显示面积；下一次左键新建")
         elif getattr(self.state, 'entry_exit_mode', False):
-            self.lbl_status.setText("服务点编辑：起点必选，终点与卸粮点可选")
+            self.lbl_status.setText("服务点编辑：起点必选，终点自动延伸且可拖动，卸粮点按需添加")
         elif self._route_edit_active:
             labels = {
                 "select": "路线编辑：选择线段或拖动端点；Shift+拖动作业线可整线平移",
@@ -7953,9 +8258,8 @@ class MainWindow(QMainWindow):
                 self._close_cancel_warning_shown = False
                 QTimer.singleShot(10000, self._warn_close_cancel_still_running)
                 # Keep the worker alive long enough to release GDAL/PyTorch
-                # resources safely, while making the close action immediately
-                # visible. Worker cleanup closes this hidden window for good.
-                self.hide()
+                # resources safely. Keep the window visible so cancellation
+                # progress remains observable to the user.
             if not getattr(self, '_task_cancel_requested', False):
                 self._cancel_background_worker()
             elif (

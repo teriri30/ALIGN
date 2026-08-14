@@ -147,7 +147,7 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
                 action="调整" if locked else "确认",
             )
         else:
-            statuses["exit"] = TaskStatus("done", "可选未设置", action="布设")
+            statuses["exit"] = TaskStatus("done", "自动延伸", action="调整")
         if unload_points:
             statuses["unload"] = TaskStatus("done", f"{len(unload_points)} 个")
         elif entry:

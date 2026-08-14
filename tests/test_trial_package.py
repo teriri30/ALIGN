@@ -36,13 +36,17 @@ def _machine_ready():
         _machine_ready(),
     ],
 )
-def test_candidate_path_export_fails_before_writing_without_machine_evidence(
-    tmp_path, readiness
+def test_research_path_export_does_not_require_machine_readiness(
+    tmp_path, readiness, monkeypatch
 ):
     QApplication.instance() or QApplication([])
     window = MainWindow()
-    output = tmp_path / "blocked.path"
-    path_result = {"machine_readiness": readiness}
+    output = tmp_path / "research.path"
+    path_result = {
+        "machine_readiness": readiness,
+        "validation": {"valid": True},
+        "is_valid": True,
+    }
     points = [{
         "lat": 30.0,
         "lon": 116.0,
@@ -54,12 +58,21 @@ def test_candidate_path_export_fails_before_writing_without_machine_evidence(
         "status": 1,
     }]
 
-    with pytest.raises(ValueError, match="机器|终端协议"):
-        window._export_candidate_path(
-            str(output), path_result=path_result, geo_points=points
-        )
+    monkeypatch.setattr(
+        window,
+        "_enforce_formal_parameter_and_recovery_gate",
+        lambda _result: None,
+    )
+    monkeypatch.setattr(
+        window,
+        "_write_export_manifest",
+        lambda path, *_args, **_kwargs: str(path) + ".manifest.json",
+    )
+    window._export_candidate_path(
+        str(output), path_result=path_result, geo_points=points
+    )
 
-    assert not output.exists()
+    assert output.exists()
     window.close()
 
 
@@ -339,8 +352,8 @@ def test_complete_trial_visual_artifacts_include_masks_path_and_diagnostics(tmp_
 
 
 def test_package_index_hashes_route_manifest_and_visual_artifacts(tmp_path):
-    (tmp_path / "mission_field_trial.path").write_text("$PATH,test*\n", encoding="utf-8")
-    (tmp_path / "mission_field_trial.path.manifest.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "mission_field_trial.txt").write_text("$PATH,test*\n", encoding="utf-8")
+    (tmp_path / "mission_field_trial.txt.manifest.json").write_text("{}", encoding="utf-8")
     (tmp_path / "preview.png").write_bytes(b"png")
 
     index_path = write_package_index(str(tmp_path))
@@ -348,8 +361,8 @@ def test_package_index_hashes_route_manifest_and_visual_artifacts(tmp_path):
 
     assert index_path == str(tmp_path / "package_index.json")
     assert {item["path"] for item in index["files"]} == {
-        "mission_field_trial.path",
-        "mission_field_trial.path.manifest.json",
+        "mission_field_trial.txt",
+        "mission_field_trial.txt.manifest.json",
         "preview.png",
     }
     assert all(len(item["sha256"]) == 64 for item in index["files"])
@@ -406,7 +419,7 @@ def test_complete_package_keeps_candidate_path_and_required_manifest_together(tm
     package_dir, route_path, manifest_path = window._export_complete_trial_package(str(tmp_path))
 
     assert package_dir.startswith(str(tmp_path))
-    assert route_path.endswith("mission_field_trial.path")
+    assert route_path.endswith("mission_field_trial.txt")
     assert manifest_path == route_path + ".manifest.json"
     assert Path(route_path).is_file()
     assert Path(manifest_path).is_file()

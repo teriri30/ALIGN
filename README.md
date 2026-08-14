@@ -4,9 +4,13 @@
 
 ## 普通用户使用（Windows 便携版）
 
-普通用户使用发布文件夹根目录的 `reUI.exe`，完整保留旁边的 `_internal` 文件夹后双击启动。源码仓库和运行包是两种交付物；直接下载 GitHub 的 `Code → Download ZIP` 不会包含本地构建产生的 EXE。便携版已携带 Python 运行库、PySide6、模型推理依赖、GeoTIFF/坐标依赖和内置模型，不需要安装 Python、Conda、pip 或项目依赖。使用 GPU 推理时仍需要电脑安装兼容的 NVIDIA 显卡驱动。
+普通用户请从 [下载最新 Windows 便携版](https://github.com/teriri30/reUI/releases/latest) 获取 ZIP。完整解压后，双击最外层的 `reUI.exe`；不要把 EXE 单独移出 `_internal` 文件夹。便携版已携带 Python 运行库、PySide6、CPU 模型推理依赖、GeoTIFF/坐标依赖和内置模型，不需要安装 Python、Conda、pip、CUDA 或项目依赖；因此下载到普通 Windows 电脑即可运行。开发者本地 CUDA 环境仍保留，GPU 版可按本地构建流程单独生成。
 
-程序配置、缓存、日志和用户模型保存在 `%LOCALAPPDATA%\\reUI`，更新程序不会覆盖这些数据。`update.bat` 是开发者同步源代码到 GitHub 的工具，不是普通用户的 EXE 更新器。
+GitHub 的 `Code → Download ZIP` 是源码包，只适合开发者，不包含可直接运行的 EXE。普通用户应下载 Release 中的 `reUI-Windows-x64-<version>.zip`，解压后即可运行整个便携项目。
+
+维护者发布新版本时，可以推送 `v*` 标签，或在 GitHub Actions 的 `build-release` 中填写 `release_tag` 手动发布；工作流会先完成测试、构建和 `reUI.exe --self-test`，通过后才上传 Release。
+
+程序配置、缓存、日志和用户模型保存在 `%LOCALAPPDATA%\\reUI`，更新程序不会覆盖这些数据。开发者运行 `update.bat` 后，脚本会先确认源码分支已推送，再询问是否创建 `v*` 标签；标签触发 Actions 构建并发布完整 Release ZIP。它不是普通用户的 EXE 更新器。
 
 ## 目录结构
 
@@ -22,6 +26,8 @@
 
 - 用途：论文方法验证、内部实验和田间试验准备。
 - 农机尺寸建议基于当前影像中的行带宽度、田头空间和已填写的机具参数计算。
+- 当前工具链还包括禁行区确认、起点/终点与卸粮点、路线编辑、混合种植区域处理、农机兼容 `$PATH` 测试文件和掩膜诊断包。
+- 论文默认实验只做掩膜阶段资料包；转弯策略目前只作为已实现功能生成并校验，不做策略优化或策略对比。
 
 ## 运行环境
 
@@ -74,7 +80,7 @@ D:\zhl\anaconda\envs\game\python.exe src\integrity_check.py path_result.csv.mani
 - GeoJSON、CSV、KML、JSON 和 `$PATH` 均可作为科研结果导出，并同步保存参数、坐标和校验记录。
 - “农机兼容测试文件”仅用于核对目标终端的 `$PATH` 文本格式和直线化转弯投影，与科研路径导出分开。
 
-当前足迹验证采用 `planar_rigid_footprint_v2` 二维平面模型。路径参考点为两条履带接地区域的几何中心；预计碾压率按有限长度有向矩形扫掠计算，作物掩膜几何覆盖按具有实测前置距离的横向有效割幅线段扫掠计算。割刀前置距离、履带宽度和中心距等参数应按实测值填写。模型结果用于比较不同路径方案的几何差异；土壤压实、打滑、坡度、悬挂、惯性、GNSS 天线偏移和完整车身外廓可作为扩展评价因素。
+当前足迹验证采用 `planar_rigid_footprint_v2` 二维平面模型。路径参考点为两条履带接地区域的几何中心；预计碾压率按有限长度有向矩形扫掠计算，作物掩膜几何覆盖按具有实测前置距离的横向有效割幅线段扫掠计算。割刀前置距离、履带宽度和中心距等参数应按实测值填写。模型结果用于记录当前路径的几何指标；土壤压实、打滑、坡度、悬挂、惯性、GNSS 天线偏移和完整车身外廓可作为后续扩展评价因素。
 
 ## 文档
 
@@ -82,6 +88,7 @@ D:\zhl\anaconda\envs\game\python.exe src\integrity_check.py path_result.csv.mani
 - [关键设计决策](docs/DECISIONS.md)
 - [科研验证协议](docs/SCIENTIFIC_VALIDATION.md)
 - [数据与溯源契约](docs/DATA_CONTRACTS.md)
+- [使用说明](docs/USER_MANUAL.md)
 
 ## 建议补充的试验数据
 

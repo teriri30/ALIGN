@@ -40,7 +40,7 @@ def test_recommendation_derives_track_limit_and_gauge_from_wide_corridors():
 
     result = recommend_machine_dimensions(mask_result, current)
 
-    assert result["validated"] is False
+    assert "validated" not in result
     assert result["method"] == "mask_geometry_heuristic_v2"
     assert result["limits"]["wide_corridor_clear_m"] == pytest.approx(0.7)
     assert result["limits"]["track_width_upper_m"] == pytest.approx(0.55)
@@ -52,6 +52,9 @@ def test_recommendation_derives_track_limit_and_gauge_from_wide_corridors():
     assert result["limits"]["matched_cutter_width_m"] == pytest.approx(2.35)
     assert result["params"]["cutter_width_m"] == pytest.approx(2.35)
     assert "自动候选割幅" in result["message"]
+    assert "不含坡度、土壤或重心模型" in result["message"]
+    assert "基于当前影像中的行带宽度和田头空间" in result["message"]
+    assert "没有 DEM" not in result["message"]
 
 
 def test_recommendation_scales_generated_cutter_width_with_machine_body():

@@ -1,4 +1,8 @@
-"""Fail-closed readiness assessment for future machine route exporters."""
+"""Report-only readiness details for optional machine compatibility studies.
+
+The research workflow keeps these fields for traceability, but does not use
+them as a gate for ordinary scientific route exports.
+"""
 
 import math
 from typing import Dict, Optional
@@ -100,10 +104,11 @@ def assess_machine_readiness(
     path_result: Dict,
     execution_config: Optional[Dict] = None,
 ) -> Dict:
-    """Report whether a validated route may enter a machine-adapter pipeline.
+    """Record evidence required by an optional machine-adapter pipeline.
 
-    This function does not make current GIS exports machine executable. It
-    only records missing evidence and remains fail-closed by default.
+    This function does not make current GIS exports machine executable and
+    does not block the ordinary research workflow; callers may use the report
+    when preparing a separate compatibility or controlled-trial study.
     """
     result = dict(path_result or {})
     cfg = dict(execution_config or {})

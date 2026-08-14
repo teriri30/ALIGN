@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 
-def test_default_experiment_plan_disables_unimplemented_model_comparison():
+def test_default_experiment_plan_disables_model_and_turn_strategy_comparison():
     from paper_experiments import default_experiment_plan
 
     plan = default_experiment_plan(["a.pt", "b.pt"])
@@ -16,18 +16,12 @@ def test_default_experiment_plan_disables_unimplemented_model_comparison():
         "body_residual_recovery",
         "full_mask_regularization",
     ]
-    assert {case["strategy"] for case in plan["path_cases"]} == {
-        "bow", "semicircle", "pear", "fishtail",
+    assert plan["path_cases"] == []
+    assert plan["path_comparison"] == {
+        "status": "disabled",
+        "reason": "turn_strategy_experiment_not_in_current_scope",
     }
-    assert [case["id"] for case in plan["path_cases"]] == [
-        "bow_baseline", "bow_headland_optimized",
-        "semicircle_baseline", "semicircle_headland_optimized",
-        "pear_baseline", "pear_headland_optimized",
-        "fishtail_baseline", "fishtail_headland_optimized",
-    ]
-    assert all("headland_turn_optimization_enabled" in case for case in plan["path_cases"])
-    assert plan["path_cases"][0]["headland_turn_optimization_enabled"] is False
-    assert plan["path_cases"][1]["headland_turn_optimization_enabled"] is True
+    assert plan["comparison_policy"]["path_strategy_comparison"] == "disabled"
     assert plan["model_cases"] == []
     assert plan["model_comparison"] == {
         "status": "disabled",
@@ -152,10 +146,8 @@ def test_runner_isolates_state_and_preserves_failed_cases(tmp_path):
     assert state.turn_strategy == original_strategy
     assert Path(result).is_dir()
     manifest = json.loads((Path(result) / "experiment_manifest.json").read_text(encoding="utf-8"))
-    pear_cases = [item for item in manifest["records"] if str(item["case_id"]).startswith("pear_")]
-    assert len(pear_cases) == 2
-    assert all(item["status"] == "failed" for item in pear_cases)
-    assert manifest["completed_count"] >= 5
+    assert not any(item["module"] == "path" for item in manifest["records"])
+    assert manifest["completed_count"] >= 4
 
 
 def test_runner_snapshot_preserves_mask_shape_for_field_boundary_validation(tmp_path):
@@ -212,7 +204,6 @@ def test_runner_snapshot_preserves_mask_shape_for_field_boundary_validation(tmp_
         "path_cases": [{
             "id": "boundary_snapshot",
             "strategy": "bow",
-            "headland_turn_optimization_enabled": True,
         }],
     })
 

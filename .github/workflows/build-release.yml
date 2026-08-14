@@ -7,6 +7,10 @@ on:
         description: "Release channel"
         required: true
         default: "stable"
+      release_tag:
+        description: "Optional release tag, for example v0.1.0; leave empty for an artifact-only build"
+        required: false
+        default: ""
   push:
     tags:
       - "v*"
@@ -28,12 +32,19 @@ jobs:
         with:
           python-version: "3.10"
           cache: pip
-          cache-dependency-path: developer/requirements/requirements.txt
+          cache-dependency-path: |
+            developer/requirements/requirements-release.txt
+            developer/requirements/requirements-ci.txt
+            developer/requirements/requirements-build.txt
       - name: Install runtime and build dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r developer/requirements/requirements.txt -r developer/requirements/requirements-ci.txt -r developer/requirements/requirements-build.txt
+          # The development environment remains CUDA-enabled.  The public
+          # portable ZIP uses CPU PyTorch so the bundled runtime stays below
+          # GitHub's single-release-asset size limit and runs on any Windows
+          # machine without a separately installed CUDA toolkit.
+          python -m pip install -r developer/requirements/requirements-release.txt -r developer/requirements/requirements-ci.txt -r developer/requirements/requirements-build.txt
       - name: Configure geospatial data paths
         shell: pwsh
         run: |
@@ -50,7 +61,9 @@ jobs:
       - name: Generate build metadata
         shell: pwsh
         run: |
-          if ($env:GITHUB_REF_TYPE -eq "tag") { $version = $env:GITHUB_REF_NAME.TrimStart("v") } else { $version = "0.1.0-dev" }
+          if ($env:GITHUB_REF_TYPE -eq "tag") { $version = $env:GITHUB_REF_NAME.TrimStart("v") }
+          elseif (-not [string]::IsNullOrWhiteSpace("${{ inputs.release_tag }}")) { $version = "${{ inputs.release_tag }}".TrimStart("v") }
+          else { $version = "0.1.0-dev" }
           $channel = "${{ inputs.channel }}"
           if ([string]::IsNullOrWhiteSpace($channel)) { $channel = "stable" }
           python scripts/generate_build_info.py --version $version --channel $channel
@@ -84,10 +97,11 @@ jobs:
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.sha }}
       - name: Publish tagged GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
           $version = (Get-Content build_info.json -Raw | ConvertFrom-Json).version
-          gh release create $env:GITHUB_REF_NAME ${{ steps.package.outputs.zip }} ${{ steps.package.outputs.sha }} --generate-notes --title "reUI $version"
+          if ($env:GITHUB_REF_TYPE -eq "tag") { $releaseTag = $env:GITHUB_REF_NAME } else { $releaseTag = "${{ inputs.release_tag }}" }
+          gh release create $releaseTag ${{ steps.package.outputs.zip }} ${{ steps.package.outputs.sha }} --target $env:GITHUB_SHA --generate-notes --title "reUI $version"

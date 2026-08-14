@@ -71,7 +71,6 @@ def test_connect_work_lines_validates_only_the_fixed_turn_geometry(monkeypatch):
         min_turn_radius_m=1.0,
         turn_strategy="bow",
         config={
-            "headland_turn_optimization_enabled": True,
             "headland_mask": headland,
             "planning_support_mask": mask,
             "uncertain_mask": np.zeros_like(mask),
@@ -84,13 +83,13 @@ def test_connect_work_lines_validates_only_the_fixed_turn_geometry(monkeypatch):
     )
 
     decision = diagnostics["turn_decisions"][0]
-    optimization = decision["headland_turn_optimization"]
+    turn_validation = decision["headland_turn_validation"]
     assert captured
     assert captured_segment_types == [["turn"]]
     assert len(captured) == 1
     assert len(captured[0]) == 1
-    assert optimization["candidate_count"] == 1
-    assert optimization["optimization_applied"] is False
+    assert turn_validation["candidate_count"] == 1
+    assert turn_validation["validation_passed"] is True
     assert decision["fallback_reason"] == ""
     candidate_geometries = {
         tuple(

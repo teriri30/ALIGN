@@ -45,18 +45,15 @@ class PaperExperimentDialog(QDialog):
         self.resize(620, 480)
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "对当前项目快照运行掩膜基线、完整规则化和六种调头策略对比。"
-            "实验不会覆盖当前界面结果；失败组会保留在结果表中。"
+            "对当前项目快照运行掩膜处理阶段对比。"
+            "当前论文范围不包含转弯策略优化或策略对比；实验不会覆盖当前界面结果。"
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         self.mask_check = QCheckBox("掩膜处理对比：原始分割掩膜 vs 完整规则化")
         self.mask_check.setChecked(True)
-        self.path_check = QCheckBox("路径策略对比：弓形、半圆、梨形、鱼尾、Alpha、自动优选")
-        self.path_check.setChecked(True)
         layout.addWidget(self.mask_check)
-        layout.addWidget(self.path_check)
 
         truth_row = QHBoxLayout()
         self.truth_path = ""
@@ -94,13 +91,15 @@ class PaperExperimentDialog(QDialog):
     def options(self):
         return {
             "include_mask": self.mask_check.isChecked(),
-            "include_path": self.path_check.isChecked(),
+            # Kept for callers that read the old options shape. The current
+            # paper scope intentionally does not run turn-strategy cases.
+            "include_path": False,
             "ground_truth_path": self.truth_path,
         }
 
     def accept(self):
-        if not self.mask_check.isChecked() and not self.path_check.isChecked():
-            QMessageBox.warning(self, "没有实验组", "请至少选择一类实验。")
+        if not self.mask_check.isChecked():
+            QMessageBox.warning(self, "没有实验组", "请勾选掩膜处理实验。")
             return
         super().accept()
 

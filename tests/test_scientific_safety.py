@@ -171,8 +171,9 @@ def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
     assert "倒车 1" in summary
     assert "进出田/卸粮 1" in summary
     assert panel._safety.text() == "路径状态：路径校验未通过"
-    assert "足迹优化" in panel._safety.toolTip()
-    assert "支撑<=100" in panel._safety.toolTip()
+    assert panel._safety.toolTip() == "尚未获得有效的路径校验结果"
+    assert "足迹优化" not in panel._safety.toolTip()
+    assert "田间试验" not in panel._safety.toolTip()
     assert [row._segment_type for row in panel.findChildren(RouteSegmentRow)] == [
         "work", "turn_approach", "turn", "turn_reverse", "exit"
     ]
@@ -491,8 +492,8 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
     assert trial_manifest["output"]["footprint_model"] == "planar_rigid_footprint_v2"
 
 
-def test_machine_parameter_output_is_explicitly_unvalidated_heuristic():
-    """DECISION-008: machine-size advice remains labelled as an unvalidated heuristic."""
+def test_machine_parameter_output_states_concise_calculation_basis():
+    """DECISION-008: machine-size advice states its useful calculation basis."""
     from pyside6_app.main_window import MainWindow
 
     QApplication.instance() or QApplication([])
@@ -503,6 +504,8 @@ def test_machine_parameter_output_is_explicitly_unvalidated_heuristic():
         "validation": {},
     })
 
-    assert recommendation["validated"] is False
+    assert "validated" not in recommendation
     assert recommendation["method"] == "mask_geometry_heuristic_v2"
-    assert "没有 DEM" in recommendation["message"]
+    assert "基于当前影像中的行带宽度和田头空间" in recommendation["message"]
+    assert "不含坡度、土壤或重心模型" in recommendation["message"]
+    assert "没有 DEM" not in recommendation["message"]

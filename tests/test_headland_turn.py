@@ -140,11 +140,12 @@ def test_validate_footprints_reports_segment_and_repeat_access_metrics():
     assert result["turn_cost_m2"] >= 0.0
 
 
-def test_headland_turn_config_has_no_optimization_switch():
-    from config import Config
+def test_headland_turn_config_requires_only_fixed_validation_inputs():
+    from config import validate_config
 
-    cfg = Config()
-    path_config = cfg.section("path_planning")
+    path_config = validate_config({
+        "path_planning": {"headland_damage_weight": 1.0}
+    })["path_planning"]
     assert "headland_turn_optimization_enabled" not in path_config
     assert path_config.get("headland_damage_weight", 1.0) == pytest.approx(1.0)
 

@@ -96,7 +96,7 @@ DECISION_ANCHORS = {
         "docs/DATA_CONTRACTS.md",
         "src/footprint_planner.py",
         "src/path_planner.py",
-        "src/headland_turn_optimizer.py",
+        "src/headland_turn_validation.py",
         "tests/test_track_pass_count.py",
         "tests/test_headland_turn.py",
         "tests/test_headland_turn_contract.py",
@@ -144,4 +144,4 @@ def test_readme_preserves_research_use_and_model_conditions():
     """DECISION-008: public wording states the research use and model conditions."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "科研软件" in readme
-    assert "模型结果用于比较不同路径方案的几何差异" in readme
+    assert "模型结果用于记录当前路径的几何指标" in readme

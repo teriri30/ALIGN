@@ -15,7 +15,7 @@ class ExportEngine:
 
     def export_to_file(self, save_path: str):
         raise RuntimeError(
-            "旧 ExportEngine 导出接口已禁用；必须通过主窗口的正式导出门禁和溯源清单导出"
+            "旧 ExportEngine 导出接口已禁用；请通过主窗口导出流程生成带 manifest 的科研文件"
         )
 
     def export_auto_path_to_file(self, save_path: str):

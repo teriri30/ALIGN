@@ -21,78 +21,6 @@ def test_path_crossing_count_uses_segment_types_when_entry_or_aux_segments_exist
     assert _count_path_intersections_proper(full_path, segment_types) == 0
 
 
-def _candidate(strategy, rolling, core):
-    return {
-        "strategy": strategy,
-        "validation": {
-            "valid": True,
-            "validation_profile": "field_trial",
-            "rolling_canopy_pct": rolling,
-            "rolling_body_pct": rolling,
-            "track_core_overlap_pct": core,
-            "track_outside_field_pct": 0.0,
-            "track_outside_support_pct": 0.0,
-            "track_uncertain_overlap_pct": 0.0,
-            "track_forbidden_overlap_pct": 0.0,
-            "crop_mask_geometric_coverage_pct": 96.0,
-            "total_length_m": 100.0,
-        },
-        "turn_assessment": {},
-        "segment_types": ["work"],
-    }
-
-
-def test_valid_candidate_ranking_uses_body_rolling_as_primary_crop_metric():
-    from path_planner import _rank_path_candidates
-
-    ranked = _rank_path_candidates([
-        _candidate("low_core_but_more_crushing", rolling=4.0, core=1.0),
-        _candidate("less_crushing", rolling=1.0, core=7.0),
-    ])
-
-    assert ranked[0]["strategy"] == "less_crushing"
-    assert ranked[0]["candidate_metrics"]["rolling_body_pct"] == 1.0
-
-
-def test_strategy_ranking_ignores_headland_rolling_and_uses_body_risk():
-    from path_planner import _rank_path_candidates
-
-    low_headland = _candidate("low_headland", rolling=1.0, core=2.0)
-    low_headland["validation"].update({
-        "rolling_body_pct": 4.0,
-        "rolling_headland_pct": 0.0,
-        "agronomic_damage_cost_m2": 1.0,
-        "total_length_m": 100.0,
-    })
-    high_headland = _candidate("high_headland", rolling=80.0, core=2.0)
-    high_headland["validation"].update({
-        "rolling_body_pct": 1.0,
-        "rolling_headland_pct": 95.0,
-        "agronomic_damage_cost_m2": 500.0,
-        "total_length_m": 90.0,
-    })
-
-    ranked = _rank_path_candidates([low_headland, high_headland])
-
-    assert ranked[0]["strategy"] == "high_headland"
-    assert ranked[0]["candidate_metrics"]["rolling_body_pct"] == 1.0
-
-
-def test_headland_weighted_damage_is_report_only_for_strategy_ranking():
-    from path_planner import _rank_path_candidates
-
-    lower_physical = _candidate("lower_physical", rolling=1.0, core=1.0)
-    lower_physical["validation"]["agronomic_damage_cost_m2"] = 500.0
-    lower_agronomic = _candidate("lower_agronomic", rolling=2.0, core=1.0)
-    lower_agronomic["validation"]["agronomic_damage_cost_m2"] = 1.0
-
-    ranked = _rank_path_candidates([lower_physical, lower_agronomic])
-
-    assert ranked[0]["strategy"] == "lower_physical"
-    assert ranked[0]["candidate_metrics"]["rolling_body_pct"] == 1.0
-    assert "agronomic_damage_cost_m2" not in ranked[0]["candidate_metrics"]
-
-
 def test_headland_weight_changes_planning_cost_without_changing_physical_rolling():
     """DECISION-013: a planning weight must never rewrite measured rolling."""
     from footprint_planner import validate_footprints
@@ -237,27 +165,6 @@ def test_headland_space_precheck_marks_outward_probe_outside_field_as_limited():
     ) is False
 
 
-def test_candidate_dedup_uses_actual_strategy_sequence_and_geometry():
-    from path_planner import _deduplicate_path_candidates
-
-    base = {
-        "path_segments": [[(0.0, 0.0), (1.0, 0.0)]],
-        "segment_types": ["turn"],
-        "validation": {"valid": True},
-        "turn_assessment": {"used_strategies": ["pear"]},
-    }
-    candidates = [
-        {**base, "strategy": "bow"},
-        {**base, "strategy": "semicircle"},
-        {**base, "strategy": "pear"},
-    ]
-
-    unique = _deduplicate_path_candidates(candidates)
-
-    assert len(unique) == 1
-    assert unique[0]["equivalent_candidate_labels"] == ["bow", "semicircle", "pear"]
-
-
 def test_unload_points_are_declared_as_end_route_candidates():
     from path_planner import _build_planning_factor_report
 
@@ -282,21 +189,6 @@ def test_unload_points_are_declared_as_end_route_candidates():
 
     assert summary["service_points"]["unload_semantics"] == "select_one_nearest_route_end"
     assert summary["service_points"]["unload_count"] == 2
-
-
-def test_candidate_ranking_rejects_non_finite_metrics_deterministically():
-    from path_planner import _rank_path_candidates
-
-    invalid = _candidate("invalid", rolling=float("nan"), core=0.0)
-    invalid["validation"]["rolling_body_pct"] = float("nan")
-    finite = _candidate("finite", rolling=1.0, core=0.0)
-
-    first = _rank_path_candidates([invalid, finite])
-    second = _rank_path_candidates([finite, invalid])
-
-    assert first[0]["strategy"] == "finite"
-    assert second[0]["strategy"] == "finite"
-    assert first[-1]["validation"]["valid"] is False
 
 
 def test_plan_worker_executes_the_same_persisted_headland_weight_it_records(monkeypatch):

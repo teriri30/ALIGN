@@ -492,9 +492,7 @@ def test_contour_route_reuses_headland_lines_and_keeps_center_single():
     assert diagnostics["contour_route_mode"] is True
     assert diagnostics["fallback_reasons"] == []
     assert all(
-        decision["headland_turn_optimization"].get(
-            "disabled_for_contour_shared_headland"
-        )
+        "headland_turn_validation" in decision
         for decision in diagnostics["turn_decisions"]
     )
     # 偶数号转弯共用右田头线，奇数号转弯共用左田头线。
@@ -736,7 +734,7 @@ def test_contour_is_a_valid_ordering_strategy_and_uses_bow_turn_geometry():
     )
 
     assert normalize_turn_strategy("spiral") == "contour"
-    assert "contour" in _candidate_strategies_for_request("auto")
+    assert _candidate_strategies_for_request("auto") == ["auto"]
     assessment = assess_turn_strategy("contour", [2.0, 2.0], 1.0)
     assert assessment["strategy"] == "contour"
     assert assessment["turn_geometry_strategy"] == "bow"

@@ -194,7 +194,7 @@ def export_visual_artifacts(
     with open(readme_path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(
             "reUI 田间试验资料包\n\n"
-            "mission_field_trial.path 为路径导入文件，使用前请按目标终端格式核对。\n"
+            "mission_field_trial.txt 为路径导入文件，使用前请按目标终端格式核对。\n"
             "同名 manifest 用于核对路径哈希、坐标规则、源影像、模型和分析参数。\n"
             "01-04 PNG 为显示坐标下的效果图，不是带地理标签的 GeoTIFF。\n"
             "masks 目录保留原始分割和处理后二值掩膜；诊断 ZIP 保存语义层和异常区域。\n"

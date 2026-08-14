@@ -20,7 +20,7 @@
 
 **代码锚点**：`MainWindow._geo_export_payload`、`MainWindow._write_export_manifest`、`integrity_check.verify_manifest`。
 
-**测试锚点**：`test_invalid_or_manually_edited_path_is_blocked_from_export`、`test_offline_manifest_checker_detects_route_tampering`、`test_legacy_export_engine_is_fail_closed`。
+**测试锚点**：`test_invalid_or_manually_edited_path_is_blocked_from_export`、`test_offline_manifest_checker_detects_route_tampering`、`test_legacy_export_engine_is_disabled_to_prevent_bypassing_export_gate`、`test_legacy_export_engine_is_fail_closed`。
 
 ## DECISION-002：缓存恢复必须验证完整阶段证据
 
@@ -126,8 +126,9 @@
 - 失效顺序固定为 inference -> mask -> path -> simulation/export。
 - 重新推理不保留旧掩膜作为成功结果。
 - 手工编辑路线后路径状态必须为未验证。默认研究导出保留该状态并写入 manifest，不弹窗、不阻断；只有显式 `fail_closed` 模式才拒绝导出。
-- 系统只自动推荐必选起点；终点和卸粮点由用户按需设置，未设置终点不得阻塞规划。已有起点、可选终点和卸粮点都必须支持在影像上直接拖动；拖动受已确认田界约束，一次按下—移动—释放只形成一个撤销事务，并在释放时使旧路径及其验证/导出证据失效。
-- 起点和可选终点拖动期间只受已确认田界约束，两个坐标轴均跟随鼠标，不得使用主航线轴、田头深度或田头走廊把点吸附到一条线；与最近作业线端点相接的正交青色线仅为预览，不写入 canonical 路径、不参与验证或导出。释放后旧路径立即失效；必选起点和其他任务条件完整时短延迟自动启动正式路径规划和完整足迹验证。
+- 系统自动推荐必选起点；终点标记默认沿最终作业段生成短延伸并写入共享控制折线和农机兼容 TXT，用户也可在影像上直接拖动该终点改为显式目标。起点、终点和卸粮点拖动受已确认田界约束，一次按下—移动—释放只形成一个撤销事务，并在释放时使旧路径及其验证/导出证据失效。
+- 起点和终点拖动期间只受已确认田界约束，两个坐标轴均跟随鼠标，不使用主航线轴、田头深度或田头走廊把点吸附到一条线；连续 canonical 路径保留真实作业/转弯几何，入口连接和最终终点延伸由共享控制折线写入兼容 TXT。释放后旧路径立即失效；必选起点和其他任务条件完整时短延迟自动启动正式路径规划和完整足迹验证。
+- 路线编辑中的起点和终点与 `state.path_points` 的首、末控制节点共享同一显示级别和状态颜色；删除首/末节点后，对应服务点自动跟随新的首/末节点。未显式设置终点时仍保留自动终点语义，只从当前共享控制折线的末节点显示和导出。
 - 释放后的短延迟期间允许保留一份显式标记为“待重新规划预览（不可导出）”的旧路线，仅供连续交互观察；canonical `auto_path`、验证、仿真和导出状态仍为空/失效，新规划提交后预览必须被清除。
 - 项目缓存恢复 `turn_strategy` 后，路径规划卡片和其他可见策略选择器必须无信号回写地同步到同一个 `AppState.turn_strategy`；不得让界面显示“套圈收割”而后台继续按缓存中的 `bow` 生成相邻行往返路线。
 - 调头方式选择器关闭时必须忽略滚轮，只有用户明确展开列表并选择或通过显式策略入口确认时，才设置 `turn_strategy_user_selected=true`。缺少该标记的旧缓存不能用非 `contour` 值覆盖“套圈收割”默认策略；与该旧值绑定的缓存路径同时失效，避免用新标签解释旧几何。
@@ -138,7 +139,7 @@
 
 ## DECISION-008：科研适用范围与指标表述
 
-**结论**：项目定位为科研软件，用于方法验证、路径方案比较和田间试验准备。结果表述应说明数据来源、计算模型和评价条件。
+**结论**：项目定位为科研软件，用于方法验证、路径生成、结果记录和田间试验准备。结果表述应说明数据来源、计算模型和评价条件。
 
 **原因**：GCP/RTK 绝对精度、目标终端格式、真实轨迹 RMSE、作业后碾压和异常工况会影响评价尺度，应作为对应试验的记录项。
 
@@ -203,7 +204,7 @@
 
 **允许的变更方式**：阈值只能依据带人工核验端点的真实样本调整；至少报告提前转弯检出率、误校正率、最小曲率、越界率和路线覆盖率。
 
-## DECISION-011：作业线模式、语义足迹与机器执行门禁
+## DECISION-011：作业线模式、语义足迹与研究导出边界
 
 **结论**：田块硬边界、语义支撑区、不确定区和人工确认禁行区必须分别统计，不得互相替代。通用地理导出不是机器执行协议。
 
@@ -244,13 +245,13 @@
 - 作业、转弯和进出场速度是明确农机配置；播放倍率仅用于演示控制。
 - 受控试验就绪检查必须核验足迹模型版本与内部路径参考点。
 
-**代码锚点**：`path_pose.py`、`path_planner._rank_path_candidates`、`footprint_planner.validate_footprints`、`workflow.AnimationEngine`、`MainWindow._store_path_result`、`machine_route_validator.assess_machine_readiness`。
+**代码锚点**：`path_pose.py`、`path_planner._select_turn_strategy`、`footprint_planner.validate_footprints`、`workflow.AnimationEngine`、`MainWindow._store_path_result`、`machine_route_validator.assess_machine_readiness`。
 
 **测试锚点**：`tests/test_cross_module_math.py`、`tests/test_animation_controls.py`。
 
 ## DECISION-013：田头碾压只作报告，不参与转弯策略选择
 
-**结论**：主作业区作物、田头作物、未确认无掩膜区和人工禁行区必须保持不同语义。转弯策略仍由运动学、田块边界、禁行区、自交、主体/核心区碾压、覆盖率和路径效率决定；`rolling_headland_pct` 与 `agronomic_damage_cost_m2` 仅作报告和论文对照，不进入局部转弯候选或全局策略排序。
+**结论**：主作业区作物、田头作物、未确认无掩膜区和人工禁行区必须保持不同语义。转弯几何按用户选定策略或明确的单步几何规则生成，再由运动学、田块边界、禁行区和足迹验证检查；当前不做转弯候选排序或路径优化。`rolling_headland_pct` 与 `agronomic_damage_cost_m2` 仅作报告和论文对照。
 
 **原因**：转弯策略用于指导农机执行，必须首先满足运动学和安全约束。当前课题没有田头碾压对转弯策略影响的实测标定依据，因此不能让田头作物分布或田头权重改变转弯几何；田头碾压仍保留为可审计统计指标。
 
@@ -258,12 +259,12 @@
 
 - `headland_damage_weight` 必须在 `(0, 1]` 内，默认 `1.0`；低于 `1.0` 只允许依据田间对照产量标定后使用。
 - 调整田头权重不得改变主体、田头、全田作物的真实碾压面积和 `rolling_canopy_pct`。
-- `agronomic_damage_cost_m2` 是报告/实验对照指标，不参与转弯策略排序，也不得称为碾压率。
+- `agronomic_damage_cost_m2` 是报告/实验对照指标，不参与转弯策略选择，也不得称为碾压率。
 - `headland_mask` 只能使用与主体掩膜同尺度的确认作物证据；重叠像素必须去重，不得重复计量。
 - 无掩膜像素不得自动认定为无作物道路；未确认区域继续接受语义支撑、禁行区和人工复核约束。
 - 实际执行配置与路径 provenance 中记录的配置必须一致，田头权重变化必须使路径阶段指纹变化。
 
-**代码锚点**：`footprint_planner.validate_footprints`、`path_planner._rank_path_candidates`、`pyside6_app.workers.PlanWorker`。
+**代码锚点**：`footprint_planner.validate_footprints`、`path_planner._select_turn_strategy`、`pyside6_app.workers.PlanWorker`。
 
 **测试锚点**：`tests/test_cross_module_math.py`。
 
@@ -271,16 +272,16 @@
 
 ## DECISION-014 论文实验必须冻结输入并保持单变量可比
 
-- 结论：论文实验从当前项目读取源影像身份、原始掩膜、地理尺度、田界、农机参数和服务点的冻结快照，在隔离状态中运行；掩膜组只改变处理阶段，路径组统一使用完整处理掩膜并只改变请求调头策略。
+- 结论：论文实验从当前项目读取源影像身份、原始掩膜、地理尺度、田界、农机参数和服务点的冻结快照，在隔离状态中运行；当前默认实验只改变掩膜处理阶段。转弯策略已实现但不纳入当前论文优化或策略对比实验。
 - 原因：批量功能如果同时改变模型、掩膜、参数或田界，生成的表格不能解释为模块贡献；后台实验若写回当前项目，还会破坏现有科研链路证据。
 - 不变量：
   1. 实验运行不得修改当前 `AppState` 的模型、掩膜、路径或策略。
   2. 原始掩膜、行带几何重构、主体残差恢复和完整规则化组必须来自同一次正式掩膜处理及其真实中间证据层，不得用伪参数或合成结果冒充消融。
-  3. 路径策略组必须共享同一完整处理掩膜、田界、服务点、禁行区和农机参数；每组记录请求策略与实际选择策略。
+  3. 论文默认计划不生成路径策略组；底层运行器仍可接受显式 `path_cases`，仅供未来单独设计的离线实验使用，不得把默认资料包解释为转弯策略比较。
   4. IoU、Dice、Precision、Recall 仅在提供同尺寸人工真值掩膜时生成；没有真值时保持缺失，不得用原始模型输出充当真值。
   5. 单个实验组失败必须保留失败原因并继续其余组；输出必须包含输入摘要、组参数、长表、宽表、逐组结果和效果图。
   6. 当前入口不具备隔离原始 GeoTIFF 多模型推理时，不得把同一原始掩膜复制并标记为不同模型结果。
-- 代码锚点：`src/paper_experiments.py`、`src/pyside6_app/workers.py`；桌面主界面不再提供消融实验入口，离线实验模块仅保留给可复现实验脚本和测试使用。
+- 代码锚点：`src/paper_experiments.py`、`src/pyside6_app/workers.py`；桌面主界面不再提供消融实验入口，离线实验模块当前只生成掩膜阶段资料包。
 - 测试锚点：`tests/test_paper_experiments.py`。
 - 允许变更方式：可增加新的真实中间层、模型隔离推理和统计图，但必须保持固定输入、人工真值门槛和失败记录，并同步更新实验 schema 与测试。
 
@@ -310,7 +311,7 @@
 
 ## DECISION-016：套圈按两半交错作业线并共享田头转弯线
 
-- **当前 v17（2026-08-12）覆盖 v16 的末线奇偶约束**：`001.txt` 的 20 条偶数作业线证据表明，若为保证唯一受阻短线“从受阻端结束”而反推交替方向，会把已正确选中的约 `0.48 m` 入口翻到约 `82.22 m` 外；原始中心线端点顺序若与全田主方向相反，先按原顺序选择进入端、随后再做轴向归一化也会产生同样的二次翻转。因此法向排序后的 `n` 条线仍取 `split=ceil(n/2)`，输出 `0, split, 1, split+1, ...`；8 条为 `0,4,1,5,2,6,3,7`，9 条为 `0,5,1,6,2,7,3,8,4`，4 条线使用 `1,3,0,2` 避免中心相邻转弯，但规划优先级改为：先保留各区域生成的全部直线；唯一受阻短线从循环候选中移除后固定追加；随后以必选起点到最终首端点的距离为第一排序键，相邻法向转弯数只作第二排序键；所有直线先统一到全田主方向，再依据起点确定交替进入方向；最后统一构造共享田头墙和全田转弯。受阻短线最后执行，但不得通过偶数/奇数条数反推并覆盖全局进入方向；若按起点优先的交替方向使受阻端成为末线起点，只允许由倒数第二条的局部正式转弯连接该端，并继续接受田界、曲率、禁行区和足迹失败关闭。每次排序变换后都必须重算法向秩间隔，端点修复与共享田头墙后必须用 canonical 作业线复核 `entry_nearest_feasible_verified=true`。诊断记录 `terminal_blocked_endpoint_role`、`terminal_blocked_endpoint_is_route_finish` 和 `terminal_finish_orientation_forced=false`；`entry_side_constrained_by_terminal_short_line` 必须为 `false`。终点为可选参考，未设置时完成最后一条作业线即结束。桌面工作流固定使用 `service_point_mode=reference_only`，不把人工驾驶到田边的起点或可选终点强行连入 canonical 路径；底层研究调用只有显式指定 `service_point_mode=connect` 才生成连接段。等距区外侧若仅存在短于主体跨度的掩膜碎片，必须在套圈排序前记录并排除该边缘碎片，不能自动把它推断成完整作业行；同一条带的内部断行只有在两侧均有足够长作业证据时才允许在掩膜阶段桥接。自动端点修复只保留原有证据约束：至少 3 条邻近完整中心线、短带自身纵向跨度和已确认田界三项证据同时成立时，才可沿主航向恢复到共同田头墙。正射影像缺失且自身证据不足时，不再提供自动“缺边处理/趋势补全”模式；用户进入路线编辑后可拖动作业线与调头段共用的控制端点，画布在拖动过程中用相同转弯半径实时重建橙色物理弧线，退出编辑后仍显示连续弧线。协议导出仍从同一组控制端点生成状态 `0` 的直线弦，不得用协议直线替换画布连续路线。种植区域只控制作业直线的来源和密度；全部区域直线生成后必须合并成一个全田集合，再统一执行本决策的排序、方向、共享田头墙和转弯生成，不得因区域边界插入 `turn_aux` 或整行 `turn_reverse`。
+- **当前 v17（2026-08-12）覆盖 v16 的末线奇偶约束**：`001.txt` 的 20 条偶数作业线证据表明，若为保证唯一受阻短线“从受阻端结束”而反推交替方向，会把已正确选中的约 `0.48 m` 入口翻到约 `82.22 m` 外；原始中心线端点顺序若与全田主方向相反，先按原顺序选择进入端、随后再做轴向归一化也会产生同样的二次翻转。因此法向排序后的 `n` 条线仍取 `split=ceil(n/2)`，输出 `0, split, 1, split+1, ...`；8 条为 `0,4,1,5,2,6,3,7`，9 条为 `0,5,1,6,2,7,3,8,4`，4 条线使用 `1,3,0,2` 避免中心相邻转弯，但规划优先级改为：先保留各区域生成的全部直线；唯一受阻短线从循环候选中移除后固定追加；随后以必选起点到最终首端点的距离为第一排序键，相邻法向转弯数只作第二排序键；所有直线先统一到全田主方向，再依据起点确定交替进入方向；最后统一构造共享田头墙和全田转弯。受阻短线最后执行，但不得通过偶数/奇数条数反推并覆盖全局进入方向；若按起点优先的交替方向使受阻端成为末线起点，只允许由倒数第二条的局部正式转弯连接该端，并继续接受田界、曲率、禁行区和足迹失败关闭。每次排序变换后都必须重算法向秩间隔，端点修复与共享田头墙后必须用 canonical 作业线复核 `entry_nearest_feasible_verified=true`。诊断记录 `terminal_blocked_endpoint_role`、`terminal_blocked_endpoint_is_route_finish` 和 `terminal_finish_orientation_forced=false`；`entry_side_constrained_by_terminal_short_line` 必须为 `false`。终点标记可以不预先布设，桌面实现会沿最终作业段生成短延伸并写入共享控制折线和兼容 TXT；显式拖动后该点作为终点目标使用。桌面工作流固定使用 `service_point_mode=reference_only`，连续 canonical 路径仍保留作业/转弯几何，入口与终点延伸由兼容控制投影承载；底层研究调用只有显式指定 `service_point_mode=connect` 才生成服务连接段。等距区外侧若仅存在短于主体跨度的掩膜碎片，必须在套圈排序前记录并排除该边缘碎片，不能自动把它推断成完整作业行；同一条带的内部断行只有在两侧均有足够长作业证据时才允许在掩膜阶段桥接。自动端点修复只保留原有证据约束：至少 3 条邻近完整中心线、短带自身纵向跨度和已确认田界三项证据同时成立时，才可沿主航向恢复到共同田头墙。正射影像缺失且自身证据不足时，不再提供自动“缺边处理/趋势补全”模式；用户进入路线编辑后可拖动作业线与调头段共用的控制端点，画布在拖动过程中用相同转弯半径实时重建橙色物理弧线，退出编辑后仍显示连续弧线。协议导出仍从同一组控制端点生成状态 `0` 的直线弦，不得用协议直线替换画布连续路线。种植区域只控制作业直线的来源和密度；全部区域直线生成后必须合并成一个全田集合，再统一执行本决策的排序、方向、共享田头墙和转弯生成，不得因区域边界插入 `turn_aux` 或整行 `turn_reverse`。
 
 - 结论：`contour`（套圈收割）保留现有作物证据支持的平行作业线，先按田块法向轴排序，再按两半交错访问；相邻访问段在对应短边田头连接，同一端的转弯共用同一条轴向田头墙。它不生成脱离作物证据的闭合偏置轮廓，也不绕过运动学和正式足迹验证。
 - **v3（2026-08-05 修订）**：替代 v2 的单侧连续扫掠。v2 虽能保证相邻法向位置连续，却仍是蛇形行走，不符合外侧两行组成第 1 圈、次外侧两行组成第 2 圈的回字形语义。v3 同时规定：
@@ -329,11 +330,11 @@
   3. 同一田头的转弯锚点必须具有相同主向投影；固定转弯校验不得移动宽间距套圈转弯的横向切线或共享田头线。
   3a. 同一田头侧的 `shared_turn_clearance_m_by_side` 必须在全田已分类区域中一致，诊断记录 `shared_turn_clearance_scope=all_classified_regions`；局部凹边界只允许整体内移该侧共同切线，不得只改变一个转弯的曲率。
   4. 套圈连接继续标记为 `turn`/`turn_reverse`/`turn_aux` 等正式转弯段，必须进入 DECISION-015 的长度、足迹和重复访问归因；不得新增绕过统计与协议的 `connector` 段类型。
-  5. 套圈候选必须经过与其他策略相同的曲率、田界、禁行区、足迹和导出门禁；失败时保留诊断，不把显示用直连段标记为可执行。混合种植田块不得先生成区域路线再拼接；全田统一排序后的每个相邻作业线对都按同一套转弯约束处理。
-  6. `auto` 可以将 `contour` 纳入候选比较，但只有正式验证通过且排序得分最优时才采用。
-- 代码锚点：`path_planner._contour_order_work_lines`、`path_planner._build_contour_connector_anchors`、`path_planner._connect_work_lines`、`path_planner._generate_uniform_zone_lines`、`path_planner._align_short_turn_anchors`、`path_planner._candidate_strategies_for_request`、`pyside6_app.panels.TaskPanel`。
+  5. 套圈路线必须经过与其他策略相同的曲率、田界、禁行区和足迹校验；失败时保留诊断，不把显示用直连段标记为可执行。混合种植田块不得先生成区域路线再拼接；全田统一排序后的每个相邻作业线对都按同一套转弯约束处理。
+  6. `auto` 只按当前相邻作业线的几何条件逐段选择实现，不比较其他转弯策略，也不计算全局策略得分。
+- 代码锚点：`path_planner._contour_order_work_lines`、`path_planner._build_contour_connector_anchors`、`path_planner._connect_work_lines`、`path_planner._generate_uniform_zone_lines`、`path_planner._align_short_turn_anchors`、`path_planner._select_turn_strategy`、`pyside6_app.panels.TaskPanel`。
 - 测试锚点：`tests/test_contour_strategy.py`。
-- 允许的变更方式：可用带人工核验田界、作业线端点和实机转弯轨迹的样本调整排序 tie-break、端点证据阈值或候选权重；不得移除中心线证据、最小半径、共享田头线诊断、正式足迹验证或失败关闭。
+- 允许的变更方式：可用带人工核验田界、作业线端点和实机转弯轨迹的样本调整端点证据阈值或几何容差；不得移除中心线证据、最小半径、共享田头线诊断、正式足迹验证或失败关闭。
 
 <!-- DECISION-016: nested contour ordering remains centerline-anchored and fail-closed. -->
 <!-- DECISION-016 v3: outside-pair ordering shares headland walls and supports a center single. -->
@@ -351,7 +352,7 @@
   6. 单一种植类型仍使用同一分类协议和原有规划/验证链路，不得因为没有混合区域而绕过证据记录。
   7. UI/缓存可删除稠密带轮廓，但必须保留至多 256 点的 `planning_contour`；历史紧凑缓存缺少该字段时，等距区必须能以中心线确定主向范围、以原始/处理掩膜确定真实横向范围，不得因此生成 0 条作业线。
   8. 两行窄带中心不得提升为四行作业线。宽窄行相邻正式四行中心线间距成为孤立异常大值、且约等于两个正常四行间距时，允许恢复一个规划期四行晶格中心：两侧稳定晶格相位支持不对称时必须从较长队列外推，不得机械取缺口中点；相位证据相当时才允许中点。支持校验必须沿候选四行带宽度做横截面占用并检查轴向连续性，不得要求机器中心线本身落在作物像素上。间隙中的 `all_bands` 窄带只能作为“已检查但忽略”的负证据。原分类、相位方法、队列证据、中心线/横截面支持、轴向长度和补线理由必须同时保留；连续多条缺失或证据不足时失败关闭。
-  9. 终点缺省时，收割结束后不得新增 `exit`、`turn_reverse` 或整行返程，路线在最后一条作业线末端结束。只有底层研究调用显式选择 `service_point_mode=connect` 且提供终点时，`exit` 才可写入路径；此时仍不得以长斜线跨越田块，终点位于最后作业线另一侧田头时先用显式 `turn_reverse` 沿最后一条已收割作业线返回对应田头，再用 `exit` 在田头横向接驳，并记录直达轴向距离、选择模式和田界检查。
+  9. 终点缺省时，连续 canonical 路径完成最后一条作业线后，桌面实现沿该作业段方向生成一小段 `exit` 终点延伸，并把它写入共享控制折线和兼容 TXT；不得新增整行返程。只有底层研究调用显式选择 `service_point_mode=connect` 且提供终点时，才按服务连接语义生成更长的 `exit`/`turn_reverse` 段；此时仍不得以长斜线跨越田块，终点位于最后作业线另一侧田头时先用显式 `turn_reverse` 沿最后一条已收割作业线返回对应田头，再用 `exit` 在田头横向接驳，并记录直达轴向距离、选择模式和田界检查。
   10. 漏线恢复算法保留用于 `research` 模式的显式手动复现；`field_trial` 和 `machine_candidate` 仍强制关闭自动恢复。缓存中存在 `planning_recovered=true` 的作业带时，结果必须保留该标记；严格 `fail_closed` 模式拒绝导出，研究导出不再弹窗或阻断。
   11. 种植类型相同不代表属于同一物理生成区。若等距区的主航线法向位置位于两组宽窄行四行带之间，分类器必须把两侧宽窄行拆成独立且连续的 `wide_narrow_rows_N` 区域，以保留各自来源带和生成密度；生成完成后的直线仍进入同一个全田转弯集合。分区依据和区域数量必须写入分类诊断。
   12. `layout.work_regions` 与 `layout.region_generation_order` 保存区域生成来源；`layout.region_execution_order` 必须为空，`turn_planning_scope=all_generated_work_lines`。`turn_assessment.contour_ordering` 必须记录 `execution_scope`、全田直线数、逐线区域 provenance 和 `region_boundaries_affect_turns=false`；`region_routes`、`region_transfers` 必须为空，并进入路径阶段指纹。
@@ -383,14 +384,14 @@
 - 原因：自动规划能够表达“有序作业线 + 相邻转弯”，人工编辑也应能表达同一结构。旧的点级编辑虽然能修端点，却不能从零搭建路线、整线调整或保存人工转弯形状；把人工转弯再次压成自动弓形还会抹掉用户明确标注的避让意图。
 - 不变量：
   1. 连续状态 `1` 边从共享控制折线即时派生为作业线对象；状态 `0` 边是相邻作业线间的转弯控制几何。所有画布操作最终回写同一 `path_points/path_status`，兼容测试导出不得读取另一份旧几何。
-  2. 新增、删除、调序或反向作业线时，只重建受影响作业线之间的局部状态 `0` 连接；端点是作业段和相邻转弯的共享节点，不得形成视觉上相接但数据中断开的两套点。
+  2. 新增、删除、调序或反向作业线时，只重建受影响作业线之间的局部状态 `0` 连接；端点是作业段和相邻转弯的共享节点，不得形成视觉上相接但数据中断开的两套点。起点/终点标记与首/末控制节点使用同一颜色、尺寸和拖动层级；删除首/末节点后服务点引用自动改到新的首/末节点。
   3. 只有两个端点的状态 `0` 连接可按当前最小转弯半径生成连续预览；人工增加到三个及以上点的状态 `0` 点列是显式 canonical 转弯几何，显示、模拟、验证和当前几何导出必须保留其点位，不得静默替换为自动弓形。
   4. 每个结构或几何修改都必须进入路线撤销栈，并立即使旧验证、自动路径阶段指纹、模拟结果和导出完成状态失效；人工编辑不得继承自动规划 provenance。
   5. “验证人工路线”复用当前掩膜、田界、禁行区、农机足迹和路径验证器，另审计人工转弯局部曲率；结果标记 `route_geometry_source=manual_control_edit_validated`、`manual_route_validated=true` 和 `automatic_planning_provenance_valid=false`。通过只表示当前几何在软件模型下通过，不等于恢复自动规划来源，更不等于田间实测或机器就绪。
-  6. 编辑过程中允许先画出尚未通过田界或影像范围检查的草稿，以便自由修形；验证与导出继续失败关闭。兼容测试文件可以按 DECISION-001 使用当前人工控制几何并保留预览标记，正式科研/机器导出仍受既有 provenance、坐标、田界、终端协议和 readiness 门禁约束。
+  6. 编辑过程中允许先画出尚未通过田界或影像范围检查的草稿，以便自由修形；验证与导出继续检查坐标、田界和 provenance。兼容测试文件可以按 DECISION-001 使用当前人工控制几何并保留预览标记；普通科研导出不要求机器就绪记录，机器兼容/受控试验流程另行使用其专门检查。
   7. 没有自动规划结果时也必须能进入编辑器并直接在画布两次点击构造第一条作业线。进入编辑后不再显示重复的上方工具宫格；选择与点/整条作业线拖动由画布直接承担，新增、删除、反向、调序、插入控制点、切换作业/转弯语义和验证由下方“路径结果”卡片的右键菜单或拖动承担。现有快捷键可保留为加速入口，但不能是完成核心编辑的唯一入口。
   8. 路线编辑是处理结果之上的增量显示层。进入编辑以及每次拖动、插点或结构调整后的重绘必须继续显示当前处理后主体、田头、不确定区、田界和禁行区；不得以 `clear_overlays` 造成前置证据视觉消失，更不得改写或清空对应状态。拖动热路径只允许替换路线动态项，不得逐帧重新降采样或生成掩膜证据图层；悬停于控制点、可拖动作业线或其他可选路径边时必须分别给出可移动、可点击的光标反馈。
   9. 编辑模式下的“路径结果”卡片是共享控制折线的对象视图，不是第二份路线。卡片与画布必须双向同步选中和高亮；右键切换整段语义、添加或删除内部航点、新增或删除作业线，以及拖拽调整作业线顺序，都必须回写 `state.path_points/path_status`、进入同一撤销栈、使旧验证失效并即时重绘两侧。只有作业线卡片允许拖拽排序；状态 `0` 转弯是相邻作业线的共享连接，不得脱离前后作业线独立搬动。结构排序后按既有规则重建相邻转弯。
-- 代码锚点：`pyside6_app.main_window.MainWindow._route_edit_work_records`、`MainWindow._route_edit_segment_records`、`MainWindow._on_route_list_edit_action`、`MainWindow._route_edit_replace_work_lines`、`MainWindow._simulation_segments_from_control_route`、`MainWindow._draw_mask_evidence_layers`、`MainWindow._draw_route_edit_overlay`、`MainWindow._validate_manual_route`、`pyside6_app.panels.StepCard`、`pyside6_app.panels.TaskPanel`、`pyside6_app.panels.RouteInfoPanel`。
+- 代码锚点：`pyside6_app.main_window.MainWindow._route_edit_work_records`、`MainWindow._route_edit_segment_records`、`MainWindow._on_route_list_edit_action`、`MainWindow._route_edit_replace_work_lines`、`MainWindow._route_control_endpoint`、`MainWindow._sync_service_points_to_route_control_endpoints`、`MainWindow._simulation_segments_from_control_route`、`MainWindow._draw_mask_evidence_layers`、`MainWindow._draw_route_edit_overlay`、`MainWindow._validate_manual_route`、`pyside6_app.panels.StepCard`、`pyside6_app.panels.TaskPanel`、`pyside6_app.panels.RouteInfoPanel`。
 - 测试锚点：`tests/test_route_edit_pyside.py`、`test_route_result_edit_cards_expose_linked_actions_and_work_drag_order`、`test_route_result_card_operations_immediately_update_shared_route_and_canvas`、`test_planning_card_fully_expands_in_scroll_area_without_overlap`。
 - 允许的变更方式：可增加框选、多选、吸附、复制和曲线手柄等编辑能力，但必须维持单一控制路线、共享端点、人工来源显式标记、修改即失效和同一验证/导出门禁；不得用“更自由”旁路坐标、田界、禁行区、曲率或 provenance 审计。

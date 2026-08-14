@@ -23,16 +23,14 @@ EXPERIMENT_SCHEMA = "reui.paper-experiment.v1"
 
 
 def default_experiment_plan(model_paths: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    """Freeze one mask input while comparing implemented turn strategies."""
-    path_cases = [
-        {
-            "id": strategy,
-            "label": strategy,
-            "strategy": strategy,
-            "comparison_group": "turn_strategy",
-        }
-        for strategy in ("bow", "semicircle", "pear", "fishtail")
-    ]
+    """Freeze one input while comparing the currently implemented mask stages.
+
+    Turn geometry is implemented and can be exercised by the planner, but turn
+    optimisation/strategy comparison is outside the current paper scope. The
+    runner still accepts explicit ``path_cases`` for future offline studies;
+    the default plan deliberately contains none.
+    """
+    path_cases: list[Dict[str, Any]] = []
     return {
         "mask_cases": [
             {"id": "raw_mask_geometry", "label": "raw mask geometry", "mode": "raw"},
@@ -44,12 +42,16 @@ def default_experiment_plan(model_paths: Optional[Sequence[str]] = None) -> Dict
         # DECISION-014: source-image model comparisons remain disabled.
         "model_cases": [],
         "model_comparison": {"status": "disabled", "reason": "independent_model_inference_not_implemented"},
+        "path_comparison": {
+            "status": "disabled",
+            "reason": "turn_strategy_experiment_not_in_current_scope",
+        },
         "comparison_policy": {
             "same_inputs_required": True,
             "supervised_metrics_require_ground_truth": True,
             "failed_cases_are_preserved": True,
             "interactive_state_is_read_only": True,
-            "turn_strategy_is_the_only_path_variant": True,
+            "path_strategy_comparison": "disabled",
         },
     }
 

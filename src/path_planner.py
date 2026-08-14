@@ -37,6 +37,135 @@ from headland_turn_validation import (
 
 
 PATH_PLANNING_VERSION = "footprint-path-v27"
+
+
+def _adjacent_snake_order_work_lines(
+    work_lines: List[List[Tuple[float, float]]],
+    entry_point: Optional[Tuple[float, float]] = None,
+    main_angle: Optional[float] = None,
+) -> Tuple[List[List[Tuple[float, float]]], Dict]:
+    """Order existing passes by adjacent normal position for the UI route.
+
+    The desktop workflow is an implementation-oriented planner: after the
+    required start row is selected, it should visit neighbouring crop rows in
+    sequence.  A half-split contour order intentionally jumps from one side
+    of the field to the other, which is useful for a separate contour study
+    but is surprising as the default route shown to an operator.  This helper
+    only changes the visit order of already generated work lines; it never
+    invents or laterally moves a line.
+    """
+    diagnostics = {
+        "ordering": "adjacent_snake",
+        "algorithm_version": "adjacent-snake-v1",
+        "ordering_basis": "parallel_line_normal_axis",
+        "normal_order_reversed": False,
+        "field_boundary_required": False,
+        "fallback_reason": None,
+    }
+    if not work_lines:
+        diagnostics["fallback_reason"] = "no_work_lines"
+        return [], diagnostics
+
+    angle = None
+    if main_angle is not None and math.isfinite(float(main_angle)):
+        angle = float(main_angle)
+    else:
+        weighted_cos = 0.0
+        weighted_sin = 0.0
+        for line in work_lines:
+            points = np.asarray(line, dtype=np.float64)
+            if points.ndim != 2 or points.shape[0] < 2:
+                continue
+            dx = float(points[-1][0] - points[0][0])
+            dy = float(points[-1][1] - points[0][1])
+            weight = math.hypot(dx, dy)
+            if weight <= 1e-9:
+                continue
+            line_angle = math.atan2(dy, dx)
+            weighted_cos += weight * math.cos(2.0 * line_angle)
+            weighted_sin += weight * math.sin(2.0 * line_angle)
+        if weighted_cos or weighted_sin:
+            angle = 0.5 * math.atan2(weighted_sin, weighted_cos)
+    if angle is None:
+        diagnostics["fallback_reason"] = "direction_unavailable"
+        return [list(line) for line in work_lines], diagnostics
+
+    normal = np.asarray((-math.sin(angle), math.cos(angle)), dtype=np.float64)
+    records = []
+    for index, line in enumerate(work_lines):
+        points = np.asarray(line, dtype=np.float64)
+        if (
+            points.ndim != 2
+            or points.shape[0] < 2
+            or points.shape[1] != 2
+            or not np.all(np.isfinite(points))
+        ):
+            diagnostics["fallback_reason"] = "invalid_work_line"
+            return [list(item) for item in work_lines], diagnostics
+        midpoint = points.mean(axis=0)
+        records.append({
+            "index": index,
+            "line": list(line),
+            "pos": float(midpoint @ normal),
+        })
+    records.sort(key=lambda item: (round(item["pos"], 6), item["index"]))
+
+    def endpoint_distance(record):
+        if entry_point is None:
+            return 0.0
+        return min(
+            math.hypot(
+                float(point[0]) - float(entry_point[0]),
+                float(point[1]) - float(entry_point[1]),
+            )
+            for point in (record["line"][0], record["line"][-1])
+        )
+
+    if entry_point is not None and len(records) >= 2:
+        low_distance = endpoint_distance(records[0])
+        high_distance = endpoint_distance(records[-1])
+        if high_distance < low_distance:
+            records.reverse()
+            diagnostics["normal_order_reversed"] = True
+        diagnostics.update({
+            "entry_priority_applied": True,
+            "entry_selected_line_distance_px": float(
+                endpoint_distance(records[0])
+            ),
+            "entry_selected_endpoint_local": [
+                float(value) for value in min(
+                    (records[0]["line"][0], records[0]["line"][-1]),
+                    key=lambda point: math.hypot(
+                        float(point[0]) - float(entry_point[0]),
+                        float(point[1]) - float(entry_point[1]),
+                    ),
+                )
+            ],
+        })
+    diagnostics.update({
+        "ordered_original_indices": [item["index"] for item in records],
+        "normal_positions": [float(item["pos"]) for item in records],
+        "sorted_normal_positions": sorted(float(item["pos"]) for item in records),
+        "split_index": None,
+        "low_block_original_indices": [],
+        "high_block_original_indices": [],
+        "ordering_variant": "adjacent_normal_snake",
+        "pair_count": (len(records) + 1) // 2,
+        "adjacent_transition_count": max(0, len(records) - 1),
+        "minimum_normal_index_gap": 1 if len(records) > 1 else 0,
+        "main_angle_rad": float(angle),
+    })
+    diagnostics["corresponding_pairs"] = [
+        {
+            "pair_index": pair_index,
+            "original_indices": [item["index"] for item in records[index:index + 2]],
+            "normal_positions": [float(item["pos"]) for item in records[index:index + 2]],
+        }
+        for pair_index, index in enumerate(range(0, len(records), 2))
+    ]
+    return [list(item["line"]) for item in records], diagnostics
+
+
 def _contour_order_work_lines(
     work_lines: List[List[Tuple[float, float]]],
     field_polygon: Optional[np.ndarray],
@@ -2478,6 +2607,121 @@ def _build_exit_service_route(
     return route, report
 
 
+def _build_route_finish_extension(
+    last_work_line: List[Tuple[float, float]],
+    mpp: float,
+    field_polygon,
+    *,
+    extension_m: float = 0.5,
+    target_point: Optional[Tuple[float, float]] = None,
+) -> Tuple[List[Tuple[float, float]], Dict]:
+    """Build the final point used by the desktop route and TXT projection.
+
+    When the operator has not supplied an end marker, the finish is a short
+    continuation of the final work segment.  A supplied/dragged end marker is
+    honoured as the target instead.  The segment is clipped to the confirmed
+    field polygon so the generated terminal point remains part of the route
+    rather than becoming a display-only label.
+    """
+    line = [tuple(map(float, point)) for point in (last_work_line or [])]
+    report = {
+        "algorithm_version": "route-finish-extension-v1",
+        "mode": "automatic_final_work_extension",
+        "requested_extension_m": float(extension_m),
+        "target_point": None,
+        "clipped_to_field": False,
+        "inside_field_boundary": False,
+    }
+    if len(line) < 2:
+        report["mode"] = "no_work_geometry"
+        return line[-1:] if line else [], report
+    start = line[-1]
+    if target_point is None:
+        try:
+            extension = max(0.0, float(extension_m)) / max(float(mpp), 1e-9)
+        except (TypeError, ValueError):
+            extension = 0.0
+        direction = np.asarray(line[-1], dtype=np.float64) - np.asarray(
+            line[-2], dtype=np.float64
+        )
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-9 or extension <= 1e-9:
+            report["mode"] = "zero_extension"
+            report["inside_field_boundary"] = True
+            return [start], report
+        direction /= norm
+        target = (
+            float(start[0] + direction[0] * extension),
+            float(start[1] + direction[1] * extension),
+        )
+    else:
+        target = (float(target_point[0]), float(target_point[1]))
+        report["mode"] = "explicit_dragged_finish"
+    report["target_point"] = [float(target[0]), float(target[1])]
+
+    if field_polygon is None or _segment_inside_field_boundary(
+        [start, target], field_polygon
+    ):
+        report["inside_field_boundary"] = True
+        return [start, target], report
+
+    # The endpoint is normally inside the field and only the short outward
+    # tail crosses a boundary.  Intersect the requested ray with the polygon
+    # and retain its farthest forward point.  This avoids inventing an
+    # extrapolated coordinate when a field edge truncates the last row.
+    try:
+        boundary_points = [
+            (float(point[0]), float(point[1]))
+            for point in np.asarray(field_polygon, dtype=np.float64)
+        ]
+        field = Polygon(boundary_points)
+        ray = LineString([start, target])
+        intersection = field.intersection(ray)
+        points = []
+
+        def collect(geometry):
+            if geometry is None or geometry.is_empty:
+                return
+            kind = str(getattr(geometry, "geom_type", ""))
+            if kind == "Point":
+                points.append((float(geometry.x), float(geometry.y)))
+                return
+            if kind in {"LineString", "LinearRing"}:
+                points.extend(
+                    (float(x), float(y)) for x, y in geometry.coords
+                )
+                return
+            for child in getattr(geometry, "geoms", ()):
+                collect(child)
+
+        collect(intersection)
+        vector = np.asarray(target, dtype=np.float64) - np.asarray(
+            start, dtype=np.float64
+        )
+        length_sq = float(vector @ vector)
+        candidates = []
+        if length_sq > 1e-12:
+            for point in points:
+                value = np.asarray(point, dtype=np.float64)
+                projection = float((value - np.asarray(start)) @ vector)
+                if projection >= -1e-7 and projection <= length_sq + 1e-7:
+                    candidates.append((projection, point))
+        if candidates:
+            finish = max(candidates, key=lambda item: item[0])[1]
+            finish = (float(finish[0]), float(finish[1]))
+            if math.hypot(finish[0] - start[0], finish[1] - start[1]) > 1e-7:
+                report["clipped_to_field"] = True
+                report["inside_field_boundary"] = _segment_inside_field_boundary(
+                    [start, finish], field_polygon
+                )
+                report["target_point"] = [float(finish[0]), float(finish[1])]
+                return [start, finish], report
+    except (TypeError, ValueError, IndexError):
+        pass
+    report["inside_field_boundary"] = False
+    return [start, target], report
+
+
 def _connect_work_lines(
         work_lines: List[List[Tuple[float, float]]],
         geo=None,
@@ -2568,9 +2812,17 @@ def _connect_work_lines(
             else None
         )
     unload_points = [to_local(point) for point in unload_globals if point]
+    adjacent_snake_requested = str(
+        cfg.get("route_order", "")
+    ).strip().lower() in {
+        "adjacent_snake",
+        "snake",
+        "row_snake",
+    }
     terminal_short_line = None
     if (
         requested_strategy == "contour"
+        and not adjacent_snake_requested
         and bool(cfg.get("_contour_allow_terminal_short_line", False))
         and exit_point is None
     ):
@@ -2600,16 +2852,32 @@ def _connect_work_lines(
         )
     )
     if requested_strategy == "contour":
-        ordered_lines, contour_ordering = _contour_order_work_lines(
-            ordered_lines,
-            _field_boundary_local_polygon(state),
-            main_angle=(
-                float(global_main_angle)
-                if global_main_angle is not None
-                and math.isfinite(float(global_main_angle))
-                else None
-            ),
-        )
+        if adjacent_snake_requested:
+            # The desktop implementation route deliberately visits adjacent
+            # rows.  Keep the selected turn implementation and its diagnostics
+            # intact, but do not use the separate half-split contour study
+            # ordering for this workflow.
+            ordered_lines, contour_ordering = _adjacent_snake_order_work_lines(
+                ordered_lines,
+                entry_point=entry_point,
+                main_angle=(
+                    float(global_main_angle)
+                    if global_main_angle is not None
+                    and math.isfinite(float(global_main_angle))
+                    else None
+                ),
+            )
+        else:
+            ordered_lines, contour_ordering = _contour_order_work_lines(
+                ordered_lines,
+                _field_boundary_local_polygon(state),
+                main_angle=(
+                    float(global_main_angle)
+                    if global_main_angle is not None
+                    and math.isfinite(float(global_main_angle))
+                    else None
+                ),
+            )
         # Wide nested-loop transitions use the two-quarter-arc bow geometry so
         # their transverse tangents overlap on one headland line.  Keep the
         # contour request visible to the selector: a narrow contour transition
@@ -2633,36 +2901,60 @@ def _connect_work_lines(
         contour_ordering["work_line_point_counts"] = [
             len(line) for line in ordered_lines
         ]
-        entry_policy = str(
-            cfg.get(
-                "_contour_entry_policy",
-                "farthest"
-                if bool(cfg.get("_contour_reverse_normal_order", False))
-                else "nearest",
+        if not adjacent_snake_requested:
+            entry_policy = str(
+                cfg.get(
+                    "_contour_entry_policy",
+                    "farthest"
+                    if bool(cfg.get("_contour_reverse_normal_order", False))
+                    else "nearest",
+                )
             )
-        )
-        ordered_lines = _select_contour_entry_rotation(
-            ordered_lines,
-            contour_ordering,
-            entry_point,
-            policy=entry_policy,
-            terminal_original_index=(
-                terminal_short_line.get("original_index")
-                if terminal_short_line is not None
-                else None
-            ),
-            terminal_endpoint=(
-                terminal_short_line.get("endpoint")
-                if terminal_short_line is not None
-                else None
-            ),
-            main_angle=(
-                float(global_main_angle)
-                if global_main_angle is not None
-                and math.isfinite(float(global_main_angle))
-                else contour_ordering.get("main_angle_rad")
-            ),
-        )
+            ordered_lines = _select_contour_entry_rotation(
+                ordered_lines,
+                contour_ordering,
+                entry_point,
+                policy=entry_policy,
+                terminal_original_index=(
+                    terminal_short_line.get("original_index")
+                    if terminal_short_line is not None
+                    else None
+                ),
+                terminal_endpoint=(
+                    terminal_short_line.get("endpoint")
+                    if terminal_short_line is not None
+                    else None
+                ),
+                main_angle=(
+                    float(global_main_angle)
+                    if global_main_angle is not None
+                    and math.isfinite(float(global_main_angle))
+                    else contour_ordering.get("main_angle_rad")
+                ),
+            )
+        else:
+            contour_ordering.update({
+                "entry_selection_policy": "adjacent_snake",
+                "entry_rotation_offset": 0,
+                "entry_rotation_reversed": False,
+                "entry_eligible_candidate_count": 1,
+                "minimum_possible_adjacent_transition_count": max(
+                    0, len(ordered_lines) - 1
+                ),
+                "selected_adjacent_transition_count": max(
+                    0, len(ordered_lines) - 1
+                ),
+                "entry_priority_overrode_minimum_adjacency": False,
+                "entry_orientation_constrained_by_terminal": False,
+                "terminal_original_index": (
+                    terminal_short_line.get("original_index")
+                    if terminal_short_line is not None
+                    else None
+                ),
+                "terminal_constraint_applied": bool(
+                    terminal_short_line is not None
+                ),
+            })
         if terminal_short_line is not None:
             contour_ordering["terminal_short_line"] = {
                 key: (list(value) if key == "endpoint" else value)
@@ -3588,6 +3880,34 @@ def _connect_work_lines(
             else:
                 full_path.append(exit_route)
             segment_types.append("exit")
+    elif (
+        bool(cfg.get("include_route_finish_extension", False))
+        and bool(cfg.get("_include_exit_service", True))
+        and oriented
+    ):
+        # Desktop planning keeps service points as references, but its
+        # terminal TXT route still needs a concrete final point.  Generate a
+        # short final-work extension by default, or use an explicitly dragged
+        # end marker as the target.
+        try:
+            finish_extension_m = float(
+                cfg.get(
+                    "route_finish_extension_m",
+                    cfg.get("work_line_endpoint_extension_m", 0.5),
+                )
+            )
+        except (TypeError, ValueError):
+            finish_extension_m = 0.5
+        finish_route, exit_service_route = _build_route_finish_extension(
+            oriented[-1],
+            mpp,
+            field_polygon,
+            extension_m=finish_extension_m,
+            target_point=exit_point,
+        )
+        if len(finish_route) >= 2:
+            full_path.append(finish_route)
+            segment_types.append("exit")
     non_work_boundary_violations = _non_work_boundary_violations(
         full_path,
         segment_types,
@@ -3636,14 +3956,20 @@ def _connect_work_lines(
         "service_points": {
             "mode": service_point_mode,
             "entry_present": bool(entry_point is not None),
-            "exit_present": bool(exit_point is not None),
+            "exit_present": bool(
+                exit_point is not None
+                or any(segment_type == "exit" for segment_type in segment_types)
+            ),
             "entry_reference_used": bool(entry_point is not None and oriented),
             "exit_reference_used": bool(exit_point is not None and oriented),
             "entry_connector_emitted": bool(
                 include_entry_service and entry_point is not None and oriented
             ),
             "exit_connector_emitted": bool(
-                include_exit_service and exit_point is not None and oriented
+                any(segment_type == "exit" for segment_type in segment_types)
+            ),
+            "finish_extension_emitted": bool(
+                any(segment_type == "exit" for segment_type in segment_types)
             ),
             "unload_count": len(unload_points) if include_exit_service else 0,
             "unload_visit_count": sum(1 for item in segment_types if item == "unload"),
@@ -4845,159 +5171,15 @@ def export_machine_compatibility_path(
 
 
 def _candidate_strategies_for_request(requested_strategy: str) -> List[str]:
-    """Return executable strategies to evaluate for a user request.
+    """Return the one requested turn implementation for this planning run.
 
-    Auto should compare the full strategy family instead of trusting one early
-    heuristic. Manual requests stay single-strategy, while _select_turn_strategy
-    may still fallback if that strategy is geometrically impossible.
+    ``auto`` is a deterministic per-transition geometry rule in
+    ``_select_turn_strategy``; it is not a global search or a comparison of
+    alternative routes. Keeping this helper makes the single-run contract
+    explicit for diagnostics and older callers.
     """
     requested = str(requested_strategy or "auto").strip().lower()
-    if requested == "auto":
-        return ["contour", "semicircle", "bow", "pear", "fishtail", "alpha"]
-    return [normalize_turn_strategy(requested)]
-
-
-def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
-    """Rank candidate routes by executable safety and body-crop risk.
-
-    Lower score is better. The score intentionally penalizes invalid geometry,
-    crop-core rolling, field-boundary excursions and self-crossings far more
-    than a modest length increase. DECISION-012 preserves physical canopy
-    Headland rolling remains a reported measurement but never selects a turn
-    strategy. Strategy choice uses body/core crop risk, boundary/forbidden
-    safety, coverage and route efficiency. DECISION-013 keeps weighted
-    headland damage as a report-only research metric.
-    """
-    def metric(value, *, default, higher_is_better=False):
-        number = _finite_float(value)
-        if number is None:
-            return float("-inf") if higher_is_better else float("inf")
-        return number
-
-    ranked = []
-    for candidate in candidates or []:
-        item = dict(candidate)
-        validation = dict(item.get("validation") or {})
-        assessment = item.get("turn_assessment") or {}
-        segment_types = item.get("segment_types") or []
-        required_values = {
-            "rolling_body_pct": validation.get("rolling_body_pct"),
-            "track_core_overlap_pct": validation.get("track_core_overlap_pct", 0.0),
-            "track_outside_field_pct": validation.get("track_outside_field_pct", 0.0),
-            "track_outside_support_pct": validation.get("track_outside_support_pct", 0.0),
-            "track_uncertain_overlap_pct": validation.get("track_uncertain_overlap_pct", 0.0),
-            "track_forbidden_overlap_pct": validation.get("track_forbidden_overlap_pct", 0.0),
-            "total_length_m": validation.get("total_length_m", 0.0),
-        }
-        invalid_metric_names = [
-            name for name, value in required_values.items()
-            if value is not None and _finite_float(value) is None
-        ]
-        if invalid_metric_names:
-            validation["valid"] = False
-            issues = list(validation.get("issues") or [])
-            issues.append("候选排序指标无效: " + ", ".join(invalid_metric_names))
-            validation["issues"] = issues
-            item["validation"] = validation
-        valid_penalty = 0.0 if validation.get("valid", False) else 10000.0
-        hard_penalty = 1500.0 * len(assessment.get("hard_reasons") or [])
-        crossing_penalty = 1200.0 * float(assessment.get("turn_self_crossing_count", 0) or 0)
-        body_rolling_value = validation.get("rolling_body_pct")
-        body_rolling_missing = body_rolling_value is None
-        rolling_body = (
-            metric(body_rolling_value, default=101.0)
-            if not body_rolling_missing else 101.0
-        )
-        core_overlap = metric(validation.get("track_core_overlap_pct", 0.0), default=float("inf"))
-        outside = metric(validation.get("track_outside_field_pct", 0.0), default=float("inf"))
-        outside_support = metric(validation.get("track_outside_support_pct", 0.0), default=float("inf"))
-        uncertain_overlap = metric(validation.get("track_uncertain_overlap_pct", 0.0), default=float("inf"))
-        forbidden_overlap = metric(validation.get("track_forbidden_overlap_pct", 0.0), default=float("inf"))
-        profile = str(validation.get("validation_profile", "research"))
-        semantic_weight = 1.0 if profile == "research" else 4.0
-        coverage = metric(
-            validation.get(
-                "crop_mask_geometric_coverage_pct",
-                validation.get("planned_target_geometric_coverage_pct", 0.0),
-            ),
-            default=float("-inf"),
-            higher_is_better=True,
-        )
-        total_length = metric(validation.get("total_length_m", 0.0), default=float("inf"))
-        reverse_turns = sum(1 for value in segment_types if str(value).startswith("turn_reverse"))
-        unload_visits = sum(1 for value in segment_types if value == "unload")
-        score = (
-            valid_penalty * 100000000.0
-            + hard_penalty * 1000000.0
-            + crossing_penalty * 1000000.0
-            + rolling_body * 1000.0
-            + core_overlap * 80.0
-            + outside * 120.0
-            + outside_support * 25.0 * semantic_weight
-            + uncertain_overlap * 15.0 * semantic_weight
-            + forbidden_overlap * 5000.0
-            + max(0.0, 95.0 - coverage) * 25.0
-            + total_length * 0.08
-            + reverse_turns * 8.0
-        )
-        item["candidate_score"] = float(score)
-        item["candidate_metrics"] = {
-            "valid_penalty": valid_penalty,
-            "hard_reason_count": len(assessment.get("hard_reasons") or []),
-            "turn_self_crossing_count": int(assessment.get("turn_self_crossing_count", 0) or 0),
-            "rolling_body_pct": None if body_rolling_missing else rolling_body,
-            "rolling_headland_pct_report_only": validation.get("rolling_headland_pct"),
-            "track_core_overlap_pct": core_overlap,
-            "track_outside_field_pct": outside,
-            "track_outside_support_pct": outside_support,
-            "track_uncertain_overlap_pct": uncertain_overlap,
-            "track_forbidden_overlap_pct": forbidden_overlap,
-            "crop_mask_geometric_coverage_pct": coverage,
-            "total_length_m": total_length,
-            "reverse_turns": reverse_turns,
-            "unload_visits": unload_visits,
-        }
-        item["candidate_rank_key"] = (
-            0 if validation.get("valid", False) else 1,
-            len(assessment.get("hard_reasons") or []),
-            int(assessment.get("turn_self_crossing_count", 0) or 0),
-            1 if body_rolling_missing else 0,
-            rolling_body,
-            forbidden_overlap,
-            outside,
-            outside_support,
-            uncertain_overlap,
-            core_overlap,
-            -coverage,
-            total_length,
-            str(item.get("strategy", "")),
-        )
-        ranked.append(item)
-    return sorted(ranked, key=lambda value: value["candidate_rank_key"])
-
-
-def _deduplicate_path_candidates(candidates: List[Dict]) -> List[Dict]:
-    """Collapse candidates that produced the same actual strategy sequence and geometry."""
-    unique = []
-    by_signature = {}
-    for candidate in candidates or []:
-        assessment = candidate.get("turn_assessment") or {}
-        actual = tuple(str(value) for value in assessment.get("used_strategies") or [])
-        geometry = tuple(
-            tuple((round(float(x), 6), round(float(y), 6)) for x, y in segment)
-            for segment in candidate.get("path_segments") or []
-        )
-        signature = (actual, tuple(candidate.get("segment_types") or []), geometry)
-        label = str(candidate.get("strategy", ""))
-        existing = by_signature.get(signature)
-        if existing is None:
-            item = dict(candidate)
-            item["equivalent_candidate_labels"] = [label]
-            by_signature[signature] = item
-            unique.append(item)
-        elif label not in existing["equivalent_candidate_labels"]:
-            existing["equivalent_candidate_labels"].append(label)
-    return unique
+    return ["auto"] if requested == "auto" else [normalize_turn_strategy(requested)]
 
 
 def _build_planning_factor_report(
@@ -5008,6 +5190,8 @@ def _build_planning_factor_report(
     validation: Optional[Dict] = None,
 ) -> Dict:
     """Summarise the physical and agronomic factors used by route planning."""
+    # DECISION-013: headland damage remains a reported metric and never
+    # changes the selected turn implementation.
     specs = _harvester_specs(state)
     ox = int(getattr(state, "mask_offset_x", 0) or 0) if state is not None else 0
     oy = int(getattr(state, "mask_offset_y", 0) or 0) if state is not None else 0
@@ -8614,6 +8798,8 @@ def plan_path(wide_bands: List[Dict],
             "description": str,
         }
     """
+    # DECISION-012: the selected path, pose sampling and footprint metrics
+    # remain one mathematical chain; no turn-strategy ranking is performed.
     def _report(pct, stage):
         if progress_callback:
             try:
@@ -8774,7 +8960,7 @@ def plan_path(wide_bands: List[Dict],
             decision["user_requested_strategy"] = turn_strategy
             decision["candidate_strategy"] = strategy_key
             if turn_strategy == "auto" and decision.get("reason") == "用户指定":
-                decision["reason"] = "自动多策略评估中的候选策略满足该处几何约束"
+                decision["reason"] = "自动规则根据该处几何约束选择固定转弯实现"
         abort_if_cancelled()
         candidate_validation = validate_path(
             candidate_segments,
@@ -8866,14 +9052,15 @@ def plan_path(wide_bands: List[Dict],
             "turn_assessment": candidate_assessment,
         }
 
-    _report(0.84, "多策略足迹验证")
+    _report(0.84, "固定转弯策略足迹验证")
     candidate_results = []
     for strategy_key in _candidate_strategies_for_request(turn_strategy):
         abort_if_cancelled()
         candidate_results.append(evaluate_strategy(strategy_key))
-    candidate_results = _deduplicate_path_candidates(candidate_results)
-    ranked_candidates = _rank_path_candidates(candidate_results)
-    selected_candidate = ranked_candidates[0] if ranked_candidates else evaluate_strategy(turn_strategy)
+    # The current scope implements and validates the selected geometry only.
+    # Do not compare or rank alternative turn strategies here.
+    selected_candidate = candidate_results[0] if candidate_results else evaluate_strategy(turn_strategy)
+    ranked_candidates = [selected_candidate]
     path_segments = selected_candidate["path_segments"]
     segment_types = selected_candidate["segment_types"]
     validation = selected_candidate["validation"]
@@ -8885,8 +9072,6 @@ def plan_path(wide_bands: List[Dict],
         selected_candidate.get("effective_strategies") or []
     )
     turn_assessment["geometry_signature"] = selected_candidate.get("geometry_signature", "")
-    turn_assessment["candidate_score"] = selected_candidate.get("candidate_score")
-    turn_assessment["candidate_metrics"] = selected_candidate.get("candidate_metrics", {})
     turn_assessment["candidate_count"] = len(ranked_candidates)
     endpoint_alignment = turn_assessment.get("endpoint_alignment", {}) or {}
     if endpoint_alignment.get("corrected_endpoint_count", 0):
@@ -8979,8 +9164,6 @@ def plan_path(wide_bands: List[Dict],
                 "machine_executable": bool(
                     (item.get("turn_assessment") or {}).get("machine_executable", False)
                 ),
-                "score": item.get("candidate_score"),
-                "metrics": item.get("candidate_metrics", {}),
                 "validation": item.get("validation", {}),
                 "turn_assessment": item.get("turn_assessment", {}),
             }
