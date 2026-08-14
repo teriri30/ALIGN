@@ -28,132 +28,76 @@ class _State:
         self.mask_raw = mask
 
 
-def test_turn_candidate_selection_prefers_body_risk_after_hard_constraints():
-    from headland_turn_optimizer import select_turn_candidate
+def test_fixed_turn_validation_preserves_the_requested_geometry():
+    from headland_turn_validation import validate_fixed_turn_candidate
 
-    result = select_turn_candidate(
-        [
-            {
-                "candidate_id": "unsafe-low-cost",
-                "path": [[(2.0, 2.0), (3.0, 3.0)]],
-                "hard_reasons": ["forbidden overlap"],
-                "metrics": {
-                    "headland_turn_track_overlap_area_m2": 0.1,
-                    "turn_cost_m2": 0.1,
-                },
-            },
-            {
-                "candidate_id": "safe-low-headland",
-                "path": [[(2.0, 2.0), (3.0, 4.0), (4.0, 5.0)]],
-                "hard_reasons": [],
-                "metrics": {
-                    "headland_turn_track_overlap_area_m2": 0.8,
-                    "turn_cost_m2": 0.8,
-                    "turn_body_overlap_area_m2": 0.3,
-                    "turn_uncertain_overlap_area_m2": 0.0,
-                    "turn_repeat_twice_or_more_area_m2": 0.0,
-                    "turn_length_m": 4.0,
-                    "turn_curvature_penalty": 0.1,
-                },
-            },
-            {
-                "candidate_id": "safe-best-headland",
-                "path": [[(2.0, 2.0), (3.0, 4.0), (4.0, 5.0)]],
-                "hard_reasons": [],
-                "metrics": {
-                    "headland_turn_track_overlap_area_m2": 0.2,
-                    "turn_cost_m2": 0.4,
-                    "turn_body_overlap_area_m2": 0.2,
-                    "turn_uncertain_overlap_area_m2": 0.0,
-                    "turn_repeat_twice_or_more_area_m2": 0.0,
-                    "turn_length_m": 4.0,
-                    "turn_curvature_penalty": 0.1,
-                },
-            },
-        ],
-        fallback_candidate={"candidate_id": "fallback"},
+    candidate = {
+        "candidate_id": "bow:fixed",
+        "path": [[(2.0, 2.0), (3.0, 4.0), (4.0, 5.0)]],
+        "hard_reasons": [],
+        "metrics": {"turn_body_overlap_area_m2": 0.3},
+    }
+    result = validate_fixed_turn_candidate(
+        candidate,
+        fallback_candidate={"candidate_id": "original"},
     )
 
-    assert result["selected"]["candidate_id"] == "safe-best-headland"
-    assert result["selected"]["metrics"]["turn_body_overlap_area_m2"] == pytest.approx(0.2)
-    assert result["diagnostics"]["hard_constraint_order"] == "hard_constraints_before_soft_cost"
+    assert result["selected"]["candidate_id"] == "bow:fixed"
+    assert result["diagnostics"]["validation_passed"] is True
+    assert result["diagnostics"]["validation_policy"] == (
+        "fixed_geometry_hard_constraints"
+    )
 
 
-def test_turn_candidate_selection_ignores_headland_rolling_cost():
-    from headland_turn_optimizer import select_turn_candidate
+def test_fixed_turn_validation_rejects_hard_constraint_failure():
+    from headland_turn_validation import validate_fixed_turn_candidate
 
-    result = select_turn_candidate([
+    result = validate_fixed_turn_candidate(
         {
-            "candidate_id": "low-headland-longer",
-            "hard_reasons": [],
-            "metrics": {
-                "headland_turn_track_overlap_area_m2": 0.0,
-                "turn_cost_m2": 0.0,
-                "turn_body_overlap_area_m2": 0.2,
-                "turn_uncertain_overlap_area_m2": 0.0,
-                "turn_repeat_twice_or_more_area_m2": 0.0,
-                "turn_length_m": 8.0,
-                "turn_curvature_penalty": 0.0,
-            },
+            "candidate_id": "bow:fixed",
+            "hard_reasons": ["forbidden_overlap"],
+            "metrics": {"turn_body_overlap_area_m2": 0.0},
         },
-        {
-            "candidate_id": "high-headland-shorter",
-            "hard_reasons": [],
-            "metrics": {
-                "headland_turn_track_overlap_area_m2": 100.0,
-                "turn_cost_m2": 100.0,
-                "turn_body_overlap_area_m2": 0.2,
-                "turn_uncertain_overlap_area_m2": 0.0,
-                "turn_repeat_twice_or_more_area_m2": 0.0,
-                "turn_length_m": 4.0,
-                "turn_curvature_penalty": 0.0,
-            },
-        },
-    ])
+        fallback_candidate={"candidate_id": "original"},
+    )
 
-    assert result["selected"]["candidate_id"] == "high-headland-shorter"
-    assert "headland_turn_track_overlap_area_m2" not in result["diagnostics"]["soft_order"]
-    assert "turn_cost_m2" not in result["diagnostics"]["soft_order"]
+    assert result["selected"]["candidate_id"] == "original"
+    assert result["diagnostics"]["validation_passed"] is False
 
 
-def test_turn_candidate_selection_keeps_safe_fallback_when_evidence_or_candidates_are_missing():
-    from headland_turn_optimizer import select_turn_candidate
+def test_fixed_turn_validation_keeps_fallback_when_evidence_is_missing():
+    from headland_turn_validation import validate_fixed_turn_candidate
 
     fallback = {
         "candidate_id": "original",
         "path": [[(2.0, 2.0), (3.0, 2.0)]],
     }
-    result = select_turn_candidate([], fallback_candidate=fallback, fallback_reason="headland_mask_missing")
+    result = validate_fixed_turn_candidate(
+        {"candidate_id": "fixed", "hard_reasons": ["headland_mask_missing"]},
+        fallback_candidate=fallback,
+        fallback_reason="headland_mask_missing",
+    )
 
     assert result["selected"] is fallback
     assert result["diagnostics"]["fallback_reason"] == "headland_mask_missing"
-    assert result["diagnostics"]["optimization_applied"] is False
+    assert result["diagnostics"]["validation_passed"] is False
 
 
-def test_turn_candidate_selection_rejects_straight_display_only_candidate():
-    from headland_turn_optimizer import select_turn_candidate
+def test_fixed_turn_validation_rejects_straight_display_only_candidate():
+    from headland_turn_validation import validate_fixed_turn_candidate
 
-    result = select_turn_candidate(
-        [
-            {
-                "candidate_id": "straight",
-                "path": [[(0.0, 0.0), (5.0, 0.0)]],
-                "kinematically_feasible": False,
-                "hard_reasons": ["display_only_connector"],
-                "metrics": {"headland_turn_track_overlap_area_m2": 0.0},
-            },
-            {
-                "candidate_id": "curve",
-                "path": [[(0.0, 0.0), (2.0, 1.0), (5.0, 0.0)]],
-                "kinematically_feasible": True,
-                "hard_reasons": [],
-                "metrics": {"headland_turn_track_overlap_area_m2": 1.0},
-            },
-        ],
+    result = validate_fixed_turn_candidate(
+        {
+            "candidate_id": "straight",
+            "path": [[(0.0, 0.0), (5.0, 0.0)]],
+            "kinematically_feasible": False,
+            "hard_reasons": ["display_only_connector"],
+            "metrics": {"headland_turn_track_overlap_area_m2": 0.0},
+        },
         fallback_candidate={"candidate_id": "fallback"},
     )
 
-    assert result["selected"]["candidate_id"] == "curve"
+    assert result["selected"]["candidate_id"] == "fallback"
 
 
 def test_validate_footprints_reports_segment_and_repeat_access_metrics():
@@ -196,17 +140,17 @@ def test_validate_footprints_reports_segment_and_repeat_access_metrics():
     assert result["turn_cost_m2"] >= 0.0
 
 
-def test_headland_turn_config_defaults_to_enabled_without_changing_headland_weight():
+def test_headland_turn_config_has_no_optimization_switch():
     from config import Config
 
     cfg = Config()
     path_config = cfg.section("path_planning")
-    assert path_config.get("headland_turn_optimization_enabled", True) is True
+    assert "headland_turn_optimization_enabled" not in path_config
     assert path_config.get("headland_damage_weight", 1.0) == pytest.approx(1.0)
 
 def test_turn_corridor_is_bounded_by_endpoint_local_envelope():
     """DECISION-015: full support evidence cannot make the corridor global."""
-    from headland_turn_optimizer import build_turn_corridor_mask
+    from headland_turn_validation import build_turn_corridor_mask
 
     shape = (100, 100)
     support = np.ones(shape, dtype=np.uint8) * 255
@@ -227,19 +171,19 @@ def test_turn_corridor_is_bounded_by_endpoint_local_envelope():
 
 
 def test_turn_corridor_dilates_only_the_endpoint_local_roi(monkeypatch):
-    from headland_turn_optimizer import build_turn_corridor_mask
-    import headland_turn_optimizer
+    from headland_turn_validation import build_turn_corridor_mask
+    import headland_turn_validation
 
     shape = (1200, 1600)
     support = np.ones(shape, dtype=np.uint8) * 255
-    original_dilate = headland_turn_optimizer.cv2.dilate
+    original_dilate = headland_turn_validation.cv2.dilate
     dilated_shapes = []
 
     def record_dilate(source, *args, **kwargs):
         dilated_shapes.append(tuple(source.shape[:2]))
         return original_dilate(source, *args, **kwargs)
 
-    monkeypatch.setattr(headland_turn_optimizer.cv2, "dilate", record_dilate)
+    monkeypatch.setattr(headland_turn_validation.cv2, "dilate", record_dilate)
     corridor, _ = build_turn_corridor_mask(
         shape,
         field_boundary=[(0, 0), (1599, 0), (1599, 1199), (0, 1199)],
@@ -258,8 +202,8 @@ def test_turn_corridor_dilates_only_the_endpoint_local_roi(monkeypatch):
 
 
 def test_turn_corridor_avoids_large_morphology_kernels(monkeypatch):
-    from headland_turn_optimizer import build_turn_corridor_mask
-    import headland_turn_optimizer
+    from headland_turn_validation import build_turn_corridor_mask
+    import headland_turn_validation
 
     shape = (900, 1200)
     support = np.zeros(shape, dtype=np.uint8)
@@ -268,7 +212,7 @@ def test_turn_corridor_avoids_large_morphology_kernels(monkeypatch):
     def reject_large_dilate(*_args, **_kwargs):
         raise AssertionError("large-radius corridor must not use cv2.dilate")
 
-    monkeypatch.setattr(headland_turn_optimizer.cv2, "dilate", reject_large_dilate)
+    monkeypatch.setattr(headland_turn_validation.cv2, "dilate", reject_large_dilate)
     corridor, diagnostics = build_turn_corridor_mask(
         shape,
         field_boundary=[(0, 0), (1199, 0), (1199, 899), (0, 899)],
@@ -286,7 +230,7 @@ def test_turn_corridor_avoids_large_morphology_kernels(monkeypatch):
     assert corridor[100, 600] == 0
 
 
-def test_missing_field_boundary_fails_closed_for_turn_optimization():
+def test_missing_field_boundary_is_reported_by_fixed_turn_validation():
     import path_planner
 
     class Geo:
@@ -317,13 +261,12 @@ def test_missing_field_boundary_fails_closed_for_turn_optimization():
     before, before_types = path_planner._connect_work_lines(
         [[(20.0, 25.0), (80.0, 25.0)], [(20.0, 55.0), (80.0, 55.0)]],
         geo=Geo(), state=State(), min_turn_radius_m=1.0, turn_strategy="bow",
-        config={"headland_turn_optimization_enabled": False}, processed_mask=mask,
+        config={}, processed_mask=mask,
     )
     after, after_types, diagnostics = path_planner._connect_work_lines(
         [[(20.0, 25.0), (80.0, 25.0)], [(20.0, 55.0), (80.0, 55.0)]],
         geo=Geo(), state=State(), min_turn_radius_m=1.0, turn_strategy="bow",
         config={
-            "headland_turn_optimization_enabled": True,
             "headland_mask": headland,
             "planning_support_mask": mask,
             "uncertain_mask": np.zeros_like(mask),
@@ -332,9 +275,9 @@ def test_missing_field_boundary_fails_closed_for_turn_optimization():
         processed_mask=mask, return_diagnostics=True,
     )
 
-    optimization = diagnostics["turn_decisions"][0]["headland_turn_optimization"]
-    assert optimization["optimization_applied"] is False
-    assert optimization["fallback_reason"] == "field_boundary_missing"
+    turn_validation = diagnostics["turn_decisions"][0]["headland_turn_validation"]
+    assert turn_validation["validation_passed"] is False
+    assert turn_validation["fallback_reason"] == "field_boundary_missing"
     assert after == before
     assert after_types == before_types
 def test_segment_attribution_sums_to_full_path_agronomic_damage_cost():
@@ -389,7 +332,6 @@ def test_real_footprint_metrics_are_used_for_fixed_turn_candidate(monkeypatch):
         [[(20.0, 25.0), (80.0, 25.0)], [(20.0, 55.0), (80.0, 55.0)]],
         geo=_MetricGeo(), state=state, min_turn_radius_m=1.0, turn_strategy="bow",
         config={
-            "headland_turn_optimization_enabled": True,
             "headland_mask": headland,
             "planning_support_mask": mask,
             "uncertain_mask": np.zeros_like(mask),
@@ -399,11 +341,12 @@ def test_real_footprint_metrics_are_used_for_fixed_turn_candidate(monkeypatch):
         processed_mask=mask, return_diagnostics=True, global_main_angle=0.0,
     )
 
-    optimization = diagnostics["turn_decisions"][0]["headland_turn_optimization"]
-    assert optimization["candidate_count"] == 1
-    assert optimization["safe_candidate_count"] >= 1
+    turn_validation = diagnostics["turn_decisions"][0]["headland_turn_validation"]
+    assert turn_validation["candidate_count"] == 1
+    assert turn_validation["safe_candidate_count"] >= 1
+    assert turn_validation["validation_passed"] is True
     assert all(
         "footprint_validation_unavailable" not in reason
-        for item in optimization["rejected_candidates"]
+        for item in turn_validation["rejected_candidates"]
         for reason in item["hard_reasons"]
     )

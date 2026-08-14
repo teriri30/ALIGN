@@ -28,13 +28,15 @@ from footprint_planner import (
     validate_footprints,
 )
 from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
-from headland_turn_optimizer import build_turn_corridor_mask, has_non_degenerate_curve, polyline_inside_mask, select_turn_candidate
+from headland_turn_validation import (
+    build_turn_corridor_mask,
+    has_non_degenerate_curve,
+    polyline_inside_mask,
+    validate_fixed_turn_candidate,
+)
 
 
 PATH_PLANNING_VERSION = "footprint-path-v27"
-HEADLAND_TURN_OPTIMIZER_VERSION = "headland-turn-corridor-v1"
-
-
 def _contour_order_work_lines(
     work_lines: List[List[Tuple[float, float]]],
     field_polygon: Optional[np.ndarray],
@@ -3188,12 +3190,7 @@ def _connect_work_lines(
             )
 
     endpoint_alignment["path_reference_shift_applied"] = False
-    turn_optimizer_cfg = dict(cfg)
-    if requested_strategy == "contour":
-        # The optimizer may move individual turns off the common headland
-        # tangent.  Nested-loop geometry is already a finite, auditable
-        # candidate and proceeds directly to the same formal footprint gates.
-        turn_optimizer_cfg["headland_turn_optimization_enabled"] = False
+    turn_validation_cfg = dict(cfg)
 
     contour_shared_clearance = {"low": clearance_m, "high": clearance_m}
     contour_clearance_records = []
@@ -3423,7 +3420,7 @@ def _connect_work_lines(
                 inner=(selected_strategy == "alpha"),
             )
             base_turn_parts = list(turn_parts)
-            turn_parts, optimization = _optimize_headland_turn(
+            turn_parts, turn_validation = _validate_fixed_headland_turn(
                 base_turn_parts, start, end, work_direction, turn_sign,
                 selected_strategy,
                 mpp=mpp,
@@ -3433,20 +3430,11 @@ def _connect_work_lines(
                 field_polygon=field_polygon,
                 geo=geo,
                 state=state,
-                config=turn_optimizer_cfg,
+                config=turn_validation_cfg,
                 validation_work_lines=oriented,
                 validation_turn_index=index,
             )
-            turn_decisions[-1]["headland_turn_optimization"] = optimization
-            optimizer_reason = optimization.get("fallback_reason")
-            if (
-                requested_strategy == "contour"
-                and optimizer_reason == "headland_turn_optimization_disabled"
-            ):
-                optimization["disabled_for_contour_shared_headland"] = True
-            elif optimizer_reason:
-                turn_decisions[-1]["fallback_reason"] = optimization["fallback_reason"]
-                fallback_reasons.append(optimization["fallback_reason"])
+            turn_decisions[-1]["headland_turn_validation"] = turn_validation
             reverse_leaves_boundary = (
                 field_polygon is not None
                 and any(
@@ -3511,7 +3499,7 @@ def _connect_work_lines(
                 preserve_curve_on_boundary_failure=preserve_boundary_curve,
             )
             base_turn_parts = [(turn, "turn")]
-            turn_parts, optimization = _optimize_headland_turn(
+            turn_parts, turn_validation = _validate_fixed_headland_turn(
                 base_turn_parts, start, end, work_direction, turn_sign,
                 selected_strategy,
                 mpp=mpp,
@@ -3521,23 +3509,11 @@ def _connect_work_lines(
                 field_polygon=field_polygon,
                 geo=geo,
                 state=state,
-                config=turn_optimizer_cfg,
+                config=turn_validation_cfg,
                 validation_work_lines=oriented,
                 validation_turn_index=index,
             )
-            turn_decisions[-1]["headland_turn_optimization"] = optimization
-            optimizer_reason = optimization.get("fallback_reason")
-            if (
-                requested_strategy == "contour"
-                and optimizer_reason == "headland_turn_optimization_disabled"
-            ):
-                optimization["disabled_for_contour_shared_headland"] = True
-            elif optimizer_reason:
-                turn_decisions[-1]["fallback_reason"] = optimization["fallback_reason"]
-                fallback_reasons.append(optimization["fallback_reason"])
-            if optimization.get("optimization_applied") and turn_parts:
-                turn = turn_parts[0][0]
-                boundary_reason = None
+            turn_decisions[-1]["headland_turn_validation"] = turn_validation
             if boundary_reason:
                 boundary_adjustments.append(boundary_reason)
                 if len(turn) > 2 and preserve_boundary_curve:
@@ -9049,7 +9025,7 @@ def _turn_parts_have_curve(parts):
             return True
     return False
 
-def _optimize_headland_turn(
+def _validate_fixed_headland_turn(
     base_parts, start, end, work_direction, turn_sign, selected_strategy,
     *, mpp, min_turn_radius_m, clearance_m, processed_mask, field_polygon,
     geo, state, config, validation_work_lines=None, validation_turn_index=None,
@@ -9057,17 +9033,14 @@ def _optimize_headland_turn(
     """Validate one fixed strategy geometry without searching headland offsets."""
     cfg = dict(config or {})
     diagnostics = {
-        "optimizer_version": "headland-turn-corridor-v1",
-        "optimization_applied": False,
+        "validator_version": "fixed-headland-turn-validation-v1",
+        "validation_passed": False,
         "fallback_reason": "",
         "candidate_count": 0,
         "safe_candidate_count": 0,
     }
     if field_polygon is None:
         diagnostics["fallback_reason"] = "field_boundary_missing"
-        return base_parts, diagnostics
-    if not bool(cfg.get("headland_turn_optimization_enabled", True)):
-        diagnostics["fallback_reason"] = "headland_turn_optimization_disabled"
         return base_parts, diagnostics
     if processed_mask is None:
         diagnostics["fallback_reason"] = "processed_mask_missing"
@@ -9100,104 +9073,106 @@ def _optimize_headland_turn(
     if not np.any(corridor > 0):
         diagnostics["fallback_reason"] = "empty_turn_corridor"
         return base_parts, diagnostics
-    candidates = []
     # The selected strategy and requested clearance define the geometry.  Do
     # not search alternative offsets here: headland/crop evidence is report
-    # data and must not move a turn.  The single candidate only passes through
+    # data and must not move a turn.  The fixed geometry only passes through
     # the existing hard-constraint validation below.
-    offsets = [float(clearance_m)]
-    seen_offsets = set()
-    for offset in offsets:
-        if round(offset, 9) in seen_offsets:
-            continue
-        seen_offsets.add(round(offset, 9))
-        hard_reasons = []
-        parts = base_parts
-        paths = [path for path, _segment_type in parts]
-        if not paths or not _turn_parts_have_curve(parts):
-            hard_reasons.append("display_only_connector")
-        if paths and field_polygon is not None and any(
-            not _segment_inside_field_boundary(path, field_polygon) for path in paths
-        ):
-            hard_reasons.append("outside_field")
-        if paths and not polyline_inside_mask(paths, corridor):
-            hard_reasons.append("corridor_violation")
-        validation = {}
-        if paths and not hard_reasons:
-            try:
-                validation_paths = paths
-                validation_types = [segment_type for _path, segment_type in parts]
-                local_validation_config = dict(cfg)
-                # This pass only checks the fixed turn footprint. Whole-route
-                # crop overlap and coverage gates are applied once by
-                # validate_path() after all turns have been assembled.
-                local_validation_config.update({
-                    "max_track_core_overlap_pct": 100.0,
-                    "min_geometric_coverage_pct": 0.0,
-                })
-                validation = validate_footprints(
-                    validation_paths, processed_mask, geo=geo, state=state,
-                    config=local_validation_config,
-                    harvester=_harvester_specs(state),
-                    segment_types=validation_types,
-                    headland_mask=headland,
-                    support_mask=cfg.get("planning_support_mask"),
-                    uncertain_mask=cfg.get("uncertain_mask"),
-                    forbidden_mask=cfg.get("forbidden_mask"),
-                )
-            except (TypeError, ValueError, RuntimeError):
-                validation = {}
-                hard_reasons.append("footprint_validation_unavailable")
-        outside = _finite_float(validation.get("turn_outside_field_pct"))
-        if outside is None and validation:
-            outside = _finite_float(validation.get("track_outside_field_pct"))
-        if outside is None and paths and not any(
+    offset = float(clearance_m)
+    hard_reasons = []
+    parts = base_parts
+    paths = [path for path, _segment_type in parts]
+    if not paths or not _turn_parts_have_curve(parts):
+        hard_reasons.append("display_only_connector")
+    if paths and any(
+        not _segment_inside_field_boundary(path, field_polygon) for path in paths
+    ):
+        hard_reasons.append("outside_field")
+    if paths and not polyline_inside_mask(paths, corridor):
+        hard_reasons.append("corridor_violation")
+    validation = {}
+    local_validation_config = dict(cfg)
+    if paths and not hard_reasons:
+        try:
+            validation_types = [segment_type for _path, segment_type in parts]
+            # This pass only checks the fixed turn footprint. Whole-route crop
+            # overlap and coverage checks run after all turns are assembled.
+            local_validation_config.update({
+                "max_track_core_overlap_pct": 100.0,
+                "min_geometric_coverage_pct": 0.0,
+            })
+            validation = validate_footprints(
+                paths,
+                processed_mask,
+                geo=geo,
+                state=state,
+                config=local_validation_config,
+                harvester=_harvester_specs(state),
+                segment_types=validation_types,
+                headland_mask=headland,
+                support_mask=cfg.get("planning_support_mask"),
+                uncertain_mask=cfg.get("uncertain_mask"),
+                forbidden_mask=cfg.get("forbidden_mask"),
+            )
+        except (TypeError, ValueError, RuntimeError):
+            validation = {}
+            hard_reasons.append("footprint_validation_unavailable")
+    outside = _finite_float(validation.get("turn_outside_field_pct"))
+    if outside is None and validation:
+        outside = _finite_float(validation.get("track_outside_field_pct"))
+    if (
+        outside is None
+        and paths
+        and not any(
             not _segment_inside_field_boundary(path, field_polygon)
             for path in paths
-        ) and not hard_reasons:
-            hard_reasons.append("outside_field_metric_missing")
-        elif outside is not None and outside > 0.0:
-            hard_reasons.append("outside_field")
-        forbidden = _finite_float(validation.get("turn_forbidden_overlap_area_m2"))
-        if forbidden is None and validation and cfg.get("forbidden_mask") is not None:
-            forbidden_pct = _finite_float(validation.get("track_forbidden_overlap_pct"))
-            forbidden = forbidden_pct
-        if cfg.get("forbidden_mask") is not None and forbidden is None and paths:
-            hard_reasons.append("forbidden_overlap_metric_missing")
-        elif forbidden is not None and forbidden > 0.0:
-            hard_reasons.append("forbidden_overlap")
-        if paths and validation:
-            formal = assess_footprint_hard_constraints(
-                validation,
-                local_validation_config,
-            )
-            validation["formal_hard_reasons"] = list(formal["hard_reasons"])
-            validation["formal_validation_issues"] = list(formal["issues"])
-            hard_reasons.extend(formal["hard_reasons"])
-        metrics = dict(validation)
-        metrics["turn_length_m"] = _turn_parts_length_m(parts, metric_scale) if parts else float("inf")
-        metrics["turn_curvature_penalty"] = abs(float(offset))
-        candidates.append({
-            "candidate_id": f"{selected_strategy}:fixed:{offset:.6f}",
-            "parts": parts,
-            "path": paths,
-            "hard_reasons": sorted(set(hard_reasons)),
-            "validation_issues": list(validation.get("formal_validation_issues") or validation.get("issues") or []),
-            "metrics": metrics,
-        })
-    selected = select_turn_candidate(
-        candidates,
+        )
+        and not hard_reasons
+    ):
+        hard_reasons.append("outside_field_metric_missing")
+    elif outside is not None and outside > 0.0:
+        hard_reasons.append("outside_field")
+    forbidden = _finite_float(validation.get("turn_forbidden_overlap_area_m2"))
+    if forbidden is None and validation and cfg.get("forbidden_mask") is not None:
+        forbidden = _finite_float(validation.get("track_forbidden_overlap_pct"))
+    if cfg.get("forbidden_mask") is not None and forbidden is None and paths:
+        hard_reasons.append("forbidden_overlap_metric_missing")
+    elif forbidden is not None and forbidden > 0.0:
+        hard_reasons.append("forbidden_overlap")
+    if paths and validation:
+        formal = assess_footprint_hard_constraints(
+            validation,
+            local_validation_config,
+        )
+        validation["formal_hard_reasons"] = list(formal["hard_reasons"])
+        validation["formal_validation_issues"] = list(formal["issues"])
+        hard_reasons.extend(formal["hard_reasons"])
+    metrics = dict(validation)
+    metrics["turn_length_m"] = (
+        _turn_parts_length_m(parts, metric_scale) if parts else float("inf")
+    )
+    candidate = {
+        "candidate_id": f"{selected_strategy}:fixed:{offset:.6f}",
+        "parts": parts,
+        "path": paths,
+        "hard_reasons": sorted(set(hard_reasons)),
+        "validation_issues": list(
+            validation.get("formal_validation_issues")
+            or validation.get("issues")
+            or []
+        ),
+        "metrics": metrics,
+    }
+    selected = validate_fixed_turn_candidate(
+        candidate,
         fallback_candidate={"candidate_id": "original", "parts": base_parts},
-        fallback_reason="no_safe_turn_candidate",
+        fallback_reason="fixed_turn_validation_failed",
     )
     diagnostics.update(selected.get("diagnostics") or {})
     diagnostics["rejected_candidates"] = selected.get("rejected_candidates", [])
     chosen = selected.get("selected")
     if chosen is None or chosen.get("candidate_id") == "original":
         return base_parts, diagnostics
-    # Validation accepted the requested fixed geometry; no geometry
-    # optimization or headland-dependent offset was applied.
-    diagnostics["optimization_applied"] = False
+    diagnostics["validation_passed"] = True
     diagnostics["selected_candidate_id"] = chosen.get("candidate_id", "")
     diagnostics["selected_metrics"] = dict(chosen.get("metrics") or {})
     return base_parts, diagnostics

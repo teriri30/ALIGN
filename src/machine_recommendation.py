@@ -186,7 +186,7 @@ def recommend_machine_dimensions(
     evidence_count = int(track_upper is not None) + int(wheelbase_upper is not None)
     evidence_quality = ("complete" if evidence_count == 2 else
                         "partial" if evidence_count == 1 else "insufficient")
-    lines = ["智能推荐候选（不是机型适配或地形安全结论）"]
+    lines = ["智能推荐参数"]
     if clear_width is not None:
         lines.extend([
             f"- 宽通道保守净宽：{clear_width:.2f} m",
@@ -216,8 +216,7 @@ def recommend_machine_dimensions(
     lines.append("- 割刀前置距离不能由影像或行带几何推算，必须对实际收获机测量。")
     lines.extend([
         "",
-        "说明：系统没有 DEM、坡度、土壤承载力、重心、侧翻或完整车辆动力学模型。",
-        "履带宽度上限来自影像通道净宽；轴距只是田头空间约束下的指导值，最终必须核对具体机型说明书并重新规划验证。",
+        "提示：参数建议基于当前影像中的行带宽度和田头空间，请结合实际机具尺寸确认。",
     ])
     return {
         "title": "基于宽窄行几何的农机尺寸候选",
@@ -233,5 +232,4 @@ def recommend_machine_dimensions(
         },
         "evidence_quality": evidence_quality,
         "method": "mask_geometry_heuristic_v2",
-        "validated": False,
     }

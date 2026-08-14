@@ -1,9 +1,9 @@
-"""Pure helpers for finite, auditable headland-turn candidate selection.
+"""Pure helpers for fixed-strategy headland-turn validation.
 
 This module does not inflate obstacles and does not run a global path search.
-The planner supplies endpoint-preserving turn geometries and canonical footprint
-metrics; this module builds a local semantic corridor and ranks candidates after
-hard constraints have been evaluated.
+The planner supplies one endpoint-preserving turn geometry selected by the user.
+This module builds a local semantic corridor and evaluates hard constraints; it
+does not search offsets, rank alternatives, or change the requested geometry.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 
-TURN_OPTIMIZER_VERSION = "headland-turn-corridor-v1"
+TURN_VALIDATOR_VERSION = "fixed-headland-turn-validation-v1"
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -23,11 +23,6 @@ def _finite(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
-
-
-def _soft_metric(metrics: Dict[str, Any], name: str, default: float = math.inf) -> float:
-    value = _finite(metrics.get(name))
-    return default if value is None else value
 
 
 def _hard_reasons(candidate: Dict[str, Any]) -> List[str]:
@@ -49,61 +44,40 @@ def _hard_reasons(candidate: Dict[str, Any]) -> List[str]:
     return reasons
 
 
-def select_turn_candidate(
-    candidates: Sequence[Dict[str, Any]],
+def validate_fixed_turn_candidate(
+    candidate: Dict[str, Any],
     *,
     fallback_candidate: Optional[Dict[str, Any]] = None,
     fallback_reason: str = "",
 ) -> Dict[str, Any]:
-    """Select one finite-search candidate with hard constraints first."""
-    safe = []
-    rejected = []
-    for candidate in candidates or []:
-        item = dict(candidate)
-        reasons = _hard_reasons(item)
-        item["hard_reasons"] = reasons
-        item["kinematically_feasible"] = not bool(reasons)
-        if reasons:
-            rejected.append({
-                "candidate_id": str(item.get("candidate_id", "")),
-                "hard_reasons": reasons,
-                "validation_issues": list(item.get("validation_issues") or []),
-            })
-            continue
-        metrics = dict(item.get("metrics") or {})
-        item["metrics"] = metrics
-        item["soft_rank_key"] = (
-            _soft_metric(metrics, "turn_body_overlap_area_m2"),
-            _soft_metric(metrics, "turn_uncertain_overlap_area_m2"),
-            _soft_metric(metrics, "turn_repeat_twice_or_more_area_m2"),
-            _soft_metric(metrics, "turn_length_m"),
-            _soft_metric(metrics, "turn_curvature_penalty"),
-            str(item.get("candidate_id", "")),
-        )
-        safe.append(item)
-
-    selected = min(safe, key=lambda item: item["soft_rank_key"]) if safe else fallback_candidate
-    applied = bool(safe)
-    selected_reason = "" if applied else str(fallback_reason or "no_safe_turn_candidate")
+    """Validate one fixed geometry and preserve the original on failure."""
+    item = dict(candidate or {})
+    reasons = _hard_reasons(item)
+    item["hard_reasons"] = reasons
+    item["kinematically_feasible"] = not bool(reasons)
+    item["metrics"] = dict(item.get("metrics") or {})
+    passed = not bool(reasons)
+    rejected = [] if passed else [{
+        "candidate_id": str(item.get("candidate_id", "")),
+        "hard_reasons": reasons,
+        "validation_issues": list(item.get("validation_issues") or []),
+    }]
+    selected = item if passed else fallback_candidate
+    selected_reason = "" if passed else str(
+        fallback_reason or "fixed_turn_validation_failed"
+    )
     return {
         "selected": selected,
-        "candidates": safe,
+        "candidates": [item] if passed else [],
         "rejected_candidates": rejected,
         "diagnostics": {
-            "optimizer_version": TURN_OPTIMIZER_VERSION,
-            "optimization_applied": applied,
-            "candidate_count": len(candidates or []),
-            "safe_candidate_count": len(safe),
+            "validator_version": TURN_VALIDATOR_VERSION,
+            "validation_passed": passed,
+            "candidate_count": 1,
+            "safe_candidate_count": int(passed),
             "rejected_candidate_count": len(rejected),
             "fallback_reason": selected_reason,
-            "hard_constraint_order": "hard_constraints_before_soft_cost",
-            "soft_order": [
-                "turn_body_overlap_area_m2",
-                "turn_uncertain_overlap_area_m2",
-                "turn_repeat_twice_or_more_area_m2",
-                "turn_length_m",
-                "turn_curvature_penalty",
-            ],
+            "validation_policy": "fixed_geometry_hard_constraints",
         },
     }
 

@@ -299,7 +299,7 @@ class MainWindow(QMainWindow):
         )
         self._add_action(
             fm,
-            "导出收获机候选路径（正式门禁）...",
+            "导出科研路径（$PATH）...",
             None,
             self._on_export_path_format,
         )
@@ -389,7 +389,7 @@ class MainWindow(QMainWindow):
         tp.simulate_requested.connect(self._on_simulate_task_action)
         tp.params_requested.connect(self._on_params_dialog)
         tp.entry_exit_toggle.connect(self._on_toggle_entry_exit)
-        tp.export_geojson_requested.connect(self._on_export_machine_compatibility_path)
+        tp.export_geojson_requested.connect(self._on_export_geojson)
         tp.export_csv_requested.connect(self._on_export_csv_geo)
         tp.export_img_requested.connect(self._on_export_img)
         tp.field_drawing_requested.connect(self._on_toggle_field_drawing)
@@ -463,7 +463,10 @@ class MainWindow(QMainWindow):
 
 
     def _has_background_worker(self):
-        return bool(self._worker_thread and self._worker_thread.isRunning())
+        thread_running = bool(
+            self._worker_thread and self._worker_thread.isRunning()
+        )
+        return thread_running or getattr(self.state, "inference_running", False) is True
 
     def _start_background_worker(self, worker, run_message, *, warn_if_busy=True, busy_message=None):
         """Start one cancellable worker without blocking the Qt UI thread."""
@@ -5702,22 +5705,22 @@ class MainWindow(QMainWindow):
             self._show_geo_export_error("JSON", e)
 
     def _on_export_path_format(self):
-        """Directly export the $PATH candidate route as txt without any dialogs.
+        """Directly export the research $PATH route as text.
 
         The trial-package export remains available from the File menu
         ("导出完整试验资料包...") for operators who need the full bundle.
         """
         try:
             path, _ = QFileDialog.getSaveFileName(
-                self, "导出收获机候选路径", "mission_field_trial.txt",
+                self, "导出科研路径", "research_path.txt",
                 "Text (*.txt);;PATH (*.path)",
             )
             if not path:
                 return
             self._export_candidate_path(path)
             message = (
-                f"已导出收获机候选路径：{os.path.basename(path)}；"
-                "必需校验记录已保存"
+                f"已导出科研路径：{os.path.basename(path)}；"
+                "路径参数与校验记录已保存"
             )
             WorkflowUpdater.advance(self.state, "EXPORTED")
             self.log_panel.success(message)
@@ -5772,28 +5775,6 @@ class MainWindow(QMainWindow):
         self.log_panel.success(f"完整试验资料包已导出：{os.path.basename(package_dir)}")
         self.lbl_status.setText("资料包导出完成")
 
-    def _prompt_path_export_scope(self):
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("导出收获机候选路径")
-        box.setText(
-            "该文件面向受控田间试验，尚未验证具体收获机终端协议。\n\n"
-            "导入前请核对终端格式、纬度/经度顺序、坐标基准、车辆参考点、"
-            "影像位置、农机参数、禁行区和调头方式。首次试跑必须低速运行、"
-            "人工看护并具备紧急停机条件。"
-        )
-        path_button = box.addButton("仅导出候选路径", QMessageBox.AcceptRole)
-        package_button = box.addButton("导出完整试验资料包", QMessageBox.ActionRole)
-        cancel_button = box.addButton(QMessageBox.Cancel)
-        box.setDefaultButton(cancel_button)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is path_button:
-            return "path"
-        if clicked is package_button:
-            return "package"
-        return ""
-
     def _export_candidate_path(
         self,
         path,
@@ -5823,38 +5804,6 @@ class MainWindow(QMainWindow):
                 # remains the source for formal research validation above.
                 geo_points = control_geo_points
                 compatibility_route_source = "shared_route_control_polyline"
-        if not preview_only:
-            from machine_route_validator import assess_machine_readiness
-
-            stored_readiness = dict(path_result.get("machine_readiness") or {})
-            readiness = assess_machine_readiness(
-                path_result, self.cfg.section("path_planning")
-            )
-            if stored_readiness != readiness:
-                self._confirm_export_risk(
-                    "导出确认",
-                    "机器就绪证据已过期或与当前路径及配置不一致，禁止生成收获机路径文件",
-                )
-            machine_ready = bool(
-                readiness.get("schema") == "reui.machine-readiness.v1"
-                and readiness.get("eligible_for_machine_export") is True
-                and readiness.get("controlled_trial_ready") is True
-                and readiness.get("blockers") == []
-                and readiness.get("controlled_trial_blockers") == []
-                and readiness.get("manual_review_required") is False
-                and readiness.get("current_route_classification")
-                == "machine_export_candidate"
-            )
-            if not machine_ready:
-                self._confirm_export_risk(
-                    "导出确认",
-                    "机器就绪证据不完整，禁止生成收获机路径文件",
-                )
-            if readiness.get("terminal_protocol_validated") is not True:
-                self._confirm_export_risk(
-                    "导出确认",
-                    "目标收获机终端协议尚未验证，禁止生成机器路径文件",
-                )
         protocol_metadata = None
         manifest_format = "$PATH"
         if machine_compatibility:

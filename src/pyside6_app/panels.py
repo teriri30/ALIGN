@@ -16,24 +16,6 @@ UI_FONT = '"Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif
 # 328 px 仍会产生 1 px 横向滚动，330 px 起全部控件不再横向挤压。
 TASK_PANEL_COMPACT_MIN_WIDTH = 330
 
-HARVESTER_PARAM_LABELS = {
-    "cutter_width_m": "割台有效割幅",
-    "cutter_forward_offset_m": "割刀前置距离",
-    "track_width_m": "履带宽度",
-    "track_gauge_m": "履带中心距",
-    "wheelbase_m": "轴距",
-    "track_length_m": "履带接地长度",
-    "turn_radius_m": "最小转弯半径",
-}
-HARVESTER_SOURCE_LABELS = {
-    "default": "默认值",
-    "recommended": "推荐值",
-    "user_entered": "用户填写但未实测",
-    "legacy_unverified": "历史来源未记录",
-    "user_measured": "用户实测",
-}
-
-
 class ExplicitPopupComboBox(QComboBox):
     """Ignore wheel selection unless the popup list is explicitly open.
 
@@ -996,52 +978,18 @@ class RouteInfoPanel(QWidget):
         ]
         self._summary.setText(" / ".join(main_parts))
         self._summary.setToolTip(" / ".join(detail_parts))
-        readiness = data.get("machine_readiness", {}) or {}
-        trial_ready = bool(readiness.get("controlled_trial_ready", False))
-        if not bool(validation.get("valid", False)):
-            execution_label = "路径校验未通过"
-        elif trial_ready:
-            execution_label = "路径校验通过"
-        else:
-            execution_label = "待补充试验记录"
-        self._safety.setText(f"路径状态：{execution_label}")
-        blockers = list(readiness.get("controlled_trial_blockers") or [])
-        blocker_labels = {
-            "path_validation_failed": "路径验证未通过",
-            "turn_hard_errors_present": "调头轨迹存在硬错误",
-            "footprint_optimized_work_lines_not_used": "未启用足迹优化",
-            "field_trial_validation_profile_not_used": "未启用田间试验检查",
-            "confirmed_field_boundary_missing": "田块边界未确认",
-            "semantic_support_missing": "场地支撑层缺失",
-            "confirmed_forbidden_map_missing": "禁行区尚未确认",
-            "planning_resolution_too_coarse": "规划分辨率不足",
-            "footprint_contract_mismatch": "足迹模型或路径参考点不一致",
-            "harvester_parameter_source_unverified": "农机参数来源未完成实测",
-            "planning_recovered_work_bands": "包含自动恢复作业带",
-        }
-        readable_blockers = [blocker_labels.get(value, value) for value in blockers]
-        limits = validation.get("validation_limits_pct", {}) or {}
-        details = [f"待补充: {'；'.join(readable_blockers)}" if blockers else "田间试验检查已通过"]
-        planning_factors = data.get("planning_factors", {}) or {}
-        source_map = dict(
-            planning_factors.get("harvester_param_sources")
-            or (readiness.get("harvester_parameter_source_status", {}) or {}).get(
-                "sources"
-            )
-            or {}
+        validation_passed = validation.get("valid") is True
+        execution_label = (
+            "路径校验通过" if validation_passed else "路径校验未通过"
         )
-        unverified_sources = [
-            f"{HARVESTER_PARAM_LABELS.get(key, key)}（{HARVESTER_SOURCE_LABELS.get(source, source)}）"
-            for key, source in source_map.items()
-            if source != "user_measured"
-        ]
-        if unverified_sources:
-            details.append("参数来源未完成实测：" + "、".join(unverified_sources))
-        if limits:
-            details.append(
-                "阈值(%): 田界<={track_outside_field:g}, 支撑<={track_outside_support:g}, "
-                "不确定<={track_uncertain_overlap:g}, 禁行<={track_forbidden_overlap:g}".format(**limits)
-            )
+        self._safety.setText(f"路径状态：{execution_label}")
+        if validation_passed:
+            details = ["已完成当前路径的几何与足迹检查"]
+        elif issues:
+            details = ["请调整路径后重新校验"]
+            details.extend(str(issue) for issue in issues[:3])
+        else:
+            details = ["尚未获得有效的路径校验结果"]
         self._safety.setToolTip("\n".join(details))
 
     def update_editable_route(self, records):

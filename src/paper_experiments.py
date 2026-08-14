@@ -23,17 +23,16 @@ EXPERIMENT_SCHEMA = "reui.paper-experiment.v1"
 
 
 def default_experiment_plan(model_paths: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    """Freeze one mask input while comparing baseline and optimized turns."""
-    path_cases = []
-    for strategy in ("bow", "semicircle", "pear", "fishtail"):
-        for variant, enabled in (("baseline", False), ("headland_optimized", True)):
-            path_cases.append({
-                "id": f"{strategy}_{variant}",
-                "label": f"{strategy} {variant}",
-                "strategy": strategy,
-                "headland_turn_optimization_enabled": enabled,
-                "comparison_group": strategy,
-            })
+    """Freeze one mask input while comparing implemented turn strategies."""
+    path_cases = [
+        {
+            "id": strategy,
+            "label": strategy,
+            "strategy": strategy,
+            "comparison_group": "turn_strategy",
+        }
+        for strategy in ("bow", "semicircle", "pear", "fishtail")
+    ]
     return {
         "mask_cases": [
             {"id": "raw_mask_geometry", "label": "raw mask geometry", "mode": "raw"},
@@ -50,7 +49,7 @@ def default_experiment_plan(model_paths: Optional[Sequence[str]] = None) -> Dict
             "supervised_metrics_require_ground_truth": True,
             "failed_cases_are_preserved": True,
             "interactive_state_is_read_only": True,
-            "turn_optimization_is_the_only_path_variant": True,
+            "turn_strategy_is_the_only_path_variant": True,
         },
     }
 
@@ -503,9 +502,6 @@ class PaperExperimentRunner:
                     "planning_support_mask": active_mask.get("planning_support_mask"),
                     "uncertain_mask": active_mask.get("uncertain_residual_mask"),
                     "forbidden_mask": active_mask.get("forbidden_mask"),
-                    "headland_turn_optimization_enabled": bool(
-                        case.get("headland_turn_optimization_enabled", True)
-                    ),
                 })
                 result = self.plan_path_fn(
                     active_mask.get("wide_bands") or [], processed,
@@ -516,10 +512,6 @@ class PaperExperimentRunner:
                 metrics = _numeric_metrics(result.get("validation") or {})
                 turn_assessment = result.get("turn_assessment") or {}
                 metrics["turn_count"] = float(len(turn_assessment.get("turn_decisions") or []))
-                metrics["headland_turn_optimization_applied_count"] = float(sum(
-                    bool((item.get("headland_turn_optimization") or {}).get("optimization_applied"))
-                    for item in (turn_assessment.get("turn_decisions") or [])
-                ))
                 # DECISION-015: preserve per-turn attribution in experiment metrics.
                 metrics["headland_turn_track_overlap_area_m2"] = float(
                     (result.get("validation") or {}).get("headland_turn_track_overlap_area_m2", 0.0) or 0.0

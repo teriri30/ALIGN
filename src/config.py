@@ -12,10 +12,10 @@ class ConfigValidationError(ValueError):
 
 
 DEFAULT_HARVESTER_PARAMS = {
-    "cutter_width_m": 2.00,
+    "cutter_width_m": 2.15,
     "cutter_forward_offset_m": 1.35,
-    "track_width_m": 0.35,
-    "track_gauge_m": 1.30,
+    "track_width_m": 0.40,
+    "track_gauge_m": 1.60,
     "wheelbase_m": 1.80,
     "track_length_m": 1.70,
     "turn_radius_m": 0.90,
@@ -282,12 +282,6 @@ def validate_config(raw: dict) -> dict:
         planning, "service_point_terminal_depth_m",
         minimum=0.1, maximum=20.0,
     )
-    if "headland_turn_optimization_enabled" in planning and not isinstance(
-        planning["headland_turn_optimization_enabled"], bool
-    ):
-        raise ConfigValidationError(
-            "headland_turn_optimization_enabled must be boolean"
-        )
     if "recover_missing_work_bands" in planning and not isinstance(
         planning["recover_missing_work_bands"], bool
     ):

@@ -150,7 +150,7 @@
 
 **文档锚点**：`README.md`、`docs/SCIENTIFIC_VALIDATION.md`、`AI_RULES.md`。
 
-**测试锚点**：`test_readme_preserves_research_prototype_boundary`、`test_machine_parameter_output_is_explicitly_unvalidated_heuristic`。
+**测试锚点**：`test_readme_preserves_research_use_and_model_conditions`、`test_machine_parameter_output_states_concise_calculation_basis`。
 
 ## DECISION-009：掩膜证据层和规划支撑层必须分离
 
@@ -211,12 +211,12 @@
 
 - `work_line_mode=band_centerline` 保持原中心线流程；`band_centerline_with_footprint_validation`保留四行带中心线并只进行足迹验证和风险评分；`footprint_optimized`先筛选、平滑并排序四行带中心线，再在每条基准线两侧的有限横向走廊内，以履带核心重叠、冠层重叠、割台覆盖、场地支撑、确认禁行区、偏移幅度和连续平滑性联合选择实际作业线。优化不得改变基准作业线数量与顺序，横移不得超过`lateral_search_m`；核心重叠始终记录，但默认 `track_core_overlap_policy=report_only`，不单独使路径无效或阻断导出。`footprint_metric_policy=report_only`时，规划覆盖率和碾压相关指标只保留为结果字段，不参与默认有效性比较；田界、支撑区、不确定区、禁行区和其他坐标完整性仍按正式验证处理。任一作业线没有完整有限候选、平滑后进入禁行候选、关键指标缺失/非有限/其他硬条件失败时，整组回退为`band_centerline_with_footprint_validation`并记录原因。
 - 用户界面不暴露“快速预览、田间试验、高级校验”等内部模式；默认按田间试验要求执行，内部配置细节不要求普通用户理解。
-- 验证等级分为 `research`、`field_trial` 和 `machine_candidate`；结果界面只显示路径状态、作业线模式和关键风险，内部阻断项放入详情提示。
+- 验证等级分为 `research`、`field_trial` 和 `machine_candidate`；默认结果界面只显示路径校验状态和必要问题提示，不显示试验记录、机器就绪或参数来源门禁。
 - 未确认的不确定残差不得自动升级为禁行区；提供禁行区时，履带重叠默认硬门限为 0%。
 - 整机包络阈值由 `machine_candidate` 验证配置固定为 0%，不提供普通用户可编辑的整机门限。
 - 禁行区必须来自用户确认多边形，并进入项目缓存、路径 provenance、足迹验证和导出 manifest；任何修改必须使旧路径失效。
 - GeoJSON、CSV、KML、JSON 和 `$PATH` 均记录坐标基准、车辆参考点和规划参数，便于与目标终端格式进行核对。
-- 机器执行就绪评估基于外部定位精度、车辆参考几何、运动学、终端适配和实车跟踪等记录项计算；记录不完整时，界面应明确显示待补充项。
+- 机器执行就绪评估可作为内部研究记录保存，但不是默认界面状态，也不是科研路径导出的条件。
 - 农机几何参数必须逐字段携带来源元数据；`default`、`recommended`、`user_entered` 和历史未记录来源不得静默写成实测值。`field_trial`/`machine_candidate` 缺少完整的显式 `user_measured` 来源时，路径结果必须为 `machine_executable=false`，但研究导出仍可保留原始来源信息。
 - 兼容测试可以在上述参数来源、机器就绪和终端协议记录不完整时生成 `$PATH` 文本；它不得提升 `machine_executable`，但不再通过警告或理论指标阻断研究作品导出。
 - 足迹验证必须记录 `planar_rigid_footprint_v2` 和参考点 `track_contact_center`。演示与验证共用左右履带、机身和割刀线；履带碾压使用有限接地长度的有向矩形扫掠，作物掩膜几何覆盖使用具有实测前置距离的有效割幅线段扫掠。
@@ -301,10 +301,10 @@
 - 不变量：
     1. `segment_metrics` 使用 `exclusive_first_segment` 规则；分段独占履带并集和为全路径 `track_swept_area_m2`，重复访问另由 `uint32` 逻辑通过计数图统计。一个逻辑路径段内部的相邻姿态先取二值并集，只能计为一次通过；姿态覆盖次数不得进入正式指标。
   2. 转弯层单独报告 `headland_turn_track_overlap_area_m2`、`headland_turn_rolling_pct`、主体/不确定区/禁行区重叠、田界越界和 `turn_cost_m2`；田头仍是软代价，不是硬障碍。
-  3. 候选搜索只在端点保持、策略和最小半径不变的有限走廊内进行；田界、禁行区、运动学不可行、无有效米制尺度和退化直线均 fail-closed。没有安全改进候选时保留原候选并记录 `fallback_reason`。
+  3. 用户所选策略只生成一套固定转弯几何，不搜索田头偏移，也不按软代价比较替代转弯；田界、禁行区、运动学不可行、无有效米制尺度和退化直线均进入校验诊断并记录 `fallback_reason`。
   4. 一次与两次及以上履带访问面积是二维几何模型指标，不等于土壤压实、产量损失、实机可执行结果或田间验证结果。
   5. 候选必须使用与正式路径一致的足迹模型并保留核心区重叠、规划目标覆盖和田界越界指标；缺少 `valid`、`issues` 或必需指标不得默认放行。默认报告模式不把碾压/覆盖率阈值当作硬门禁，真实田界、禁行区、交叉和坐标完整性仍按配置检查。
-- 代码锚点：`footprint_planner._accumulate_logical_segment_pass`、`footprint_planner.validate_footprints`、`path_planner._connect_work_lines`、`headland_turn_optimizer.select_turn_candidate`。
+- 代码锚点：`footprint_planner._accumulate_logical_segment_pass`、`footprint_planner.validate_footprints`、`path_planner._connect_work_lines`、`headland_turn_validation.validate_fixed_turn_candidate`。
 - 测试锚点：`tests/test_track_pass_count.py`、`tests/test_headland_turn.py`、`tests/test_headland_turn_contract.py`、`tests/test_headland_turn_integration.py`。
 - 允许变更方式：可增加有实测依据的足迹模型或标定代价，但必须保留整路径/分段核对、访问计数类型、硬约束诊断和实验输入冻结。
 
@@ -326,7 +326,7 @@
 - 不变量：
   1. `contour` 不改变作业线数量和法向层级；只允许已有端点群体/邻线证据支持、位于田界内的主向端点校正，不允许横向移动作业线或伪造闭合轮廓。
   2. 诊断必须记录原始索引、分半索引、低/高半原始索引、交错原始索引、对应作业线对、两条田头墙投影、逐次横向转弯距离和奇数中心收尾状态；`minimum_possible_adjacent_transition_count` 与实际 `selected_adjacent_transition_count` 必须同时记录。起点最近可行首端点优先于相邻数最小值，发生覆盖时记录 `entry_priority_overrode_minimum_adjacency=true`，并仍由逐转弯田界、曲率、自交和足迹验证失败关闭；`turn_distances_m` 按实际交错顺序记录，不再强行要求单调不增。
-  3. 同一田头的转弯锚点必须具有相同主向投影；宽间距套圈转弯的横向切线不得被逐转弯优化器移离共享田头线。
+  3. 同一田头的转弯锚点必须具有相同主向投影；固定转弯校验不得移动宽间距套圈转弯的横向切线或共享田头线。
   3a. 同一田头侧的 `shared_turn_clearance_m_by_side` 必须在全田已分类区域中一致，诊断记录 `shared_turn_clearance_scope=all_classified_regions`；局部凹边界只允许整体内移该侧共同切线，不得只改变一个转弯的曲率。
   4. 套圈连接继续标记为 `turn`/`turn_reverse`/`turn_aux` 等正式转弯段，必须进入 DECISION-015 的长度、足迹和重复访问归因；不得新增绕过统计与协议的 `connector` 段类型。
   5. 套圈候选必须经过与其他策略相同的曲率、田界、禁行区、足迹和导出门禁；失败时保留诊断，不把显示用直连段标记为可执行。混合种植田块不得先生成区域路线再拼接；全田统一排序后的每个相邻作业线对都按同一套转弯约束处理。
