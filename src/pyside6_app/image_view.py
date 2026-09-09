@@ -2,7 +2,7 @@
 image_view.py — 可缩放/平移/覆盖绘制的图像显示控件
 """
 import numpy as np
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal
+from PySide6.QtCore import Qt, QRectF, QPoint, QPointF, Signal
 from PySide6.QtGui import (
     QPainter, QPen, QColor, QBrush, QPixmap, QImage,
     QWheelEvent, QMouseEvent, QKeyEvent, QTransform, QFont,
@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsEllipseItem,
     QGraphicsItem,
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame,
-    QSlider, QComboBox, QToolButton, QStyle,
+    QSlider, QComboBox, QToolButton, QStyle, QTreeWidget, QTreeWidgetItem,
+    QAbstractItemView,
 )
 from pyside6_app.styles import COLORS
 
@@ -27,6 +28,19 @@ def _is_dark_theme():
         return (r * 299 + g * 587 + b * 114) < 38000
     except (ValueError, IndexError):
         return True
+
+
+DISPLAY_LAYER_KEYS = (
+    "field_boundary",
+    "raw_mask",
+    "processed_mask",
+    "headland_mask",
+    "uncertain_residual",
+    "centerlines",
+    "route",
+    "forbidden_regions",
+    "service_points",
+)
 
 
 class RotationRuler(QWidget):
@@ -181,10 +195,10 @@ class RotationRuler(QWidget):
 
 
 class ImageViewer(QGraphicsView):
-    mouse_moved = Signal(int, int, int)
-    mouse_pressed = Signal(int, int, int)
-    mouse_released = Signal(int, int, int)
-    mouse_dragged = Signal(int, int, int)
+    mouse_moved = Signal(float, float, int)
+    mouse_pressed = Signal(float, float, int)
+    mouse_released = Signal(float, float, int)
+    mouse_dragged = Signal(float, float, int)
     view_scale_changed = Signal(float)
 
     def __init__(self, parent=None):
@@ -195,6 +209,15 @@ class ImageViewer(QGraphicsView):
         self._pixmap_item.setTransformationMode(Qt.SmoothTransformation)
         self._scene.addItem(self._pixmap_item)
         self._overlay_group = []
+        # Keep dynamic display layers independent.  Replacing one route or
+        # centerline must not require rebuilding the orthomosaic or mask
+        # evidence pixmaps.
+        self._overlay_layers = {}
+        # Visibility is a display-only preference.  It intentionally survives
+        # ``set_image``/compare swaps while the overlay items themselves are
+        # rebuilt from the current AppState.
+        self._overlay_layer_visibility = {}
+        self._active_overlay_layer = None
         self.setRenderHint(QPainter.SmoothPixmapTransform)
         self.setRenderHint(QPainter.Antialiasing)
         self.setDragMode(QGraphicsView.NoDrag)
@@ -378,14 +401,14 @@ class ImageViewer(QGraphicsView):
         if e.button() == Qt.LeftButton and self._direct_drag_hit_test is not None:
             try:
                 capture = bool(
-                    self._direct_drag_hit_test(int(pos.x()), int(pos.y()))
+                    self._direct_drag_hit_test(float(pos.x()), float(pos.y()))
                 )
             except Exception:
                 capture = False
             if capture:
                 self._direct_drag_active = True
                 self.setCursor(Qt.ClosedHandCursor)
-                self.mouse_pressed.emit(int(pos.x()), int(pos.y()), 1)
+                self.mouse_pressed.emit(float(pos.x()), float(pos.y()), 1)
                 e.accept()
                 return
         # 中键 → 始终平移
@@ -405,13 +428,13 @@ class ImageViewer(QGraphicsView):
         # 绘制模式左键 → 记录按下位置，延迟到 release 判断是点击(加点)还是拖拽(平移)
         if e.button() == Qt.LeftButton and self.drawing_mode:
             self._draw_press_pos = e.pos()
-            self._draw_press_scene = (int(pos.x()), int(pos.y()))
+            self._draw_press_scene = (float(pos.x()), float(pos.y()))
             self._draw_dragged = False
             self._pan_origin = e.pos()
             self._pan_button = Qt.LeftButton
             e.accept()
             return
-        self.mouse_pressed.emit(int(pos.x()), int(pos.y()), btn)
+        self.mouse_pressed.emit(float(pos.x()), float(pos.y()), btn)
         super().mousePressEvent(e)
 
     def mouseReleaseEvent(self, e):
@@ -420,7 +443,7 @@ class ImageViewer(QGraphicsView):
         if e.button() == Qt.LeftButton and self._direct_drag_active:
             self._direct_drag_active = False
             self.setCursor(Qt.CrossCursor if self.drawing_mode else Qt.ArrowCursor)
-            self.mouse_released.emit(int(pos.x()), int(pos.y()), 1)
+            self.mouse_released.emit(float(pos.x()), float(pos.y()), 1)
             e.accept()
             return
         # 绘制模式左键释放
@@ -445,7 +468,7 @@ class ImageViewer(QGraphicsView):
             self.setCursor(Qt.ArrowCursor)
             e.accept()
             return
-        self.mouse_released.emit(int(pos.x()), int(pos.y()), btn)
+        self.mouse_released.emit(float(pos.x()), float(pos.y()), btn)
         super().mouseReleaseEvent(e)
 
     def mouseMoveEvent(self, e):
@@ -454,8 +477,8 @@ class ImageViewer(QGraphicsView):
              | (2 if e.buttons() & Qt.RightButton else 0) \
              | (4 if e.buttons() & Qt.MiddleButton else 0)
         if self._direct_drag_active and (e.buttons() & Qt.LeftButton):
-            self.mouse_moved.emit(int(pos.x()), int(pos.y()), btns)
-            self.mouse_dragged.emit(int(pos.x()), int(pos.y()), btns)
+            self.mouse_moved.emit(float(pos.x()), float(pos.y()), btns)
+            self.mouse_dragged.emit(float(pos.x()), float(pos.y()), btns)
             e.accept()
             return
         # 绘制模式左键拖拽检测
@@ -484,9 +507,9 @@ class ImageViewer(QGraphicsView):
             self._pan_origin = e.pos()
             e.accept()
             return
-        self.mouse_moved.emit(int(pos.x()), int(pos.y()), btns)
+        self.mouse_moved.emit(float(pos.x()), float(pos.y()), btns)
         if btns:
-            self.mouse_dragged.emit(int(pos.x()), int(pos.y()), btns)
+            self.mouse_dragged.emit(float(pos.x()), float(pos.y()), btns)
         super().mouseMoveEvent(e)
 
     def keyPressEvent(self, e):
@@ -509,24 +532,88 @@ class ImageViewer(QGraphicsView):
         for i in self._overlay_group:
             self._scene.removeItem(i)
         self._overlay_group.clear()
+        self._overlay_layers.clear()
+        self._active_overlay_layer = None
+
+    def begin_overlay_layer(self, name):
+        """Route subsequently drawn items into a named removable layer."""
+        value = str(name or "").strip()
+        self._active_overlay_layer = value or None
+        if value:
+            self._overlay_layers.setdefault(value, [])
+
+    def end_overlay_layer(self):
+        self._active_overlay_layer = None
+
+    def has_overlay_layer(self, name):
+        return bool(self._overlay_layers.get(str(name or "").strip()))
+
+    def clear_overlay_layer(self, name):
+        """Remove only one overlay layer and leave all other layers intact."""
+        key = str(name or "").strip()
+        if not key:
+            return
+        items = list(self._overlay_layers.get(key, []))
+        self.remove_overlays(items)
+        self._overlay_layers.pop(key, None)
+
+    def set_overlay_layer_visible(self, name, visible):
+        """Show or hide a named overlay without changing its geometry."""
+        key = str(name or "").strip()
+        if not key:
+            return
+        value = bool(visible)
+        self._overlay_layer_visibility[key] = value
+        for item in list(self._overlay_layers.get(key, [])):
+            try:
+                item.setVisible(value)
+            except RuntimeError:
+                # A caller may have retained an item after Qt removed it from
+                # the scene.  The layer registry is still repaired by the
+                # normal removal path; visibility changes must stay harmless.
+                continue
+
+    def overlay_layer_visible(self, name, default=True):
+        """Return the display preference for a layer."""
+        key = str(name or "").strip()
+        if not key:
+            return bool(default)
+        return bool(self._overlay_layer_visibility.get(key, default))
+
+    def _register_overlay_item(self, item, layer=None):
+        self._overlay_group.append(item)
+        key = str(
+            layer if layer is not None else self._active_overlay_layer or ""
+        ).strip()
+        if key:
+            self._overlay_layers.setdefault(key, []).append(item)
+            if key in self._overlay_layer_visibility:
+                item.setVisible(self._overlay_layer_visibility[key])
+        return item
 
     def remove_overlays(self, items):
         """Remove a caller-owned overlay subset without disturbing other layers."""
         for item in list(items or []):
             if item in self._overlay_group:
                 self._overlay_group.remove(item)
+            for key, layer_items in list(self._overlay_layers.items()):
+                if item in layer_items:
+                    self._overlay_layers[key] = [
+                        candidate for candidate in layer_items if candidate is not item
+                    ]
+                    if not self._overlay_layers[key]:
+                        self._overlay_layers.pop(key, None)
             if item is not None and item.scene() is self._scene:
                 self._scene.removeItem(item)
 
-    def draw_line(self, x1, y1, x2, y2, color=(0, 200, 80), width=2, style=Qt.SolidLine):
+    def draw_line(self, x1, y1, x2, y2, color=(0, 200, 80), width=2, style=Qt.SolidLine, layer=None):
         pen = QPen(QColor(*reversed(color) if len(color) == 3 else color), width, style)
         pen.setCosmetic(True)
         line = self._scene.addLine(x1, y1, x2, y2, pen)
         line.setZValue(25)
-        self._overlay_group.append(line)
-        return line
+        return self._register_overlay_item(line, layer=layer)
 
-    def draw_polyline(self, pts, color=(0, 200, 80), width=2, style=Qt.SolidLine):
+    def draw_polyline(self, pts, color=(0, 200, 80), width=2, style=Qt.SolidLine, layer=None):
         if len(pts) < 2:
             return
         pen = QPen(QColor(*reversed(color)), width, style)
@@ -536,9 +623,9 @@ class ImageViewer(QGraphicsView):
             x2, y2 = pts[i + 1]
             line = self._scene.addLine(x1, y1, x2, y2, pen)
             line.setZValue(25)
-            self._overlay_group.append(line)
+            self._register_overlay_item(line, layer=layer)
 
-    def draw_polygon(self, pts, color=(0, 200, 80), outline=None, width=1, alpha=255):
+    def draw_polygon(self, pts, color=(0, 200, 80), outline=None, width=1, alpha=255, layer=None):
         if len(pts) < 3:
             return None
         polygon = QPolygonF([QPointF(float(x), float(y)) for x, y in pts])
@@ -548,10 +635,9 @@ class ImageViewer(QGraphicsView):
         pen.setCosmetic(True)
         item = self._scene.addPolygon(polygon, pen, brush)
         item.setZValue(29)
-        self._overlay_group.append(item)
-        return item
+        return self._register_overlay_item(item, layer=layer)
 
-    def draw_circle(self, x, y, radius=4, color=(255, 255, 0), scene_scaled=False):
+    def draw_circle(self, x, y, radius=4, color=(255, 255, 0), scene_scaled=False, layer=None):
         brush = QBrush(QColor(*reversed(color)))
         pen_w = max(1, radius // 3)
         pen = QPen(QColor(*reversed(color)), pen_w)
@@ -564,19 +650,17 @@ class ImageViewer(QGraphicsView):
             e.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         e.setZValue(30)
         self._scene.addItem(e)
-        self._overlay_group.append(e)
-        return e
+        return self._register_overlay_item(e, layer=layer)
 
-    def draw_text(self, x, y, text, color=(255, 255, 255), size=12):
+    def draw_text(self, x, y, text, color=(255, 255, 255), size=12, layer=None):
         i = self._scene.addText(text, QFont("", size))
         i.setPos(x, y)
         i.setDefaultTextColor(QColor(*reversed(color)))
         i.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         i.setZValue(31)
-        self._overlay_group.append(i)
-        return i
+        return self._register_overlay_item(i, layer=layer)
 
-    def draw_mask_overlay(self, mask, x=0, y=0, color=(120, 255, 140), max_dim=1400):
+    def draw_mask_overlay(self, mask, x=0, y=0, color=(120, 255, 140), max_dim=1400, layer=None):
         """Draw a downsampled transparent mask overlay in image coordinates."""
         if mask is None or mask.size == 0:
             return None
@@ -610,8 +694,7 @@ class ImageViewer(QGraphicsView):
         item.setScale(float(w) / max(1.0, float(sw)))
         item.setZValue(10)
         self._scene.addItem(item)
-        self._overlay_group.append(item)
-        return item
+        return self._register_overlay_item(item, layer=layer)
 
 
 class MetricScaleBar(QWidget):
@@ -717,9 +800,23 @@ class MetricScaleBar(QWidget):
         return f"{meters * 100:.0f} cm"
 
 
+class _DisplayLayerPopup(QFrame):
+    """Small transient chooser anchored to the toolbar display button."""
+
+    hidden = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+
+    def hideEvent(self, event):
+        self.hidden.emit()
+        super().hideEvent(event)
+
+
 class ImageViewerGroup(QWidget):
     snapshot_requested = Signal()
     mask_compare_requested = Signal()
+    display_layer_changed = Signal(str, bool)
     measure_tool_changed = Signal(str)
     route_display_mode_changed = Signal(str)
     animation_pause_requested = Signal()
@@ -742,6 +839,13 @@ class ImageViewerGroup(QWidget):
         super().__init__(parent)
         self._ppm = 0.0
         self._tb_buttons = []
+        self._display_panel_buttons = []
+        self._display_layer_items = {}
+        self._display_layer_available = {}
+        self._display_layer_visibility = {}
+        self._display_layer_defaults = {}
+        self._display_layer_user_overrides = set()
+        self._display_tree_updating = False
         self._machine_route_info = ""
         self._machine_route_tooltip = ""
         layout = QVBoxLayout(self)
@@ -872,6 +976,18 @@ class ImageViewerGroup(QWidget):
         btn_compare.clicked.connect(self.mask_compare_requested.emit)
         tbar.addWidget(btn_compare); self._tb_buttons.append(btn_compare)
 
+        # 图层显示开关放在快照/对比旁边，展开后使用树形复选框承载多层
+        # 组合；它是纯显示状态，不会触发重新识别、掩膜处理或路径规划。
+        self.display_toggle_button = QToolButton()
+        self.display_toggle_button.setObjectName("displayToggleButton")
+        self.display_toggle_button.setText("显示")
+        self.display_toggle_button.setArrowType(Qt.RightArrow)
+        self.display_toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.display_toggle_button.setFixedWidth(58)
+        self.display_toggle_button.setToolTip("展开或收起图层显示开关")
+        self.display_toggle_button.clicked.connect(self._toggle_display_panel)
+        tbar.addWidget(self.display_toggle_button)
+
         self._measure_buttons = {}
         for text, tool, tip in [
             ("•", "point", "点选查看经纬度"),
@@ -898,6 +1014,43 @@ class ImageViewerGroup(QWidget):
         tbar.addStretch()
 
         layout.addLayout(tbar)
+
+        # This is deliberately a popup instead of a row in the main layout:
+        # opening the chooser must not reduce the canvas or push the log down.
+        self.display_layers_panel = _DisplayLayerPopup(self)
+        self.display_layers_panel.setObjectName("displayLayersPanel")
+        self.display_layers_panel.setFixedWidth(228)
+        self.display_layers_panel.hidden.connect(
+            self._on_display_layers_popup_hidden
+        )
+        display_panel_layout = QVBoxLayout(self.display_layers_panel)
+        display_panel_layout.setContentsMargins(4, 4, 4, 4)
+        display_panel_layout.setSpacing(0)
+
+        self.display_layer_tree = QTreeWidget()
+        self.display_layer_tree.setObjectName("displayLayerTree")
+        self.display_layer_tree.setColumnCount(1)
+        self.display_layer_tree.setHeaderHidden(True)
+        self.display_layer_tree.setIndentation(16)
+        self.display_layer_tree.setUniformRowHeights(True)
+        self.display_layer_tree.setSelectionMode(QAbstractItemView.NoSelection)
+        self.display_layer_tree.setMinimumHeight(0)
+        self.display_layer_tree.setMaximumHeight(260)
+        self.display_layer_tree.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+        self.display_layer_tree.itemChanged.connect(
+            self._on_display_layer_item_changed
+        )
+        self.display_layer_tree.itemExpanded.connect(
+            lambda _item: self._resize_display_layers_popup()
+        )
+        self.display_layer_tree.itemCollapsed.connect(
+            lambda _item: self._resize_display_layers_popup()
+        )
+        display_panel_layout.addWidget(self.display_layer_tree)
+        self.display_layers_panel.hide()
+        self._build_display_layer_tree()
 
         # 路径有两套用途不同的几何：连续规划轨迹用于模拟/评价，农机
         # 文件视图严格复现已经写出的 $PATH 控制点折线。单独占一行可
@@ -930,10 +1083,262 @@ class ImageViewerGroup(QWidget):
 
         self.set_machine_route_available(False)
         self.viewer.mouse_moved.connect(
-            lambda x, y, b: self.lbl_coord.setText(f"x:{x}  y:{y}"))
+            lambda x, y, b: self.lbl_coord.setText(
+                f"x:{float(x):.3f}  y:{float(y):.3f}"
+            )
+        )
         self.viewer.view_scale_changed.connect(
             lambda s: self._scale_bar.update_scale(self._ppm, s))
         self.refresh_theme()
+
+    def _build_display_layer_tree(self):
+        self._display_layer_items = {}
+        self.display_layer_tree.clear()
+
+        def make_item(label, key=None, parent=None, *, tristate=False):
+            item = QTreeWidgetItem(parent or self.display_layer_tree, [label])
+            flags = Qt.ItemIsEnabled | Qt.ItemIsUserCheckable
+            if tristate:
+                flags |= Qt.ItemIsAutoTristate
+            item.setFlags(flags)
+            item.setCheckState(0, Qt.Unchecked)
+            if key:
+                item.setData(0, Qt.UserRole, key)
+                self._display_layer_items[key] = item
+                item.setHidden(
+                    not self._display_layer_available.get(key, False)
+                )
+            return item
+
+        make_item("田块圈选（边界）", "field_boundary")
+        mask_group = make_item("掩膜", tristate=True)
+        self._display_mask_group_item = mask_group
+        for key, label in (
+            ("raw_mask", "原始掩膜"),
+            ("processed_mask", "处理掩膜（主体）"),
+            ("headland_mask", "田头层"),
+            ("uncertain_residual", "不确定残差"),
+        ):
+            make_item(label, key, mask_group)
+        make_item("中心线（已选）", "centerlines")
+        make_item("路径（当前显示）", "route")
+        make_item("禁行区", "forbidden_regions")
+        make_item("起终点 / 卸粮点", "service_points")
+        self._refresh_display_layer_rows()
+
+    def _toggle_display_panel(self):
+        if self.display_layers_panel.isVisible():
+            self.display_layers_panel.hide()
+            return
+        if not any(self._display_layer_available.values()):
+            return
+        self._resize_display_layers_popup()
+        anchor = self.display_toggle_button.mapToGlobal(
+            QPoint(0, self.display_toggle_button.height())
+        )
+        screen = self.display_toggle_button.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            x = min(anchor.x(), available.right() - self.display_layers_panel.width() + 1)
+            y = anchor.y()
+            if y + self.display_layers_panel.height() > available.bottom() + 1:
+                y = self.display_toggle_button.mapToGlobal(
+                    QPoint(0, -self.display_layers_panel.height())
+                ).y()
+            anchor = QPoint(max(available.left(), x), max(available.top(), y))
+        self.display_layers_panel.move(anchor)
+        self.display_layers_panel.show()
+        self.display_layers_panel.raise_()
+        self.display_toggle_button.setArrowType(Qt.DownArrow)
+
+    def _on_display_layers_popup_hidden(self):
+        if hasattr(self, "display_toggle_button"):
+            self.display_toggle_button.setArrowType(Qt.RightArrow)
+
+    def _resize_display_layers_popup(self):
+        """Fit the popup to visible tree rows, not to unavailable placeholders."""
+        if not hasattr(self, "display_layer_tree"):
+            return
+        row_count = 0
+        tree = self.display_layer_tree
+        for index in range(tree.topLevelItemCount()):
+            parent = tree.topLevelItem(index)
+            if parent.isHidden():
+                continue
+            row_count += 1
+            if not parent.isExpanded():
+                continue
+            row_count += sum(
+                not parent.child(child_index).isHidden()
+                for child_index in range(parent.childCount())
+            )
+        row_height = tree.sizeHintForRow(0)
+        if row_height <= 0:
+            row_height = tree.fontMetrics().height() + 8
+        row_height = max(20, min(28, int(row_height)))
+        tree_height = max(4, row_count * row_height + 2)
+        tree.setFixedHeight(min(260, tree_height))
+        self.display_layers_panel.setFixedHeight(
+            min(268, tree.height() + 8)
+        )
+
+    def _refresh_display_layer_rows(self):
+        """Hide placeholders so the popup only exposes drawable layers."""
+        if not hasattr(self, "display_layer_tree"):
+            return
+        updating_before = self._display_tree_updating
+        self._display_tree_updating = True
+        try:
+            for key, item in self._display_layer_items.items():
+                available = bool(self._display_layer_available.get(key, False))
+                item.setHidden(not available)
+                item.setDisabled(not available)
+
+            mask_available = any(
+                self._display_layer_available.get(key, False)
+                for key in (
+                    "raw_mask",
+                    "processed_mask",
+                    "headland_mask",
+                    "uncertain_residual",
+                )
+            )
+            self._display_mask_group_item.setHidden(not mask_available)
+            self._display_mask_group_item.setDisabled(not mask_available)
+        finally:
+            self._display_tree_updating = updating_before
+        has_available = any(self._display_layer_available.values())
+        self.display_toggle_button.setEnabled(has_available)
+        if not has_available and self.display_layers_panel.isVisible():
+            self.display_layers_panel.hide()
+        self._resize_display_layers_popup()
+
+    def _set_display_layer_state(
+        self, key, visible, *, user=False, emit=False, update_item=True
+    ):
+        key = str(key or "").strip()
+        if key not in self._display_layer_items:
+            return
+        value = bool(visible)
+        if user:
+            self._display_layer_user_overrides.add(key)
+        self._display_layer_visibility[key] = value
+        self.viewer.set_overlay_layer_visible(key, value)
+        if update_item:
+            item = self._display_layer_items[key]
+            state = Qt.Checked if value else Qt.Unchecked
+            if item.checkState(0) != state:
+                self._display_tree_updating = True
+                try:
+                    item.setCheckState(0, state)
+                finally:
+                    self._display_tree_updating = False
+        if emit:
+            self.display_layer_changed.emit(key, value)
+
+    def _on_display_layer_item_changed(self, item, column):
+        if self._display_tree_updating:
+            return
+        key = item.data(0, Qt.UserRole)
+        # ``ItemIsAutoTristate`` propagates a parent click to its children;
+        # child notifications below are therefore the single source of truth.
+        if not key:
+            return
+        self._set_display_layer_state(
+            str(key),
+            item.checkState(column) == Qt.Checked,
+            user=True,
+            emit=True,
+            update_item=False,
+        )
+
+    def set_display_layer_available(self, key, available, *, default_visible=False):
+        """Expose a display row only when its corresponding state exists.
+
+        Defaults follow the current workflow stage until the user explicitly
+        changes a row.  The visibility map is deliberately view-only and does
+        not enter AppState snapshots, provenance, or export gates.
+        """
+        key = str(key or "").strip()
+        item = self._display_layer_items.get(key)
+        if item is None:
+            return
+        available = bool(available)
+        self._display_layer_available[key] = available
+        if available:
+            self._display_layer_defaults[key] = bool(default_visible)
+            if key not in self._display_layer_user_overrides:
+                self._display_layer_visibility[key] = bool(default_visible)
+            value = bool(
+                self._display_layer_visibility.get(key, default_visible)
+            )
+        else:
+            value = False
+        self._display_tree_updating = True
+        try:
+            item.setDisabled(not available)
+            item.setCheckState(0, Qt.Checked if value else Qt.Unchecked)
+            self.viewer.set_overlay_layer_visible(key, value if available else False)
+        finally:
+            self._display_tree_updating = False
+        self._refresh_display_layer_rows()
+
+    def set_display_layer_visibility(self, key, visible, *, user=False, emit=False):
+        """Set one display row programmatically without touching analysis state."""
+        self._set_display_layer_state(
+            key, visible, user=bool(user), emit=bool(emit), update_item=True
+        )
+
+    def display_layer_visible(self, key, default=False):
+        key = str(key or "").strip()
+        if not self._display_layer_available.get(key, False):
+            return False
+        return bool(self._display_layer_visibility.get(key, default))
+
+    def display_layer_states(self):
+        return {
+            key: bool(self._display_layer_visibility.get(key, False))
+            for key, available in self._display_layer_available.items()
+            if available
+        }
+
+    def _set_all_display_layers(self, visible):
+        changed = []
+        self._display_tree_updating = True
+        try:
+            for key, available in self._display_layer_available.items():
+                if not available:
+                    continue
+                old = self.display_layer_visible(key)
+                self._set_display_layer_state(
+                    key, visible, user=True, emit=False, update_item=True
+                )
+                if old != bool(visible):
+                    changed.append((key, bool(visible)))
+        finally:
+            self._display_tree_updating = False
+        for key, value in changed:
+            self.display_layer_changed.emit(key, value)
+
+    def _reset_display_layer_defaults(self):
+        changed = []
+        self._display_tree_updating = True
+        try:
+            for key, available in self._display_layer_available.items():
+                if not available:
+                    continue
+                self._display_layer_user_overrides.discard(key)
+                value = bool(self._display_layer_defaults.get(key, False))
+                old = self.display_layer_visible(key)
+                self._set_display_layer_state(
+                    key, value, user=False, emit=False, update_item=True
+                )
+                if old != value:
+                    changed.append((key, value))
+        finally:
+            self._display_tree_updating = False
+        for key, value in changed:
+            self.display_layer_changed.emit(key, value)
 
     def _emit_animation_speed(self, index):
         value = self.anim_speed_combo.itemData(index)
@@ -1062,6 +1467,22 @@ class ImageViewerGroup(QWidget):
             self._tb_sep.setStyleSheet(f"background:{COLORS['border']};max-width:1px;")
         if hasattr(self, '_tb_sep_tools'):
             self._tb_sep_tools.setStyleSheet(f"background:{COLORS['border']};max-width:1px;")
+        if hasattr(self, 'display_toggle_button'):
+            self.display_toggle_button.setStyleSheet(
+                f"QToolButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
+                f"border:1px solid {COLORS['border']};border-radius:4px;"
+                f"padding:2px 4px;font-size:11px;min-height:20px;}}"
+                f"QToolButton:hover{{background:{COLORS['bg_hover']};}}"
+            )
+        if hasattr(self, 'display_layers_panel'):
+            self.display_layers_panel.setStyleSheet(
+                f"QFrame#displayLayersPanel{{background:{COLORS['bg_dark']};"
+                f"border:1px solid {COLORS['border']};border-radius:4px;}}"
+                f"QTreeWidget#displayLayerTree{{background:{COLORS['bg_dark']};"
+                f"color:{COLORS['text']};border:0;}}"
+            )
+            for button in getattr(self, '_display_panel_buttons', []):
+                button.setStyleSheet(self._tb_btn_style())
         if hasattr(self, 'lbl_coord'):
             self.lbl_coord.setStyleSheet(f"color:{COLORS['text_dim']};font-size:11px;")
         if hasattr(self, 'animation_bar'):

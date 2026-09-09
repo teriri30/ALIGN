@@ -13,6 +13,7 @@ import numpy as np
 
 from config import save_json_atomic
 from mask_diagnostics import export_mask_diagnostic_bundle
+from inference_diagnostics import export_inference_diagnostic_bundle
 
 
 PACKAGE_SCHEMA = "reui.field-trial-package.v1"
@@ -130,6 +131,7 @@ def export_visual_artifacts(
     service_points: Mapping[str, Any],
     geo=None,
     mask_config: Optional[Dict[str, Any]] = None,
+    inference_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     if not isinstance(source_image, np.ndarray) or source_image.ndim != 3:
         raise ValueError("source display image is missing")
@@ -174,6 +176,20 @@ def export_visual_artifacts(
 
     _write_mask(register("masks/raw_mask.png"), raw_mask)
     _write_mask(register("masks/processed_mask.png"), processed)
+    inference_path = register("05_inference_diagnostics.zip")
+    inference_meta = dict(inference_metadata or {})
+    preprocessing = dict(inference_meta.get("preprocessing") or {})
+    tiled = dict(preprocessing.get("tiled_inference") or {})
+    export_inference_diagnostic_bundle(
+        inference_path,
+        source_image,
+        raw_mask,
+        metadata=inference_meta,
+        mask_offset=offset,
+        field_boundary=field_boundary,
+        tile_trace=preprocessing.get("tile_trace") or tiled.get("tile_trace") or [],
+        context_tile_trace=preprocessing.get("context_tile_trace") or [],
+    )
     diagnostic_path = register("05_mask_diagnostics.zip")
     export_mask_diagnostic_bundle(
         diagnostic_path,
@@ -183,6 +199,10 @@ def export_visual_artifacts(
         geo=geo,
         config=mask_config,
         source_image=source_image,
+        metadata={
+            **inference_meta,
+            "run_label": str(inference_meta.get("mask_run_label", "掩膜优化001") or "掩膜优化001"),
+        },
     )
     save_json_atomic(register("06_validation.json"), {
         "validation": path_result.get("validation", {}),
@@ -198,6 +218,7 @@ def export_visual_artifacts(
             "同名 manifest 用于核对路径哈希、坐标规则、源影像、模型和分析参数。\n"
             "01-04 PNG 为显示坐标下的效果图，不是带地理标签的 GeoTIFF。\n"
             "masks 目录保留原始分割和处理后二值掩膜；诊断 ZIP 保存语义层和异常区域。\n"
+            "05_inference_diagnostics.zip 保存逐切片识别位置、模型和原始掩膜；\n"
             "原始 GeoTIFF 未复制到资料包，其绝对路径、SHA-256 和地理元数据记录在 manifest 中。\n"
         )
     return artifacts

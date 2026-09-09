@@ -1,18 +1,18 @@
-﻿import math
+import math
 import time
 from PySide6.QtCore import Qt, Signal, QMimeData
 from PySide6.QtGui import QDrag, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QScrollArea, QFrame, QTextEdit, QToolButton, QMenu,
-    QApplication,
+    QApplication, QCheckBox, QSizePolicy,
 )
 from pyside6_app.styles import COLORS
 from pyside6_app.task_state import TASK_ORDER
 
 UI_FONT = '"Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif'
 
-# 真实窗口 show() 后逐级缩窄测得：路径规划卡片展开且出现纵向滚动条时，
+# 真实窗口 show() 后逐级缩窄测得：高级设置或路径规划卡片展开且出现纵向滚动条时，
 # 328 px 仍会产生 1 px 横向滚动，330 px 起全部控件不再横向挤压。
 TASK_PANEL_COMPACT_MIN_WIDTH = 330
 
@@ -33,26 +33,28 @@ class ExplicitPopupComboBox(QComboBox):
 
 
 TASK_DEFS = [
-    {"id": "import_img", "label": "影像导入", "hint": "加载正射影像 GeoTIFF 文件。", "color": "#6FA37F", "action": "导入"},
-    {"id": "draw_field", "label": "田块圈选", "hint": "在影像上圈选田块范围。", "color": "#5EAF6E", "action": "圈选"},
-    {"id": "segment", "label": "AI识别", "hint": "使用模型分割作物行带。", "color": "#649C7E", "action": "运行"},
-    {"id": "process", "label": "掩膜处理", "hint": "优化 AI 识别掩膜并提取作物行带。", "color": "#648C82", "action": "处理"},
-    {"id": "params", "label": "农机参数", "hint": "设置农机参数。", "color": "#AC7E56", "action": "设置"},
+    {"id": "import_img", "label": "影像导入", "hint": "加载航拍正射影像 GeoTIFF 文件（必须含地理坐标）。", "color": "#6FA37F", "action": "导入"},
+    {"id": "draw_field", "label": "田块圈选", "hint": "在影像上圈选田块作业范围。", "color": "#5EAF6E", "action": "圈选"},
+    {"id": "segment", "label": "作物识别", "hint": "使用训练好的模型识别作物种植带（像素级分割）。", "color": "#649C7E", "action": "运行"},
+    {"id": "process", "label": "掩膜优化", "hint": "对识别掩膜去噪、聚合，提取清晰的种植带几何。", "color": "#648C82", "action": "处理"},
+    {"id": "params", "label": "农机参数", "hint": "设置收割机幅宽、轮距、转弯半径等参数。", "color": "#AC7E56", "action": "设置"},
+    {"id": "centerline_generate", "label": "生成作业线", "hint": "从识别出的种植带生成收割路线（作业线）。", "color": "#5EAF8A", "action": "生成"},
+    {"id": "centerline_select", "label": "选择作业线", "hint": "勾选要采用的作业线；每条4行种植带对应一条作业线。", "color": "#4F9D8E", "action": "选择"},
     {"id": "entry", "label": "起点（必选）", "hint": "可自由布设或拖动；规划必须从离起点最近的作业线端点开始。", "color": "#589C94", "action": "布设"},
     {
         "id": "exit",
-        "label": "终点",
-        "hint": "默认沿最终作业段延伸并写入 TXT；可在画布上拖动调整。",
+        "label": "终点（可选）",
+        "hint": "默认沿最终作业段延伸并写入终端文件；可在画布上拖动调整。",
         "color": "#C76B6B",
         "action": "调整",
     },
-    {"id": "unload", "label": "卸粮点", "hint": "按需要添加一个或多个卸粮点，可为空。", "color": "#C9A64A", "action": "布设"},
-    {"id": "plan", "label": "路径规划", "hint": "生成作业路线。", "color": "#589862", "action": "生成"},
-    {"id": "simulate", "label": "模拟演示", "hint": "沿规划路径模拟农机运动。", "color": "#4C8C7C", "action": "演示"},
+    {"id": "unload", "label": "卸粮点（可选）", "hint": "按需要添加一个或多个卸粮点，可为空。", "color": "#C9A64A", "action": "布设"},
+    {"id": "plan", "label": "路径规划", "hint": "生成完整收割路径（含转弯、进出场）。", "color": "#589862", "action": "生成"},
+    {"id": "simulate", "label": "模拟演示", "hint": "沿规划路径模拟农机运动，检验可行性。", "color": "#4C8C7C", "action": "演示"},
     {
         "id": "export",
-        "label": "TXT路径",
-        "hint": "按终端 $PATH 格式导出 001.txt、002.txt；GeoJSON 在文件菜单单独导出。",
+        "label": "TXT路径导出",
+        "hint": "按终端 $PATH 格式导出路径文件（001.txt、002.txt）；GeoJSON 在文件菜单单独导出。",
         "color": "#4484BE",
         "action": "导出",
     },
@@ -61,10 +63,12 @@ TASK_DEFS = [
 STEP_GROUPS = [
     {"label": "影像导入", "tasks": ["import_img"]},
     {"label": "田块圈选", "tasks": ["draw_field"]},
-    {"label": "AI识别", "tasks": ["segment"]},
-    {"label": "掩膜处理", "tasks": ["process"]},
-    {"label": "参数配置", "tasks": ["params"]},
+    {"label": "作物识别", "tasks": ["segment"]},
+    {"label": "掩膜优化", "tasks": ["process"]},
+    {"label": "生成作业线", "tasks": ["centerline_generate"]},
+    {"label": "选择作业线", "tasks": ["centerline_select"]},
     {"label": "路径规划", "tasks": ["entry", "exit", "unload", "plan"]},
+    {"label": "高级设置", "tasks": ["params"]},
     {"label": "模拟演示", "tasks": ["simulate"]},
     {"label": "TXT路径导出", "tasks": ["export"]},
 ]
@@ -99,6 +103,7 @@ class TaskRow(QWidget):
         self._label.setFont(QFont("Microsoft YaHei UI", 10))
         self._label.setStyleSheet(f"color:{COLORS['text']};font-size:13px;font-family:{UI_FONT};")
         self._label.setMinimumWidth(0)
+        self._label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         lo.addWidget(self._label, 1)
         self._status = QLabel(self._status_text)
         self._status.setFont(QFont("Microsoft YaHei UI", 9))
@@ -298,7 +303,7 @@ class StepCard(QWidget):
             self._mark.setText("")
         self.setStyleSheet(
             f"#stepCard{{background:{bg};border:1px solid {border};"
-            "border-radius:7px;margin:1px 0;}}"
+            "border-radius:7px;margin:1px 0;}"
             f"#stepCard QLabel{{font-family:{UI_FONT};}}"
             f"QToolButton{{background:transparent;color:{COLORS['text_dim']};border:none;font-family:{UI_FONT};}}"
             f"QToolButton:hover{{background:{COLORS['bg_hover']};border-radius:4px;}}"
@@ -310,6 +315,7 @@ class TaskPanel(QWidget):
     load_model_requested = Signal()
     run_requested = Signal()
     segment_requested = Signal()
+    export_inference_diagnostics_requested = Signal()
     process_requested = Signal()
     export_mask_diagnostics_requested = Signal()
     plan_requested = Signal()
@@ -329,6 +335,8 @@ class TaskPanel(QWidget):
     route_edit_requested = Signal()
     route_edit_tool_requested = Signal(str)
     recommend_service_points_requested = Signal()
+    centerline_generate_requested = Signal()
+    centerline_selection_changed = Signal(str, bool)
     step_deleted = Signal(str)
 
     def __init__(self, parent=None):
@@ -374,8 +382,8 @@ class TaskPanel(QWidget):
                     )
                     rows.append(self._mask_strength_label)
                     rows.append(self.mask_strength_value_label)
-                    self.mask_diagnostic_btn = QPushButton("导出诊断数据")
-                    self.mask_diagnostic_btn.setToolTip("导出各处理阶段、连通区域指标和异常编号总览")
+                    self.mask_diagnostic_btn = QPushButton("导出掩膜优化诊断")
+                    self.mask_diagnostic_btn.setToolTip("导出掩膜处理各阶段、连通区域指标和异常编号总览")
                     self.mask_diagnostic_btn.setMinimumHeight(30)
                     self.mask_diagnostic_btn.setEnabled(False)
                     self.mask_diagnostic_btn.clicked.connect(
@@ -391,14 +399,23 @@ class TaskPanel(QWidget):
                         f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
                     )
                     rows.append(self.model_combo)
-                if tid == "plan":
-                    # 任务行下方的设置区：分隔线 + 紧凑单行控件，
-                    # 与上方的 4 个任务行在视觉上区分开。
-                    sep = QFrame()
-                    sep.setFrameShape(QFrame.HLine)
-                    sep.setFixedHeight(1)
-                    sep.setStyleSheet(f"color:{COLORS.get('border', '#383848')};background:{COLORS.get('border', '#383848')};")
-                    rows.append(sep)
+                    self.inference_diagnostic_btn = QPushButton("导出识别诊断")
+                    self.inference_diagnostic_btn.setToolTip(
+                        "导出源影像位置、模型、切片网格、置信度和原始推理掩膜"
+                    )
+                    self.inference_diagnostic_btn.setMinimumHeight(30)
+                    self.inference_diagnostic_btn.setEnabled(False)
+                    self.inference_diagnostic_btn.clicked.connect(
+                        self.export_inference_diagnostics_requested.emit
+                    )
+                    rows.append(self.inference_diagnostic_btn)
+                if tid == "centerline_select":
+                    self.centerline_selector = CenterlineSelectionPanel()
+                    self.centerline_selector.centerline_selection_changed.connect(
+                        self.centerline_selection_changed.emit
+                    )
+                    rows.append(self.centerline_selector)
+                if tid == "entry":
                     self.recommend_service_points_btn = QPushButton("智能推荐起点")
                     self.recommend_service_points_btn.setToolTip(
                         "推荐一个靠近作业线端部的起点；确认或拖动后，路径从离它最近的作业线端点开始"
@@ -408,6 +425,14 @@ class TaskPanel(QWidget):
                         self.recommend_service_points_requested.emit
                     )
                     rows.append(self.recommend_service_points_btn)
+                if tid == "params":
+                    # 高级设置单独放在“高级设置”折叠卡中，默认不挤占
+                    # 基础的中心线选择、起终点和路径规划流程。
+                    sep = QFrame()
+                    sep.setFrameShape(QFrame.HLine)
+                    sep.setFixedHeight(1)
+                    sep.setStyleSheet(f"color:{COLORS.get('border', '#383848')};background:{COLORS.get('border', '#383848')};")
+                    rows.append(sep)
                     forbidden_row = QWidget()
                     forbidden_layout = QHBoxLayout(forbidden_row)
                     forbidden_layout.setContentsMargins(8, 0, 8, 0)
@@ -465,7 +490,7 @@ class TaskPanel(QWidget):
                     rows.append(turn_row)
                     self.route_edit_btn = QPushButton("编辑路线")
                     self.route_edit_btn.setToolTip(
-                        "进入人工路线编辑；画布负责点线拖动，下面的路径结果负责结构操作与验证"
+                        "进入人工路线编辑；画布负责点线拖动和加点，下面的路径结果负责结构操作、直线/转弯切换与验证"
                     )
                     self.route_edit_btn.setMinimumHeight(30)
                     self.route_edit_btn.setStyleSheet(
@@ -476,6 +501,57 @@ class TaskPanel(QWidget):
                     )
                     self.route_edit_btn.clicked.connect(self.route_edit_requested.emit)
                     rows.append(self.route_edit_btn)
+                    self.route_edit_action_row = QWidget()
+                    route_edit_action_layout = QHBoxLayout(
+                        self.route_edit_action_row
+                    )
+                    route_edit_action_layout.setContentsMargins(8, 0, 8, 0)
+                    route_edit_action_layout.setSpacing(6)
+                    self.route_add_point_btn = QPushButton("新增点")
+                    self.route_add_point_btn.setCheckable(True)
+                    self.route_add_point_btn.setToolTip(
+                        "在线段上单击可插入控制点；空白处单击会从当前路线末端追加控制点"
+                    )
+                    self.route_toggle_status_btn = QPushButton("作业/转弯")
+                    self.route_toggle_status_btn.setToolTip(
+                        "把当前选中的整条线段在作业状态与转弯状态之间切换"
+                    )
+                    self.route_toggle_geometry_btn = QPushButton("直线/转弯")
+                    self.route_toggle_geometry_btn.setToolTip(
+                        "把当前选中的点—点连接切换为直线或曲线转弯；不改变作业语义"
+                    )
+                    for button in (
+                        self.route_add_point_btn,
+                        self.route_toggle_status_btn,
+                        self.route_toggle_geometry_btn,
+                    ):
+                        button.setMinimumHeight(28)
+                        button.setStyleSheet(
+                            f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
+                            f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;font-family:{UI_FONT};}}"
+                            f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
+                            f"QPushButton:checked{{background:{COLORS['accent']};color:white;}}"
+                        )
+                    self.route_add_point_btn.clicked.connect(
+                        lambda: self.route_edit_tool_requested.emit("add_point")
+                    )
+                    self.route_toggle_status_btn.clicked.connect(
+                        lambda: self.route_edit_tool_requested.emit("toggle_status")
+                    )
+                    self.route_toggle_geometry_btn.clicked.connect(
+                        lambda: self.route_edit_tool_requested.emit("toggle_geometry")
+                    )
+                    route_edit_action_layout.addWidget(
+                        self.route_add_point_btn, 1
+                    )
+                    route_edit_action_layout.addWidget(
+                        self.route_toggle_status_btn, 1
+                    )
+                    route_edit_action_layout.addWidget(
+                        self.route_toggle_geometry_btn, 1
+                    )
+                    self.route_edit_action_row.setVisible(False)
+                    rows.append(self.route_edit_action_row)
             card = StepCard(f"{idx}. {group['label']}", rows)
             card.toggled.connect(lambda _checked=False, i=idx - 1: self._on_card_toggled(i))
             self._step_cards.append(card); bl.addWidget(card)
@@ -489,6 +565,7 @@ class TaskPanel(QWidget):
             "segment": self.segment_requested,
             "process": self.process_requested,
             "params": self.params_requested,
+            "centerline_generate": self.centerline_generate_requested,
             "entry": self.entry_exit_toggle,
             "exit": self.entry_exit_toggle,
             "unload": self.entry_exit_toggle,
@@ -500,12 +577,22 @@ class TaskPanel(QWidget):
             # a different artifact than the operator requested.
             "export": self.export_machine_compatibility_requested,
         }
+        if tid == "centerline_select":
+            self._expand_card_for_task(tid)
+            return
         sig = mapping.get(tid)
         if sig:
             if tid in {"entry", "exit", "unload"}:
                 self.entry_exit_toggle.emit(tid)
             else:
                 sig.emit()
+
+    def _expand_card_for_task(self, tid):
+        for index, group in enumerate(STEP_GROUPS):
+            if tid in group["tasks"]:
+                self._manual_step = index
+                self._refresh_cards()
+                return
 
     def _refresh_cards(self):
         first = 0
@@ -580,6 +667,18 @@ class TaskPanel(QWidget):
         row = self._task_widgets.get(tid)
         if row: row._action_btn.setText(str(text))
 
+    def update_centerline_selection(self, catalog, selected_ids=None):
+        if hasattr(self, "centerline_selector"):
+            self.centerline_selector.update_centerline_selection(catalog, selected_ids)
+
+    def clear_centerline_selection(self):
+        if hasattr(self, "centerline_selector"):
+            self.centerline_selector.clear_centerline_selection()
+
+    def set_centerline_checked(self, centerline_id, checked):
+        if hasattr(self, "centerline_selector"):
+            self.centerline_selector.set_centerline_checked(centerline_id, checked)
+
 
     def _on_turn_combo_changed(self, index):
         if not hasattr(self, 'turn_combo'):
@@ -630,6 +729,10 @@ class TaskPanel(QWidget):
         if hasattr(self, "mask_diagnostic_btn"):
             self.mask_diagnostic_btn.setEnabled(bool(available))
 
+    def set_inference_diagnostic_available(self, available):
+        if hasattr(self, "inference_diagnostic_btn"):
+            self.inference_diagnostic_btn.setEnabled(bool(available))
+
     def set_model_options(self, models, current=""):
         if not hasattr(self, 'model_combo'): return
         self.model_combo.blockSignals(True)
@@ -642,6 +745,24 @@ class TaskPanel(QWidget):
                 self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
         self.model_combo.addItem("导入模型文件夹...", "__IMPORT_MODEL_FOLDER__")
         self.model_combo.blockSignals(False)
+
+    def set_model_loading(self, loading):
+        """Lock model selection and AI start while a weight is deserialised."""
+        loading = bool(loading)
+        if hasattr(self, "model_combo"):
+            self.model_combo.setEnabled(not loading)
+            self.model_combo.setToolTip(
+                "模型正在后台加载，请等待完成..."
+                if loading
+                else "选择 AI 识别模型，或从文件夹导入其他 .pt 权重"
+            )
+        row = self._task_widgets.get("segment")
+        if row is not None and loading:
+            # ``_sync_task_statuses`` may refresh the row while the worker is
+            # active; the main window reapplies this lock after that refresh.
+            row._action_btn.setEnabled(False)
+        elif row is not None:
+            row._action_btn.setEnabled(row.isEnabled())
 
     def populate_models(self, models, current=""):
         normalized = [{"name": str(item), "path": str(item)} for item in (models or [])]
@@ -666,7 +787,7 @@ class TaskPanel(QWidget):
             if combo:
                 combo.setStyleSheet(combo_style)
         for button_name in (
-            "route_edit_btn", "mask_diagnostic_btn",
+            "route_edit_btn", "mask_diagnostic_btn", "inference_diagnostic_btn",
             "recommend_service_points_btn",
         ):
             button = getattr(self, button_name, None)
@@ -688,6 +809,8 @@ class TaskPanel(QWidget):
         self.set_forbidden_state(self._forbidden_count, self._forbidden_confirmed)
         for row in self.findChildren(TaskRow):
             row.refresh_theme()
+        if hasattr(self, "centerline_selector"):
+            self.centerline_selector.refresh_theme()
         for card in self._step_cards:
             card.refresh_state()
 
@@ -695,6 +818,16 @@ class TaskPanel(QWidget):
         active = bool(active)
         if hasattr(self, "route_edit_btn"):
             self.route_edit_btn.setText("完成编辑" if active else "编辑路线")
+        if hasattr(self, "route_edit_action_row"):
+            self.route_edit_action_row.setVisible(active)
+        if not active and hasattr(self, "route_add_point_btn"):
+            self.route_add_point_btn.setChecked(False)
+        for card in self._step_cards:
+            if hasattr(self, "route_edit_btn") and self.route_edit_btn in getattr(
+                card, "_rows", []
+            ):
+                card.refresh_content_geometry()
+                break
 
     def set_route_edit_mode(self, mode):
         mode = str(mode or "select")
@@ -735,11 +868,17 @@ class RouteSegmentRow(QWidget):
         number = index + 1 if display_number is None else int(display_number)
         self._label = QLabel(f"{label} {number:02d}")
         self._point_count = QLabel(f"{int(point_count)}点") if point_count is not None else None
+        self._geometry = None
+        if self._edit_meta:
+            mode = str(self._edit_meta.get("geometry_mode") or "straight")
+            self._geometry = QLabel("转弯" if mode == "turn" else "直线")
         self._dist = QLabel(f"{distance_m:.1f} m")
         lo.addWidget(self._badge)
         lo.addWidget(self._label, 1)
         if self._point_count is not None:
             lo.addWidget(self._point_count)
+        if self._geometry is not None:
+            lo.addWidget(self._geometry)
         lo.addWidget(self._dist)
         if self._edit_meta:
             self.setToolTip(
@@ -760,6 +899,10 @@ class RouteSegmentRow(QWidget):
             self._point_count.setStyleSheet(
                 f"color:{COLORS['text_dim']};font-size:10px;"
             )
+        if self._geometry is not None:
+            self._geometry.setStyleSheet(
+                f"color:{COLORS['accent']};font-size:10px;"
+            )
         self._dist.setStyleSheet(f"color:{COLORS['text_dim']};font-family:Consolas;")
         self.setStyleSheet(
             f"RouteSegmentRow{{background:{COLORS['bg_accent'] if self._edit_selected else COLORS['bg']};"
@@ -774,7 +917,12 @@ class RouteSegmentRow(QWidget):
     def available_edit_actions(self):
         if not self._edit_meta:
             return []
-        actions = ["toggle_segment", "add_waypoint", "validate_route"]
+        actions = [
+            "toggle_segment",
+            "toggle_geometry",
+            "add_waypoint",
+            "validate_route",
+        ]
         if int(self._edit_meta.get("node_end", -1)) - int(
             self._edit_meta.get("node_start", -1)
         ) >= 2:
@@ -855,6 +1003,15 @@ class RouteSegmentRow(QWidget):
         status = int(self._edit_meta.get("status", 1))
         toggle = menu.addAction("切换为转弯" if status == 1 else "切换为作业")
         toggle.triggered.connect(lambda: self.trigger_edit_action("toggle_segment"))
+        geometry_mode = str(self._edit_meta.get("geometry_mode") or "straight")
+        geometry_toggle = menu.addAction(
+            "切换为直线"
+            if geometry_mode == "turn"
+            else "切换为转弯"
+        )
+        geometry_toggle.triggered.connect(
+            lambda: self.trigger_edit_action("toggle_geometry")
+        )
         add_point = menu.addAction("在中点添加航点")
         add_point.triggered.connect(lambda: self.trigger_edit_action("add_waypoint"))
         node_start = int(self._edit_meta.get("node_start", -1))
@@ -882,6 +1039,177 @@ class RouteSegmentRow(QWidget):
         menu.exec(event.globalPos())
 
 
+class CenterlineSelectionRow(QWidget):
+    """One detected centerline with an explicit planning checkbox."""
+
+    toggled = Signal(str, bool)
+
+    def __init__(self, item, checked=True, parent=None):
+        super().__init__(parent)
+        item = dict(item or {})
+        self.centerline_id = str(item.get("id") or "")
+        sequence = int(item.get("sequence", 0) or 0)
+        label = str(item.get("label") or f"中心线 {sequence}")
+        source = str(item.get("line_source") or item.get("kind") or "识别中心线")
+        self.setMinimumHeight(28)
+        lo = QHBoxLayout(self)
+        lo.setContentsMargins(8, 2, 8, 2)
+        lo.setSpacing(6)
+        self.checkbox = QCheckBox()
+        self.checkbox.setFixedWidth(22)
+        self.checkbox.setToolTip("勾选后参与路径；取消勾选后隐藏并不录用")
+        self.checkbox.setChecked(bool(checked))
+        self.checkbox.toggled.connect(
+            lambda value: self.toggled.emit(self.centerline_id, bool(value))
+        )
+        self._label = QLabel(label)
+        self._label.setMinimumWidth(0)
+        self._label.setStyleSheet(
+            f"font-size:12px;color:{COLORS['text']};font-family:{UI_FONT};"
+        )
+        self._source = QLabel(source)
+        self._source.setMinimumWidth(0)
+        self._source.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._source.setStyleSheet(
+            f"font-size:10px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+        )
+        lo.addWidget(self.checkbox)
+        lo.addWidget(self._label, 1)
+        lo.addWidget(self._source)
+
+    def set_checked(self, checked):
+        self.checkbox.blockSignals(True)
+        self.checkbox.setChecked(bool(checked))
+        self.checkbox.blockSignals(False)
+
+    def refresh_theme(self):
+        self._label.setStyleSheet(
+            f"font-size:12px;color:{COLORS['text']};font-family:{UI_FONT};"
+        )
+        self._source.setStyleSheet(
+            f"font-size:10px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+        )
+
+
+class CenterlineSelectionPanel(QWidget):
+    """Independent workflow control for selecting detected centerlines."""
+
+    centerline_selection_changed = Signal(str, bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._centerline_rows = {}
+        self.setObjectName("centerlineSelectionPanel")
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(8, 0, 8, 2)
+        lo.setSpacing(3)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        self._count_label = QLabel("已选择 0/0 条")
+        self._count_label.setStyleSheet(
+            f"font-size:12px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+        )
+        header.addWidget(self._count_label)
+        header.addStretch()
+        lo.addLayout(header)
+
+        self._hint = QLabel(
+            "一条种植带对应一条作业线（复选框）；取消勾选只移除该带，底图和其他路线保持不动。"
+        )
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet(
+            f"font-size:10px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+        )
+        lo.addWidget(self._hint)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setMaximumHeight(160)
+        self._container = QWidget()
+        self._layout = QVBoxLayout(self._container)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(1)
+        self._scroll.setWidget(self._container)
+        lo.addWidget(self._scroll)
+        self._empty_label = QLabel("尚未生成中心线，请先点击上一步“生成中心线”。")
+        self._empty_label.setWordWrap(True)
+        self._empty_label.setStyleSheet(
+            f"font-size:11px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+        )
+        lo.addWidget(self._empty_label)
+        self.clear_centerline_selection()
+
+    def _clear_rows(self):
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._centerline_rows.clear()
+
+    def clear_centerline_selection(self):
+        self._clear_rows()
+        self._count_label.setText("已选择 0/0 条")
+        self._scroll.setVisible(False)
+        self._empty_label.setVisible(True)
+
+    def update_centerline_selection(self, catalog, selected_ids=None):
+        items = list((catalog or {}).get("items") or [])
+        self._clear_rows()
+        if not items:
+            self.clear_centerline_selection()
+            return
+        selected = {str(value) for value in (selected_ids or [])}
+        selected_count = 0
+        for item in items:
+            row = CenterlineSelectionRow(
+                item,
+                checked=str(item.get("id")) in selected,
+            )
+            selected_count += int(row.checkbox.isChecked())
+            row.toggled.connect(self._on_row_toggled)
+            self._centerline_rows[str(item.get("id"))] = row
+            self._layout.addWidget(row)
+        self._layout.addStretch()
+        self._count_label.setText(f"已选择 {selected_count}/{len(items)} 条")
+        self._scroll.setMinimumHeight(min(160, 30 * len(items) + 4))
+        self._scroll.setVisible(True)
+        self._empty_label.setVisible(False)
+
+    def _on_row_toggled(self, centerline_id, checked):
+        selected_count = sum(
+            int(row.checkbox.isChecked()) for row in self._centerline_rows.values()
+        )
+        self._count_label.setText(
+            f"已选择 {selected_count}/{len(self._centerline_rows)} 条"
+        )
+        self.centerline_selection_changed.emit(centerline_id, bool(checked))
+
+    def set_centerline_checked(self, centerline_id, checked):
+        row = self._centerline_rows.get(str(centerline_id))
+        if row is not None:
+            row.set_checked(checked)
+
+    def refresh_theme(self):
+        self._count_label.setStyleSheet(
+            f"font-size:12px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+        )
+        self._hint.setStyleSheet(
+            f"font-size:10px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+        )
+        self._empty_label.setStyleSheet(
+            f"font-size:11px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+        )
+        self._container.setStyleSheet(f"background:{COLORS['bg']};")
+        self._scroll.setStyleSheet(
+            f"QScrollArea{{background:{COLORS['bg']};border:none;}}"
+        )
+        for row in self._centerline_rows.values():
+            row.refresh_theme()
+
+
 class RouteInfoPanel(QWidget):
     segment_selected = Signal(int)
     service_point_selected = Signal(str, int)
@@ -889,7 +1217,9 @@ class RouteInfoPanel(QWidget):
     edit_action_requested = Signal(str, int, int)
     work_reorder_requested = Signal(int, int)
     def __init__(self, parent=None):
-        super().__init__(parent); self._segments = []; self._build_ui()
+        super().__init__(parent)
+        self._segments = []
+        self._build_ui()
     def _build_ui(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(0,0,0,0); lo.setSpacing(0)
         self._title_hdr = QLabel("路径结果"); self._title_hdr.setStyleSheet(f"font-size:13px;font-weight:600;color:{COLORS['text']};padding:8px 14px 2px;")

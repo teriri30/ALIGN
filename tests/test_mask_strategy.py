@@ -26,6 +26,23 @@ def test_row_angle_estimation_does_not_depend_on_numpy_covariance(monkeypatch):
     assert abs(angle - np.arctan(0.35)) < np.deg2rad(3.0)
 
 
+def test_row_angle_estimation_uses_component_axes_when_global_layout_is_skewed():
+    """Separated planting regions must not let their centroids define row angle."""
+    import cv2
+    from row_geometry import estimate_row_angle
+
+    mask = np.zeros((700, 900), dtype=np.uint8)
+    for y_value in range(390, 611, 20):
+        cv2.line(mask, (40, y_value), (360, y_value), 255, 6)
+    for y_value in range(90, 311, 20):
+        cv2.line(mask, (540, y_value), (860, y_value), 255, 6)
+
+    angle = estimate_row_angle(mask)
+    error = min(abs(angle), abs(np.pi - angle))
+
+    assert error < np.deg2rad(3.0)
+
+
 def test_profile_gate_edges_isolate_band_next_to_broad_uniform_block():
     """宽等距块旁的四行带不能被宽块尾部拉偏中心线门控。"""
     from row_geometry import _profile_run_gates

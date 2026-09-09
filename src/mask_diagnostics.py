@@ -304,6 +304,7 @@ def export_mask_diagnostic_bundle(
     geo=None,
     config: Optional[Dict[str, Any]] = None,
     source_image: Optional[np.ndarray] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write a ZIP bundle that preserves stages and quantifies suspicious components."""
     if not isinstance(raw_mask, np.ndarray) or raw_mask.ndim != 2:
@@ -364,6 +365,9 @@ def export_mask_diagnostic_bundle(
 
     manifest = {
         "schema": DIAGNOSTIC_SCHEMA,
+        "stage": "mask_optimization",
+        "run_label": str((metadata or {}).get("run_label", "") or ""),
+        "provenance": dict(metadata or {}),
         "mask_shape": [int(shape[0]), int(shape[1])],
         "mask_offset_xy": [int(offset[0]), int(offset[1])],
         "meters_per_pixel": mpp,
@@ -406,7 +410,8 @@ def export_mask_diagnostic_bundle(
                 "README.txt",
                 "红色为主体残差，紫色为补缝新增，黄色为不确定残差，蓝色为田头，绿色为规则化主体。\n"
                 "深蓝色为端部田头走廊；该走廊与主体的交叉像素已从主作业区移入田头层。\n"
-                "components.csv 中 review_required=true 的区域需要人工复核；诊断标记不会自动删除掩膜。\n",
+                "components.csv 中 review_required=true 的区域需要人工复核；诊断标记不会自动删除掩膜。\n"
+                "manifest.json 的 provenance 记录源影像位置、模型、推理配置、掩膜处理配置和上下游指纹。\n",
             )
         os.replace(temporary, target)
     finally:

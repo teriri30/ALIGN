@@ -144,6 +144,15 @@ class TopToolbar(QWidget):
             btn.setEnabled(bool(visible))
     def set_action_enabled(self, aid, enabled):
         if aid in self._action_buttons: self._action_buttons[aid].setEnabled(enabled)
+    def set_model_loading(self, loading):
+        """Disable any toolbar model controls while weights are loading."""
+        loading = bool(loading)
+        button = self._action_buttons.get("MODEL")
+        if button is not None:
+            button.setEnabled(not loading)
+        combo = getattr(self, "_model_combo", None)
+        if combo is not None:
+            combo.setEnabled(not loading)
     def set_action_active(self, aid, active):
         if aid in self._action_buttons:
             btn = self._action_buttons[aid]

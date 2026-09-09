@@ -235,3 +235,48 @@ def test_prepare_band_centerlines_does_not_trim_harvestable_row_ends_by_default(
 
     assert line[0][0] == 10.0
     assert line[-1][0] == 110.0
+
+
+def test_centerline_simplification_keeps_a_straight_band_to_two_points():
+    from path_planner import _smooth_band_centerline
+
+    points = [(float(x), 20.0) for x in range(10, 111, 10)]
+    line = _smooth_band_centerline(
+        points,
+        main_angle=0.0,
+        mpp=0.1,
+        config={
+            "centerline_interval_m": 1.0,
+            "centerline_simplify_max_deviation_m": 0.20,
+            "centerline_simplify_max_heading_change_deg": 8.0,
+            "centerline_simplify_max_points": 8,
+        },
+    )
+
+    assert line == [(10.0, 20.0), (110.0, 20.0)]
+
+
+def test_curved_centerline_keeps_extra_points_but_one_checkbox_item():
+    from path_planner import _smooth_band_centerline
+    from work_band_selection import build_centerline_catalog
+
+    points = [(float(x), 0.05 * float(x) ** 2) for x in range(0, 11)]
+    line = _smooth_band_centerline(
+        points,
+        main_angle=0.0,
+        mpp=1.0,
+        config={
+            "centerline_interval_m": 1.0,
+            "centerline_simplify_max_deviation_m": 0.20,
+            "centerline_simplify_max_heading_change_deg": 8.0,
+            "centerline_simplify_max_points": 8,
+        },
+    )
+    catalog = build_centerline_catalog(
+        [{"region_id": "field", "work_lines": [line]}],
+        main_angle=0.0,
+    )
+
+    assert 3 <= len(line) <= 8
+    assert catalog["count"] == 1
+    assert catalog["items"][0]["centerline"] == line

@@ -18,6 +18,62 @@ def _band(band_id, y, profile_width_m, width_m=None, height=20.0):
     }
 
 
+def test_selection_filter_keeps_only_four_complete_work_bands():
+    """Small selections use context for analysis but not edge work passes."""
+    from path_planner import _filter_work_bands_to_selection
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.1
+
+    class State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+        field_boundary = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+        harvester_params = {"cutter_width_m": 2.15}
+
+    bands = [
+        _band(2, 8.0, 1.02, 1.01),
+        _band(4, 25.0, 1.00, 1.00),
+        _band(6, 43.0, 0.96, 0.98),
+        _band(8, 61.0, 0.98, 1.00),
+        _band(10, 79.0, 0.98, 1.00),
+        _band(11, 88.0, 2.20, 1.67),
+    ]
+
+    selected, report = _filter_work_bands_to_selection(
+        bands,
+        np.zeros((100, 100), dtype=np.uint8),
+        main_angle=0.0,
+        geo=Geo(),
+        state=State(),
+        config={"uniform_zone_min_width_m": 4.0},
+    )
+
+    assert [band["id"] for band in selected] == [4, 6, 8, 10]
+    excluded = {item["band_id"]: item["reasons"] for item in report["excluded"]}
+    assert "insufficient_cutter_normal_clearance" in excluded[2]
+    assert "edge_width_outlier_below_uniform_threshold" in excluded[11]
+
+    lines, layout, regions = __import__("path_planner")._prepare_work_line_layout(
+        bands,
+        np.zeros((100, 100), dtype=np.uint8),
+        0.0,
+        geo=Geo(),
+        state=State(),
+        config={"uniform_zone_min_width_m": 4.0},
+        return_regions=True,
+    )
+    assert len(lines) == 4
+    assert layout["selection_work_band_filter"]["kept_band_ids"] == [4, 6, 8, 10]
+    assert [item["band_ids"] for item in regions] == [[4, 6, 8, 10]]
+
+
 def test_uniform_reference_geometry_ignores_malformed_cache_values():
     """DECISION-009/017: malformed compact geometry must fail locally, not crash planning."""
     from path_planner import _uniform_zone_reference_geometry

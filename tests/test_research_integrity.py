@@ -27,6 +27,8 @@ def test_missing_config_uses_native_640_capture_size():
     [
         ({"model": {"tile_overlap": 1.0}}, "tile_overlap"),
         ({"model": {"conf_threshold": -0.1}}, "conf_threshold"),
+        ({"model": {"orthomosaic_primary_mask_threshold": 1.1}}, "orthomosaic_primary_mask_threshold"),
+        ({"model": {"orthomosaic_tile_edge_weight_floor": -0.1}}, "orthomosaic_tile_edge_weight_floor"),
         ({"harvester": {"track_width_m": 0.8, "track_gauge_m": 0.5}}, "track_width_m"),
         (
             {
@@ -205,7 +207,7 @@ def test_cache_restore_rejects_mask_before_run_edge_gate_version(tmp_path, monke
     from row_geometry import MASK_REGULARIZATION_VERSION
     from state import AppState
 
-    assert MASK_REGULARIZATION_VERSION == 17
+    assert MASK_REGULARIZATION_VERSION == 18
     monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
     source = tmp_path / "field.tif"
     source.write_bytes(b"geotiff-source")
@@ -429,6 +431,64 @@ def test_offline_manifest_checker_detects_route_tampering(tmp_path):
     assert verify_manifest(manifest_path) == []
     output.write_text("lon,lat\n0,0\n", encoding="utf-8")
     assert "output SHA-256 does not match manifest" in verify_manifest(manifest_path)
+
+
+def test_offline_manifest_checker_checks_every_machine_file_and_point_count(tmp_path):
+    """DECISION-001: split machine files share one checked manifest contract."""
+    import json
+    from integrity_check import verify_manifest
+    from provenance import file_sha256, make_stage_record
+
+    first = tmp_path / "001.txt"
+    second = tmp_path / "002.txt"
+    infm = "$INFM,0,0.7,0.7,0.7,0.7,0,5,0*"
+    first.write_text(
+        "$PATH,0,0,2,30.00000000,116.00000000,0,0,2*\n"
+        "$PATH,0,1,2,30.00100000,116.00000000,0,0,2*\n"
+        f"{infm}\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        "$PATH,0,0,1,30.00200000,116.00000000,0,0,2*\n"
+        f"{infm}\n",
+        encoding="utf-8",
+    )
+    records = {
+        stage: make_stage_record(stage, "v1", {"input": "fixed"}, {stage: 1})
+        for stage in ("inference", "mask", "path")
+    }
+    manifest = {
+        "output": {
+            "path": str(first),
+            "format": "$PATH_MACHINE_COMPAT",
+            "sha256": file_sha256(first),
+            "point_count": 3,
+            "path_protocol": {
+                "output_files": [str(first), str(second)],
+                "points_per_file": [2, 1],
+                "final_record": infm,
+                "status_codes": {"file_record_status": 2},
+                "output_file_integrity": [
+                    {"path": str(first), "sha256": file_sha256(first), "point_count": 2},
+                    {"path": str(second), "sha256": file_sha256(second), "point_count": 1},
+                ],
+            },
+        },
+        "analysis": {"stage_provenance": records},
+    }
+    manifest_path = tmp_path / "001.txt.manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert verify_manifest(manifest_path) == []
+    second.write_text(
+        "$PATH,0,0,2,30.00200000,116.00000000,0,0,2*\n"
+        "$PATH,0,1,2,30.00300000,116.00000000,0,0,2*\n"
+        f"{infm}\n",
+        encoding="utf-8",
+    )
+    errors = verify_manifest(manifest_path)
+    assert any("output file SHA-256 does not match manifest" in error for error in errors)
+    assert any("point count does not match manifest" in error for error in errors)
 
 
 def test_config_updates_are_atomic_and_temporary_overrides_are_restored():

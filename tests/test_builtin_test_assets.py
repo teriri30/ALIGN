@@ -1,5 +1,9 @@
 import os
 import json
+from pathlib import Path
+
+import pytest
+
 from PySide6.QtWidgets import QApplication
 
 
@@ -7,6 +11,8 @@ def test_builtin_test_image_resolves_to_existing_geotiff():
     from builtin_test_assets import builtin_assets_status, builtin_test_image
 
     path = builtin_test_image()
+    if not path:
+        pytest.skip("data/tif/result.tif is an optional local demo asset")
     assert os.path.isfile(path)
     assert os.path.basename(path) == "result.tif"
     assert builtin_assets_status() == "available"
@@ -26,8 +32,14 @@ def test_builtin_test_models_include_all_registered_trained_best_weights():
         "YOLO11s-seg（返青期50m）",
         "YOLO11s-seg（分蘖期12m）",
         "YOLO11s-seg（分蘖期30m）",
+        "YOLO11s-seg（插秧期12m｜旧版基线）",
+        "YOLO11s-seg（返青期12m｜旧版基线）",
+        "YOLO11s-seg（返青期30m｜旧版基线）",
+        "YOLO11s-seg（返青期50m｜旧版基线）",
+        "YOLO11s-seg（分蘖期12m｜旧版基线）",
+        "YOLO11s-seg（分蘖期30m｜旧版基线）",
     ]
-    assert len(models) == 9
+    assert len(models) == 15
     assert all(model["path"].endswith(".pt") for model in models)
     assert all(os.path.isfile(model["path"]) for model in models)
     assert all(len(model["sha256"]) == 64 for model in models)
@@ -41,9 +53,12 @@ def test_launcher_exposes_builtin_image_independently_of_stale_recent_files(monk
     monkeypatch.setattr(launcher, "RECENT_FILE", str(stale))
 
     entries = launcher.project_entries()
-    assert entries[0]["kind"] == "builtin_test"
-    assert entries[0]["path"].endswith("result.tif")
-    assert os.path.isfile(entries[0]["path"])
+    if launcher.builtin_test_image():
+        assert entries[0]["kind"] == "builtin_test"
+        assert entries[0]["path"].endswith("result.tif")
+        assert os.path.isfile(entries[0]["path"])
+    else:
+        assert all(entry["kind"] != "builtin_test" for entry in entries)
 
 
 def test_main_window_merges_trusted_builtin_comparison_models(monkeypatch):
@@ -55,7 +70,7 @@ def test_main_window_merges_trusted_builtin_comparison_models(monkeypatch):
     monkeypatch.setattr(window, "_model_registry", lambda model_dir=None: {})
 
     models = window._builtin_model_list()
-    assert len(models) == 9
+    assert len(models) == 15
     assert all(model.get("trusted_builtin") for model in models)
     assert all(os.path.isfile(model["path"]) for model in models)
     assert window._is_trusted_builtin_model_path(models[0]["path"])
@@ -80,7 +95,8 @@ def test_builtin_assets_report_partial_without_returning_personal_paths(monkeypa
     assert [model["path"] for model in discovered["existing_models"]] == [
         str((model_dir / "yolo11m_seg_best.pt").resolve())
     ]
-    assert all("D:" not in model["path"] for model in discovered["models"])
+    expected_root = model_dir.resolve()
+    assert all(Path(model["path"]).parent == expected_root for model in discovered["models"])
 
 
 def test_builtin_assets_report_missing_when_no_env_or_packaged_asset_exists(monkeypatch, tmp_path):

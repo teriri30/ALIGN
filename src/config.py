@@ -45,6 +45,9 @@ LEGACY_MASK_PROCESSING_STRENGTHS = frozenset(
     {"light", "standard", "strong", "very_strong"}
 )
 
+# Keep the active log filename and cross-run cleanup pattern coupled.
+LOG_FILE_PREFIX = "app_log"
+
 
 def _validated_number(section: dict, key: str, *, minimum=None, maximum=None, strict_min=False):
     if key not in section:
@@ -82,6 +85,12 @@ def validate_config(raw: dict) -> dict:
     _validated_number(model, "max_source_crop_pixels", minimum=1)
     _validated_number(
         model, "orthomosaic_recovery_conf_threshold", minimum=0.0, maximum=1.0
+    )
+    _validated_number(
+        model, "orthomosaic_primary_mask_threshold", minimum=0.0, maximum=1.0
+    )
+    _validated_number(
+        model, "orthomosaic_tile_edge_weight_floor", minimum=0.0, maximum=1.0
     )
     _validated_number(
         model, "orthomosaic_context_capture_multiplier", minimum=1, maximum=4
@@ -190,6 +199,15 @@ def validate_config(raw: dict) -> dict:
     _validated_number(planning, "endpoint_shortfall_min_m", minimum=0.0)
     _validated_number(planning, "endpoint_extension_max_m", minimum=0.0)
     _validated_number(planning, "work_line_endpoint_extension_m", minimum=0.0)
+    _validated_number(planning, "centerline_simplify_max_deviation_m", minimum=0.0)
+    _validated_number(
+        planning, "centerline_simplify_max_heading_change_deg",
+        minimum=0.0, maximum=180.0,
+    )
+    _validated_number(
+        planning, "centerline_simplify_max_points",
+        minimum=2.0, maximum=64.0,
+    )
     _validated_number(planning, "centerline_endpoint_repair_completion_ratio",
                       minimum=0.5, maximum=1.0)
     _validated_number(planning, "centerline_endpoint_repair_min_cohort",
@@ -695,7 +713,7 @@ class Config:
     @property
     def OFFSET_Y(self) -> str: return self._get("export", "offset_y", default="0.00")
     @property
-    def INFM_LINE(self) -> str: return self._get("export", "infoline", default="$INFM,4,0.7,0.7,0.7,0.7,1,15,254*")
+    def INFM_LINE(self) -> str: return self._get("export", "infoline", default="$INFM,0,0.7,0.7,0.7,0.7,0,5,0*")
 
 
 class AppLogger:
@@ -716,7 +734,7 @@ class AppLogger:
         os.makedirs(log_dir, exist_ok=True)
         self._cleanup_old_logs(log_dir, max_keep=5)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = os.path.join(log_dir, f"app_log_{ts}.log")
+        log_path = os.path.join(log_dir, f"{LOG_FILE_PREFIX}_{ts}.log")
 
         self._logger = logging.getLogger("HarvesterPro")
         self._logger.setLevel(logging.DEBUG)
@@ -740,7 +758,7 @@ class AppLogger:
     @staticmethod
     def _cleanup_old_logs(log_dir: str, max_keep: int = 5):
         """清理旧日志文件，仅保留最近 max_keep 个。"""
-        pattern = os.path.join(log_dir, "v*_log_*.log")
+        pattern = os.path.join(log_dir, f"{LOG_FILE_PREFIX}_*.log*")
         log_files = sorted(_glob.glob(pattern), key=os.path.getmtime, reverse=True)
         for old_file in log_files[max_keep:]:
             try:

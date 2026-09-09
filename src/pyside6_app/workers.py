@@ -114,6 +114,161 @@ class MaskDiagnosticExportWorker(QObject):
             self.error.emit(traceback.format_exc())
 
 
+class InferenceDiagnosticExportWorker(QObject):
+    """Build a tile-level inference diagnostic ZIP without blocking the UI."""
+
+    progress = Signal(int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, output_path, source_image, raw_mask, options=None, parent=None):
+        super().__init__(parent)
+        self.output_path = str(output_path)
+        self.source_image = source_image
+        self.raw_mask = raw_mask
+        self.options = dict(options or {})
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            if self._cancelled:
+                return
+            self.progress.emit(10, "正在整理切片位置和模型溯源...")
+            from inference_diagnostics import export_inference_diagnostic_bundle
+            result = export_inference_diagnostic_bundle(
+                self.output_path,
+                self.source_image,
+                self.raw_mask,
+                **self.options,
+            )
+            if self._cancelled:
+                return
+            self.progress.emit(100, "识别诊断包已生成")
+            self.finished.emit(result)
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
+class ModelLoadWorker(QObject):
+    """Load one model in a worker thread without replacing the active engine.
+
+    ``ModelEngine.load`` constructs an Ultralytics model and may initialise a
+    CUDA context.  Keeping that call in the GUI thread makes Windows classify
+    the application as hung while a large ``.pt`` file is deserialised.  The
+    worker creates a separate engine and returns it only after the load has
+    completed; the GUI can then swap engines atomically and discard the old
+    one without exposing a half-loaded model to inference.
+    """
+
+    progress = Signal(int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        expected_sha256: str = "",
+        token=None,
+        engine_factory=None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.model_path = os.path.abspath(os.fspath(model_path))
+        self.expected_sha256 = str(expected_sha256 or "").strip().lower()
+        self.token = token
+        self.engine_factory = engine_factory
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _is_cancelled(self):
+        return self._cancelled or bool(
+            getattr(self.token, "invalidated", False)
+        )
+
+    def _finish(self, status, result=None, error=""):
+        self.finished.emit({
+            "task_token": self.token,
+            "status": str(status),
+            "result": result,
+            "error": str(error or ""),
+        })
+
+    def run(self):
+        engine = None
+        try:
+            if self._is_cancelled():
+                self._finish("cancelled")
+                return
+            if not os.path.isfile(self.model_path):
+                self._finish("failed", error=f"模型文件不存在: {self.model_path}")
+                return
+
+            self.progress.emit(5, "正在校验模型文件...")
+            from provenance import file_sha256
+
+            model_sha256 = str(file_sha256(self.model_path) or "").lower()
+            if self.expected_sha256 and model_sha256 != self.expected_sha256:
+                self._finish(
+                    "failed",
+                    error="内置模型哈希与注册表不一致，已拒绝加载",
+                )
+                return
+            if self._is_cancelled():
+                self._finish("cancelled")
+                return
+
+            self.progress.emit(10, "正在后台加载模型权重...窗口仍可操作")
+            factory = self.engine_factory
+            if factory is None:
+                from inference import ModelEngine
+
+                factory = ModelEngine
+            engine = factory()
+            if not bool(engine.load(self.model_path)):
+                try:
+                    engine.unload()
+                except Exception:
+                    pass
+                self._finish("failed", error="模型加载失败")
+                return
+            if self._is_cancelled():
+                try:
+                    engine.unload()
+                except Exception:
+                    pass
+                self._finish("cancelled")
+                return
+
+            self.progress.emit(100, "模型加载完成")
+            self._finish(
+                "completed",
+                result={
+                    "engine": engine,
+                    "model_path": self.model_path,
+                    "model_sha256": model_sha256,
+                    "runtime_config": dict(
+                        getattr(engine, "runtime_config", lambda: {})() or {}
+                    ),
+                },
+            )
+        except Exception as exc:
+            if engine is not None:
+                try:
+                    engine.unload()
+                except Exception:
+                    pass
+            self._finish(
+                "failed",
+                error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+            )
+
+
 def display_affine(source_affine, full_width, full_height, display_width, display_height):
     """Map display pixel centres to the exact source raster footprint."""
     from affine import Affine
@@ -474,7 +629,12 @@ class CacheRestoreWorker(QObject):
                 self._finish("cancelled")
                 return
             self.progress.emit(10, "正在读取项目缓存...")
-            from cache import load_project_state, load_mask, load_mask_bundle
+            from cache import (
+                load_mask,
+                load_mask_bundle,
+                load_project_history,
+                load_project_state,
+            )
             from row_geometry import MASK_REGULARIZATION_VERSION
             saved = load_project_state(self.path, self.expected_source_sha256)
             if self._is_cancelled():
@@ -606,6 +766,21 @@ class CacheRestoreWorker(QObject):
                 saved["auto_path_valid"] = False
                 saved["simulation_done"] = False
                 saved["export_done"] = False
+            # DECISION-025: operation history is a separate artifact from the
+            # latest project_state.json.  Decode it in this worker so dense
+            # masks never block the GUI thread during project restore.
+            self.progress.emit(90, "正在读取逐步操作历史...")
+            history = load_project_history(
+                self.path,
+                self.expected_source_sha256 or saved.get("source_sha256", ""),
+                expected_save_session_id=str(
+                    saved.get("save_session_id", "") or ""
+                ),
+                expected_save_revision=int(saved.get("save_revision", 0) or 0),
+                expected_project_generation=int(
+                    saved.get("project_generation", 0) or 0
+                ),
+            )
             if self._is_cancelled():
                 self._finish("cancelled")
                 return
@@ -615,6 +790,7 @@ class CacheRestoreWorker(QObject):
                 "processed_cache_valid": processed_cache_valid,
                 "path_cache_valid": path_cache_valid,
                 "cache_validation_messages": reasons,
+                "history": history,
                 "raw_mask": raw_mask,
                 "raw_ox": raw_ox,
                 "raw_oy": raw_oy,
@@ -899,7 +1075,22 @@ class MaskProcessWorker(QObject):
                 return
             self._finish("completed", processed)
         except Exception as e:
-            self._finish("failed", error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+            model_name = str(
+                getattr(self.state, "current_model_name", "")
+                or getattr(self.state, "current_model_path", "")
+                or "未记录模型"
+            )
+            diagnostic = (
+                f"模型={model_name}; "
+                f"输入掩膜像素={int(np.count_nonzero(self.raw_mask))}"
+            )
+            self._finish(
+                "failed",
+                error=(
+                    f"{type(e).__name__}: {e}（{diagnostic}）\n"
+                    f"{traceback.format_exc()}"
+                ),
+            )
         finally:
             if previous_cv_threads is not None:
                 try:
@@ -907,6 +1098,78 @@ class MaskProcessWorker(QObject):
                     cv2.setNumThreads(previous_cv_threads)
                 except Exception:
                     pass
+
+
+class CenterlineCatalogWorker(QObject):
+    """Build every candidate centerline before turn planning off the GUI thread."""
+    progress = Signal(int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, mask_result, geo, state, config, token=None, parent=None):
+        super().__init__(parent)
+        self.mask_result = dict(mask_result or {})
+        self.geo = geo
+        self.state = state
+        self.config = dict(config or {})
+        self.token = token
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _is_cancelled(self):
+        return self._cancelled or bool(getattr(self.token, "invalidated", False))
+
+    def run(self):
+        try:
+            if self._is_cancelled():
+                self.finished.emit({"task_token": self.token, "status": "cancelled"})
+                return
+            self.progress.emit(15, "正在按整田方向生成全部中心线...")
+            from path_planner import prepare_operator_centerline_plan
+            processed_mask = self.mask_result.get("processed_mask")
+            if processed_mask is None:
+                raise RuntimeError("缺少处理后的掩膜")
+            config = dict(self.config)
+            config["_cancel_callback"] = self._is_cancelled
+            prepared = prepare_operator_centerline_plan(
+                self.mask_result.get("wide_bands", []),
+                processed_mask,
+                self.mask_result.get("main_angle", 0.0),
+                geo=self.geo,
+                state=self.state,
+                config=config,
+                progress_callback=lambda value, message: self.progress.emit(
+                    min(95, 15 + int(float(value) * 70)), str(message)
+                ),
+                detected_mask=getattr(self.state, "inference_original_mask", None),
+                all_bands=self.mask_result.get("all_bands", []),
+            )
+            if self._is_cancelled():
+                self.finished.emit({"task_token": self.token, "status": "cancelled"})
+                return
+            self.progress.emit(100, "全部中心线生成完成")
+            self.finished.emit({
+                "task_token": self.token,
+                "status": "completed",
+                "result": prepared,
+                "error": "",
+            })
+
+        except Exception as exc:
+            self.finished.emit({
+                "task_token": self.token,
+                "status": "failed",
+                "result": None,
+                "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+            })
+
+
+# Compatibility import for older callers and cached development sessions.  The
+# desktop workflow uses CenterlineCatalogWorker and no longer exposes a work-
+# band selection action.
+WorkBandCatalogWorker = CenterlineCatalogWorker
 
 
 class PlanWorker(QObject):
@@ -990,6 +1253,14 @@ class PlanWorker(QObject):
             if self._is_cancelled():
                 self._finish("cancelled")
                 return
+            layout = path_result.get("layout") or {}
+            selection = layout.get("centerline_selection")
+            if not isinstance(selection, dict):
+                selection = layout.get("work_band_selection")
+            if isinstance(selection, dict):
+                config["selected_centerline_ids"] = list(
+                    selection.get("selected_ids") or []
+                )
             attach_path_provenance(
                 path_result, self.mask_result, self.state, config
             )

@@ -32,6 +32,7 @@ def _window_with_path():
     from path_planner import PATH_PLANNING_VERSION
     from provenance import file_sha256, make_stage_record
     from pyside6_app.workers import (
+        path_planning_config_snapshot,
         planning_config_with_mask_evidence,
         semantic_mask_fingerprints,
     )
@@ -74,10 +75,12 @@ def _window_with_path():
     window.state.harvester_param_sources = {
         key: "user_measured" for key in harvester
     }
-    path_config = window.cfg.section("path_planning")
-    path_config.update({
+    path_config = path_planning_config_snapshot({
         "min_turn_radius_m": float(harvester["turn_radius_m"]),
         "turn_strategy": str(window.state.turn_strategy),
+        "route_order": "contour",
+        "service_point_mode": "reference_only",
+        "include_route_finish_extension": True,
         "forbidden_mask_confirmed": False,
     })
     path_inputs = {

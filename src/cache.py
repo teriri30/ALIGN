@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from contextlib import nullcontext
+from dataclasses import fields, is_dataclass
 from typing import Optional, Tuple, Dict, Any
 import numpy as np
 from runtime_paths import cache_dir
@@ -12,11 +13,28 @@ from runtime_paths import cache_dir
 # DECISION-002/018: cached project evidence is user data, not an install file.
 CACHE_ROOT = str(cache_dir())
 PROJECT_STATE_SCHEMA = 6
+# DECISION-025: the latest project snapshot and the ordered operation history
+# are separate artifacts.  History snapshots use content-addressed arrays so
+# repeated route edits do not duplicate the same raw/processed masks.
+PROJECT_HISTORY_SCHEMA = 1
+PROJECT_HISTORY_LIMIT = 50
+_HISTORY_TYPE_KEY = "__reui_history_type__"
 _PROJECT_LOCKS = {}
 _PROJECT_LOCKS_GUARD = threading.Lock()
 _PENDING_STATE_SAVES = {}
 _ACTIVE_STATE_SAVERS = set()
 _STATE_SAVE_QUEUE_LOCK = threading.Lock()
+_SAVE_SESSION_ID = uuid.uuid4().hex
+_SAVE_REVISION_LOCK = threading.Lock()
+_LAST_SAVE_REVISION = 0
+
+
+def _next_save_revision() -> int:
+    """Return a process-local order key for stale async-write rejection."""
+    global _LAST_SAVE_REVISION
+    with _SAVE_REVISION_LOCK:
+        _LAST_SAVE_REVISION += 1
+        return _LAST_SAVE_REVISION
 
 
 def source_identity(tif_path: str) -> Dict[str, Any]:
@@ -112,6 +130,22 @@ def _image_cache_meta_path(tif_path: str) -> str:
     return os.path.join(_cache_dir(tif_path), "image_bgr.json")
 
 
+def _history_dir(tif_path: str) -> str:
+    return os.path.join(_cache_dir(tif_path), "history")
+
+
+def _history_index_path(tif_path: str) -> str:
+    return os.path.join(_history_dir(tif_path), "index.json")
+
+
+def _history_snapshots_dir(tif_path: str) -> str:
+    return os.path.join(_history_dir(tif_path), "snapshots")
+
+
+def _history_artifacts_dir(tif_path: str) -> str:
+    return os.path.join(_history_dir(tif_path), "artifacts")
+
+
 def _meta_path_from_dir(cache_dir: str) -> str:
     return os.path.join(cache_dir, "meta.json")
 
@@ -202,6 +236,453 @@ def _jsonable(value):
     return str(value)
 
 
+def _history_array_digest(array: np.ndarray) -> Tuple[str, np.ndarray]:
+    """Return a stable content digest and contiguous view for one array."""
+    contiguous = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(str(contiguous.dtype.str).encode("ascii"))
+    digest.update(json.dumps(list(contiguous.shape), separators=(",", ":")).encode("ascii"))
+    if contiguous.nbytes:
+        digest.update(memoryview(contiguous).cast("B"))
+    return digest.hexdigest(), contiguous
+
+
+def _history_artifact_path(tif_path: str, digest: str) -> str:
+    return os.path.join(_history_artifacts_dir(tif_path), f"{digest}.npz")
+
+
+def _write_history_array(tif_path: str, array: np.ndarray) -> Dict[str, Any]:
+    """Persist one immutable numeric array once and return its JSON reference."""
+    if np.asarray(array).dtype.hasobject:
+        return {
+            _HISTORY_TYPE_KEY: "object_array",
+            "dtype": str(np.asarray(array).dtype.str),
+            "shape": list(np.asarray(array).shape),
+            "items": _history_encode(tif_path, np.asarray(array).tolist()),
+        }
+    digest, contiguous = _history_array_digest(np.asarray(array))
+    target = _history_artifact_path(tif_path, digest)
+    if not os.path.isfile(target):
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        temporary = (
+            f"{target}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp.npz"
+        )
+        try:
+            np.savez_compressed(temporary, array=contiguous)
+            if not os.path.isfile(target):
+                os.replace(temporary, target)
+        finally:
+            try:
+                if os.path.exists(temporary):
+                    os.remove(temporary)
+            except OSError:
+                pass
+    return {
+        _HISTORY_TYPE_KEY: "ndarray",
+        "sha256": digest,
+        "dtype": str(contiguous.dtype.str),
+        "shape": list(contiguous.shape),
+    }
+
+
+def _history_encode(tif_path: str, value):
+    """Encode an undo snapshot without flattening dataclasses or dense arrays."""
+    if isinstance(value, np.ndarray):
+        return _write_history_array(tif_path, value)
+    if isinstance(value, np.generic):
+        return _history_encode(tif_path, value.item())
+    if is_dataclass(value):
+        class_name = type(value).__name__
+        if class_name not in {"PathPoint", "BandInstance", "Corridor", "AutoPathSegment"}:
+            raise TypeError(f"unsupported history dataclass: {class_name}")
+        return {
+            _HISTORY_TYPE_KEY: "dataclass",
+            "class": class_name,
+            "fields": {
+                item.name: _history_encode(tif_path, getattr(value, item.name))
+                for item in fields(value)
+            },
+        }
+    if isinstance(value, dict):
+        return {str(key): _history_encode(tif_path, item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_history_encode(tif_path, item) for item in value]
+    if isinstance(value, tuple):
+        return {
+            _HISTORY_TYPE_KEY: "tuple",
+            "items": [_history_encode(tif_path, item) for item in value],
+        }
+    if isinstance(value, set):
+        return {
+            _HISTORY_TYPE_KEY: "set",
+            "items": [_history_encode(tif_path, item) for item in sorted(value, key=str)],
+        }
+    if isinstance(value, bytes):
+        return {_HISTORY_TYPE_KEY: "bytes", "hex": value.hex()}
+    if isinstance(value, float) and not math.isfinite(value):
+        return {
+            _HISTORY_TYPE_KEY: "nonfinite_float",
+            "value": "nan" if math.isnan(value) else ("inf" if value > 0 else "-inf"),
+        }
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise TypeError(f"unsupported history value: {type(value).__name__}")
+
+
+def _load_history_array(
+    tif_path: str,
+    reference: Dict[str, Any],
+    array_cache: Dict[str, np.ndarray],
+) -> np.ndarray:
+    digest = str(reference.get("sha256", "") or "")
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("history array digest is invalid")
+    if digest in array_cache:
+        return array_cache[digest]
+    path = _history_artifact_path(tif_path, digest)
+    with np.load(path, allow_pickle=False) as payload:
+        array = np.asarray(payload["array"]).copy()
+    expected_shape = tuple(int(value) for value in reference.get("shape", []))
+    expected_dtype = str(reference.get("dtype", "") or "")
+    if array.shape != expected_shape or str(array.dtype.str) != expected_dtype:
+        raise ValueError("history array metadata does not match its artifact")
+    actual_digest, _contiguous = _history_array_digest(array)
+    if actual_digest != digest:
+        raise ValueError("history array artifact hash mismatch")
+    # History arrays are immutable evidence.  Current algorithms may read them
+    # after undo, but any display/processing mutation must operate on a copy.
+    array.setflags(write=False)
+    array_cache[digest] = array
+    return array
+
+
+def _history_decode(tif_path: str, value, array_cache: Dict[str, np.ndarray]):
+    if isinstance(value, list):
+        return [_history_decode(tif_path, item, array_cache) for item in value]
+    if not isinstance(value, dict):
+        return value
+    marker = value.get(_HISTORY_TYPE_KEY)
+    if not marker:
+        return {
+            key: _history_decode(tif_path, item, array_cache)
+            for key, item in value.items()
+        }
+    if marker == "ndarray":
+        return _load_history_array(tif_path, value, array_cache)
+    if marker == "object_array":
+        items = _history_decode(tif_path, value.get("items"), array_cache)
+        array = np.asarray(items, dtype=np.dtype(str(value.get("dtype")))).reshape(
+            tuple(int(item) for item in value.get("shape", []))
+        )
+        array.setflags(write=False)
+        return array
+    if marker == "tuple":
+        return tuple(
+            _history_decode(tif_path, item, array_cache)
+            for item in value.get("items", [])
+        )
+    if marker == "set":
+        return {
+            _history_decode(tif_path, item, array_cache)
+            for item in value.get("items", [])
+        }
+    if marker == "bytes":
+        return bytes.fromhex(str(value.get("hex", "") or ""))
+    if marker == "nonfinite_float":
+        token = str(value.get("value", "nan"))
+        return {"nan": float("nan"), "inf": float("inf"), "-inf": float("-inf")}[token]
+    if marker == "dataclass":
+        from state import AutoPathSegment, BandInstance, Corridor, PathPoint
+        classes = {
+            "PathPoint": PathPoint,
+            "BandInstance": BandInstance,
+            "Corridor": Corridor,
+            "AutoPathSegment": AutoPathSegment,
+        }
+        class_name = str(value.get("class", "") or "")
+        cls = classes.get(class_name)
+        if cls is None:
+            raise ValueError(f"unsupported history dataclass: {class_name}")
+        decoded_fields = {
+            key: _history_decode(tif_path, item, array_cache)
+            for key, item in dict(value.get("fields") or {}).items()
+        }
+        return cls(**decoded_fields)
+    raise ValueError(f"unsupported history marker: {marker}")
+
+
+def _valid_history_id(value: str) -> bool:
+    value = str(value or "")
+    return len(value) == 32 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _history_snapshot_path(tif_path: str, history_id: str) -> str:
+    if not _valid_history_id(history_id):
+        raise ValueError("history snapshot id is invalid")
+    return os.path.join(_history_snapshots_dir(tif_path), f"{history_id}.json")
+
+
+def _write_history_snapshot(tif_path: str, snapshot: Dict[str, Any]) -> str:
+    history_id = str(snapshot.get("history_id", "") or "")
+    target = _history_snapshot_path(tif_path, history_id)
+    if os.path.isfile(target):
+        return history_id
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    payload = {
+        "schema": PROJECT_HISTORY_SCHEMA,
+        "history_id": history_id,
+        "snapshot": _history_encode(tif_path, snapshot),
+    }
+    _atomic_write_json(target, payload, compact=True)
+    return history_id
+
+
+def _capture_project_history(
+    tif_path: str,
+    state,
+    save_revision: int = 0,
+) -> Dict[str, Any]:
+    clone = getattr(state, "_snapshot_clone", None)
+    if not callable(clone):
+        return {"undo_stack": [], "redo_stack": []}
+    source_sha256 = str(getattr(state, "source_sha256", "") or "")
+    if not source_sha256 and tif_path and os.path.isfile(tif_path):
+        from provenance import file_sha256
+        source_sha256 = file_sha256(tif_path)
+    return {
+        "project_generation": int(getattr(state, "project_generation", 0) or 0),
+        "save_session_id": _SAVE_SESSION_ID,
+        "save_revision": int(save_revision or 0),
+        "source_identity": source_identity(tif_path),
+        "source_sha256": source_sha256,
+        "undo_stack": clone(list(getattr(state, "undo_stack", []) or [])[-PROJECT_HISTORY_LIMIT:]),
+        "redo_stack": clone(list(getattr(state, "redo_stack", []) or [])[-PROJECT_HISTORY_LIMIT:]),
+    }
+
+
+def _collect_history_artifact_digests(value, result: set) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _collect_history_artifact_digests(item, result)
+        return
+    if not isinstance(value, dict):
+        return
+    if value.get(_HISTORY_TYPE_KEY) == "ndarray":
+        digest = str(value.get("sha256", "") or "")
+        if len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest):
+            result.add(digest)
+    for item in value.values():
+        _collect_history_artifact_digests(item, result)
+
+
+def _write_project_history(tif_path: str, history: Dict[str, Any]) -> bool:
+    """Write immutable per-operation snapshots, then atomically replace the index."""
+    if not tif_path:
+        return False
+    incoming_generation = int(history.get("project_generation", 0) or 0)
+    incoming_session = str(history.get("save_session_id", "") or "")
+    incoming_revision = int(history.get("save_revision", 0) or 0)
+    try:
+        with open(_history_index_path(tif_path), "r", encoding="utf-8") as handle:
+            current_index = json.load(handle) or {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        current_index = {}
+    current_generation = int(current_index.get("project_generation", -1) or 0)
+    current_session = str(current_index.get("save_session_id", "") or "")
+    current_revision = int(current_index.get("save_revision", 0) or 0)
+    if incoming_generation < current_generation:
+        return False
+    if (
+        incoming_generation == current_generation
+        and incoming_session
+        and incoming_session == current_session
+        and incoming_revision < current_revision
+    ):
+        return False
+    undo_ids = [
+        _write_history_snapshot(tif_path, snapshot)
+        for snapshot in list(history.get("undo_stack") or [])[-PROJECT_HISTORY_LIMIT:]
+    ]
+    redo_ids = [
+        _write_history_snapshot(tif_path, snapshot)
+        for snapshot in list(history.get("redo_stack") or [])[-PROJECT_HISTORY_LIMIT:]
+    ]
+    os.makedirs(_history_dir(tif_path), exist_ok=True)
+    _atomic_write_json(
+        _history_index_path(tif_path),
+        {
+            "schema": PROJECT_HISTORY_SCHEMA,
+            "project_generation": incoming_generation,
+            "save_session_id": incoming_session,
+            "save_revision": incoming_revision,
+            "source_identity": dict(history.get("source_identity") or {}),
+            "source_sha256": str(history.get("source_sha256", "") or ""),
+            "updated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "undo_ids": undo_ids,
+            "redo_ids": redo_ids,
+        },
+        compact=True,
+    )
+    referenced = set(undo_ids + redo_ids)
+    snapshots_dir = _history_snapshots_dir(tif_path)
+    if os.path.isdir(snapshots_dir):
+        for name in os.listdir(snapshots_dir):
+            if not name.endswith(".json"):
+                continue
+            history_id = name[:-5]
+            if history_id not in referenced:
+                try:
+                    os.remove(os.path.join(snapshots_dir, name))
+                except OSError:
+                    pass
+    # The stacks are bounded, so their content-addressed arrays must be bounded
+    # too.  Only artifacts no longer referenced by any indexed snapshot in this
+    # exact project history directory are removed.
+    artifact_digests = set()
+    for history_id in referenced:
+        try:
+            with open(
+                _history_snapshot_path(tif_path, history_id),
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                snapshot_payload = json.load(handle) or {}
+            _collect_history_artifact_digests(
+                snapshot_payload.get("snapshot"), artifact_digests
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    artifacts_dir = _history_artifacts_dir(tif_path)
+    if os.path.isdir(artifacts_dir):
+        for name in os.listdir(artifacts_dir):
+            if not name.endswith(".npz"):
+                continue
+            digest = name[:-4]
+            if (
+                len(digest) == 64
+                and all(ch in "0123456789abcdef" for ch in digest)
+                and digest not in artifact_digests
+            ):
+                try:
+                    os.remove(os.path.join(artifacts_dir, name))
+                except OSError:
+                    pass
+    return True
+
+
+def _loaded_history_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark cross-session route evidence historical without deleting geometry."""
+    snapshot = dict(snapshot or {})
+    snapshot["persisted"] = True
+    values = snapshot.get("values")
+    if not isinstance(values, dict):
+        return snapshot
+    if values.get("auto_path_planned"):
+        values = dict(values)
+        values["auto_path_valid"] = False
+        values["simulation_done"] = False
+        values["export_done"] = False
+        validation = dict(values.get("path_validation") or {})
+        validation["validation_source"] = "history_snapshot"
+        validation["valid"] = False
+        values["path_validation"] = validation
+        snapshot["values"] = values
+    return snapshot
+
+
+def load_project_history(
+    tif_path: str,
+    expected_source_sha256: str = "",
+    expected_save_session_id: str = "",
+    expected_save_revision: int = 0,
+    expected_project_generation: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Load the newest contiguous valid suffix of each persisted history stack."""
+    empty = {"undo_stack": [], "redo_stack": [], "messages": []}
+    path = _history_index_path(tif_path)
+    if not os.path.isfile(path):
+        return empty
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            index = json.load(handle) or {}
+        if int(index.get("schema", 0) or 0) != PROJECT_HISTORY_SCHEMA:
+            return {
+                **empty,
+                "messages": ["历史记录版本不兼容，已停止恢复"],
+            }
+        if expected_project_generation is not None and int(
+            index.get("project_generation", 0) or 0
+        ) != int(expected_project_generation):
+            return {
+                **empty,
+                "messages": ["历史记录与最近项目状态不一致，已停止恢复"],
+            }
+        if expected_save_session_id and (
+            str(index.get("save_session_id", "") or "")
+            != str(expected_save_session_id)
+            or int(index.get("save_revision", 0) or 0)
+            != int(expected_save_revision or 0)
+        ):
+            return {
+                **empty,
+                "messages": ["历史记录与最近项目状态不一致，已停止恢复"],
+            }
+        if dict(index.get("source_identity") or {}) != source_identity(tif_path):
+            return {
+                **empty,
+                "messages": ["历史记录与当前源影像不一致，已停止恢复"],
+            }
+        saved_sha256 = str(index.get("source_sha256", "") or "")
+        if expected_source_sha256:
+            current_sha256 = str(expected_source_sha256)
+        else:
+            from provenance import file_sha256
+            current_sha256 = file_sha256(tif_path)
+        if not saved_sha256 or saved_sha256 != current_sha256:
+            return {
+                **empty,
+                "messages": ["历史记录与当前源影像不一致，已停止恢复"],
+            }
+        array_cache: Dict[str, np.ndarray] = {}
+        messages = []
+
+        def load_stack(values, label):
+            loaded_reversed = []
+            for history_id in reversed(list(values or [])[-PROJECT_HISTORY_LIMIT:]):
+                try:
+                    with open(
+                        _history_snapshot_path(tif_path, history_id),
+                        "r",
+                        encoding="utf-8",
+                    ) as handle:
+                        payload = json.load(handle) or {}
+                    if int(payload.get("schema", 0) or 0) != PROJECT_HISTORY_SCHEMA:
+                        raise ValueError("snapshot schema mismatch")
+                    if str(payload.get("history_id", "") or "") != str(history_id):
+                        raise ValueError("snapshot id mismatch")
+                    snapshot = _history_decode(
+                        tif_path, payload.get("snapshot"), array_cache
+                    )
+                    if not isinstance(snapshot, dict):
+                        raise ValueError("snapshot is not an object")
+                    loaded_reversed.append(_loaded_history_snapshot(snapshot))
+                except Exception as exc:
+                    messages.append(f"{label}历史在损坏记录处停止恢复: {exc}")
+                    break
+            return list(reversed(loaded_reversed))
+
+        return {
+            "undo_stack": load_stack(index.get("undo_ids"), "撤销"),
+            "redo_stack": load_stack(index.get("redo_ids"), "重做"),
+            "messages": messages,
+        }
+    except Exception as exc:
+        return {
+            **empty,
+            "messages": [f"历史记录读取失败，已停止恢复: {exc}"],
+        }
+
+
 def _mask_result_summary(mask_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not mask_result:
         return None
@@ -221,7 +702,12 @@ def _mask_result_summary(mask_result: Optional[Dict[str, Any]]) -> Optional[Dict
     return _jsonable(keep)
 
 
-def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[str, Any]:
+def _build_project_state_payload(
+    tif_path: str,
+    state,
+    stage: str = "",
+    save_revision: int = 0,
+) -> Dict[str, Any]:
     """Freeze a consistent, JSON-safe project snapshot at request time."""
     if not tif_path or state is None:
         return {}
@@ -231,6 +717,9 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         auto_path.append({
             "status": int(getattr(segment, "status", 1)),
             "segment_type": str(getattr(segment, "segment_type", "work")),
+            "geometry_mode": str(
+                getattr(segment, "geometry_mode", "straight") or "straight"
+            ),
             "corridor_id": int(getattr(segment, "corridor_id", -1)),
             "length_m": float(getattr(segment, "length_m", 0.0)),
             "points": [
@@ -247,6 +736,8 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
     payload = {
         "schema": PROJECT_STATE_SCHEMA,
         "project_generation": int(getattr(state, "project_generation", 0) or 0),
+        "save_session_id": _SAVE_SESSION_ID,
+        "save_revision": int(save_revision or 0),
         "source_identity": source_identity(tif_path),
         "source_sha256": source_sha256,
         "source_metadata": _jsonable(getattr(state, "source_metadata", {}) or {}),
@@ -271,6 +762,36 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "mask_offset_y": int(getattr(state, "mask_offset_y", 0)),
         "mask_result": _mask_result_summary(getattr(state, "mask_result", None)),
         "mask_provenance": _jsonable(getattr(state, "mask_provenance", {}) or {}),
+        "work_band_catalog": _jsonable(
+            getattr(state, "work_band_catalog", None)
+            or getattr(state, "centerline_catalog", {})
+            or {}
+        ),
+        "selected_work_band_ids": _jsonable(
+            getattr(state, "selected_work_band_ids", None)
+            or getattr(state, "selected_centerline_ids", [])
+            or []
+        ),
+        "work_band_selection_report": _jsonable(
+            getattr(state, "work_band_selection_report", None)
+            or getattr(state, "centerline_selection_report", {})
+            or {}
+        ),
+        "centerline_catalog": _jsonable(
+            getattr(state, "centerline_catalog", None)
+            or getattr(state, "work_band_catalog", {})
+            or {}
+        ),
+        "selected_centerline_ids": _jsonable(
+            getattr(state, "selected_centerline_ids", None)
+            or getattr(state, "selected_work_band_ids", [])
+            or []
+        ),
+        "centerline_selection_report": _jsonable(
+            getattr(state, "centerline_selection_report", None)
+            or getattr(state, "work_band_selection_report", {})
+            or {}
+        ),
         "harvester_params": _jsonable(getattr(state, "harvester_params", {})),
         "harvester_param_sources": _jsonable(
             getattr(state, "harvester_param_sources", {})
@@ -309,6 +830,9 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "auto_path_geo": _jsonable(getattr(state, "auto_path_geo", [])),
         "path_points": _jsonable(getattr(state, "path_points", [])),
         "path_status": _jsonable(getattr(state, "path_status", [])),
+        "path_geometry_modes": _jsonable(
+            getattr(state, "path_geometry_modes", [])
+        ),
         "last_total_path_m": float(getattr(state, "last_total_path_m", 0.0) or 0.0),
         "last_work_path_m": float(getattr(state, "last_work_path_m", 0.0) or 0.0),
         "last_turn_path_m": float(getattr(state, "last_turn_path_m", 0.0) or 0.0),
@@ -341,27 +865,50 @@ def _write_project_state_payload(tif_path: str, payload: Dict[str, Any]) -> bool
     os.makedirs(_cache_dir(tif_path), exist_ok=True)
     target = _project_state_path(tif_path)
     incoming_generation = int(payload.get("project_generation", 0) or 0)
+    incoming_session = str(payload.get("save_session_id", "") or "")
+    incoming_revision = int(payload.get("save_revision", 0) or 0)
     try:
         with open(target, "r", encoding="utf-8") as handle:
-            current_generation = int((json.load(handle) or {}).get("project_generation", 0) or 0)
+            current_payload = json.load(handle) or {}
+        current_generation = int(current_payload.get("project_generation", 0) or 0)
+        current_session = str(current_payload.get("save_session_id", "") or "")
+        current_revision = int(current_payload.get("save_revision", 0) or 0)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         current_generation = -1
+        current_session = ""
+        current_revision = 0
     if incoming_generation < current_generation:
+        return False
+    if (
+        incoming_generation == current_generation
+        and incoming_session
+        and incoming_session == current_session
+        and incoming_revision < current_revision
+    ):
         return False
     _atomic_write_json(target, payload, compact=True)
     return True
 
 
 def save_project_state(tif_path: str, state, stage: str = "", commit_callback=None) -> bool:
-    """Serialize one project's state in call order without temp-file collisions."""
+    """Serialize the latest state and its independent operation history."""
     if not tif_path or state is None:
         return False
     state_lock = getattr(state, "state_lock", None)
+    save_revision = _next_save_revision()
     with state_lock if state_lock is not None else nullcontext():
-        payload = _build_project_state_payload(tif_path, state, stage)
+        payload = _build_project_state_payload(
+            tif_path, state, stage, save_revision=save_revision
+        )
+        history = _capture_project_history(
+            tif_path, state, save_revision=save_revision
+        )
     if commit_callback is not None and not bool(commit_callback()):
         return False
     with _project_lock(tif_path):
+        if commit_callback is not None and not bool(commit_callback()):
+            return False
+        _write_project_history(tif_path, history)
         if commit_callback is not None and not bool(commit_callback()):
             return False
         return _write_project_state_payload(tif_path, payload)
@@ -378,10 +925,22 @@ def request_project_state_save(
         return
     key = os.path.abspath(tif_path)
     state_lock = getattr(state, "state_lock", None)
+    save_revision = _next_save_revision()
     with state_lock if state_lock is not None else nullcontext():
-        payload = _build_project_state_payload(tif_path, state, stage)
+        payload = _build_project_state_payload(
+            tif_path, state, stage, save_revision=save_revision
+        )
+        history = _capture_project_history(
+            tif_path, state, save_revision=save_revision
+        )
     with _STATE_SAVE_QUEUE_LOCK:
-        _PENDING_STATE_SAVES[key] = (tif_path, payload, stage, on_error)
+        _PENDING_STATE_SAVES[key] = (
+            tif_path,
+            payload,
+            history,
+            stage,
+            on_error,
+        )
         if key in _ACTIVE_STATE_SAVERS:
             return
         _ACTIVE_STATE_SAVERS.add(key)
@@ -393,9 +952,16 @@ def request_project_state_save(
                 if item is None:
                     _ACTIVE_STATE_SAVERS.discard(key)
                     return
-            path, current_payload, current_stage, error_callback = item
+            (
+                path,
+                current_payload,
+                current_history,
+                current_stage,
+                error_callback,
+            ) = item
             try:
                 with _project_lock(path):
+                    _write_project_history(path, current_history)
                     _write_project_state_payload(path, current_payload)
             except Exception as exc:
                 if error_callback is not None:

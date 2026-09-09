@@ -31,12 +31,39 @@ for %%D in (src scripts tests) do (
   "%PYTHON%" -m compileall -q "%%D"
   if errorlevel 1 exit /b 1
 )
-"%PYTHON%" -m pytest -q
+rem Do not reuse a fixed temp directory: Windows ACLs or a previous pytest
+rem worker can leave it undeletable, turning every test into a setup error.
+rem An explicit REUI_PYTEST_BASETEMP is supported for CI; otherwise use a
+rem unique directory under the active TEMP and clean only that exact path.
+set "BUILD_PYTEST_BASETEMP=%REUI_PYTEST_BASETEMP%"
+set "BUILD_PYTEST_BASETEMP_OWNED=0"
+if "%BUILD_PYTEST_BASETEMP%"=="" (
+  set "BUILD_PYTEST_BASETEMP=%TEMP%\reui-pytest-%RANDOM%-%RANDOM%"
+  set "BUILD_PYTEST_BASETEMP_OWNED=1"
+)
+if exist "%BUILD_PYTEST_BASETEMP%" rmdir /S /Q "%BUILD_PYTEST_BASETEMP%"
+mkdir "%BUILD_PYTEST_BASETEMP%"
 if errorlevel 1 exit /b 1
+"%PYTHON%" -m pytest -q -p no:cov --basetemp "%BUILD_PYTEST_BASETEMP%"
+set "PYTEST_EXIT=%ERRORLEVEL%"
+if "%BUILD_PYTEST_BASETEMP_OWNED%"=="1" if exist "%BUILD_PYTEST_BASETEMP%" rmdir /S /Q "%BUILD_PYTEST_BASETEMP%"
+if not "%PYTEST_EXIT%"=="0" exit /b %PYTEST_EXIT%
 
 echo [5/6] Building onedir bundle
+rem PyInstaller resolves transitive native dependencies through PATH.  Keep
+rem host tools (for example Codex/Poppler, GIS, or another Qt installation)
+rem out of that search so their same-named DLLs cannot enter the bundle.
+set "BUILD_ORIGINAL_PATH=%PATH%"
+set "BUILD_ORIGINAL_YOLO_AUTOINSTALL=%YOLO_AUTOINSTALL%"
+for %%I in ("%PYTHON%") do set "BUILD_PYTHON_DIR=%%~dpI"
+set "BUILD_PYINSTALLER_PATH=%BUILD_PYTHON_DIR%;%BUILD_PYTHON_DIR%Scripts;%BUILD_PYTHON_DIR%Library\bin;%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemRoot%\System32\WindowsPowerShell\v1.0"
+set "PATH=%BUILD_PYINSTALLER_PATH%"
+set "YOLO_AUTOINSTALL=false"
 "%PYTHON%" -m PyInstaller packaging\reUI.spec --noconfirm --clean
-if errorlevel 1 exit /b 1
+set "PYINSTALLER_EXIT=%ERRORLEVEL%"
+set "PATH=%BUILD_ORIGINAL_PATH%"
+set "YOLO_AUTOINSTALL=%BUILD_ORIGINAL_YOLO_AUTOINSTALL%"
+if not "%PYINSTALLER_EXIT%"=="0" exit /b %PYINSTALLER_EXIT%
 
 echo [6/6] Running frozen self-test and preparing portable folder
 set "SELF_TEST_DIR=%TEMP%\reUI-build-self-test-%RANDOM%"

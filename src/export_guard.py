@@ -20,7 +20,8 @@ class ExportEngine:
 
     def export_auto_path_to_file(self, save_path: str):
         """导出自动路径到文件。
-        直接使用已有的 path_points/path_status（已由 _action_plan 同步），
+        直接使用已有的 path_points/path_status（已由 _action_plan 同步）；
+        物理直线/转弯预览由主窗口的路径导出流程负责，旧接口本身继续禁用，
         不再破坏性覆写，保留段间过渡状态。
         """
         self.export_to_file(save_path)

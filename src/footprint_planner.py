@@ -19,6 +19,89 @@ from row_geometry import meters_per_pixel, odd_size, rotate_bound, smooth_1d
 Point = Tuple[float, float]
 
 
+# 用户友好的验证提示翻译字典
+METRIC_TRANSLATIONS = {
+    # 指标名称翻译
+    "track_outside_field_pct": "履带越出田界",
+    "track_forbidden_overlap_pct": "履带进入禁行区",
+    "track_core_overlap_pct": "履带碾压作物核心区",
+    "track_outside_support_pct": "履带在无作物支撑区",
+    "track_uncertain_overlap_pct": "履带在不确定区域",
+    "planned_target_geometric_coverage_pct": "割刀覆盖率",
+    "rolling_canopy_pct": "预计碾压率",
+    "crop_mask_geometric_coverage_pct": "作物掩膜覆盖率",
+    "machine_outside_field_pct": "机身越出田界",
+    "machine_forbidden_overlap_pct": "机身进入禁行区",
+    # 符号翻译
+    "exceeds limit": "超过限制",
+    "below minimum": "低于最低要求",
+}
+
+ISSUE_SUGGESTIONS = {
+    "履带越出田界": "→ 请调整路径，或扩大田块圈选范围",
+    "履带进入禁行区": "→ 请拖动作业线避开禁行区",
+    "机身越出田界": "→ 请调整路径，确保机身完全在田界内",
+    "机身进入禁行区": "→ 请调整路径，避免机身进入禁行区",
+    "割刀覆盖率": "→ 覆盖率略低，可调整作业线位置优化",
+    "预计碾压率": "→ 碾压率略高，可优化转弯策略或作业线位置",
+    "履带碾压作物核心区": "→ 碾压核心区略多，可调整作业线横向位置",
+}
+
+
+def translate_validation_issue(description: str, severity: str = "error") -> str:
+    """将技术指标描述翻译为用户友好提示
+
+    示例：
+    输入："track_outside_field_pct=5.2 exceeds limit=2.0"
+    输出："❌ 履带越出田界 5.2%（限制：2.0%）\n   → 请调整路径，或扩大田块圈选范围"
+    """
+    result = str(description)
+
+    # 1. 替换技术术语
+    for tech, user in METRIC_TRANSLATIONS.items():
+        result = result.replace(tech, user)
+
+    # 2. 美化数值格式：提取百分比值
+    if "=" in result and ("超过限制" in result or "低于最低要求" in result):
+        try:
+            # "履带越出田界=5.2 超过限制=2.0" → "履带越出田界 5.2%（限制：2.0%）"
+            parts = result.split()
+            if len(parts) >= 2:
+                # 提取指标和值
+                metric_part = parts[0].split("=")
+                if len(metric_part) == 2:
+                    metric_name = metric_part[0]
+                    metric_value = metric_part[1]
+
+                    # 提取限制值
+                    limit_value = None
+                    for part in parts[1:]:
+                        if "=" in part:
+                            limit_value = part.split("=")[-1]
+                            break
+
+                    if limit_value:
+                        if "超过限制" in result:
+                            result = f"{metric_name} {metric_value}%（限制：{limit_value}%）"
+                        elif "低于最低要求" in result:
+                            result = f"{metric_name} {metric_value}%（最低要求：{limit_value}%）"
+        except:
+            pass  # 保持原始格式
+
+    # 3. 添加图标
+    icon = "❌" if severity == "error" else "⚠️"
+    result = f"{icon} {result}"
+
+    # 4. 添加改进建议（仅对 warning）
+    if severity == "warning":
+        for keyword, suggestion in ISSUE_SUGGESTIONS.items():
+            if keyword in result:
+                result += f"\n   {suggestion}"
+                break
+
+    return result
+
+
 def rasterize_forbidden_regions(shape, state=None) -> Optional[np.ndarray]:
     """Rasterize confirmed display-coordinate polygons into local mask space."""
     regions = list(getattr(state, "forbidden_regions", []) or []) if state is not None else []
@@ -1414,14 +1497,18 @@ def validate_footprints(
     }
     # DECISION-015: logical segment-union pass counts, not pose occupancy,
     # support the auditable once/repeated rolling metrics.
+    manual_edit_mode = bool(cfg.get("manual_edit_mode", False))
     formal = assess_footprint_hard_constraints(
         result,
         cfg,
         require_explicit_valid=False,
+        manual_edit_mode=manual_edit_mode,
     )
     result.update({
         "valid": formal["valid"],
         "issues": formal["issues"],
+        "errors": formal.get("errors", []),
+        "warnings": formal.get("warnings", []),
         "validation_profile": formal["validation_profile"],
         "validation_limits_pct": formal["validation_limits_pct"],
     })
@@ -1432,6 +1519,7 @@ def assess_footprint_hard_constraints(
     footprint: Dict, config: Optional[Dict] = None, *, crossing_count: int = 0,
     require_optional_layers: bool = False,
     require_explicit_valid: bool = True,
+    manual_edit_mode: bool = False,
 ) -> Dict:
     """Apply structural footprint checks and optional metric thresholds.
 
@@ -1442,6 +1530,11 @@ def assess_footprint_hard_constraints(
     ``footprint_metric_policy=report_only`` default keeps rolling/coverage
     comparisons as report fields; it does not suppress missing metrics,
     coordinate integrity, crossings, or confirmed semantic/field violations.
+
+    When ``manual_edit_mode=True``, issues are separated into hard errors
+    (severity="error") and soft warnings (severity="warning"). Hard errors
+    block export; soft warnings do not. This allows users to manually edit
+    paths and receive guidance without being blocked by minor issues.
     """
     cfg = dict(config or {})
     metrics = dict(footprint or {})
@@ -1505,13 +1598,31 @@ def assess_footprint_hard_constraints(
         required.extend(("machine_outside_field_pct", "machine_forbidden_overlap_pct"))
 
     reasons = []
-    issues = [str(issue) for issue in metrics.get("issues") or [] if str(issue)]
+    issues = []  # Changed to list of dicts with severity
     explicit_valid = metrics.get("valid")
+
+    def add_issue(description: str, severity: str = "error"):
+        """Helper to add an issue with severity classification and translation."""
+        # 翻译为用户友好描述
+        translated = translate_validation_issue(description, severity)
+        issues.append({
+            "description": translated,
+            "severity": severity,
+            "raw": description  # 保留原始技术描述用于调试
+        })
+
+    # Import existing issues (maintain backward compatibility)
+    for issue in (metrics.get("issues") or []):
+        if isinstance(issue, dict):
+            issues.append(issue)
+        elif str(issue):
+            add_issue(str(issue), "error")
+
     if explicit_valid is False:
         reasons.append("validation_invalid")
     elif explicit_valid is None and require_explicit_valid:
         reasons.append("validation_validity_metric_missing")
-        issues.append("required footprint validity evidence missing: valid")
+        add_issue("required footprint validity evidence missing: valid", "error")
     elif explicit_valid is not None and explicit_valid is not True:
         reasons.append("validation_validity_metric_invalid")
     if issues:
@@ -1526,20 +1637,36 @@ def assess_footprint_hard_constraints(
         values[name] = value if np.isfinite(value) else None
         if values[name] is None:
             reasons.append(f"validation_metric_missing:{name}")
-            issues.append(f"required footprint metric missing: {name}")
+            add_issue(f"required footprint metric missing: {name}", "error")
 
-    def add_exceeded(name):
+    def add_exceeded(name, severity="error"):
+        """Add exceeded metric with configurable severity."""
         value = values.get(name)
         try:
             limit = float(limits[name])
         except (KeyError, TypeError, ValueError):
             limit = float("nan")
         if value is not None and np.isfinite(limit) and value > limit:
-            reasons.append(f"validation_gate_exceeded:{name}")
-            issues.append(f"{name}={value:.6g} exceeds limit={limit:.6g}")
+            # Hard violations:田界越界、禁行区冲突 → error
+            # Soft warnings: 略高的碾压率、略低的覆盖率 → warning (manual_edit_mode only)
+            is_critical = name in (
+                "track_outside_field_pct",
+                "track_forbidden_overlap_pct",
+                "machine_outside_field_pct",
+                "machine_forbidden_overlap_pct"
+            )
+            issue_severity = "error" if (is_critical or not manual_edit_mode) else severity
+
+            if issue_severity == "error":
+                reasons.append(f"validation_gate_exceeded:{name}")
+
+            add_issue(
+                f"{name}={value:.6g} exceeds limit={limit:.6g}",
+                issue_severity
+            )
 
     if core_overlap_policy == "hard_gate":
-        add_exceeded("track_core_overlap_pct")
+        add_exceeded("track_core_overlap_pct", "warning" if manual_edit_mode else "error")
     if metric_policy == "hard_gate":
         coverage = values.get("planned_target_geometric_coverage_pct")
         try:
@@ -1551,33 +1678,43 @@ def assess_footprint_hard_constraints(
             and np.isfinite(minimum_coverage)
             and coverage < minimum_coverage
         ):
-            reasons.append(
-                "validation_gate_below_minimum:planned_target_geometric_coverage_pct"
-            )
-            issues.append(
-                f"planned_target_geometric_coverage_pct={coverage:.6g} "
+            issue_severity = "warning" if manual_edit_mode else "error"
+            if issue_severity == "error":
+                reasons.append("validation_gate_below_minimum:planned_target_geometric_coverage_pct")
+            add_issue(
+                f"planned_target_geometric_coverage_pct={coverage:.6g} below minimum={minimum_coverage:.6g}",
+                issue_severity
             )
     for name in (
         "track_outside_field_pct", "track_outside_support_pct",
         "track_uncertain_overlap_pct", "track_forbidden_overlap_pct",
     ):
-        add_exceeded(name)
+        severity = "error" if name in ("track_outside_field_pct", "track_forbidden_overlap_pct") else "warning"
+        add_exceeded(name, severity)
 
     if profile == "machine_candidate":
         for name, limit in (("machine_outside_field_pct", 0.0), ("machine_forbidden_overlap_pct", 0.0)):
             value = values.get(name)
             if value is not None and value > limit:
                 reasons.append(f"validation_gate_exceeded:{name}")
-                issues.append(f"{name}={value:.6g} exceeds limit={limit:.6g}")
+                add_issue(f"{name}={value:.6g} exceeds limit={limit:.6g}", "error")
 
     if int(crossing_count or 0) > 0:
         reasons.append("non_adjacent_work_line_crossing")
-        issues.append(f"non-adjacent work-line crossings: {int(crossing_count)}")
+        add_issue(f"non-adjacent work-line crossings: {int(crossing_count)}", "error")
+
     hard_reasons = list(dict.fromkeys(reasons))
+
+    # Separate errors and warnings
+    errors = [issue for issue in issues if issue["severity"] == "error"]
+    warnings = [issue for issue in issues if issue["severity"] == "warning"]
+
     return {
         "valid": not hard_reasons,
         "hard_reasons": hard_reasons,
-        "issues": list(dict.fromkeys(issues)),
+        "issues": issues,  # Full list with severity
+        "errors": errors,  # Hard errors only
+        "warnings": warnings,  # Soft warnings only
         "validation_profile": profile,
         "track_core_overlap_policy": core_overlap_policy,
         "footprint_metric_policy": metric_policy,

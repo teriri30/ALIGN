@@ -143,8 +143,10 @@ def recommend_machine_dimensions(
         max(0.0, clear_width - TRACK_CLEARANCE_RESERVE_M)
         if clear_width is not None else None
     )
+    track_width_candidate = None
     if track_upper is not None and track_upper >= 0.20:
-        params["track_width_m"] = _largest_option_not_above(track_upper)
+        track_width_candidate = _largest_option_not_above(track_upper)
+        params["track_width_m"] = track_width_candidate
 
     gauge_target = None
     if len(wide_centers) >= 2:
@@ -191,8 +193,13 @@ def recommend_machine_dimensions(
         lines.extend([
             f"- 宽通道保守净宽：{clear_width:.2f} m",
             f"- 预留 {TRACK_CLEARANCE_RESERVE_M:.2f} m 安全余量后，履带宽度影像约束上限：{track_upper:.2f} m",
-            f"- 推荐履带宽度：{params.get('track_width_m', 0.0) * 100:.0f} cm",
         ])
+        if track_width_candidate is None:
+            lines.append("- 通道过窄或缺少有效机宽候选，无法推荐履带宽度，保留当前值。")
+        else:
+            lines.append(
+                f"- 推荐履带宽度：{track_width_candidate * 100:.0f} cm"
+            )
     else:
         lines.append("- 行带几何证据不足，无法计算履带宽度上限，保留当前值。")
     if gauge_target is not None:

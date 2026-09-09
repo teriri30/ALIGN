@@ -9,6 +9,7 @@ _PATH_DERIVED_FIELDS = (
     "auto_path_geo",
     "path_points",
     "path_status",
+    "path_geometry_modes",
     "path_artifact",
 )
 
@@ -75,6 +76,7 @@ def cached_path_restore_plan(saved, *, path_cache_valid: bool) -> dict:
                 "auto_path_geo": [],
                 "path_points": [],
                 "path_status": [],
+                "path_geometry_modes": [],
                 "auto_path_planned": True,
                 "path_artifact": {},
             },

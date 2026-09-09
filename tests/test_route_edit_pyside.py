@@ -185,6 +185,38 @@ def test_machine_file_preview_uses_outgoing_status_and_never_joins_volumes():
     window.close()
 
 
+def test_machine_file_preview_replaces_continuous_route_result_rows():
+    """TXT-file view must show only edges that were actually exported."""
+    window = _window()
+    continuous = window._normalise_path_result({
+        "full_path": [
+            [(0.0, 0.0), (10.0, 0.0)],
+            [(10.0, 0.0), (10.0, 8.0)],
+            [(10.0, 8.0), (0.0, 8.0)],
+        ],
+        "segment_types": ["work", "turn", "work"],
+    })
+    window.route_info.update_route(continuous)
+    assert len(window.route_info._segments) == 3
+
+    preview = window._build_machine_route_preview(
+        [
+            {"pixel_x": 0.0, "pixel_y": 0.0, "status": 1},
+            {"pixel_x": 10.0, "pixel_y": 0.0, "status": 0},
+        ],
+        {"points_per_file": [2], "output_files": ["C:/route/001.txt"]},
+    )
+    window._machine_route_preview = preview
+    window._show_machine_route_preview(preview)
+
+    assert preview["path_result"]["segment_types"] == ["work"]
+    assert len(window.route_info._segments) == 1
+    assert window.route_info._segments[0]._label.text() == "作业线 01"
+    assert "作业线 1" in window.route_info._summary.toolTip()
+    assert "正式调头 0" in window.route_info._summary.toolTip()
+    window.close()
+
+
 def test_continuous_display_uses_solid_direct_turn_for_manual_adjustment():
     window = _window()
     result = window._normalise_path_result({
@@ -360,6 +392,74 @@ def test_route_edit_insert_delete_drag_and_sync_auto_path():
     window._route_edit_delete_point(1)
     assert window.state.path_points == [(0.0, 0.0), (10.0, 0.0)]
     assert window.state.path_status == [1]
+
+
+def test_route_edit_can_append_free_point_and_create_a_straight_edge():
+    window = _window()
+    window._route_edit_active = True
+    window._route_edit_mode = "add_point"
+    window.state.path_points = [(0.0, 0.0), (10.0, 0.0)]
+    window.state.path_status = [1]
+    window.state.path_geometry_modes = ["straight"]
+
+    assert window._handle_route_edit_press(100.0, 80.0, 1) is True
+
+    assert window.state.path_points == [
+        (0.0, 0.0), (10.0, 0.0), (100.0, 80.0)
+    ]
+    assert window.state.path_status == [1, 1]
+    assert window.state.path_geometry_modes == ["straight", "straight"]
+    window.close()
+
+
+def test_route_edit_switches_one_edge_between_straight_and_turn_preview():
+    window = _window()
+    window.state.path_points = [
+        (0.0, 0.0), (100.0, 0.0), (100.0, 30.0)
+    ]
+    window.state.path_status = [1, 0]
+    window.state.path_geometry_modes = ["straight", "turn"]
+
+    assert window._route_edit_set_segment_geometry_mode(1, 1, "straight") is True
+    assert window.state.path_geometry_modes == ["straight", "straight"]
+    window._sync_auto_path_from_editable_route()
+    straight_turn = next(
+        segment for segment in window.state.auto_path
+        if segment.segment_type == "turn"
+    )
+    assert len(straight_turn.points) == 2
+
+    assert window._route_edit_set_segment_geometry_mode(1, 1, "turn") is True
+    assert window.state.path_geometry_modes == ["straight", "turn"]
+    curved_turn = next(
+        segment for segment in window.state.auto_path
+        if segment.segment_type == "turn"
+    )
+    assert len(curved_turn.points) > 2
+    window.close()
+
+
+def test_route_edit_geometry_toolbar_targets_only_the_selected_point_edge():
+    window = _window()
+    window._route_edit_active = True
+    window.state.path_points = [
+        (0.0, 0.0), (50.0, 0.0), (100.0, 0.0), (100.0, 30.0)
+    ]
+    window.state.path_status = [1, 1, 0]
+    window.state.path_geometry_modes = ["straight", "straight", "turn"]
+    window.state.selected_type = "edge"
+    window.state.selected_idx = 1
+
+    window._on_route_edit_tool_requested("toggle_geometry")
+
+    assert window.state.path_geometry_modes == ["straight", "turn", "turn"]
+    work_records = [
+        record for record in window._route_edit_segment_records()
+        if record["type"] == "work"
+    ]
+    assert len(work_records) == 2
+    assert [record["work_index"] for record in work_records] == [0, 0]
+    window.close()
 
 
 def test_stale_plan_worker_result_is_ignored():
@@ -543,6 +643,31 @@ def test_route_editor_moves_deletes_reorders_and_reverses_whole_work_lines():
     records = window._route_edit_work_records()
     assert len(records) == 2
     assert window.state.path_status == [1, 0, 1]
+    window.close()
+
+
+def test_deleting_to_one_work_line_removes_all_turns_from_canonical_route():
+    """The route state must contain exactly what remains in the editor."""
+    window = _window()
+    for start, end in (
+        ((0.0, 0.0), (100.0, 0.0)),
+        ((100.0, 30.0), (0.0, 30.0)),
+        ((0.0, 60.0), (100.0, 60.0)),
+    ):
+        window._route_edit_add_work_line(start, end)
+
+    assert window._route_edit_delete_work_line(2) is True
+    assert window._route_edit_delete_work_line(1) is True
+
+    assert window.state.path_points == [(0.0, 0.0), (100.0, 0.0)]
+    assert window.state.path_status == [1]
+    assert len(window.state.auto_path) == 1
+    assert len(window.state.auto_path_segments) == 1
+    assert window.state.auto_path[0].segment_type == "work"
+    assert window._pipeline_result["path"]["segment_types"] == ["work"]
+    assert window._pipeline_result["path"]["full_path"] == [
+        [(0.0, 0.0), (100.0, 0.0)]
+    ]
     window.close()
 
 
@@ -985,6 +1110,28 @@ def test_visible_add_point_tool_keeps_exact_geometry_on_any_selected_edge():
     assert [(point.pixel_x, point.pixel_y) for point in work.points] == [
         (0.0, 0.0), (50.0, 18.0), (100.0, 0.0)
     ]
+    window.close()
+
+
+def test_add_point_tool_drags_existing_node_without_inserting_duplicate():
+    """Dragging an existing control point must never create another point."""
+    window = _window()
+    window._route_edit_active = True
+    window._route_edit_mode = "add_point"
+    window.state.path_points = [(0.0, 0.0), (100.0, 0.0)]
+    window.state.path_status = [1]
+    window.state.selected_type = "edge"
+    window.state.selected_idx = 0
+
+    assert window._handle_route_edit_press(0.0, 0.0, 1) is True
+    assert window._route_drag_idx == 0
+    assert window.state.path_points == [(0.0, 0.0), (100.0, 0.0)]
+
+    window._on_viewer_mouse_moved(12.0, 8.0, 1)
+    window._on_viewer_mouse_released(12.0, 8.0, 1)
+
+    assert window.state.path_points == [(12.0, 8.0), (100.0, 0.0)]
+    assert window.state.path_status == [1]
     window.close()
 
 

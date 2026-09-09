@@ -130,7 +130,29 @@ def test_machine_compatibility_removes_sub_two_centimetre_points(tmp_path):
         assert fields[1] == "0"
         assert fields[2] == str(index)
         assert fields[3] == "2"
-        assert fields[-1] in {"0", "1"}
+        assert fields[-1] == "2"
+    raw_lines = output.read_text(encoding="utf-8").splitlines()
+    assert raw_lines[0].startswith("$PATH,")
+    assert raw_lines[1].startswith("$PATH,")
+    assert raw_lines[-1] == "$INFM,0,0.7,0.7,0.7,0.7,0,5,0*"
+
+
+def test_machine_compatibility_matches_verified_terminal_file_bytes(tmp_path):
+    from path_planner import export_machine_compatibility_path
+
+    route = [
+        _point(116.45186929, 30.60105564, 0, "work", 0, 0),
+        _point(116.45161054, 30.60035398, 0, "work", 10, 0),
+    ]
+    output = tmp_path / "path_export.txt"
+
+    export_machine_compatibility_path(route, str(output))
+
+    assert output.read_text(encoding="utf-8") == (
+        "$PATH,0,0,2,30.60105564,116.45186929,0,0,2*\n"
+        "$PATH,0,1,2,30.60035398,116.45161054,0,0,2*\n"
+        "$INFM,0,0.7,0.7,0.7,0.7,0,5,0*\n"
+    )
 
 
 def test_machine_compatibility_treats_reverse_tag_as_one_straight_turn():
@@ -291,8 +313,11 @@ def test_machine_compatibility_splits_after_fifty_points_and_continues_numbering
         assert rows[0].split(",")[2] == "0"
         assert rows[-1].rstrip("*").split(",")[3] == str(expected_total)
         assert rows[-1].rstrip("*").split(",")[2] == str(expected_total - 1)
-        assert all(row.rstrip("*").split(",")[-1] in {"0", "1"} for row in rows)
-        assert rows[-1].rstrip("*").split(",")[-1] == "0"
+        assert all(row.rstrip("*").split(",")[-1] == "2" for row in rows)
+        assert rows[-1].rstrip("*").split(",")[-1] == "2"
+        assert path.read_text(encoding="utf-8").splitlines()[-1] == (
+            "$INFM,0,0.7,0.7,0.7,0.7,0,5,0*"
+        )
 
 
 def test_machine_compatibility_directory_export_starts_at_001(tmp_path):

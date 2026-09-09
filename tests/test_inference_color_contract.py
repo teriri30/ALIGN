@@ -89,7 +89,29 @@ def test_source_tif_inference_keeps_rgb_channel_order(monkeypatch):
     assert preprocessing["valid_tile_count"] == 1
     assert engine.captured
     assert engine.captured[0][0, 0].tolist() == [11, 22, 33]
-    assert engine.confidences == [0.10]
+    assert engine.confidences == [0.25]
+
+
+def test_source_tile_blend_weight_prefers_tile_centres_and_keeps_edge_support():
+    """DECISION-004/009: overlap fusion must downweight, not hard-paste, tile edges."""
+    from inference import _gaussian_tile_weight
+
+    weight = _gaussian_tile_weight(64, 64)
+
+    assert weight.shape == (64, 64)
+    assert weight[32, 32] > weight[0, 0]
+    assert weight[0, 0] >= 0.05
+    assert np.isclose(weight[0, 0], weight[-1, -1], atol=1e-6)
+    assert np.isclose(weight[0, -1], weight[-1, 0], atol=1e-6)
+
+
+def test_fused_probability_uses_explicit_threshold():
+    """DECISION-009: fused masks use one auditable threshold across tiles."""
+    from inference import _probability_to_mask
+
+    probability = np.asarray([[0.49, 0.50, 0.51]], dtype=np.float32)
+
+    assert _probability_to_mask(probability).tolist() == [[0, 255, 255]]
 
 
 def test_context_separator_filter_keeps_long_parallel_components():

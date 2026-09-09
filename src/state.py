@@ -1,5 +1,7 @@
 """数据类 + 应用状态"""
 import threading
+import datetime
+import uuid
 from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass, field
 from copy import deepcopy
@@ -44,11 +46,13 @@ class AutoPathSegment:
     corridor_id: int = -1
     length_m: float = 0.0
     segment_type: str = "work"  # "work", "turn", "entry", "exit"
+    geometry_mode: str = "straight"  # "straight" or "turn"
 
 
 class AppState:
     def __init__(self):
         self.state_lock = threading.Lock()
+        self._history_persist_callback = None
         self.reset()
 
     def reset(self):
@@ -76,6 +80,10 @@ class AppState:
 
         self.path_points: List[Tuple[float, float]] = []
         self.path_status: List[int] = []
+        # One value per control edge.  ``path_status`` keeps the terminal
+        # 0/1 work semantic; this parallel list controls whether the physical
+        # preview is straight or curved.
+        self.path_geometry_modes: List[str] = []
         self.undo_stack: List[Dict] = []
         self.redo_stack: List[Dict] = []
 
@@ -113,6 +121,16 @@ class AppState:
         self.mask_processing_progress: float = 0.0  # 0.0~1.0
         self.mask_result: Optional[Dict] = None   # process_mask() 返回的完整结果
         self.mask_provenance: Dict[str, Any] = {}
+
+        # 掩膜处理后、转弯连接前的整田中心线目录与操作员选择。
+        # The centerline fields are canonical for the left-panel checkbox UI;
+        # work_band_* remain as a cache/layout compatibility alias.
+        self.centerline_catalog: Dict[str, Any] = {}
+        self.selected_centerline_ids: List[str] = []
+        self.centerline_selection_report: Dict[str, Any] = {}
+        self.work_band_catalog: Dict[str, Any] = {}
+        self.selected_work_band_ids: List[str] = []
+        self.work_band_selection_report: Dict[str, Any] = {}
 
         # 路径规划进度
         self.plan_running: bool = False
@@ -289,14 +307,19 @@ class AppState:
             "historical_model_name", "historical_model_path", "historical_model_sha256",
             "cache_model_matches_active_engine",
             "mask_raw", "inference_original_mask", "mask_offset_x", "mask_offset_y",
-            "inference_done", "mask_processed", "mask_result",
+            "inference_done", "inference_provenance", "inference_runtime",
+            "mask_processed", "mask_result", "mask_provenance",
+            "work_band_catalog", "selected_work_band_ids",
+            "work_band_selection_report",
+            "centerline_catalog", "selected_centerline_ids",
+            "centerline_selection_report",
             "smooth_original_mask", "smoothed_result", "_show_original",
             "band_list", "corridors", "harvester_params", "harvester_param_sources",
             "turn_strategy", "turn_strategy_user_selected",
             "harvester_params_confirmed",
             "entry_point", "exit_point", "unload_points", "unload_point",
             "entry_point_locked", "exit_point_locked", "unload_point_locked",
-            "path_points", "path_status", "auto_path", "auto_path_planned",
+            "path_points", "path_status", "path_geometry_modes", "auto_path", "auto_path_planned",
             "auto_path_segments", "auto_path_geo", "auto_path_valid", "auto_path_desc",
             "workflow_step", "simulation_done", "export_done",
             "last_rolling_rate", "last_crop_mask_geometric_coverage_pct",
@@ -321,7 +344,7 @@ class AppState:
     def capture_route_snapshot(self, label: str = "路线编辑") -> Dict[str, Any]:
         """Capture only route-owned state so interactive edits stay responsive."""
         fields = (
-            "path_points", "path_status", "auto_path", "auto_path_planned",
+            "path_points", "path_status", "path_geometry_modes", "auto_path", "auto_path_planned",
             "auto_path_segments", "auto_path_geo", "auto_path_valid",
             "auto_path_desc", "simulation_done", "export_done",
             "entry_point", "exit_point", "entry_point_locked",
@@ -346,12 +369,39 @@ class AppState:
     def capture_mask_snapshot(self) -> Dict[str, Any]:
         return self.capture_system_snapshot("掩膜操作")
 
+    def set_history_persist_callback(self, callback):
+        """Register the UI-owned debounced disk checkpoint callback."""
+        self._history_persist_callback = callback
+
+    @staticmethod
+    def _ensure_history_identity(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        if not snapshot.get("history_id"):
+            snapshot["history_id"] = uuid.uuid4().hex
+        if not snapshot.get("created_at"):
+            snapshot["created_at"] = datetime.datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            )
+        return snapshot
+
+    def _history_changed(self):
+        callback = self._history_persist_callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            pass
+
     def push_history(self, snapshot: Dict[str, Any], clear_redo: bool = True):
+        # DECISION-025: every logical operation receives a stable identity so
+        # its JSON snapshot and dense array artifacts can be stored separately.
+        snapshot = self._ensure_history_identity(snapshot)
         if len(self.undo_stack) >= 50:
             self.undo_stack.pop(0)
         self.undo_stack.append(snapshot)
         if clear_redo:
             self.redo_stack.clear()
+        self._history_changed()
 
     def save_undo(self, label: str = "路线编辑"):
         self.push_history(self.capture_system_snapshot(label))
@@ -381,6 +431,9 @@ class AppState:
             self.auto_path_planned = bool(snapshot.get("auto_path_planned", False))
             self.path_points = deepcopy(snapshot.get("path_points", []))
             self.path_status = deepcopy(snapshot.get("path_status", []))
+            self.path_geometry_modes = deepcopy(
+                snapshot.get("path_geometry_modes", [])
+            )
             self.entry_point = deepcopy(snapshot.get("entry_point"))
             self.exit_point = deepcopy(snapshot.get("exit_point"))
             self.unload_points = deepcopy(snapshot.get("unload_points", []))
@@ -412,6 +465,9 @@ class AppState:
         else:
             self.path_points = deepcopy(snapshot.get("points", []))
             self.path_status = deepcopy(snapshot.get("status", []))
+            self.path_geometry_modes = deepcopy(
+                snapshot.get("geometry_modes", [])
+            )
         self.turn_strategy = {
             "uturn": "bow",
             "bulb": "pear",
@@ -442,6 +498,9 @@ class AppState:
             if last.get("kind") == "route_edit"
             else self.capture_system_snapshot(redo_label)
         )
+        redo_snapshot = self._ensure_history_identity(redo_snapshot)
+        if len(self.redo_stack) >= 50:
+            self.redo_stack.pop(0)
         self.redo_stack.append(redo_snapshot)
         self._restore_snapshot(last)
         self.status_message = f"已撤回：{last.get('label', '系统操作')}"
@@ -455,11 +514,15 @@ class AppState:
             return False
         nxt = self.redo_stack.pop()
         undo_label = nxt.get("label", "系统操作").replace("恢复：", "")
-        self.undo_stack.append(
+        undo_snapshot = (
             self.capture_route_snapshot(undo_label)
             if nxt.get("kind") == "route_edit"
             else self.capture_system_snapshot(undo_label)
         )
+        undo_snapshot = self._ensure_history_identity(undo_snapshot)
+        if len(self.undo_stack) >= 50:
+            self.undo_stack.pop(0)
+        self.undo_stack.append(undo_snapshot)
         self._restore_snapshot(nxt)
         self.status_message = f"已恢复：{nxt.get('label', '系统操作').replace('恢复：', '')}"
         self._persist_history_restore("redo")
@@ -489,6 +552,12 @@ class AppState:
             "mask_raw",
             "mask_processed",
             "mask_result",
+            "work_band_catalog",
+            "selected_work_band_ids",
+            "work_band_selection_report",
+            "centerline_catalog",
+            "selected_centerline_ids",
+            "centerline_selection_report",
             "current_model_path",
             "harvester_params",
             "entry_point",

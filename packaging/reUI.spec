@@ -37,6 +37,40 @@ def add_directory_if_present(path: Path, destination: str) -> None:
     if path.is_dir():
         datas.append((str(path), destination))
 
+
+def filter_host_tool_binaries(entries):
+    """Keep Codex/workspace helper runtimes out of the portable bundle."""
+    cleaned = []
+    replacement_dirs = (
+        Path(sys.prefix),
+        Path(sys.prefix) / "DLLs",
+        Path(sys.prefix) / "Library" / "bin",
+    )
+    for destination, source, kind in entries:
+        source_path = Path(source)
+        source_parts = {part.casefold() for part in source_path.parts}
+        if "codex-runtimes" not in source_parts:
+            cleaned.append((destination, source, kind))
+            continue
+
+        replacement = next(
+            (
+                directory / source_path.name
+                for directory in replacement_dirs
+                if (directory / source_path.name).is_file()
+            ),
+            None,
+        )
+        if replacement is not None:
+            print(
+                "Replacing host-tool DLL with build-environment DLL: "
+                f"{source_path} -> {replacement}"
+            )
+            cleaned.append((destination, str(replacement), kind))
+        else:
+            print(f"Excluding host-tool DLL from bundle: {source_path}")
+    return cleaned
+
 for package in (
     "PySide6", "numpy", "cv2", "PIL", "scipy", "shapely", "affine",
     "pyproj", "rasterio", "torch", "torchvision", "ultralytics",
@@ -84,6 +118,7 @@ analysis = Analysis(
     excludes=["pytest", "pytest_cov", "ruff", "tkinter"],
     noarchive=False,
 )
+analysis.binaries = filter_host_tool_binaries(analysis.binaries)
 pyz = PYZ(analysis.pure)
 exe = EXE(
     pyz,

@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,6 +21,41 @@ def _window():
     window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)
     window.image_view.set_image(window._tif_rgb)
     return window
+
+
+def test_snapshot_save_uses_next_number_in_selected_folder(monkeypatch, tmp_path):
+    window = _window()
+    (tmp_path / "snapshot.png").write_bytes(b"old-default")
+    (tmp_path / "快照1.png").write_bytes(b"one")
+    (tmp_path / "快照2.jpg").write_bytes(b"two")
+    saved = []
+
+    class FakeGrab:
+        def save(self, path):
+            target = Path(path)
+            target.write_bytes(b"snapshot")
+            saved.append(target)
+            return True
+
+    def reject_filename_dialog(*_args, **_kwargs):
+        raise AssertionError("snapshot saving must select a folder, not overwrite a file")
+
+    monkeypatch.setattr(
+        "pyside6_app.main_window.QFileDialog.getSaveFileName",
+        reject_filename_dialog,
+    )
+    monkeypatch.setattr(
+        "pyside6_app.main_window.QFileDialog.getExistingDirectory",
+        lambda *_args, **_kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr(window.image_view.viewer, "grab", lambda: FakeGrab())
+
+    window._on_save_snapshot()
+    window._on_save_snapshot()
+
+    assert saved == [tmp_path / "快照3.png", tmp_path / "快照4.png"]
+    assert window._snapshot_directory == str(tmp_path)
+    window.close()
 
 
 class _FixedMetricGeo:
@@ -129,6 +165,148 @@ def test_path_result_is_normalised_and_stored_for_current_ui():
     assert window.state.last_total_path_m == 15.0
 
 
+def test_path_overlay_keeps_the_current_base_image(monkeypatch):
+    """The live route overlay must not replace/reload the orthomosaic."""
+    window = _window()
+    set_image_calls = []
+    monkeypatch.setattr(
+        window.image_view,
+        "set_image",
+        lambda *args, **kwargs: set_image_calls.append((args, kwargs)),
+    )
+
+    window._show_path(
+        {
+            "full_path": [[(1.0, 2.0), (18.0, 2.0)]],
+            "segment_types": ["work"],
+        }
+    )
+
+    assert set_image_calls == []
+    window.close()
+
+
+def test_route_layer_can_be_removed_without_removing_mask_evidence():
+    """Live route edits must leave the base and evidence items in the scene."""
+    window = _window()
+    viewer = window.image_view.viewer
+    viewer.begin_overlay_layer("mask_evidence")
+    mask_item = viewer.draw_line(2, 2, 20, 2, color=(120, 255, 140))
+    viewer.end_overlay_layer()
+    viewer.begin_overlay_layer("route")
+    route_item = viewer.draw_line(2, 8, 20, 8, color=(0, 255, 70))
+    viewer.end_overlay_layer()
+
+    viewer.clear_overlay_layer("route")
+
+    assert route_item.scene() is None
+    assert mask_item.scene() is viewer._scene
+    assert viewer.has_overlay_layer("mask_evidence") is True
+    window.close()
+
+
+def test_named_overlay_visibility_can_be_toggled_independently():
+    """Display controls must hide one overlay without changing the base or route."""
+    window = _window()
+    viewer = window.image_view.viewer
+    viewer.begin_overlay_layer("raw_mask")
+    raw_item = viewer.draw_line(2, 2, 20, 2, color=(120, 255, 140))
+    viewer.end_overlay_layer()
+    viewer.begin_overlay_layer("route")
+    route_item = viewer.draw_line(2, 8, 20, 8, color=(0, 255, 70))
+    viewer.end_overlay_layer()
+
+    viewer.set_overlay_layer_visible("raw_mask", False)
+
+    assert viewer._pixmap_item.isVisible() is True
+    assert raw_item.isVisible() is False
+    assert route_item.isVisible() is True
+
+    viewer.set_overlay_layer_visible("raw_mask", True)
+    assert raw_item.isVisible() is True
+    window.close()
+
+
+def test_display_panel_lists_layers_and_keeps_visibility_view_only():
+    """The expanded display tree controls rows without changing planning state."""
+    window = _window()
+    group = window.image_view
+    selected_before = list(window.state.selected_centerline_ids)
+    group.set_display_layer_available("raw_mask", True, default_visible=True)
+    group.set_display_layer_available("route", True, default_visible=False)
+    window.show()
+    QApplication.processEvents()
+
+    raw_item = group._display_layer_items["raw_mask"]
+    route_item = group._display_layer_items["route"]
+    assert raw_item.text(0) == "原始掩膜"
+    assert raw_item.checkState(0) == Qt.Checked
+    assert route_item.checkState(0) == Qt.Unchecked
+
+    group.display_toggle_button.click()
+    assert group.display_layers_panel.isVisible() is True
+    raw_item.setCheckState(0, Qt.Unchecked)
+
+    assert group.display_layer_visible("raw_mask") is False
+    assert window.state.selected_centerline_ids == selected_before
+    window.close()
+
+
+def test_display_panel_hides_unavailable_rows_and_stale_centerlines():
+    """Only currently drawable layers remain selectable in the popup."""
+    window = _window()
+    group = window.image_view
+
+    window.state.centerline_catalog = {
+        "items": [
+            {"id": "invalid", "centerline": [(1.0, 1.0)]},
+            {"id": "valid", "centerline": [(1.0, 1.0), (8.0, 8.0)]},
+        ]
+    }
+    window.state.selected_centerline_ids = ["invalid"]
+    window._sync_display_layer_availability()
+
+    centerline_item = group._display_layer_items["centerlines"]
+    assert centerline_item.isHidden() is True
+
+    window.state.selected_centerline_ids = ["valid"]
+    window._sync_display_layer_availability()
+    assert centerline_item.isHidden() is False
+
+    window.state.mask_raw = np.ones((4, 4), dtype=np.uint8)
+    window.state.mask_result = {
+        "processed_mask": np.ones((4, 4), dtype=np.uint8),
+    }
+    window._sync_display_layer_availability()
+    assert group._display_layer_items["raw_mask"].isHidden() is False
+    assert group._display_layer_items["raw_mask"].checkState(0) == Qt.Unchecked
+
+    group.set_display_layer_available("raw_mask", False)
+    assert group._display_layer_items["raw_mask"].isHidden() is True
+    window.close()
+
+
+def test_display_layers_popup_does_not_consume_main_layout_height():
+    """The compact layer chooser overlays the canvas like a combo popup."""
+    window = _window()
+    group = window.image_view
+    group.set_display_layer_available("route", True, default_visible=True)
+    window.show()
+    QApplication.processEvents()
+
+    viewer_height_before = group.viewer.height()
+    assert group.layout().indexOf(group.display_layers_panel) == -1
+
+    group.display_toggle_button.click()
+    QApplication.processEvents()
+
+    assert group.display_layers_panel.windowFlags() & Qt.Popup
+    assert group.display_layers_panel.isVisible() is True
+    assert group.display_layers_panel.height() <= 70
+    assert group.viewer.height() == viewer_height_before
+    window.close()
+
+
 def test_pipeline_step_results_update_state():
     window = _window()
     raw = np.ones((20, 20), dtype=np.uint8) * 255
@@ -147,13 +325,21 @@ def test_pipeline_step_results_update_state():
     assert window.state.mask_result is processed
 
 
-def test_service_point_tasks_belong_to_path_planning_stage():
+def test_workflow_separates_centerlines_from_path_planning_and_advanced_settings():
     from pyside6_app.panels import STEP_GROUPS
 
-    parameter_group = next(group for group in STEP_GROUPS if group["label"] == "参数配置")
+    advanced_group = next(group for group in STEP_GROUPS if group["label"] == "高级设置")
+    centerline_generation_group = next(
+        group for group in STEP_GROUPS if group["label"] == "生成中心线"
+    )
+    centerline_selection_group = next(
+        group for group in STEP_GROUPS if group["label"] == "选择中心线"
+    )
     planning_group = next(group for group in STEP_GROUPS if group["label"] == "路径规划")
 
-    assert parameter_group["tasks"] == ["params"]
+    assert advanced_group["tasks"] == ["params"]
+    assert centerline_generation_group["tasks"] == ["centerline_generate"]
+    assert centerline_selection_group["tasks"] == ["centerline_select"]
     assert planning_group["tasks"] == ["entry", "exit", "unload", "plan"]
 
 
@@ -164,7 +350,9 @@ def test_task_rows_stack_actions_below_summary_without_overlap():
     app = QApplication.instance()
     app.processEvents()
     panel = window.task_panel
-    card = panel._step_cards[5]
+    card = next(
+        card for card in panel._step_cards if card._title.text().endswith("路径规划")
+    )
     card.set_expanded(True)
     for other in panel._step_cards:
         if other is not card:
@@ -202,14 +390,14 @@ def test_planning_card_fully_expands_in_scroll_area_without_overlap():
     panel = window.task_panel
     panel.set_route_editing_active(True)
     app.processEvents()
-    card = next(c for c in panel._step_cards if c._title.text().startswith("6."))
+    card = next(c for c in panel._step_cards if c._title.text().endswith("高级设置"))
     card.set_expanded(True)
     for other in panel._step_cards:
         if other is not card:
             other.set_expanded(False)
     app.processEvents()
 
-    rows = [panel._task_widgets[tid] for tid in ("entry", "exit", "unload", "plan")]
+    rows = [panel._task_widgets["params"]]
     tops = [row.mapTo(panel, QPoint(0, 0)).y() for row in rows]
     for i in range(1, len(rows)):
         assert tops[i] >= tops[i - 1] + rows[i - 1].height() - 1, f"任务行 {rows[i].tid} 与上一行重叠"
@@ -235,7 +423,7 @@ def test_edit_mode_does_not_inject_a_duplicate_tool_grid_into_planning_card():
     app = QApplication.instance()
     app.processEvents()
     panel = window.task_panel
-    card = next(c for c in panel._step_cards if c._title.text().startswith("6."))
+    card = next(c for c in panel._step_cards if c._title.text().endswith("高级设置"))
     card.set_expanded(True)
     for other in panel._step_cards:
         if other is not card:
@@ -246,8 +434,70 @@ def test_edit_mode_does_not_inject_a_duplicate_tool_grid_into_planning_card():
     panel.set_route_editing_active(True)
     app.processEvents()
 
-    assert card.height() == height_before
+    # Editing exposes the three compact route tools in the same advanced card;
+    # the card must grow to contain that row rather than injecting a second
+    # tool grid or clipping the existing controls.
+    assert card.height() > height_before
+    assert panel.route_edit_action_row.isHidden() is False
     assert not hasattr(panel, "route_edit_tools")
+    window.close()
+
+
+def test_centerline_selection_is_rendered_in_its_own_task_card():
+    from pyside6_app.panels import CenterlineSelectionRow, RouteInfoPanel, TaskPanel
+
+    app = QApplication.instance() or QApplication([])
+    panel = TaskPanel()
+    panel.show()
+    app.processEvents()
+
+    centerline_card = next(
+        card for card in panel._step_cards if card._title.text().endswith("选择中心线")
+    )
+    advanced_card = next(
+        card for card in panel._step_cards if card._title.text().endswith("高级设置")
+    )
+    planning_card = next(
+        card for card in panel._step_cards if card._title.text().endswith("路径规划")
+    )
+    assert not centerline_card._expanded
+    assert not advanced_card._expanded
+    assert panel._task_widgets["exit"]._label.text() == "终点（可选）"
+    assert panel._task_widgets["unload"]._label.text() == "卸粮点（可选）"
+    assert panel._task_widgets["params"].parentWidget() is advanced_card._content
+    assert panel.route_edit_btn.parentWidget() is advanced_card._content
+    assert panel.route_edit_btn.parentWidget() is not planning_card._content
+
+    catalog = {
+        "items": [
+            {
+                "id": "centerline-001",
+                "sequence": 1,
+                "label": "中心线 1",
+                "centerline": [(1.0, 1.0), (2.0, 2.0)],
+            }
+        ]
+    }
+    panel.update_centerline_selection(catalog, ["centerline-001"])
+    app.processEvents()
+    assert len(panel.centerline_selector.findChildren(CenterlineSelectionRow)) == 1
+    row = panel.centerline_selector.findChildren(CenterlineSelectionRow)[0]
+    row.checkbox.setChecked(False)
+    app.processEvents()
+    assert panel.centerline_selector._count_label.text() == "已选择 0/1 条"
+
+    result_panel = RouteInfoPanel()
+    assert not result_panel.findChildren(CenterlineSelectionRow)
+    result_panel.close()
+    panel.close()
+
+
+def test_step_card_stylesheet_has_balanced_qss_braces():
+    """A malformed card stylesheet must not emit Qt parse warnings."""
+    window = _window()
+    stylesheet = window.task_panel._step_cards[0].styleSheet()
+
+    assert ";}}" not in stylesheet
     window.close()
 
 
@@ -259,7 +509,9 @@ def test_task_panel_uses_smallest_width_without_horizontal_squeeze():
     panel = TaskPanel()
     panel.resize(TASK_PANEL_COMPACT_MIN_WIDTH, 520)
     panel.show()
-    planning_card = panel._step_cards[5]
+    planning_card = next(
+        card for card in panel._step_cards if card._title.text().endswith("路径规划")
+    )
     planning_card.set_expanded(True)
     for other in panel._step_cards:
         if other is not planning_card:
@@ -364,6 +616,30 @@ def test_mask_processing_start_prompt_defers_service_points_to_path_planning(mon
     assert messages == [
         "掩膜处理已开始，完成后请进入“路径规划”确认起点；终点将沿最终作业段自动延伸。"
     ]
+
+
+def test_mask_processing_rejects_historical_mask_without_active_model(monkeypatch):
+    window = _window()
+    messages = []
+    window.state.safe_update(
+        mask_raw=np.ones((20, 20), dtype=np.uint8),
+        inference_done=True,
+        cache_model_matches_active_engine=False,
+    )
+    monkeypatch.setattr(
+        window.log_panel,
+        "warn",
+        lambda message: messages.append(message),
+    )
+    monkeypatch.setattr(window, "_has_background_worker", lambda: False)
+
+    window._on_mask_process()
+
+    assert messages == [
+        "当前掩膜来自历史模型缓存，但该模型尚未加载；"
+        "请先加载同一模型，或重新执行 AI识别后再处理掩膜。"
+    ]
+    window.close()
 
 def test_pending_segment_completion_enables_mask_process_action():
     window = _window()
@@ -632,6 +908,7 @@ def test_source_tif_inference_streams_oversized_crop_at_source_tile_size(monkeyp
     state.current_model_name = "model.pt"
     state.source_sha256 = "source-sha"
     state.model_sha256 = "model-sha"
+    state.cache_model_matches_active_engine = False
     engine = inference.ModelEngine()
     engine._loaded = True
     engine._model = object()
@@ -732,6 +1009,7 @@ def test_source_tif_inference_streams_oversized_crop_at_source_tile_size(monkeyp
     assert calls["inference_shape"][:2] == (640, 640)
     assert state.inference_done is True
     assert state.inference_running is False
+    assert state.cache_model_matches_active_engine is True
     assert state.mask_raw.shape == (5255, 3769)
     assert state.mask_offset_x == 0
     assert state.mask_offset_y == 0
@@ -892,7 +1170,8 @@ def test_recommended_harvester_params_sync_state_when_same_as_config(monkeypatch
     assert window.state.harvester_params["track_width_m"] == defaults["track_width_m"]
     assert window.state.harvester_params["track_length_m"] == defaults["track_length_m"]
     assert window.state.harvester_params["cutter_forward_offset_m"] == pytest.approx(1.35)
-    assert window.task_panel._task_widgets["plan"]._action_btn.isEnabled()
+    assert window.task_panel._task_widgets["centerline_generate"]._action_btn.isEnabled()
+    assert not window.task_panel._task_widgets["plan"]._action_btn.isEnabled()
 
 
 def test_restore_visual_prefers_planned_path_over_boundary_only(monkeypatch):
@@ -1020,6 +1299,11 @@ def test_path_planning_action_stays_clickable_when_only_cutter_offset_is_missing
     state.mask_raw = raw
     state.mask_processed = True
     state.mask_result = {"processed_mask": raw}
+    state.centerline_catalog = {
+        "algorithm_version": "operator-centerline-catalog-v1",
+        "items": [{"id": "centerline-001", "sequence": 1}],
+    }
+    state.selected_centerline_ids = ["centerline-001"]
     state.harvester_params = {
         "cutter_width_m": 2.15,
         "cutter_forward_offset_m": None,
@@ -1057,6 +1341,11 @@ def test_mask_completion_stops_at_parameter_confirmation_before_path_planning():
     state.mask_raw = raw
     state.mask_processed = True
     state.mask_result = {"processed_mask": raw}
+    state.centerline_catalog = {
+        "algorithm_version": "operator-centerline-catalog-v1",
+        "items": [{"id": "centerline-001", "sequence": 1}],
+    }
+    state.selected_centerline_ids = ["centerline-001"]
     state.harvester_params = {
         "cutter_width_m": 2.15,
         "cutter_forward_offset_m": 0.65,
@@ -1088,6 +1377,11 @@ def test_path_planning_unlocks_after_parameters_and_start_are_confirmed():
     state.mask_raw = raw
     state.mask_processed = True
     state.mask_result = {"processed_mask": raw}
+    state.centerline_catalog = {
+        "algorithm_version": "operator-centerline-catalog-v1",
+        "items": [{"id": "centerline-001", "sequence": 1}],
+    }
+    state.selected_centerline_ids = ["centerline-001"]
     state.harvester_params = {
         "cutter_width_m": 2.15,
         "cutter_forward_offset_m": 0.65,
@@ -1128,6 +1422,20 @@ def test_plan_action_accepts_confirmed_start_without_optional_exit(monkeypatch):
         entry_point_locked=True,
         exit_point=None,
         exit_point_locked=False,
+        centerline_catalog={
+            "algorithm_version": "operator-centerline-catalog-v1",
+            "items": [{
+                "id": "centerline-001",
+                "sequence": 1,
+                "label": "中心线 1",
+                "centerline": [(2.0, 3.0), (18.0, 3.0)],
+            }],
+        },
+        selected_centerline_ids=["centerline-001"],
+        centerline_selection_report={
+            "selection_origin": "operator",
+            "selected_ids": ["centerline-001"],
+        },
     )
     created = []
 
@@ -1154,6 +1462,8 @@ def test_plan_action_accepts_confirmed_start_without_optional_exit(monkeypatch):
     assert created[0][0] == (2.0, 3.0)
     assert created[0][1] is None
     assert created[0][2]["service_point_mode"] == "reference_only"
+    assert created[0][2]["include_route_finish_extension"] is True
+    assert created[0][2].get("route_order") != "adjacent_snake"
 
 
 def test_start_recommendation_removes_only_unconfirmed_legacy_exit(monkeypatch):
@@ -1218,6 +1528,23 @@ def test_canvas_compare_toggles_source_image_and_current_result(monkeypatch):
     window._on_toggle_mask_compare()
     assert window._show_mask_before is False
     assert calls[-1] == ("current", True)
+
+
+def test_canvas_compare_hides_all_overlay_choices_in_source_mode(monkeypatch):
+    """Source TIF mode must not leave stale overlay rows selectable."""
+    window = _window()
+    group = window.image_view
+    group.set_display_layer_available("route", True, default_visible=True)
+    route_item = group._display_layer_items["route"]
+    assert route_item.isHidden() is False
+
+    monkeypatch.setattr(group, "set_image", lambda *_args, **_kwargs: None)
+    window._on_toggle_mask_compare()
+
+    assert window._show_mask_before is True
+    assert route_item.isHidden() is True
+    assert group.display_toggle_button.isEnabled() is False
+    window.close()
 
 
 def test_canvas_compare_preserves_zoom_rotation_and_image_location():
@@ -1310,6 +1637,24 @@ def test_harvester_parameter_confirmation_is_persisted_in_project_state(tmp_path
     payload = cache._build_project_state_payload(str(tif), state, "params_confirmed")
 
     assert payload["harvester_params_confirmed"] is True
+
+
+def test_project_state_persists_route_geometry_modes(tmp_path):
+    import cache
+    from state import AppState
+
+    tif = tmp_path / "field.tif"
+    tif.write_bytes(b"field")
+    state = AppState()
+    state.path_points = [(0.0, 0.0), (10.0, 0.0), (10.0, 5.0)]
+    state.path_status = [1, 0]
+    state.path_geometry_modes = ["straight", "turn"]
+
+    payload = cache._build_project_state_payload(str(tif), state, "manual_route")
+
+    assert payload["path_points"] == [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0]]
+    assert payload["path_status"] == [1, 0]
+    assert payload["path_geometry_modes"] == ["straight", "turn"]
 
 
 def test_cache_restore_reenables_confirmed_parameters_after_processed_mask(monkeypatch):
@@ -1525,8 +1870,8 @@ def test_missing_optional_exit_finishes_on_last_work_line_without_return():
     assert diagnostics["service_points"]["exit_present"] is False
 
 
-def test_desktop_route_uses_adjacent_snake_order_and_writes_finish_extension():
-    """The implementation route visits neighbouring rows and has a concrete finish."""
+def test_contour_route_ignores_legacy_adjacent_snake_override_and_writes_finish_extension():
+    """DECISION-016: contour must keep the half-split order at the desktop boundary."""
     from path_planner import _connect_work_lines
     from state import AppState
 
@@ -1559,14 +1904,16 @@ def test_desktop_route_uses_adjacent_snake_order_and_writes_finish_extension():
         segment for segment, kind in zip(full_path, segment_types)
         if kind == "work"
     ]
-    assert [line[0][1] for line in work_lines] == [10.0, 20.0, 30.0, 40.0]
+    assert [line[0][1] for line in work_lines] == [10.0, 30.0, 20.0, 40.0]
     assert segment_types[-1] == "exit"
     assert full_path[-1][0] == work_lines[-1][-1]
     assert full_path[-1][-1] != full_path[-1][0]
     assert np.linalg.norm(
         np.asarray(full_path[-1][-1]) - np.asarray(full_path[-1][0])
     ) > 0.0
-    assert diagnostics["contour_ordering"]["ordering"] == "adjacent_snake"
+    assert diagnostics["contour_ordering"]["ordering"] == (
+        "contour_half_split_interleaved"
+    )
 
 
 def test_service_points_can_explicitly_remain_reference_only():
@@ -2021,6 +2368,29 @@ def test_confirming_no_forbidden_area_invalidates_existing_path():
     assert window.state.auto_path == []
 
 
+def test_mask_overlay_hides_analysis_context_outside_selected_field(monkeypatch):
+    """The display boundary clips copies without discarding analysis context."""
+    window = _window()
+    window._tif_rgb = np.zeros((30, 40, 3), dtype=np.uint8)
+    window.image_view.set_image(window._tif_rgb)
+    mask = np.full((30, 40), 255, dtype=np.uint8)
+    window.state.safe_update(field_boundary=[(10, 5), (30, 5), (30, 25), (10, 25)])
+    calls = []
+    monkeypatch.setattr(
+        window.image_view.viewer,
+        "draw_mask_overlay",
+        lambda drawn, *_args, **_kwargs: calls.append(drawn),
+    )
+
+    window._show_mask_overlay(mask)
+
+    assert len(calls) == 1
+    assert calls[0] is not mask
+    assert calls[0][15, 20] == 255
+    assert calls[0][2, 2] == 0
+    assert mask[2, 2] == 255
+
+
 def test_mask_overlay_draws_headland_and_uncertain_as_separate_layers(monkeypatch):
     """DECISION-009: uncertain residuals must not look like work-body pixels."""
     window = _window()
@@ -2051,6 +2421,61 @@ def test_mask_overlay_draws_headland_and_uncertain_as_separate_layers(monkeypatc
     assert calls[1][0] is uncertain
     assert calls[2][0] is body
     assert len({calls[0][1], calls[1][1], calls[2][1]}) == 3
+
+
+def test_mask_display_layers_can_be_composed_without_replacing_the_tif():
+    """Raw/processed overlays are independent and all-off returns to the TIF."""
+    window = _window()
+    window._tif_rgb = np.zeros((40, 60, 3), dtype=np.uint8)
+    window.image_view.set_image(window._tif_rgb)
+    raw = np.zeros((40, 60), dtype=np.uint8)
+    raw[4:18, 4:22] = 255
+    processed = np.zeros_like(raw)
+    processed[22:36, 30:56] = 255
+    window.state.mask_raw = raw
+    window.state.mask_result = {"processed_mask": processed}
+
+    window._show_mask_overlay(processed)
+    viewer = window.image_view.viewer
+    assert set(("raw_mask", "processed_mask")) <= set(viewer._overlay_layers)
+    assert all(not item.isVisible() for item in viewer._overlay_layers["raw_mask"])
+    assert all(item.isVisible() for item in viewer._overlay_layers["processed_mask"])
+
+    window.image_view.set_display_layer_visibility(
+        "raw_mask", True, user=True
+    )
+    window.image_view.set_display_layer_visibility(
+        "processed_mask", False, user=True
+    )
+    assert all(item.isVisible() for item in viewer._overlay_layers["raw_mask"])
+    assert all(not item.isVisible() for item in viewer._overlay_layers["processed_mask"])
+
+    for key in list(window.image_view.display_layer_states()):
+        window.image_view.set_display_layer_visibility(key, False, user=True)
+    assert viewer._pixmap_item.isVisible() is True
+    assert all(not item.isVisible() for item in viewer._overlay_group)
+    window.close()
+
+
+def test_centerline_overlay_keeps_display_offset_in_display_coordinates():
+    """DECISION-004/024: display-space centerlines must not rescale their offset."""
+    window = _window()
+    window._tif_rgb = np.zeros((1000, 1600, 3), dtype=np.uint8)
+    window.state.safe_update(
+        source_img_h=4000,
+        source_img_w=6400,
+        display_h=1000,
+        display_w=1600,
+        mask_offset_x=1200,
+        mask_offset_y=300,
+    )
+
+    points = window._centerline_display_points({
+        "centerline": [(20.0, 30.0), (200.0, 430.0)],
+    })
+
+    np.testing.assert_allclose(points, [(1220.0, 330.0), (1400.0, 730.0)])
+    window.close()
 
 
 def test_source_resolution_mask_is_normalised_to_display_coordinates():
@@ -2156,15 +2581,160 @@ def test_mask_diagnostic_bundle_preserves_stages_and_flags_detached_components(t
     assert detached["nearest_band_id"] == 7
 
 
+def test_inference_diagnostic_bundle_records_source_model_and_tile_positions(tmp_path):
+    import io
+    import json
+    import zipfile
+
+    from inference_diagnostics import export_inference_diagnostic_bundle
+
+    source = np.full((80, 120, 3), 90, dtype=np.uint8)
+    raw = np.zeros((40, 60), dtype=np.uint8)
+    raw[8:28, 12:48] = 255
+    summary = export_inference_diagnostic_bundle(
+        str(tmp_path / "识别001.zip"),
+        source,
+        raw,
+        metadata={
+            "run_label": "识别001",
+            "source_image": {"path": "E:/field/result.tif", "sha256": "source"},
+            "model": {"name": "tiller12.pt", "path": "E:/models/tiller12.pt", "sha256": "model"},
+            "image_position": {"source_crop_window_xywh": [100, 200, 600, 400]},
+            "inference": {"algorithm_version": "test-v1", "config": {"overlap": 0.4}},
+        },
+        mask_offset=(20, 10),
+        field_boundary=[(22, 12), (76, 12), (76, 45), (22, 45)],
+        tile_trace=[{
+            "tile_index": 0,
+            "row": 0,
+            "column": 0,
+            "source_window_xywh": [100, 200, 640, 640],
+            "output_window_xywh": [0, 0, 32, 32],
+            "accepted_instance_count": 2,
+            "max_confidence": 0.83,
+            "tile_probability_pixels": 120,
+            "skipped_nodata": False,
+        }],
+    )
+
+    with zipfile.ZipFile(summary["path"], "r") as archive:
+        assert {
+            "manifest.json", "source_preview.png", "raw_overlay.png",
+            "field_clipped_overlay.png", "tile_grid.png", "raw_mask.png",
+            "raw_mask.npz", "tile_trace.csv", "tile_trace.json",
+        } <= set(archive.namelist())
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["schema"] == "reui.inference-diagnostic.v1"
+        assert manifest["run_label"] == "识别001"
+        assert manifest["source_image"]["path"].endswith("result.tif")
+        assert manifest["model"]["name"] == "tiller12.pt"
+        assert manifest["image_position"]["source_crop_window_xywh"] == [100, 200, 600, 400]
+        assert manifest["tile_summary"]["primary"]["tile_count"] == 1
+        with np.load(io.BytesIO(archive.read("raw_mask.npz"))) as arrays:
+            assert arrays["raw_mask"].shape == raw.shape
+
+
+def test_inference_diagnostic_field_clipped_overlay_uses_mask_offset(tmp_path):
+    import cv2
+    import json
+    import zipfile
+
+    from inference_diagnostics import export_inference_diagnostic_bundle
+
+    source = np.full((12, 16, 3), 90, dtype=np.uint8)
+    raw = np.full((6, 8), 255, dtype=np.uint8)
+    output = export_inference_diagnostic_bundle(
+        str(tmp_path / "识别002.zip"),
+        source,
+        raw,
+        metadata={"run_label": "识别002"},
+        mask_offset=(4, 3),
+        field_boundary=[(4, 3), (11, 3), (11, 9), (4, 9)],
+    )
+
+    with zipfile.ZipFile(output["path"], "r") as archive:
+        overlay = cv2.imdecode(
+            np.frombuffer(archive.read("field_clipped_overlay.png"), np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["image_position"]["mask_offset_xy_display"] == [4, 3]
+    # A point outside the selected field remains the original gray pixel.
+    assert np.all(overlay[1, 1] == [90, 90, 90])
+    # A point inside the offset mask receives the green blend.
+    assert not np.all(overlay[6, 7] == [90, 90, 90])
+
+
+def test_mask_diagnostic_manifest_includes_stage_provenance_and_run_label(tmp_path):
+    import cv2
+    import json
+    import zipfile
+    from mask_diagnostics import export_mask_diagnostic_bundle
+
+    shape = (30, 40)
+    raw = np.zeros(shape, dtype=np.uint8)
+    raw[8:22, 4:34] = 255
+    result = {
+        "processed_mask": raw.copy(),
+        "regularized_body_mask": raw.copy(),
+        "headland_mask": np.zeros(shape, dtype=np.uint8),
+        "uncertain_residual_mask": np.zeros(shape, dtype=np.uint8),
+        "planning_support_mask": raw.copy(),
+        "main_angle": 0.0,
+        "all_bands": [],
+        "diagnostics": {"meters_per_pixel": 0.1, "algorithm_version": 17},
+    }
+    summary = export_mask_diagnostic_bundle(
+        str(tmp_path / "掩膜优化001.zip"),
+        raw,
+        result,
+        metadata={
+            "run_label": "掩膜优化001",
+            "source_image": {"path": "E:/field/result.tif"},
+            "model": {"name": "tiller12.pt"},
+        },
+        source_image=np.zeros((*shape, 3), dtype=np.uint8),
+    )
+    with zipfile.ZipFile(summary["path"], "r") as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["stage"] == "mask_optimization"
+        assert manifest["run_label"] == "掩膜优化001"
+        assert manifest["provenance"]["model"]["name"] == "tiller12.pt"
+
+
 def test_mask_diagnostic_button_requires_processed_mask():
     window = _window()
+    assert window.task_panel.inference_diagnostic_btn.isEnabled() is False
     assert window.task_panel.mask_diagnostic_btn.isEnabled() is False
 
+    window.state.inference_done = True
+    window.state.mask_raw = np.ones((20, 20), dtype=np.uint8)
     window.state.mask_processed = True
     window.state.mask_result = {"processed_mask": np.ones((20, 20), dtype=np.uint8)}
     window._refresh_state()
 
+    assert window.task_panel.inference_diagnostic_btn.isEnabled() is True
     assert window.task_panel.mask_diagnostic_btn.isEnabled() is True
+
+
+def test_diagnostic_export_path_continues_numbering_in_selected_directory(tmp_path):
+    window = _window()
+    window._tif_path = str(tmp_path / "result.tif")
+    (tmp_path / "识别001.zip").write_bytes(b"existing")
+    assert os.path.basename(window._next_diagnostic_default_path("识别")) == "识别002.zip"
+
+    selected_dir = tmp_path / "desktop"
+    selected_dir.mkdir()
+    (selected_dir / "识别001.zip").write_bytes(b"existing")
+    selected = window._reserve_diagnostic_path(
+        str(selected_dir / "识别001.zip"), "识别"
+    )
+    assert os.path.basename(selected) == "识别002.zip"
+    (selected_dir / "识别002.zip").write_bytes(b"existing")
+    assert (
+        os.path.abspath(window._next_diagnostic_default_path("识别"))
+        == os.path.abspath(str(selected_dir / "识别003.zip"))
+    )
 
 
 def _synthetic_terminal_headland():

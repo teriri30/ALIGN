@@ -284,6 +284,242 @@
         "requires_manual_confirmation": false,
         "reason": "training metadata, class mapping, preprocessing and validation metrics are recorded"
       }
+    },
+    {
+      "name": "yolo11s_seg_transplant_12m_legacy_best.pt",
+      "display_name": "YOLO11s-seg（插秧期12m｜旧版基线）",
+      "sha256": "9df14dfb7c8800504737dcd34d42389684c9d52eb7e88c51ea4c514da48cf9a9",
+      "framework": "ultralytics",
+      "architecture": "yolo11s-seg",
+      "task": "instance_segmentation",
+      "reported_metrics": {
+        "mask_mAP50": 0.9680237982798596,
+        "mask_mAP50_95": 0.7829040670232211,
+        "precision": 0.97880877263013,
+        "recall": 0.9173042966450854
+      },
+      "metadata_status": "complete",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-baseline",
+      "class_mapping": {
+        "0": "rice"
+      },
+      "training_preprocessing": {
+        "slice_size": 640,
+        "imgsz": 640,
+        "overlap": 0.4,
+        "augmentation_scope": "train_only_online_baseline"
+      },
+      "source_context": "插秧期12m（旧版基线，未使用strongaug配方）",
+      "legacy_baseline": true,
+      "stage": "插秧期",
+      "height_m": 12,
+      "source_groups": [
+        "4.12 田4 12m"
+      ],
+      "source_count": 111,
+      "train_tiles": 11504,
+      "val_tiles": 2315,
+      "compatibility": {
+        "requires_manual_confirmation": false,
+        "reason": "旧版基线权重已复制到内置模型目录并完成 SHA-256 登记，用于与强增强版对照"
+      }
+    },
+    {
+      "name": "yolo11s_seg_greenup_12m_legacy_best.pt",
+      "display_name": "YOLO11s-seg（返青期12m｜旧版基线）",
+      "sha256": "234ddd2a7681c807bec34399118c3cc9f8619dcd8566b9003b058ed1ce804798",
+      "framework": "ultralytics",
+      "architecture": "yolo11s-seg",
+      "task": "instance_segmentation",
+      "reported_metrics": {
+        "mask_mAP50": 0.9174291168006979,
+        "mask_mAP50_95": 0.7157645772282359,
+        "precision": 0.9427687852614353,
+        "recall": 0.8791477471184073
+      },
+      "metadata_status": "complete",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-baseline",
+      "class_mapping": {
+        "0": "rice"
+      },
+      "training_preprocessing": {
+        "slice_size": 640,
+        "imgsz": 640,
+        "overlap": 0.4,
+        "augmentation_scope": "train_only_online_baseline"
+      },
+      "source_context": "返青期12m（旧版基线，未使用strongaug配方）",
+      "legacy_baseline": true,
+      "stage": "返青期",
+      "height_m": 12,
+      "source_groups": [
+        "5.6 田1 12m"
+      ],
+      "source_count": 124,
+      "train_tiles": 13099,
+      "val_tiles": 2146,
+      "compatibility": {
+        "requires_manual_confirmation": false,
+        "reason": "旧版基线权重已复制到内置模型目录并完成 SHA-256 登记，用于与强增强版对照"
+      }
+    },
+    {
+      "name": "yolo11s_seg_greenup_30m_legacy_best.pt",
+      "display_name": "YOLO11s-seg（返青期30m｜旧版基线）",
+      "sha256": "4034f5dfd41e228c1dd599eccfb26746ef9a696b0336c3c075fcb545628ffbc6",
+      "framework": "ultralytics",
+      "architecture": "yolo11s-seg",
+      "task": "instance_segmentation",
+      "reported_metrics": {
+        "mask_mAP50": 0.9439347306571716,
+        "mask_mAP50_95": 0.7749159153821987,
+        "precision": 0.9477068569391112,
+        "recall": 0.902804788183017
+      },
+      "metadata_status": "complete",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-baseline",
+      "class_mapping": {
+        "0": "rice"
+      },
+      "training_preprocessing": {
+        "slice_size": 640,
+        "imgsz": 640,
+        "overlap": 0.4,
+        "augmentation_scope": "train_only_online_baseline"
+      },
+      "source_context": "返青期30m（旧版基线，未使用strongaug配方）",
+      "legacy_baseline": true,
+      "stage": "返青期",
+      "height_m": 30,
+      "source_groups": [
+        "5.6 田1 30m"
+      ],
+      "source_count": 17,
+      "train_tiles": 1353,
+      "val_tiles": 275,
+      "compatibility": {
+        "requires_manual_confirmation": false,
+        "reason": "旧版基线权重已复制到内置模型目录并完成 SHA-256 登记，用于与强增强版对照"
+      }
+    },
+    {
+      "name": "yolo11s_seg_greenup_50m_legacy_best.pt",
+      "display_name": "YOLO11s-seg（返青期50m｜旧版基线）",
+      "sha256": "21bf9f4d065454bdb001a7a14c9ebd6fedc2d264b9f1872ddc9ae8badf0b5be4",
+      "framework": "ultralytics",
+      "architecture": "yolo11s-seg",
+      "task": "instance_segmentation",
+      "reported_metrics": {
+        "mask_mAP50": 0.9625754628523708,
+        "mask_mAP50_95": 0.8298466544318929,
+        "precision": 0.9495876250434511,
+        "recall": 0.9388882652122528
+      },
+      "metadata_status": "complete",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-baseline",
+      "class_mapping": {
+        "0": "rice"
+      },
+      "training_preprocessing": {
+        "slice_size": 640,
+        "imgsz": 640,
+        "overlap": 0.4,
+        "augmentation_scope": "train_only_online_baseline"
+      },
+      "source_context": "返青期50m（旧版基线，未使用strongaug配方）",
+      "legacy_baseline": true,
+      "stage": "返青期",
+      "height_m": 50,
+      "source_groups": [
+        "5.6 田1 50m"
+      ],
+      "source_count": 5,
+      "train_tiles": 268,
+      "val_tiles": 60,
+      "compatibility": {
+        "requires_manual_confirmation": false,
+        "reason": "旧版基线权重已复制到内置模型目录并完成 SHA-256 登记，用于与强增强版对照"
+      }
+    },
+    {
+      "name": "yolo11s_seg_tiller_12m_legacy_best.pt",
+      "display_name": "YOLO11s-seg（分蘖期12m｜旧版基线）",
+      "sha256": "98c5ea6bbc05243c164b72f9b9e6cb4442832051b4e06b3bb96047dc122816b5",
+      "framework": "ultralytics",
+      "architecture": "yolo11s-seg",
+      "task": "instance_segmentation",
+      "reported_metrics": {
+        "mask_mAP50": 0.9482353549558535,
+        "mask_mAP50_95": 0.841796580144648,
+        "precision": 0.9410528207740032,
+        "recall": 0.9224464060529635
+      },
+      "metadata_status": "complete",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-baseline",
+      "class_mapping": {
+        "0": "rice"
+      },
+      "training_preprocessing": {
+        "slice_size": 640,
+        "imgsz": 640,
+        "overlap": 0.4,
+        "augmentation_scope": "train_only_online_baseline"
+      },
+      "source_context": "分蘖期12m（旧版基线，未使用strongaug配方）",
+      "legacy_baseline": true,
+      "stage": "分蘖期",
+      "height_m": 12,
+      "source_groups": [
+        "5.27 田1 12m",
+        "5.27 田4 12m",
+        "5.27 田5三模式 12m"
+      ],
+      "source_count": 256,
+      "train_tiles": 26768,
+      "val_tiles": 5083,
+      "compatibility": {
+        "requires_manual_confirmation": false,
+        "reason": "旧版基线权重已复制到内置模型目录并完成 SHA-256 登记，用于与强增强版对照"
+      }
+    },
+    {
+      "name": "yolo11s_seg_tiller_30m_legacy_best.pt",
+      "display_name": "YOLO11s-seg（分蘖期30m｜旧版基线）",
+      "sha256": "5941c8e8a804b680f964bc519818a4d1d6ed97a84522970112a03b3d5d79e188",
+      "framework": "ultralytics",
+      "architecture": "yolo11s-seg",
+      "task": "instance_segmentation",
+      "reported_metrics": {
+        "mask_mAP50": 0.7064374846279948,
+        "mask_mAP50_95": 0.49689921552108407,
+        "precision": 0.8032217032450101,
+        "recall": 0.6572398190045249
+      },
+      "metadata_status": "complete",
+      "training_dataset_version": "stage-height-yolo-seg-20260805-baseline",
+      "class_mapping": {
+        "0": "rice"
+      },
+      "training_preprocessing": {
+        "slice_size": 640,
+        "imgsz": 640,
+        "overlap": 0.4,
+        "augmentation_scope": "train_only_online_baseline"
+      },
+      "source_context": "分蘖期30m（旧版基线，未使用strongaug配方）",
+      "legacy_baseline": true,
+      "stage": "分蘖期",
+      "height_m": 30,
+      "source_groups": [
+        "5.27 田1 30m"
+      ],
+      "source_count": 9,
+      "train_tiles": 750,
+      "val_tiles": 191,
+      "compatibility": {
+        "requires_manual_confirmation": false,
+        "reason": "旧版基线权重已复制到内置模型目录并完成 SHA-256 登记，用于与强增强版对照"
+      }
     }
   ]
 }

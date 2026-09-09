@@ -104,3 +104,26 @@ def test_recommendation_does_not_invent_limits_without_geometry_evidence():
     assert result["limits"]["wheelbase_upper_guide_m"] is None
     assert result["evidence_quality"] == "insufficient"
     assert "无法计算" in result["message"]
+
+
+def test_recommendation_handles_unknown_track_width_in_a_too_narrow_corridor():
+    """An unavailable candidate must not be formatted as ``None * 100``."""
+    mask_result = {
+        "main_angle": 0.0,
+        "all_bands": [_band(1, 0), _band(2, 30)],
+        "diagnostics": {"meters_per_pixel": 0.01},
+    }
+    current = {
+        "cutter_width_m": 2.15,
+        "track_width_m": None,
+        "track_gauge_m": 1.60,
+        "wheelbase_m": 1.80,
+        "track_length_m": 1.70,
+        "turn_radius_m": 0.90,
+    }
+
+    result = recommend_machine_dimensions(mask_result, current)
+
+    assert result["params"]["track_width_m"] is None
+    assert "无法推荐履带宽度" in result["message"]
+    assert "None" not in result["message"]

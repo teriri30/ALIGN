@@ -24,7 +24,7 @@ class EventBridge(QObject):
     status_changed = Signal(str)
     need_redraw = Signal()
     workflow_changed = Signal(str)
-    double_clicked = Signal(int, int)  # x, y — 双击事件
+    double_clicked = Signal(float, float)  # x, y — 双击事件
 
     # 双击检测参数
     _DBLCLICK_DIST = 15   # 像素
@@ -42,11 +42,11 @@ class EventBridge(QObject):
         self._model_engine = None
 
         # ── 鼠标状态（始终维护） ──
-        self._last_xy: Tuple[int, int] = (0, 0)
+        self._last_xy: Tuple[float, float] = (0.0, 0.0)
         self._buttons_down: Set[int] = set()
 
         # ── 双击检测 ──
-        self._last_click_xy: Tuple[int, int] = (0, 0)
+        self._last_click_xy: Tuple[float, float] = (0.0, 0.0)
         self._last_click_time: float = 0.0
         self._last_click_button: int = 0
 
@@ -61,7 +61,7 @@ class EventBridge(QObject):
 
     # ── 状态查询 ──
 
-    def get_last_xy(self) -> Tuple[int, int]:
+    def get_last_xy(self) -> Tuple[float, float]:
         return self._last_xy
 
     def is_button_down(self, button: int) -> bool:
@@ -70,7 +70,7 @@ class EventBridge(QObject):
 
     # ── Qt 鼠标事件处理 ──
 
-    def on_mouse_pressed(self, x: int, y: int, button: int):
+    def on_mouse_pressed(self, x: float, y: float, button: int):
         """鼠标按下 — 更新状态 + 双击检测 + 可选 cv2 转发。"""
         # 始终更新状态
         self._buttons_down.add(button)
@@ -94,7 +94,7 @@ class EventBridge(QObject):
         if self._handler is not None:
             self._forward_mouse_press_cv2(x, y, button)
 
-    def on_mouse_released(self, x: int, y: int, button: int):
+    def on_mouse_released(self, x: float, y: float, button: int):
         """鼠标释放。"""
         self._buttons_down.discard(button)
         self._last_xy = (x, y)
@@ -102,7 +102,7 @@ class EventBridge(QObject):
         if self._handler is not None:
             self._forward_mouse_release_cv2(x, y, button)
 
-    def on_mouse_moved(self, x: int, y: int, buttons: int):
+    def on_mouse_moved(self, x: float, y: float, buttons: int):
         """鼠标移动。"""
         self._last_xy = (x, y)
 
@@ -112,9 +112,11 @@ class EventBridge(QObject):
             if buttons & 1: flags |= 1   # EVENT_FLAG_LBUTTON
             if buttons & 2: flags |= 2   # EVENT_FLAG_RBUTTON
             if buttons & 4: flags |= 4   # EVENT_FLAG_MBUTTON
-            self._handler.mouse_callback(EVENT_MOUSEMOVE, x, y, flags, None)
+            self._handler.mouse_callback(
+                EVENT_MOUSEMOVE, int(round(x)), int(round(y)), flags, None
+            )
 
-    def on_mouse_dragged(self, x: int, y: int, buttons: int):
+    def on_mouse_dragged(self, x: float, y: float, buttons: int):
         """鼠标拖拽（移动 + 按下）。"""
         self._last_xy = (x, y)
         if self._handler is not None:
@@ -135,7 +137,7 @@ class EventBridge(QObject):
             flags |= EVENT_FLAG_MBUTTON
         return flags
 
-    def _forward_mouse_press_cv2(self, x: int, y: int, button: int):
+    def _forward_mouse_press_cv2(self, x: float, y: float, button: int):
         """将按下事件转为 cv2 格式转发给 handler。"""
         from cv2 import EVENT_LBUTTONDOWN, EVENT_RBUTTONDOWN, EVENT_MBUTTONDOWN
         evt = {1: EVENT_LBUTTONDOWN, 2: EVENT_RBUTTONDOWN,
@@ -143,9 +145,11 @@ class EventBridge(QObject):
         flags = self._qt_buttons_to_flags(
             {1: Qt.LeftButton, 2: Qt.RightButton, 3: Qt.MiddleButton}.get(
                 button, Qt.NoButton))
-        self._handler.mouse_callback(evt, x, y, flags, None)
+        self._handler.mouse_callback(
+            evt, int(round(x)), int(round(y)), flags, None
+        )
 
-    def _forward_mouse_release_cv2(self, x: int, y: int, button: int):
+    def _forward_mouse_release_cv2(self, x: float, y: float, button: int):
         """将释放事件转为 cv2 格式转发给 handler。"""
         from cv2 import EVENT_LBUTTONUP, EVENT_RBUTTONUP, EVENT_MBUTTONUP
         evt = {1: EVENT_LBUTTONUP, 2: EVENT_RBUTTONUP,

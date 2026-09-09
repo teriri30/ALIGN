@@ -36,7 +36,7 @@ from headland_turn_validation import (
 )
 
 
-PATH_PLANNING_VERSION = "footprint-path-v27"
+PATH_PLANNING_VERSION = "footprint-path-v31"
 
 
 def _adjacent_snake_order_work_lines(
@@ -749,6 +749,167 @@ def build_band_mask(shape, bands: List[Dict]) -> np.ndarray:
     return mask
 
 
+def _centerline_simplification_settings(config: Dict) -> Dict[str, float | int]:
+    """Return bounded controls for the operator-facing centerline polyline."""
+    cfg = config or {}
+    try:
+        max_deviation_m = float(
+            cfg.get("centerline_simplify_max_deviation_m", 0.20)
+        )
+    except (TypeError, ValueError):
+        max_deviation_m = 0.20
+    if not math.isfinite(max_deviation_m) or max_deviation_m < 0.0:
+        max_deviation_m = 0.20
+
+    try:
+        max_heading_change_deg = float(
+            cfg.get("centerline_simplify_max_heading_change_deg", 8.0)
+        )
+    except (TypeError, ValueError):
+        max_heading_change_deg = 8.0
+    if not math.isfinite(max_heading_change_deg) or max_heading_change_deg < 0.0:
+        max_heading_change_deg = 8.0
+
+    try:
+        max_points = int(cfg.get("centerline_simplify_max_points", 8))
+    except (TypeError, ValueError):
+        max_points = 8
+    max_points = max(2, min(max_points, 64))
+    return {
+        "max_deviation_m": max_deviation_m,
+        "max_heading_change_deg": max_heading_change_deg,
+        "max_points": max_points,
+    }
+
+
+def _simplify_centerline_polyline(
+    points: List[Tuple[float, float]],
+    mpp: float,
+    config: Dict,
+) -> List[Tuple[float, float]]:
+    """Keep endpoints and add vertices only where a band bends materially.
+
+    The dense row-profile trace is useful as source evidence, but it should not
+    become the operator's selectable geometry.  This bounded recursive
+    simplifier keeps one polyline per band, using perpendicular chord error and
+    local heading change as the two curvature signals.
+    """
+    values = np.asarray(points, dtype=np.float64)
+    if (
+        values.ndim != 2
+        or values.shape[0] < 2
+        or values.shape[1] != 2
+        or not np.all(np.isfinite(values))
+    ):
+        return []
+    if values.shape[0] == 2:
+        return [(float(x), float(y)) for x, y in values]
+
+    settings = _centerline_simplification_settings(config)
+    try:
+        meters_per_pixel_value = float(mpp)
+    except (TypeError, ValueError):
+        meters_per_pixel_value = 0.0
+    if not math.isfinite(meters_per_pixel_value) or meters_per_pixel_value <= 0.0:
+        return [(float(x), float(y)) for x, y in values[[0, -1]]]
+    deviation_px = float(settings["max_deviation_m"]) / meters_per_pixel_value
+    heading_limit = float(settings["max_heading_change_deg"])
+    max_points = int(settings["max_points"])
+
+    def segment_heading(start: int, end: int) -> Optional[float]:
+        dx = float(values[end, 0] - values[start, 0])
+        dy = float(values[end, 1] - values[start, 1])
+        if math.hypot(dx, dy) <= 1e-9:
+            return None
+        return math.atan2(dy, dx)
+
+    def heading_delta(first: float, second: float) -> float:
+        return abs((first - second + math.pi) % (2.0 * math.pi) - math.pi)
+
+    def range_error(start: int, end: int):
+        chord = values[end] - values[start]
+        chord_length = float(np.linalg.norm(chord))
+        if chord_length <= 1e-9:
+            deviations = np.linalg.norm(values[start + 1:end] - values[start], axis=1)
+        else:
+            relative = values[start + 1:end] - values[start]
+            deviations = np.abs(
+                chord[0] * relative[:, 1] - chord[1] * relative[:, 0]
+            ) / chord_length
+        if deviations.size:
+            deviation_offset = int(np.argmax(deviations))
+            max_deviation = float(deviations[deviation_offset])
+            deviation_index = start + 1 + deviation_offset
+        else:
+            max_deviation = 0.0
+            deviation_index = None
+
+        chord_heading = segment_heading(start, end)
+        max_heading = 0.0
+        heading_index = None
+        if chord_heading is not None:
+            for index in range(start, end):
+                local_heading = segment_heading(index, index + 1)
+                if local_heading is None:
+                    continue
+                delta = heading_delta(local_heading, chord_heading)
+                if delta > max_heading:
+                    max_heading = delta
+                    heading_index = index
+        return (
+            max_deviation,
+            deviation_index,
+            math.degrees(max_heading),
+            heading_index,
+        )
+
+    def split_index(start: int, end: int, error):
+        max_deviation, deviation_index, max_heading, heading_index = error
+        deviation_score = (
+            max_deviation / max(deviation_px, 1e-9)
+            if deviation_index is not None
+            else 0.0
+        )
+        heading_score = (
+            max_heading / max(heading_limit, 1e-9)
+            if heading_index is not None
+            else 0.0
+        )
+        if deviation_score <= 1.0 and heading_score <= 1.0:
+            return None, 0.0
+        if deviation_score >= heading_score and deviation_index is not None:
+            candidate = deviation_index
+        elif heading_index is not None:
+            candidate = heading_index + 1
+        else:
+            candidate = deviation_index
+        candidate = max(start + 1, min(end - 1, int(candidate)))
+        return candidate, max(deviation_score, heading_score)
+
+    kept = {0, values.shape[0] - 1}
+    pending = [(0, values.shape[0] - 1)]
+    while pending and len(kept) < max_points:
+        best = None
+        for start, end in pending:
+            error = range_error(start, end)
+            candidate, score = split_index(start, end, error)
+            if candidate is None:
+                continue
+            if best is None or score > best[0]:
+                best = (score, start, end, candidate)
+        if best is None:
+            break
+        _score, start, end, candidate = best
+        pending.remove((start, end))
+        kept.add(candidate)
+        pending.extend(((start, candidate), (candidate, end)))
+
+    return [
+        (float(values[index, 0]), float(values[index, 1]))
+        for index in sorted(kept)
+    ]
+
+
 def _smooth_band_centerline(
     points: List[Tuple[float, float]],
     main_angle: float,
@@ -839,7 +1000,7 @@ def _smooth_band_centerline(
         sample_along[:, None] * direction[None, :]
         + sample_lateral[:, None] * normal[None, :]
     )
-    return [(float(x), float(y)) for x, y in fitted]
+    return _simplify_centerline_polyline(fitted, mpp, config)
 
 
 def prepare_band_centerlines(
@@ -866,8 +1027,9 @@ def prepare_band_centerlines(
 
     candidates = []
     for band in wide_bands:
+        source_centerline = list(band.get("centerline", []))
         centerline = _smooth_band_centerline(
-            list(band.get("centerline", [])),
+            source_centerline,
             main_angle,
             mpp,
             cfg,
@@ -888,6 +1050,7 @@ def prepare_band_centerlines(
             "observed_span_ratio": _finite_float(
                 band.get("observed_span_ratio")
             ),
+            "source_point_count": len(source_centerline),
         })
 
     if not candidates:
@@ -1067,6 +1230,16 @@ def prepare_band_centerlines(
         accepted = candidates
     accepted.sort(key=lambda item: item["normal"])
 
+    simplification = _centerline_simplification_settings(cfg)
+    simplification["algorithm_version"] = "centerline-adaptive-polyline-v1"
+    simplification["records"] = [
+        {
+            "band_id": item["id"],
+            "source_point_count": int(item.get("source_point_count", 0)),
+            "centerline_point_count": int(len(item["line"])),
+        }
+        for item in accepted
+    ]
     return [item["line"] for item in accepted], {
         "source": "four_row_band_centerlines",
         "candidate_four_row_count": len(wide_bands),
@@ -1074,6 +1247,7 @@ def prepare_band_centerlines(
         "median_centerline_span_m": median_span,
         "ordered_band_ids": [item["id"] for item in accepted],
         "pass_count": len(accepted),
+        "centerline_simplification": simplification,
         "endpoint_repair": endpoint_repair_report,
     }
 
@@ -1195,6 +1369,77 @@ def segment_within_field_boundary(segment, polygon: Optional[np.ndarray]) -> boo
 def _segment_inside_field_boundary(segment, polygon: Optional[np.ndarray]) -> bool:
     """Backward-compatible private name for complete field-boundary coverage."""
     return segment_within_field_boundary(segment, polygon)
+
+
+def _filter_generated_centerline_regions_to_field(
+    work_regions,
+    field_polygon: Optional[np.ndarray],
+) -> Tuple[List[Dict], Dict]:
+    """Drop generated centerlines that are not covered by the selected field.
+
+    Row reconstruction and uniform-zone generation both have their own mask
+    evidence gates.  The final operator catalog still needs one common hard
+    boundary gate because a detached mask component can otherwise become a
+    selectable centerline outside the blue field boundary.
+    """
+    regions = [dict(region) for region in (work_regions or [])]
+    report = {
+        "algorithm_version": "centerline-field-boundary-filter-v1",
+        "enabled": field_polygon is not None,
+        "input_line_count": sum(
+            len(region.get("work_lines") or []) for region in regions
+        ),
+        "kept_line_count": 0,
+        "excluded": [],
+        "reason": None,
+    }
+    if field_polygon is None:
+        report["reason"] = "missing_field_boundary"
+        report["kept_line_count"] = report["input_line_count"]
+        return regions, report
+
+    filtered_regions = []
+    for region_order, region in enumerate(regions):
+        lines = list(region.get("work_lines") or [])
+        kept_indices = []
+        for line_index, line in enumerate(lines):
+            if _segment_inside_field_boundary(line, field_polygon):
+                kept_indices.append(line_index)
+                continue
+            report["excluded"].append({
+                "region_id": region.get("region_id"),
+                "region_order": int(region_order),
+                "region_line_index": int(line_index),
+                "reason": "centerline_outside_field_boundary",
+            })
+
+        if not kept_indices:
+            continue
+
+        updated = dict(region)
+        updated["work_lines"] = [lines[index] for index in kept_indices]
+        updated["line_count"] = len(kept_indices)
+
+        source_ids = list(region.get("work_line_source_ids") or [])
+        if len(source_ids) == len(lines):
+            updated["work_line_source_ids"] = [
+                source_ids[index] for index in kept_indices
+            ]
+
+        band_ids = list(region.get("band_ids") or [])
+        if len(band_ids) == len(lines):
+            updated["band_ids"] = [
+                band_ids[index] for index in kept_indices
+            ]
+        filtered_regions.append(updated)
+
+    report["kept_line_count"] = sum(
+        len(region.get("work_lines") or []) for region in filtered_regions
+    )
+    report["excluded_count"] = len(report["excluded"])
+    if report["excluded"]:
+        report["reason"] = "excluded_lines_outside_field_boundary"
+    return filtered_regions, report
 
 
 def _non_work_boundary_violations(full_path, segment_types, polygon: Optional[np.ndarray]) -> List[Dict]:
@@ -2812,17 +3057,11 @@ def _connect_work_lines(
             else None
         )
     unload_points = [to_local(point) for point in unload_globals if point]
-    adjacent_snake_requested = str(
-        cfg.get("route_order", "")
-    ).strip().lower() in {
-        "adjacent_snake",
-        "snake",
-        "row_snake",
-    }
+    # DECISION-016: a contour request owns the field-wide half-split order.
+    # Legacy/runtime adjacent-snake labels are intentionally ignored.
     terminal_short_line = None
     if (
         requested_strategy == "contour"
-        and not adjacent_snake_requested
         and bool(cfg.get("_contour_allow_terminal_short_line", False))
         and exit_point is None
     ):
@@ -2852,32 +3091,16 @@ def _connect_work_lines(
         )
     )
     if requested_strategy == "contour":
-        if adjacent_snake_requested:
-            # The desktop implementation route deliberately visits adjacent
-            # rows.  Keep the selected turn implementation and its diagnostics
-            # intact, but do not use the separate half-split contour study
-            # ordering for this workflow.
-            ordered_lines, contour_ordering = _adjacent_snake_order_work_lines(
-                ordered_lines,
-                entry_point=entry_point,
-                main_angle=(
-                    float(global_main_angle)
-                    if global_main_angle is not None
-                    and math.isfinite(float(global_main_angle))
-                    else None
-                ),
-            )
-        else:
-            ordered_lines, contour_ordering = _contour_order_work_lines(
-                ordered_lines,
-                _field_boundary_local_polygon(state),
-                main_angle=(
-                    float(global_main_angle)
-                    if global_main_angle is not None
-                    and math.isfinite(float(global_main_angle))
-                    else None
-                ),
-            )
+        ordered_lines, contour_ordering = _contour_order_work_lines(
+            ordered_lines,
+            _field_boundary_local_polygon(state),
+            main_angle=(
+                float(global_main_angle)
+                if global_main_angle is not None
+                and math.isfinite(float(global_main_angle))
+                else None
+            ),
+        )
         # Wide nested-loop transitions use the two-quarter-arc bow geometry so
         # their transverse tangents overlap on one headland line.  Keep the
         # contour request visible to the selector: a narrow contour transition
@@ -2901,60 +3124,36 @@ def _connect_work_lines(
         contour_ordering["work_line_point_counts"] = [
             len(line) for line in ordered_lines
         ]
-        if not adjacent_snake_requested:
-            entry_policy = str(
-                cfg.get(
-                    "_contour_entry_policy",
-                    "farthest"
-                    if bool(cfg.get("_contour_reverse_normal_order", False))
-                    else "nearest",
-                )
+        entry_policy = str(
+            cfg.get(
+                "_contour_entry_policy",
+                "farthest"
+                if bool(cfg.get("_contour_reverse_normal_order", False))
+                else "nearest",
             )
-            ordered_lines = _select_contour_entry_rotation(
-                ordered_lines,
-                contour_ordering,
-                entry_point,
-                policy=entry_policy,
-                terminal_original_index=(
-                    terminal_short_line.get("original_index")
-                    if terminal_short_line is not None
-                    else None
-                ),
-                terminal_endpoint=(
-                    terminal_short_line.get("endpoint")
-                    if terminal_short_line is not None
-                    else None
-                ),
-                main_angle=(
-                    float(global_main_angle)
-                    if global_main_angle is not None
-                    and math.isfinite(float(global_main_angle))
-                    else contour_ordering.get("main_angle_rad")
-                ),
-            )
-        else:
-            contour_ordering.update({
-                "entry_selection_policy": "adjacent_snake",
-                "entry_rotation_offset": 0,
-                "entry_rotation_reversed": False,
-                "entry_eligible_candidate_count": 1,
-                "minimum_possible_adjacent_transition_count": max(
-                    0, len(ordered_lines) - 1
-                ),
-                "selected_adjacent_transition_count": max(
-                    0, len(ordered_lines) - 1
-                ),
-                "entry_priority_overrode_minimum_adjacency": False,
-                "entry_orientation_constrained_by_terminal": False,
-                "terminal_original_index": (
-                    terminal_short_line.get("original_index")
-                    if terminal_short_line is not None
-                    else None
-                ),
-                "terminal_constraint_applied": bool(
-                    terminal_short_line is not None
-                ),
-            })
+        )
+        ordered_lines = _select_contour_entry_rotation(
+            ordered_lines,
+            contour_ordering,
+            entry_point,
+            policy=entry_policy,
+            terminal_original_index=(
+                terminal_short_line.get("original_index")
+                if terminal_short_line is not None
+                else None
+            ),
+            terminal_endpoint=(
+                terminal_short_line.get("endpoint")
+                if terminal_short_line is not None
+                else None
+            ),
+            main_angle=(
+                float(global_main_angle)
+                if global_main_angle is not None
+                and math.isfinite(float(global_main_angle))
+                else contour_ordering.get("main_angle_rad")
+            ),
+        )
         if terminal_short_line is not None:
             contour_ordering["terminal_short_line"] = {
                 key: (list(value) if key == "endpoint" else value)
@@ -4695,25 +4894,40 @@ def _machine_compatibility_output_paths(
     return paths
 
 
+def _plain_offset_field(value) -> str:
+    """Render an export offset as a plain number (``0.00`` -> ``0``)."""
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+MACHINE_COMPATIBILITY_INFM_LINE = "$INFM,0,0.7,0.7,0.7,0.7,0,5,0*"
+
+
 def _write_machine_compatibility_file(
     output_path: str,
     points: List[Dict],
     cfg: Config,
 ) -> None:
-    """Write one independently indexed <=50-point terminal PATH file."""
-    with _atomic_text_writer(output_path, encoding="utf-8") as handle:
+    """Write one independently indexed <=50-point terminal PATH file.
+
+    Terminal sample layout: every line starts directly with ``$PATH``;
+    offsets are plain numbers, every record carries the fixed terminal
+    status code ``2`` (``...2*``), and the final ``$INFM`` line is fixed.
+    """
+    # The verified terminal sample uses LF, including on Windows.  Do not let
+    # text-mode newline translation turn it into CRLF.
+    with _atomic_text_writer(output_path, encoding="utf-8", newline="\n") as handle:
         total = len(points)
         for index, point in enumerate(points):
-            # A split file is imported as an independent route. Its final
-            # record has no outgoing edge, so it must terminate as non-work
-            # even when the canonical point would continue in the next file.
-            status = 0 if index == total - 1 else int(point["status"])
             handle.write(
                 f"$PATH,0,{index},{total},"
                 f"{float(point['lat']):.8f},{float(point['lon']):.8f},"
-                f"{cfg.OFFSET_X},{cfg.OFFSET_Y},{status}*\n"
+                f"{_plain_offset_field(cfg.OFFSET_X)},"
+                f"{_plain_offset_field(cfg.OFFSET_Y)},2*\n"
             )
-        handle.write(f"{cfg.INFM_LINE}\n")
+        handle.write(f"{MACHINE_COMPATIBILITY_INFM_LINE}\n")
 
 
 def _machine_compatibility_distance_m(first: Dict, second: Dict) -> float:
@@ -5036,7 +5250,8 @@ def prepare_machine_compatibility_points(
     diagnostics = {
         "protocol": MACHINE_COMPATIBILITY_PROTOCOL,
         "turn_geometry": "straight_chord",
-        "status_semantics": "outgoing_edge",
+        "status_semantics": "internal_outgoing_edge_only",
+        "file_record_status": 2,
         "source_point_count": int(len(geo_points)),
         "output_point_count": int(len(compat_points)),
         "source_segment_count": int(len(groups)),
@@ -5059,8 +5274,11 @@ def prepare_machine_compatibility_points(
         "work_line_point_compression": True,
         "deduplicate_distance_m": float(threshold),
         "route_id": 0,
-        "status_codes": {"turn_or_other": 0, "work": 1},
-        "infoline": str(cfg.INFM_LINE),
+        "status_codes": {
+            "file_record_status": 2,
+            "internal_control_route": {"turn_or_other": 0, "work": 1},
+        },
+        "infoline": MACHINE_COMPATIBILITY_INFM_LINE,
     }
     return compat_points, diagnostics
 
@@ -5130,7 +5348,11 @@ def export_machine_compatibility_path(
     field_polygon: Optional[np.ndarray] = None,
     forbidden_regions: Optional[List[List[Tuple[float, float]]]] = None,
 ) -> Tuple[List[Dict], Dict]:
-    """Export straight-turn, 0/1-only PATH files, max 50 points each.
+    """Export straight-turn terminal PATH files, max 50 points each.
+
+    Each written record follows the supplied terminal sample: a standalone
+    point-index line, then ``$PATH,0,index,total,lat,lon,offset_x,offset_y,2*``
+    (offsets as plain numbers, status code fixed to ``2``).
 
     When one file is enough, a caller-supplied file path is preserved.  When
     the route is split, or when a directory is supplied, numbered files are
@@ -6342,6 +6564,121 @@ def _uniform_zone_spacing(
     }
 
 
+def _filter_work_bands_to_selection(
+    bands: List[Dict],
+    mask: np.ndarray,
+    main_angle: float,
+    geo=None,
+    state=None,
+    config: Optional[Dict] = None,
+) -> Tuple[List[Dict], Dict]:
+    """Keep automatic passes whose lateral cutter footprint fits the selection."""
+    candidates = list(bands or [])
+    report = {
+        "algorithm_version": "selection-work-band-filter-v1",
+        "enabled": False,
+        "input_band_ids": [item.get("id") for item in candidates],
+        "kept_band_ids": [item.get("id") for item in candidates],
+        "excluded": [],
+    }
+    if not candidates or state is None or mask is None:
+        report["reason"] = "missing_bands_state_or_mask"
+        return candidates, report
+    polygon = field_polygon_local(state, mask.shape[:2])
+    if polygon is None:
+        report["reason"] = "missing_field_boundary"
+        return candidates, report
+    try:
+        mpp = meters_per_pixel(mask, geo, state)
+    except (RuntimeError, ValueError):
+        report["reason"] = "metric_scale_unavailable"
+        return candidates, report
+
+    cfg = dict(config or {})
+    specs = _harvester_specs(state)
+    cutter_half_m = 0.5 * float(specs["cutter_width_m"])
+    normal = np.asarray(
+        (-math.sin(float(main_angle)), math.cos(float(main_angle))),
+        dtype=np.float64,
+    )
+    polygon_positions = np.asarray(polygon, dtype=np.float64) @ normal
+    low_position = float(np.min(polygon_positions))
+    high_position = float(np.max(polygon_positions))
+    records = []
+    for index, band in enumerate(candidates):
+        position = _band_normal_position(band, main_angle)
+        clearance_m = None
+        if position is not None:
+            clearance_m = min(
+                float(position) - low_position,
+                high_position - float(position),
+            ) * mpp
+        records.append({
+            "band_index": int(index),
+            "band_id": band.get("id"),
+            "normal_position": position,
+            "normal_clearance_m": clearance_m,
+            "profile_width_m": _finite_float(band.get("profile_width_m")),
+            "reasons": [],
+        })
+
+    measured_widths = [
+        float(item["profile_width_m"])
+        for item in records
+        if item["profile_width_m"] is not None
+    ]
+    cohort_width_m = float(np.median(measured_widths)) if measured_widths else None
+    positioned = [item for item in records if item["normal_position"] is not None]
+    edge_ids = set()
+    if positioned:
+        edge_ids.add(min(positioned, key=lambda item: item["normal_position"])["band_id"])
+        edge_ids.add(max(positioned, key=lambda item: item["normal_position"])["band_id"])
+    uniform_threshold_m = max(
+        0.1, float(cfg.get("uniform_zone_min_width_m", 4.0))
+    )
+    outlier_ratio = max(
+        1.0, float(cfg.get("selection_edge_width_outlier_ratio", 1.75))
+    )
+    tolerance_m = max(
+        0.0, float(cfg.get("selection_cutter_clearance_tolerance_m", 0.05))
+    )
+    for item in records:
+        clearance_m = item["normal_clearance_m"]
+        if (
+            clearance_m is not None
+            and clearance_m + tolerance_m < cutter_half_m
+        ):
+            item["reasons"].append("insufficient_cutter_normal_clearance")
+        width_m = item["profile_width_m"]
+        if (
+            item["band_id"] in edge_ids
+            and width_m is not None
+            and cohort_width_m is not None
+            and width_m < uniform_threshold_m
+            and width_m > cohort_width_m * outlier_ratio
+        ):
+            item["reasons"].append("edge_width_outlier_below_uniform_threshold")
+
+    kept = [
+        band for band, item in zip(candidates, records)
+        if not item["reasons"]
+    ]
+    excluded = [item for item in records if item["reasons"]]
+    report.update({
+        "enabled": True,
+        "reason": None,
+        "cutter_half_width_m": cutter_half_m,
+        "clearance_tolerance_m": tolerance_m,
+        "cohort_profile_width_m": cohort_width_m,
+        "edge_width_outlier_ratio": outlier_ratio,
+        "uniform_threshold_m": uniform_threshold_m,
+        "records": records,
+        "kept_band_ids": [item.get("id") for item in kept],
+        "excluded": excluded,
+    })
+    return kept, report
+
+
 def _prepare_work_line_layout(
     wide_bands: List[Dict],
     processed_mask: np.ndarray,
@@ -6360,6 +6697,19 @@ def _prepare_work_line_layout(
     mode = str(
         cfg.get("work_line_mode", "band_centerline_with_footprint_validation")
     ).strip().lower()
+    precomputed_selection_filter = cfg.get("_selection_work_band_filter")
+    if isinstance(precomputed_selection_filter, dict):
+        selection_filter = dict(precomputed_selection_filter)
+        wide_bands = list(wide_bands or [])
+    else:
+        wide_bands, selection_filter = _filter_work_bands_to_selection(
+            wide_bands,
+            processed_mask,
+            main_angle,
+            geo=geo,
+            state=state,
+            config=cfg,
+        )
     # 等距区分离：剖面宽度远大于正常作物带（正常约 1m）的带是整片等距
     # 种植区（如右侧 12.45m 宽的大片区域），一趟固定作业间距收不完，
     # 必须细分多条平行作业线（常规全覆盖），而不是过滤掉或只提一条中心线。
@@ -6388,6 +6738,7 @@ def _prepare_work_line_layout(
                 else mode
             ),
             "requested_work_line_mode": mode,
+            "selection_work_band_filter": selection_filter,
         }
         if return_regions:
             return [], layout, []
@@ -6759,6 +7110,7 @@ def _prepare_work_line_layout(
         layout["excluded_wide_bands"] = excluded_bands
     layout.setdefault("work_line_mode", mode)
     layout["requested_work_line_mode"] = mode
+    layout["selection_work_band_filter"] = selection_filter
     work_regions = []
     ordered_regular_band_ids = list(layout.get("ordered_band_ids") or [])
     lines_by_band_id = {
@@ -8765,6 +9117,320 @@ def _connect_work_regions(
     return full_path, segment_types, assessment, source_regions
 
 
+def _apply_operator_work_band_selection(
+    work_regions,
+    layout,
+    main_angle,
+    processed_mask,
+    planned_mask,
+    *,
+    geo=None,
+    state=None,
+    config=None,
+):
+    """Bind operator work-band selection to geometry and validation scope."""
+    from work_band_selection import (
+        apply_work_band_selection,
+        rasterize_work_band_coverage,
+    )
+
+    cfg = dict(config or {})
+    explicit = "selected_work_band_ids" in cfg
+    requested = cfg.get("selected_work_band_ids") if explicit else None
+    selected_regions, catalog, report = apply_work_band_selection(
+        work_regions,
+        main_angle,
+        selected_ids=requested,
+    )
+    selected_lines = [
+        list(line)
+        for region in selected_regions
+        for line in (region.get("work_lines") or [])
+    ]
+    selected_mask = planned_mask
+    if explicit and selected_lines:
+        support = cfg.get("planning_support_mask")
+        if not isinstance(support, np.ndarray):
+            support = processed_mask
+        selected_mask = rasterize_work_band_coverage(
+            catalog,
+            report["selected_ids"],
+            shape=processed_mask.shape[:2],
+            cutter_width_m=float(_harvester_specs(state)["cutter_width_m"]),
+            meters_per_pixel=meters_per_pixel(processed_mask, geo, state),
+            support_mask=support,
+        )
+    updated_layout = dict(layout or {})
+    updated_layout["work_band_catalog"] = catalog
+    updated_layout["work_band_selection"] = report
+    updated_layout["work_regions"] = [
+        {key: value for key, value in region.items() if key != "work_lines"}
+        for region in selected_regions
+    ]
+    updated_layout["selected_work_line_count"] = len(selected_lines)
+    updated_layout["planning_scope"] = (
+        "operator_selected_work_bands" if explicit else "whole_field_default"
+    )
+    return selected_lines, selected_regions, selected_mask, updated_layout
+
+
+def prepare_operator_work_band_plan(
+    wide_bands,
+    processed_mask,
+    main_angle,
+    *,
+    geo=None,
+    state=None,
+    config=None,
+    progress_callback=None,
+    detected_mask=None,
+    all_bands=None,
+):
+    """Generate the final selectable work-line catalog before turn planning."""
+    cfg = Config().section("path_planning")
+    cfg.update(dict(config or {}))
+    validation_profile = str(cfg.get("validation_profile", "field_trial"))
+    if validation_profile in {"field_trial", "machine_candidate"}:
+        cfg["recover_missing_work_bands"] = False
+
+    planning_bands, recovery = _recover_lattice_supported_work_bands(
+        wide_bands,
+        all_bands,
+        processed_mask,
+        main_angle,
+        geo=geo,
+        state=state,
+        config=cfg,
+    )
+    planning_bands, boundary_filter = _filter_work_bands_to_selection(
+        planning_bands,
+        processed_mask,
+        main_angle,
+        geo=geo,
+        state=state,
+        config=cfg,
+    )
+    if boundary_filter.get("excluded"):
+        kept_ids = set(boundary_filter.get("kept_band_ids") or [])
+        recovery["recovered_band_ids"] = [
+            band_id
+            for band_id in (recovery.get("recovered_band_ids") or [])
+            if band_id in kept_ids
+        ]
+        recovery["selection_filter"] = boundary_filter
+    cfg["_selection_work_band_filter"] = boundary_filter
+
+    planned_mask = build_band_mask(processed_mask.shape, planning_bands)
+    work_lines, layout, work_regions = _prepare_work_line_layout(
+        planning_bands,
+        processed_mask,
+        main_angle,
+        geo=geo,
+        state=state,
+        config=cfg,
+        progress_callback=progress_callback,
+        detected_mask=detected_mask,
+        planned_mask=planned_mask,
+        reference_bands=all_bands,
+        return_regions=True,
+    )
+    layout = dict(layout or {})
+    layout["coverage_gap_recovery"] = recovery
+    layout["planning_recovered"] = bool(recovery.get("recovered_band_ids"))
+    work_lines, work_regions, planned_mask, layout = (
+        _apply_operator_work_band_selection(
+            work_regions,
+            layout,
+            main_angle,
+            processed_mask,
+            planned_mask,
+            geo=geo,
+            state=state,
+            config=cfg,
+        )
+    )
+    return {
+        "work_lines": work_lines,
+        "work_regions": work_regions,
+        "planned_mask": planned_mask,
+        "planning_bands": planning_bands,
+        "layout": layout,
+        "catalog": dict(layout.get("work_band_catalog") or {}),
+        "selection": dict(layout.get("work_band_selection") or {}),
+        "executed_config": cfg,
+    }
+
+
+def _apply_operator_centerline_selection(
+    work_regions,
+    layout,
+    main_angle,
+    processed_mask,
+    planned_mask,
+    *,
+    geo=None,
+    state=None,
+    config=None,
+):
+    """Apply left-panel centerline checkboxes after all lines are generated."""
+    from work_band_selection import (
+        apply_centerline_selection,
+        rasterize_centerline_coverage,
+    )
+
+    cfg = dict(config or {})
+    explicit = (
+        "selected_centerline_ids" in cfg
+        or "selected_work_band_ids" in cfg
+    )
+    requested = cfg.get("selected_centerline_ids")
+    if requested is None and "selected_work_band_ids" in cfg:
+        requested = cfg.get("selected_work_band_ids")
+    selected_regions, catalog, report = apply_centerline_selection(
+        work_regions,
+        main_angle,
+        selected_ids=requested if explicit else None,
+    )
+    selected_lines = [
+        list(line)
+        for region in selected_regions
+        for line in (region.get("work_lines") or [])
+    ]
+    selected_mask = planned_mask
+    if explicit and selected_lines:
+        support = cfg.get("planning_support_mask")
+        if not isinstance(support, np.ndarray):
+            support = processed_mask
+        selected_mask = rasterize_centerline_coverage(
+            catalog,
+            report["selected_ids"],
+            shape=processed_mask.shape[:2],
+            cutter_width_m=float(_harvester_specs(state)["cutter_width_m"]),
+            meters_per_pixel=meters_per_pixel(processed_mask, geo, state),
+            support_mask=support,
+        )
+    updated_layout = dict(layout or {})
+    updated_layout["centerline_catalog"] = catalog
+    updated_layout["centerline_selection"] = report
+    # Keep old cache/layout readers able to inspect the same selection without
+    # reintroducing the old canvas-selection UI.
+    updated_layout["work_band_catalog"] = catalog
+    updated_layout["work_band_selection"] = report
+    updated_layout["work_regions"] = [
+        {key: value for key, value in region.items() if key != "work_lines"}
+        for region in selected_regions
+    ]
+    updated_layout["selected_work_line_count"] = len(selected_lines)
+    updated_layout["selected_centerline_count"] = len(selected_lines)
+    updated_layout["planning_scope"] = (
+        "operator_selected_centerlines" if explicit else "whole_field_default"
+    )
+    return selected_lines, selected_regions, selected_mask, updated_layout
+
+
+def prepare_operator_centerline_plan(
+    wide_bands,
+    processed_mask,
+    main_angle,
+    *,
+    geo=None,
+    state=None,
+    config=None,
+    progress_callback=None,
+    detected_mask=None,
+    all_bands=None,
+):
+    """Generate every candidate centerline before connecting any turn."""
+    cfg = Config().section("path_planning")
+    cfg.update(dict(config or {}))
+    validation_profile = str(cfg.get("validation_profile", "field_trial"))
+    if validation_profile in {"field_trial", "machine_candidate"}:
+        cfg["recover_missing_work_bands"] = False
+
+    planning_bands, recovery = _recover_lattice_supported_work_bands(
+        wide_bands,
+        all_bands,
+        processed_mask,
+        main_angle,
+        geo=geo,
+        state=state,
+        config=cfg,
+    )
+    planning_bands, boundary_filter = _filter_work_bands_to_selection(
+        planning_bands,
+        processed_mask,
+        main_angle,
+        geo=geo,
+        state=state,
+        config=cfg,
+    )
+    if boundary_filter.get("excluded"):
+        kept_ids = set(boundary_filter.get("kept_band_ids") or [])
+        recovery["recovered_band_ids"] = [
+            band_id
+            for band_id in (recovery.get("recovered_band_ids") or [])
+            if band_id in kept_ids
+        ]
+        recovery["selection_filter"] = boundary_filter
+    cfg["_selection_work_band_filter"] = boundary_filter
+
+    planned_mask = build_band_mask(processed_mask.shape, planning_bands)
+    work_lines, layout, work_regions = _prepare_work_line_layout(
+        planning_bands,
+        processed_mask,
+        main_angle,
+        geo=geo,
+        state=state,
+        config=cfg,
+        progress_callback=progress_callback,
+        detected_mask=detected_mask,
+        planned_mask=planned_mask,
+        reference_bands=all_bands,
+        return_regions=True,
+    )
+    layout = dict(layout or {})
+    field_polygon = (
+        field_polygon_local(state, processed_mask.shape[:2])
+        if state is not None
+        else None
+    )
+    work_regions, centerline_boundary_filter = (
+        _filter_generated_centerline_regions_to_field(
+            work_regions,
+            field_polygon,
+        )
+    )
+    layout["centerline_field_boundary_filter"] = centerline_boundary_filter
+    layout["work_regions"] = [
+        {key: value for key, value in region.items() if key != "work_lines"}
+        for region in work_regions
+    ]
+    layout["coverage_gap_recovery"] = recovery
+    layout["planning_recovered"] = bool(recovery.get("recovered_band_ids"))
+    selected_lines, selected_regions, planned_mask, layout = (
+        _apply_operator_centerline_selection(
+            work_regions,
+            layout,
+            main_angle,
+            processed_mask,
+            planned_mask,
+            geo=geo,
+            state=state,
+            config=cfg,
+        )
+    )
+    return {
+        "work_lines": selected_lines,
+        "work_regions": selected_regions,
+        "planned_mask": planned_mask,
+        "planning_bands": planning_bands,
+        "layout": layout,
+        "catalog": dict(layout.get("centerline_catalog") or {}),
+        "selection": dict(layout.get("centerline_selection") or {}),
+        "executed_config": cfg,
+    }
+
+
 def plan_path(wide_bands: List[Dict],
               processed_mask: np.ndarray,
               main_angle: float,
@@ -8850,23 +9516,10 @@ def plan_path(wide_bands: List[Dict],
         f"转弯={turn_strategy} ==="
     )
 
-    _report(0.12, "四行带中心线筛选")
+    _report(0.12, "生成全部候选中心线")
     abort_if_cancelled()
-    planning_bands, coverage_gap_recovery = _recover_lattice_supported_work_bands(
+    prepared = prepare_operator_centerline_plan(
         wide_bands,
-        all_bands,
-        processed_mask,
-        main_angle,
-        geo=geo,
-        state=state,
-        config=cfg,
-    )
-    if coverage_gap_recovery.get("recovered_band_ids"):
-        recovered_mask = build_band_mask(processed_mask.shape, planning_bands)
-        if np.any(recovered_mask):
-            planned_mask = recovered_mask
-    work_lines, layout, work_regions = _prepare_work_line_layout(
-        planning_bands,
         processed_mask,
         main_angle,
         geo=geo,
@@ -8874,14 +9527,14 @@ def plan_path(wide_bands: List[Dict],
         config=cfg,
         progress_callback=progress_callback,
         detected_mask=detected_mask,
-        planned_mask=planned_mask,
-        reference_bands=all_bands,
-        return_regions=True,
+        all_bands=all_bands,
     )
-    layout["coverage_gap_recovery"] = coverage_gap_recovery
-    layout["planning_recovered"] = bool(
-        coverage_gap_recovery.get("recovered_band_ids")
-    )
+    work_lines = prepared["work_lines"]
+    work_regions = prepared["work_regions"]
+    planned_mask = prepared["planned_mask"]
+    planning_bands = prepared["planning_bands"]
+    layout = prepared["layout"]
+    cfg = prepared["executed_config"]
     # 等距区细分线不参与田头端点校正（已在掩膜边界正确截断）
     abort_if_cancelled()
     if not work_lines:

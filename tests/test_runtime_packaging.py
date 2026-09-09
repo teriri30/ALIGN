@@ -72,6 +72,32 @@ def test_self_test_flag_is_handled_before_qt_startup(monkeypatch):
     assert app_entry.run_app(["--self-test"]) == 7
 
 
+def test_frozen_self_test_imports_qt_extension_modules():
+    import app_entry
+
+    assert {
+        "PySide6.QtCore",
+        "PySide6.QtGui",
+        "PySide6.QtWidgets",
+    } <= set(app_entry.SELF_TEST_MODULES)
+
+
+def test_windows_build_isolates_pyinstaller_dll_search_path():
+    script = (ROOT / "build_windows.bat").read_text(encoding="utf-8")
+
+    assert 'set "BUILD_ORIGINAL_PATH=%PATH%"' in script
+    assert 'set "PATH=%BUILD_PYINSTALLER_PATH%"' in script
+    assert 'set "PATH=%BUILD_ORIGINAL_PATH%"' in script
+    assert 'set "YOLO_AUTOINSTALL=false"' in script
+
+
+def test_build_spec_rejects_codex_tool_runtime_dlls():
+    spec = (ROOT / "packaging" / "reUI.spec").read_text(encoding="utf-8")
+
+    assert '"codex-runtimes"' in spec
+    assert "analysis.binaries = filter_host_tool_binaries" in spec
+
+
 def test_version_has_one_runtime_source():
     import provenance
     from version import APP_VERSION

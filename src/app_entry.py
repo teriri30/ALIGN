@@ -21,6 +21,22 @@ from runtime_paths import (
 from version import APP_VERSION
 
 
+SELF_TEST_MODULES = (
+    "numpy",
+    "cv2",
+    "PySide6.QtCore",
+    "PySide6.QtGui",
+    "PySide6.QtWidgets",
+    "rasterio",
+    "pyproj",
+    "shapely",
+    "scipy",
+    "torch",
+    "torchvision",
+    "ultralytics",
+)
+
+
 def run_self_test() -> int:
     """Check the frozen bundle without creating a Qt window."""
     _configure_runtime_environment()
@@ -34,11 +50,7 @@ def run_self_test() -> int:
             failures.append(f"{name}: {exc}")
             print(f"[FAIL] {name}: {exc}")
 
-    modules = (
-        "numpy", "cv2", "PySide6", "rasterio", "pyproj", "shapely",
-        "scipy", "torch", "torchvision", "ultralytics",
-    )
-    for module_name in modules:
+    for module_name in SELF_TEST_MODULES:
         check(f"import {module_name}", lambda name=module_name: __import__(name))
 
     check("config.example.json", lambda: _require_file("config.example.json"))

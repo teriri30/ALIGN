@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-MASK_REGULARIZATION_VERSION = 17
+MASK_REGULARIZATION_VERSION = 18
 
 
 def odd_size(value: float, minimum: int = 3) -> int:
@@ -111,6 +111,46 @@ def clip_band_polygon(
         return None
     contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
     return contour + (x, y)
+
+
+def expand_polygon_px(
+    polygon: np.ndarray,
+    px: float,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Expand a polygon outward by ``px`` pixels (bbox-local dilation).
+
+    The dilation runs on a small mask covering only the polygon bbox plus
+    the expansion margin, so huge rasters never allocate a full-resolution
+    mask.  The returned contour is the outer boundary of the expanded
+    region.
+    """
+    poly = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+    if len(poly) < 3 or px <= 0:
+        return poly
+    px = int(math.ceil(px))
+    bmin = np.floor(poly.min(axis=0)).astype(np.int64)
+    bmax = np.ceil(poly.max(axis=0)).astype(np.int64)
+    x0 = max(0, int(bmin[0] - px))
+    y0 = max(0, int(bmin[1] - px))
+    x1 = min(int(width), int(bmax[0] + px) + 1)
+    y1 = min(int(height), int(bmax[1] + px) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return poly
+    local = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.fillPoly(local, [np.round(poly - (x0, y0)).astype(np.int32)], 255)
+    kernel = 2 * px + 1
+    local = cv2.dilate(local, np.ones((kernel, kernel), np.uint8))
+    contours, _ = cv2.findContours(
+        local,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return poly
+    contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
+    return contour.astype(np.float64) + (x0, y0)
 
 
 def smooth_1d(values: np.ndarray, window: float) -> np.ndarray:
@@ -1700,8 +1740,9 @@ def rotate_bound(
 
 
 def estimate_row_angle(mask: np.ndarray) -> float:
-    """Estimate crop-row direction with PCA followed by a Radon-like search."""
-    ys, xs = np.where(mask > 0)
+    """Estimate crop-row direction from global and major-region PCA seeds."""
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    ys, xs = np.where(binary > 0)
     if xs.size < 100:
         return 0.0
 
@@ -1717,26 +1758,60 @@ def estimate_row_angle(mask: np.ndarray) -> float:
     covariance_xx = float(np.sum(sample_x * sample_x, dtype=np.float64))
     covariance_xy = float(np.sum(sample_x * sample_y, dtype=np.float64))
     covariance_yy = float(np.sum(sample_y * sample_y, dtype=np.float64))
-    coarse = 0.5 * math.atan2(
+    global_coarse = 0.5 * math.atan2(
         2.0 * covariance_xy,
         covariance_xx - covariance_yy,
     ) % math.pi
-    coords = np.column_stack([sample_x, sample_y])
+    coarse_candidates = [global_coarse]
 
-    best_angle = coarse
+    # Multiple separated planting regions can make the line between their
+    # centroids dominate global PCA.  Major-region moments retain the row axis
+    # inside each region, so include their axes as alternative search seeds.
+    contours, _ = cv2.findContours(
+        binary,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    ranked_contours = sorted(contours, key=cv2.contourArea, reverse=True)[:6]
+    largest_area = cv2.contourArea(ranked_contours[0]) if ranked_contours else 0.0
+    for contour in ranked_contours:
+        area = cv2.contourArea(contour)
+        if area < max(100.0, largest_area * 0.05):
+            continue
+        moments = cv2.moments(contour)
+        if moments["m00"] <= 0.0:
+            continue
+        candidate = 0.5 * math.atan2(
+            2.0 * moments["mu11"],
+            moments["mu20"] - moments["mu02"],
+        ) % math.pi
+        if all(
+            abs((candidate - existing + math.pi / 2.0) % math.pi - math.pi / 2.0)
+            > math.radians(3.0)
+            for existing in coarse_candidates
+        ):
+            coarse_candidates.append(candidate)
+
+    coords = np.column_stack([sample_x, sample_y])
+    best_angle = global_coarse
     best_score = -1.0
-    for angle in np.linspace(coarse - math.radians(12), coarse + math.radians(12), 49):
-        normal_x = -math.sin(angle)
-        normal_y = math.cos(angle)
-        projection = coords[:, 0] * normal_x + coords[:, 1] * normal_y
-        bins = max(128, min(1600, int(np.ptp(projection)) + 1))
-        histogram, _ = np.histogram(projection, bins=bins)
-        trend = smooth_1d(histogram, max(5, bins // 80))
-        high_frequency = histogram - trend
-        score = float(np.std(high_frequency)) / max(float(np.mean(histogram)), 1.0)
-        if score > best_score:
-            best_score = score
-            best_angle = angle % math.pi
+    for coarse in coarse_candidates:
+        for angle in np.linspace(
+            coarse - math.radians(12),
+            coarse + math.radians(12),
+            49,
+        ):
+            normal_x = -math.sin(angle)
+            normal_y = math.cos(angle)
+            projection = coords[:, 0] * normal_x + coords[:, 1] * normal_y
+            bins = max(128, min(1600, int(np.ptp(projection)) + 1))
+            histogram, _ = np.histogram(projection, bins=bins)
+            trend = smooth_1d(histogram, max(5, bins // 80))
+            high_frequency = histogram - trend
+            score = float(np.std(high_frequency)) / max(float(np.mean(histogram)), 1.0)
+            if score > best_score:
+                best_score = score
+                best_angle = angle % math.pi
     return best_angle
 
 
@@ -2221,9 +2296,24 @@ def regularize_crop_mask(
 
     h, w = raw.shape[:2]
     field_polygon = field_polygon_local(state, raw.shape)
-    if field_polygon is not None:
-        clip_mask_to_polygon_stripes(raw, field_polygon)
     mpp = meters_per_pixel(raw, geo, state)
+    # DECISION-020: mask analysis uses the field polygon expanded outward
+    # so a tightly circled field keeps the row-surrounding structure the
+    # profile needs (a tight clip previously cut the model output down to
+    # one connected blob and band reconstruction failed with
+    # 种植带重构失败).  Bands and centrelines are still clipped back to
+    # the ORIGINAL field polygon below.
+    analysis_polygon = field_polygon
+    if field_polygon is not None:
+        analysis_expand_m = float(cfg.get("field_analysis_expand_m", 6.0))
+        if analysis_expand_m > 0:
+            analysis_polygon = expand_polygon_px(
+                field_polygon,
+                analysis_expand_m / mpp,
+                h,
+                w,
+            )
+        clip_mask_to_polygon_stripes(raw, analysis_polygon)
     max_work_dim = int(cfg.get("max_work_dim", 5000))
     scale = min(1.0, float(max_work_dim) / max(h, w))
     work = cv2.resize(
@@ -2233,11 +2323,11 @@ def regularize_crop_mask(
     )
     work = (work >= int(cfg.get("resize_threshold", 96))).astype(np.uint8) * 255
     field_work_mask = None
-    if field_polygon is not None:
+    if analysis_polygon is not None:
         field_work_mask = np.zeros_like(work)
         cv2.fillPoly(
             field_work_mask,
-            [np.round(field_polygon * scale).astype(np.int32)],
+            [np.round(analysis_polygon * scale).astype(np.int32)],
             255,
         )
         cv2.bitwise_and(work, field_work_mask, dst=work)
@@ -2724,8 +2814,16 @@ def regularize_crop_mask(
             f"逐带重构 {band_index + 1}/{len(runs)}",
         )
 
+    # Diagnostic detail in the failure message: report how many candidate
+    # bands were detected and why each was skipped (observations, span
+    # ratio vs min_band_span_ratio, longitudinal extent) so a failed run
+    # is debuggable without re-instrumenting.
     if len(bands) < 2:
-        raise RuntimeError("种植带重构失败")
+        raise RuntimeError(
+            "种植带重构失败"
+            f" runs={len(runs)} bands={len(bands)} skipped={len(skipped_bands)}"
+            f" skip_detail={[{'id': s.get('id'), 'reason': s.get('reason'), 'obs': s.get('observations'), 'span': round(float(s.get('span_ratio', 0.0)), 3), 'extent_m': round(float(s.get('extent_m', 0.0)), 2)} for s in skipped_bands]}"
+        )
 
     report(0.82, "几何回写")
     abort_if_cancelled()
@@ -2849,6 +2947,25 @@ def regularize_crop_mask(
         "center_trend_preserved": True,
     }
     report(0.98, "结果统计")
+    # DECISION-020 follow-up: the analysis polygon is expanded outward for
+    # row reconstruction, but every OUTPUT layer must stay inside the
+    # original user-drawn field boundary (mask never displays outside the
+    # box).  Band polygons and centrelines are already clipped; this makes
+    # the residual/headland/planning layers consistent with them.
+    if field_polygon is not None:
+        for _output_layer in (
+            visible_body,
+            rebuilt,
+            body_residual_mask,
+            gap_repair_added_mask,
+            support_clip_removed_mask,
+            headland_corridor_mask,
+            headland_mask,
+            uncertain_residual_mask,
+            neutral_support_mask,
+            planning_support_mask,
+        ):
+            clip_mask_to_polygon_stripes(_output_layer, field_polygon)
     report(1.0, "完成")
     return {
         "processed_mask": visible_body,

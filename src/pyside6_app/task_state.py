@@ -16,6 +16,8 @@ TASK_ORDER: List[str] = [
     "segment",
     "process",
     "params",
+    "centerline_generate",
+    "centerline_select",
     "entry",
     "exit",
     "unload",
@@ -27,23 +29,27 @@ TASK_ORDER: List[str] = [
 TASK_LABELS: Dict[str, str] = {
     "import_img": "影像导入",
     "draw_field": "田块圈选",
-    "segment": "AI识别",
-    "process": "掩膜处理",
+    "segment": "作物识别",
+    "process": "掩膜优化",
     "params": "农机参数",
+    "centerline_generate": "生成中心线",
+    "centerline_select": "选择中心线",
     "entry": "起点",
     "exit": "终点",
     "unload": "卸粮点",
     "plan": "路径规划",
     "simulate": "模拟演示",
-    "export": "路径导出",
+    "export": "TXT路径导出",
 }
 
 TASK_DESCRIPTIONS: Dict[str, str] = {
     "import_img": "影像、田块、识别结果、路径与导出状态都会清除。",
-    "draw_field": "田块边界及其后的 AI 识别、掩膜、起终点、路径、演示、导出都会清除；底图保留。",
-    "segment": "AI 识别结果及其后的掩膜、起终点、路径、演示、导出都会清除；底图和田块边界保留。",
-    "process": "掩膜处理结果及其后的智能起终点、路径、演示、导出都会清除；原始 AI 识别和田块边界保留。",
+    "draw_field": "田块边界及其后的 作物识别、掩膜、起终点、路径、演示、导出都会清除；底图保留。",
+    "segment": "作物识别结果及其后的掩膜、起终点、路径、演示、导出都会清除；底图和田块边界保留。",
+    "process": "掩膜优化结果及其后的智能起终点、路径、演示、导出都会清除；原始 作物识别和田块边界保留。",
     "params": "农机参数及其后的起终点、路径、演示、导出都会回退。",
+    "centerline_generate": "候选作业线目录及其后的作业线选择、起终点、路径、演示、导出都会回退；掩膜和农机参数保留。",
+    "centerline_select": "作业线选择及其后的起终点、路径、演示、导出都会回退；已生成的候选作业线保留。",
     "entry": "起点及其后的可选终点、卸粮点、路径、演示、导出都会回退。",
     "exit": "可选终点及其后的卸粮点、路径、演示、导出都会回退。",
     "unload": "卸粮点及其后的路径、演示、导出都会回退；起点和终点保留。",
@@ -107,6 +113,21 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     exit_point = getattr(state, "exit_point", None)
     unload_points = list(getattr(state, "unload_points", []) or [])
     path_done = bool(getattr(state, "auto_path_planned", False))
+    centerline_catalog = getattr(state, "centerline_catalog", None) or getattr(
+        state, "work_band_catalog", {}
+    ) or {}
+    centerline_items = list(centerline_catalog.get("items") or [])
+    centerline_ids = {
+        str(item.get("id")) for item in centerline_items if item.get("id") is not None
+    }
+    selected_centerlines = list(
+        getattr(state, "selected_centerline_ids", None)
+        or getattr(state, "selected_work_band_ids", [])
+        or []
+    )
+    centerlines_selected = bool(
+        centerline_ids.intersection(str(value) for value in selected_centerlines)
+    )
     sim_done = bool(getattr(state, "simulation_done", False))
     export_done = bool(getattr(state, "export_done", False))
 
@@ -130,39 +151,73 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
             statuses["params"] = TaskStatus("available", "缺割刀前置", action="补填")
         else:
             statuses["params"] = TaskStatus("available")
-        if entry:
-            locked = bool(getattr(state, "entry_point_locked", False))
-            statuses["entry"] = TaskStatus(
-                "done" if locked else "available",
-                "已确认" if locked else "推荐待确认",
-                action="调整" if locked else "确认",
+
+        if not centerline_items:
+            statuses["centerline_generate"] = TaskStatus(
+                "available", "待生成", action="生成"
             )
         else:
-            statuses["entry"] = TaskStatus("available", "待设置")
-        if exit_point:
-            locked = bool(getattr(state, "exit_point_locked", False))
-            statuses["exit"] = TaskStatus(
-                "done" if locked else "available",
-                "已确认（可选）" if locked else "待确认（可选）",
-                action="调整" if locked else "确认",
+            statuses["centerline_generate"] = TaskStatus("done")
+            selected_count = len(
+                centerline_ids.intersection(str(value) for value in selected_centerlines)
             )
+            statuses["centerline_select"] = TaskStatus(
+                "done" if selected_count else "available",
+                f"已选择 {selected_count}/{len(centerline_ids)} 条"
+                if selected_count
+                else "待选择",
+                action="调整" if selected_count else "选择",
+            )
+        if not centerline_items:
+            statuses["centerline_select"] = TaskStatus("pending", "先生成中心线")
+
+        if not centerline_items or not centerlines_selected:
+            statuses["entry"] = TaskStatus("pending", "先选择中心线")
+            statuses["exit"] = TaskStatus("pending", "先选择中心线")
+            statuses["unload"] = TaskStatus("pending", "可选；先选择中心线")
         else:
-            statuses["exit"] = TaskStatus("done", "自动延伸", action="调整")
-        if unload_points:
-            statuses["unload"] = TaskStatus("done", f"{len(unload_points)} 个")
-        elif entry:
-            statuses["unload"] = TaskStatus("done", "可选")
-        else:
-            statuses["unload"] = TaskStatus("pending", "可选")
+            if entry:
+                locked = bool(getattr(state, "entry_point_locked", False))
+                statuses["entry"] = TaskStatus(
+                    "done" if locked else "available",
+                    "已确认" if locked else "推荐待确认",
+                    action="调整" if locked else "确认",
+                )
+            else:
+                statuses["entry"] = TaskStatus("available", "待设置")
+            if exit_point:
+                locked = bool(getattr(state, "exit_point_locked", False))
+                statuses["exit"] = TaskStatus(
+                    "done" if locked else "available",
+                    "已确认（可选）" if locked else "待确认（可选）",
+                    action="调整" if locked else "确认",
+                )
+            else:
+                statuses["exit"] = TaskStatus("done", "自动延伸", action="调整")
+            if unload_points:
+                statuses["unload"] = TaskStatus("done", f"{len(unload_points)} 个")
+            else:
+                statuses["unload"] = TaskStatus("done", "可选")
 
     ready_to_plan = bool(
         process_done
+        and centerlines_selected
         and params_ready
         and params_confirmed
         and _has_points(entry)
         and getattr(state, "entry_point_locked", False)
     )
-    if ready_to_plan:
+    if process_done and not centerline_items:
+        statuses["plan"] = TaskStatus("pending", "先生成中心线")
+    elif process_done and centerline_items and not centerlines_selected:
+        statuses["plan"] = TaskStatus("pending", "先选择中心线")
+    elif process_done and centerlines_selected and not params_confirmed:
+        statuses["plan"] = TaskStatus("pending", "先确认高级设置")
+    elif process_done and centerlines_selected and not getattr(
+        state, "entry_point_locked", False
+    ):
+        statuses["plan"] = TaskStatus("pending", "先设置并确认起点")
+    elif ready_to_plan:
         statuses["plan"] = TaskStatus("done" if path_done else "available", action="重算" if path_done else "生成")
     if plan_running:
         statuses["plan"] = TaskStatus("in_progress", "规划中")

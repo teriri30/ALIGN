@@ -145,9 +145,91 @@ def test_machine_compatibility_preview_exports_without_formal_machine_evidence(
         if line.startswith("$PATH")
     ]
     assert len(rows) == 2
-    assert all(row.rstrip("*").split(",")[-1] in {"0", "1"} for row in rows)
+    assert all(row.rstrip("*").split(",")[-1] == "2" for row in rows)
     assert window._machine_route_preview["point_count"] == 2
     assert "compatibility-preview.path" in window._machine_route_preview["info"]
+    window.close()
+
+
+def test_machine_compatibility_export_fails_closed_on_manifest_mismatch(
+    tmp_path, monkeypatch
+):
+    """DECISION-001: a replaced TXT must not be reported as a successful export."""
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    output = tmp_path / "machine-preview.txt"
+    path_result = {
+        "machine_readiness": {},
+        "validation": {"valid": True},
+        "is_valid": True,
+    }
+    points = [
+        {
+            "lat": 30.0,
+            "lon": 116.0,
+            "pixel_x": 1.0,
+            "pixel_y": 1.0,
+            "segment_index": 0,
+            "point_index": 0,
+            "segment_type": "work",
+            "status": 1,
+        },
+        {
+            "lat": 30.001,
+            "lon": 116.0,
+            "pixel_x": 1.0,
+            "pixel_y": 10.0,
+            "segment_index": 0,
+            "point_index": 1,
+            "segment_type": "work",
+            "status": 1,
+        },
+    ]
+    manifest_path = Path(str(output) + ".manifest.json")
+
+    def fake_manifest(path, *_args, **_kwargs):
+        Path(str(path) + ".manifest.json").write_text("{}", encoding="utf-8")
+        return str(manifest_path)
+
+    monkeypatch.setattr(window, "_write_export_manifest", fake_manifest)
+    calls = []
+    monkeypatch.setattr(
+        "integrity_check.verify_manifest",
+        lambda path: calls.append(str(path))
+        or ["output SHA-256 does not match manifest"],
+    )
+
+    with pytest.raises(ValueError, match="完整性校验失败"):
+        window._export_candidate_path(
+            str(output),
+            path_result=path_result,
+            geo_points=points,
+            machine_compatibility=True,
+            preview_only=True,
+        )
+
+    assert calls == [str(manifest_path)]
+    assert not output.exists()
+    assert not manifest_path.exists()
+    window.close()
+
+
+def test_machine_route_preview_rechecks_manifest_before_display(tmp_path, monkeypatch):
+    """DECISION-001: replacing TXT after export invalidates the preview."""
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    manifest_path = tmp_path / "001.txt.manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "integrity_check.verify_manifest",
+        lambda _path: ["output SHA-256 does not match manifest"],
+    )
+
+    errors = window._machine_route_preview_integrity_errors({
+        "manifest_path": str(manifest_path),
+    })
+
+    assert errors == ["output SHA-256 does not match manifest"]
     window.close()
 
 
@@ -230,7 +312,7 @@ def test_machine_compatibility_export_matches_visible_compact_control_points(
     ]
     assert len(rows) == len(window.state.path_points)
     assert [row.rstrip("*").split(",")[-1] for row in rows] == [
-        "1", "0", "1", "0"
+        "2", "2", "2", "2"
     ]
     assert captured["protocol"]["route_source"] == (
         "shared_route_control_polyline"
@@ -424,4 +506,38 @@ def test_complete_package_keeps_candidate_path_and_required_manifest_together(tm
     assert Path(route_path).is_file()
     assert Path(manifest_path).is_file()
     assert (Path(package_dir) / "package_index.json").is_file()
+    window.close()
+
+
+def test_trial_package_handler_reports_export_failure_and_restores_cursor(
+    tmp_path, monkeypatch
+):
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    monkeypatch.setattr(
+        "pyside6_app.main_window.QFileDialog.getExistingDirectory",
+        lambda *_args, **_kwargs: str(tmp_path),
+    )
+
+    def fail_export(_parent):
+        raise RuntimeError("package build failed")
+
+    errors = []
+    advanced = []
+    monkeypatch.setattr(window, "_export_complete_trial_package", fail_export)
+    monkeypatch.setattr(
+        window,
+        "_show_geo_export_error",
+        lambda label, error: errors.append((label, str(error))),
+    )
+    monkeypatch.setattr(
+        "pyside6_app.main_window.WorkflowUpdater.advance",
+        lambda *args: advanced.append(args),
+    )
+
+    window._on_export_trial_package()
+
+    assert errors == [("完整试验资料包", "package build failed")]
+    assert advanced == []
+    assert QApplication.overrideCursor() is None
     window.close()

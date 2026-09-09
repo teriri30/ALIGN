@@ -189,7 +189,7 @@ def test_manual_route_edit_can_export_current_compatibility_control_route(
     assert route_path == str(tmp_path / "001.txt")
     assert len(rows) == len(window.state.path_points)
     assert [row.rstrip("*").split(",")[-1] for row in rows] == [
-        "1", "0", "1", "0"
+        "2", "2", "2", "2"
     ]
     assert window._pipeline_result["path"]["full_path"][1][0] == (20.0, 2.0)
     assert window._pipeline_result["path"]["full_path"][1][-1] == (20.0, 20.0)

@@ -33,7 +33,7 @@ from runtime_paths import resolve_model_path
 # conversion at the external-library boundary.  v3 passed RGB directly and its
 # cached masks must be recomputed.
 # DECISION-005: keep application arrays RGB and adapt once at the Ultralytics boundary.
-INFERENCE_PIPELINE_VERSION = "source-tif-sahi-v7-native-context-conservative"
+INFERENCE_PIPELINE_VERSION = "source-tif-sahi-v8-overlap-fusion-context-conservative"
 
 
 INFERENCE_DEFAULT_BATCH_SIZE = 8
@@ -42,6 +42,53 @@ INFERENCE_MAX_BATCH_SIZE = 32
 # repeated support in most overlapping context tiles prevents one weak
 # 1280px response from expanding the semantic mask across an orthomosaic.
 INFERENCE_DEFAULT_CONTEXT_SUPPORT_RATIO = 0.80
+INFERENCE_DEFAULT_RECOVERY_CONF = 0.20
+INFERENCE_DEFAULT_MASK_THRESHOLD = 0.50
+INFERENCE_DEFAULT_TILE_EDGE_WEIGHT = 0.05
+
+
+def _gaussian_tile_weight(
+    height: int,
+    width: int,
+    *,
+    edge_floor: float = INFERENCE_DEFAULT_TILE_EDGE_WEIGHT,
+) -> np.ndarray:
+    """Return a smooth centre-weight for one source tile.
+
+    The native GeoTIFF path previously pasted each tile with a hard maximum,
+    which made the rectangular tile grid visible in the final mask.  A
+    normalized Gaussian keeps the tile centre authoritative and makes the
+    overlap area an evidence-weighted blend.  The small positive floor keeps
+    edge pixels represented when a neighbouring tile has no valid prediction.
+    """
+    height = max(1, int(height))
+    width = max(1, int(width))
+    floor = min(max(float(edge_floor), 0.0), 1.0)
+    gy, gx = np.ogrid[:height, :width]
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    sx = max(width / 4.5, 1.0)
+    sy = max(height / 4.5, 1.0)
+    weight = np.exp(
+        -(((gx - cx) ** 2) / (2.0 * sx * sx)
+          + ((gy - cy) ** 2) / (2.0 * sy * sy))
+    ).astype(np.float32)
+    weight -= float(weight.min())
+    peak = float(weight.max())
+    if peak > 1e-10:
+        weight /= peak
+    return (weight * (1.0 - floor) + floor).astype(np.float32, copy=False)
+
+
+def _probability_to_mask(
+    probability: np.ndarray,
+    *,
+    threshold: float = INFERENCE_DEFAULT_MASK_THRESHOLD,
+) -> np.ndarray:
+    """Convert a fused probability map with one explicit threshold."""
+    value = np.asarray(probability, dtype=np.float32)
+    finite = np.nan_to_num(value, nan=0.0, posinf=1.0, neginf=0.0)
+    return (finite >= float(threshold)).astype(np.uint8) * 255
 
 
 def _model_config(cfg=None) -> dict:
@@ -370,9 +417,29 @@ class ModelEngine:
 
     def unload(self):
         """Release the active model when project history restores 'no model'."""
+        model = self._model
         self._model = None
         self._model_path = ""
         self._loaded = False
+        # Model switching is deliberately serialized by the GUI, but the
+        # previous engine can still hold a large CPU/GPU allocation until its
+        # last Python reference is collected.  Release it explicitly after
+        # clearing the engine identity; this is a resource cleanup, not a
+        # change to inference semantics.
+        try:
+            del model
+            import gc
+
+            gc.collect()
+            import torch
+
+            if bool(torch.cuda.is_available()):
+                torch.cuda.empty_cache()
+        except Exception:
+            # CPU-only/frozen environments may not ship torch or CUDA.  The
+            # model identity is already cleared, so cleanup remains best
+            # effort and must never turn a successful switch into a failure.
+            pass
 
     def runtime_config(self) -> dict:
         """Return the device/precision settings used by ``predict``."""
@@ -447,25 +514,21 @@ class TiledInference:
         self.engine = engine
         self.log = AppLogger()
         self._gauss_cache = {}  # 高斯权重缓存
+        self._last_diagnostics: Dict[str, Any] = {}
 
     def _get_gauss_weight(self, sz: int) -> np.ndarray:
         """获取或生成高斯权重图：中心 1.0，边缘渐近 0，用于无缝融合"""
         if sz in self._gauss_cache:
             return self._gauss_cache[sz]
-        gy, gx = np.ogrid[:sz, :sz]
-        c = sz / 2.0
-        s = sz / 4.5  # sigma更大 → 边缘降权更柔和
-        w = np.exp(-((gx - c)**2 + (gy - c)**2) / (2 * s * s))
-        # 边缘权重降至 ~0.05，中心保持 1.0
-        w = (w - w.min()) / max(w.max() - w.min(), 1e-10)
-        w = w * 0.95 + 0.05
-        self._gauss_cache[sz] = w.astype(np.float32)
+        self._gauss_cache[sz] = _gaussian_tile_weight(sz, sz)
         return self._gauss_cache[sz]
 
     def run(self, full_image: np.ndarray, progress_cb=None,
             capture_sz=DEFAULT_CAPTURE_SIZE, overlap=DEFAULT_OVERLAP,
             erode=False, conf=DEFAULT_CONF, iou=DEFAULT_IOU,
-            batch_size: int = 4) -> Optional[np.ndarray]:
+            batch_size: int = 4,
+            mask_threshold: float = INFERENCE_DEFAULT_MASK_THRESHOLD
+            ) -> Optional[np.ndarray]:
         """SAHI 三步：滑窗切块 -> 单块概率推理 -> 高斯加权融合
         Args:
             capture_sz: 从原图裁切的块尺寸，默认固定 640，避免额外缩放损失
@@ -473,9 +536,13 @@ class TiledInference:
             erode: 是否执行防粘连腐蚀（细线建议 False）
             conf: 模型置信度阈值，默认 0.25
             iou: NMS 阈值，默认 0.45
+            mask_threshold: 融合概率的固定掩膜阈值，默认 0.50
         """
 
-        if not self.engine.is_loaded(): return None
+        self._last_diagnostics = {}
+        if not self.engine.is_loaded():
+            self._last_diagnostics = {}
+            return None
 
         H, W = full_image.shape[:2]
         capture_sz = int(capture_sz)
@@ -499,6 +566,8 @@ class TiledInference:
         processed = 0
         batch_images = []
         batch_meta = []
+        tile_trace: List[Dict[str, Any]] = []
+        next_tile_index = 0
 
         def flush_batch():
             nonlocal processed, batch_images, batch_meta
@@ -509,7 +578,8 @@ class TiledInference:
                 # Retry one-by-one after a batch failure, but never convert a
                 # failed tile into valid background data.
                 results = []
-                for image, (x0, y0, _ah, _aw) in zip(batch_images, batch_meta):
+                for image, meta in zip(batch_images, batch_meta):
+                    x0, y0 = int(meta[3]), int(meta[4])
                     single = self.engine.predict(image, conf=conf, iou=iou)
                     if not single:
                         raise RuntimeError(
@@ -521,26 +591,38 @@ class TiledInference:
                 raise RuntimeError(
                     "tile inference failed: model result count does not match input tiles"
                 )
-            for result, (x0, y0, ah, aw) in zip(results, batch_meta):
+            for result, (tile_index, row_index, col_index, x0, y0, ah, aw) in zip(results, batch_meta):
                 if result is None:
                     raise RuntimeError(
                         f"tile inference failed at pixel window ({x0}, {y0})"
                     )
                 tile_prob = np.zeros((capture_sz, capture_sz), dtype=np.float32)
-                if result is not None and result.masks is not None:
-                    md = result.masks.data.cpu().numpy()
-                    if len(md) > 0:
-                        probability = np.max(md, axis=0)
-                        if probability.shape[:2] != (capture_sz, capture_sz):
-                            probability = cv2.resize(
-                                probability,
-                                (capture_sz, capture_sz),
-                                interpolation=cv2.INTER_LINEAR,
-                            )
-                        tile_prob = probability.astype(np.float32)
+                masks, confidences = _result_mask_stack(
+                    result,
+                    (capture_sz, capture_sz),
+                )
+                accepted = confidences >= float(conf)
+                if np.any(accepted):
+                    tile_prob = np.max(masks[accepted], axis=0).astype(
+                        np.float32,
+                        copy=False,
+                    )
                 roi_w = gauss_w[:ah, :aw]
                 prob_acc[y0:y0+ah, x0:x0+aw] += tile_prob[:ah, :aw] * roi_w
                 weight_acc[y0:y0+ah, x0:x0+aw] += roi_w
+                tile_trace.append({
+                    "tile_index": int(tile_index),
+                    "row": int(row_index),
+                    "column": int(col_index),
+                    "source_window_xywh": [int(x0), int(y0), int(aw), int(ah)],
+                    "output_window_xywh": [int(x0), int(y0), int(aw), int(ah)],
+                    "accepted_instance_count": int(np.count_nonzero(accepted)),
+                    "max_confidence": float(np.max(confidences)) if confidences.size else 0.0,
+                    "tile_probability_pixels": int(
+                        np.count_nonzero(tile_prob[:ah, :aw] >= float(mask_threshold))
+                    ),
+                    "skipped_nodata": False,
+                })
                 processed += 1
             if progress_cb:
                 progress_cb(processed / total)
@@ -572,17 +654,39 @@ class TiledInference:
                 ah = min(capture_sz, H - y0)
                 aw = min(capture_sz, W - x0)
                 batch_images.append(np.ascontiguousarray(tile_infer))
-                batch_meta.append((x0, y0, ah, aw))
+                batch_meta.append((next_tile_index, row, col, x0, y0, ah, aw))
+                next_tile_index += 1
                 if len(batch_images) >= max(1, int(batch_size)):
                     flush_batch()
         flush_batch()
 
-        # 归一化概率 → 自适应二值化
-        np.maximum(weight_acc, 1e-10, out=weight_acc)
-        np.divide(prob_acc, weight_acc, out=prob_acc)
-        prob_uint8 = (np.clip(prob_acc, 0, 1) * 255).astype(np.uint8)
-        otsu_th, mask = cv2.threshold(prob_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        self.log.info(f"概率融合完成, Otsu阈值={otsu_th}, 非零像素: {np.count_nonzero(mask)}")
+        # 归一化概率 → 固定阈值。逐块 Otsu 会让相邻切片使用不同的掩膜
+        # 标准，且无法表达跨切片的重叠证据。
+        np.divide(
+            prob_acc,
+            weight_acc,
+            out=prob_acc,
+            where=weight_acc > 1e-10,
+        )
+        mask = _probability_to_mask(prob_acc, threshold=mask_threshold)
+        self._last_diagnostics = {
+            "capture_size": int(capture_sz),
+            "overlap": float(overlap),
+            "stride": int(capture_stride),
+            "rows": int(n_rows),
+            "columns": int(n_cols),
+            "tile_count": int(total),
+            "confidence_threshold": float(conf),
+            "iou_threshold": float(iou),
+            "mask_threshold": float(mask_threshold),
+            "native_tile_input": bool(native),
+            "tile_fusion": "gaussian_probability_mean",
+            "tile_trace": tile_trace,
+        }
+        self.log.info(
+            f"概率融合完成, threshold={float(mask_threshold):.2f}, "
+            f"非零像素: {np.count_nonzero(mask)}"
+        )
 
         # 可选轻度腐蚀（默认关闭）
         if erode:
@@ -702,9 +806,35 @@ class InferenceRunner:
         overlap = min(max(float(self.cfg.TILE_OVERLAP), 0.0), 0.95)
         model_cfg = self.cfg.section("model")
         primary_conf = float(self.cfg.MODEL_CONF)
+        configured_recovery_conf = float(
+            model_cfg.get(
+                "orthomosaic_recovery_conf_threshold",
+                INFERENCE_DEFAULT_RECOVERY_CONF,
+            )
+        )
         recovery_conf = min(
             primary_conf,
-            float(model_cfg.get("orthomosaic_recovery_conf_threshold", 0.10)),
+            max(configured_recovery_conf, INFERENCE_DEFAULT_RECOVERY_CONF),
+        )
+        tile_mask_threshold = min(
+            max(
+                float(model_cfg.get(
+                    "orthomosaic_primary_mask_threshold",
+                    INFERENCE_DEFAULT_MASK_THRESHOLD,
+                )),
+                0.05,
+            ),
+            0.95,
+        )
+        tile_edge_weight_floor = min(
+            max(
+                float(model_cfg.get(
+                    "orthomosaic_tile_edge_weight_floor",
+                    INFERENCE_DEFAULT_TILE_EDGE_WEIGHT,
+                )),
+                0.0,
+            ),
+            1.0,
         )
         context_enabled = bool(
             model_cfg.get("orthomosaic_context_enabled", True)
@@ -719,23 +849,40 @@ class InferenceRunner:
         n_cols = max(1, math.ceil((crop_w - capture_sz) / stride) + 1)
         n_rows = max(1, math.ceil((crop_h - capture_sz) / stride) + 1)
         total = n_rows * n_cols
+        # DECISION-004/009: native tiles remain authoritative, while their
+        # overlapping evidence is blended with centre weights before the
+        # semantic mask is formed; tile edges are never hard-pasted.
         out_mask = np.zeros((out_h, out_w), dtype=np.uint8)
+        tile_probability_acc = np.zeros((out_h, out_w), dtype=np.float32)
+        tile_weight_acc = np.zeros((out_h, out_w), dtype=np.float32)
+        tile_blend_weight = _gaussian_tile_weight(
+            capture_sz,
+            capture_sz,
+            edge_floor=tile_edge_weight_floor,
+        )
         preprocessing = {
             "streamed_source_tiles": True,
             "tile_capture_size": int(capture_sz),
             "tile_overlap": float(overlap),
             "tile_count": int(total),
             "primary_conf_threshold": float(primary_conf),
+            "configured_recovery_conf_threshold": float(configured_recovery_conf),
             "effective_recovery_conf_threshold": float(recovery_conf),
+            "primary_mask_threshold": float(tile_mask_threshold),
+            "tile_fusion": "gaussian_probability_mean",
+            "tile_edge_weight_floor": float(tile_edge_weight_floor),
             "batch_size": int(batch_size),
             "context_enabled": bool(context_enabled and context_multiplier > 1),
             "tile_preprocessing": [],
+            "tile_trace": [],
+            "context_tile_trace": [],
         }
         processed = 0
         valid_tile_count = 0
         skipped_nodata_count = 0
         batch_images = []
         batch_meta = []
+        next_tile_index = 0
 
         def flush_batch():
             nonlocal processed, batch_images, batch_meta
@@ -743,7 +890,7 @@ class InferenceRunner:
                 return
             results = self.engine.predict(
                 batch_images,
-                conf=float(recovery_conf),
+                conf=float(primary_conf),
                 iou=float(self.cfg.MODEL_IOU),
             )
             if results is None:
@@ -751,31 +898,32 @@ class InferenceRunner:
                 for image, meta in zip(batch_images, batch_meta):
                     single = self.engine.predict(
                         image,
-                        conf=float(recovery_conf),
+                        conf=float(primary_conf),
                         iou=float(self.cfg.MODEL_IOU),
                     )
                     if not single:
-                        raise RuntimeError(f"tile inference failed at source window ({meta[0]}, {meta[1]})")
+                        raise RuntimeError(f"tile inference failed at source window ({meta[3]}, {meta[4]})")
                     results.append(single[0])
             results = list(results)
             if len(results) != len(batch_meta):
                 raise RuntimeError("tile inference failed: model result count does not match input tiles")
-            for result, (sx0, sy0, sw, sh) in zip(results, batch_meta):
+            for result, (tile_index, row_index, col_index, sx0, sy0, sw, sh) in zip(results, batch_meta):
                 if result is None:
                     raise RuntimeError(f"tile inference failed at source window ({sx0}, {sy0})")
-                tile_mask = np.zeros((capture_sz, capture_sz), dtype=np.uint8)
-                masks, _confidences = _result_mask_stack(
+                masks, confidences = _result_mask_stack(
                     result,
                     (capture_sz, capture_sz),
                 )
-                if len(masks) > 0:
-                    probability = np.max(masks, axis=0)
-                    prob_u8 = (np.clip(probability, 0, 1) * 255).astype(np.uint8)
-                    _, tile_mask = cv2.threshold(
-                        prob_u8,
-                        0,
-                        255,
-                        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+                accepted = confidences >= float(primary_conf)
+                if np.any(accepted):
+                    tile_probability = np.max(masks[accepted], axis=0).astype(
+                        np.float32,
+                        copy=False,
+                    )
+                else:
+                    tile_probability = np.zeros(
+                        (capture_sz, capture_sz),
+                        dtype=np.float32,
                     )
                 dx0 = int(math.floor((sx0 / max(1, crop_w)) * out_w))
                 dy0 = int(math.floor((sy0 / max(1, crop_h)) * out_h))
@@ -784,8 +932,39 @@ class InferenceRunner:
                 dx0, dy0 = max(0, dx0), max(0, dy0)
                 dx1, dy1 = min(out_w, dx1), min(out_h, dy1)
                 if dx1 > dx0 and dy1 > dy0:
-                    projected = cv2.resize(tile_mask[:sh, :sw], (dx1 - dx0, dy1 - dy0), interpolation=cv2.INTER_NEAREST)
-                    np.maximum(out_mask[dy0:dy1, dx0:dx1], projected, out=out_mask[dy0:dy1, dx0:dx1])
+                    target_size = (dx1 - dx0, dy1 - dy0)
+                    projected_probability = cv2.resize(
+                        tile_probability[:sh, :sw],
+                        target_size,
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    projected_weight = cv2.resize(
+                        tile_blend_weight[:sh, :sw],
+                        target_size,
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    tile_probability_acc[dy0:dy1, dx0:dx1] += (
+                        projected_probability * projected_weight
+                    )
+                    tile_weight_acc[dy0:dy1, dx0:dx1] += projected_weight
+                preprocessing["tile_trace"].append({
+                    "tile_index": int(tile_index),
+                    "row": int(row_index),
+                    "column": int(col_index),
+                    "source_window_xywh": [
+                        int(x0_src + sx0), int(y0_src + sy0), int(sw), int(sh)
+                    ],
+                    "source_crop_window_xywh": [int(sx0), int(sy0), int(sw), int(sh)],
+                    "output_window_xywh": [
+                        int(dx0), int(dy0), int(max(0, dx1 - dx0)), int(max(0, dy1 - dy0))
+                    ],
+                    "accepted_instance_count": int(np.count_nonzero(accepted)),
+                    "max_confidence": float(np.max(confidences)) if confidences.size else 0.0,
+                    "tile_probability_pixels": int(
+                        np.count_nonzero(tile_probability[:sh, :sw] >= tile_mask_threshold)
+                    ),
+                    "skipped_nodata": False,
+                })
                 processed += 1
             self._update(
                 inference_progress=0.04 + (processed / max(1, total)) * 0.60,
@@ -813,6 +992,20 @@ class InferenceRunner:
                     )
                 except EmptyRasterWindowError:
                     skipped_nodata_count += 1
+                    preprocessing["tile_trace"].append({
+                        "tile_index": int(next_tile_index),
+                        "row": int(row),
+                        "column": int(col),
+                        "source_window_xywh": [
+                            int(x0_src + sx0), int(y0_src + sy0), int(sw), int(sh)
+                        ],
+                        "source_crop_window_xywh": [int(sx0), int(sy0), int(sw), int(sh)],
+                        "accepted_instance_count": 0,
+                        "max_confidence": 0.0,
+                        "tile_probability_pixels": 0,
+                        "skipped_nodata": True,
+                    })
+                    next_tile_index += 1
                     processed += 1
                     continue
                 valid_tile_count += 1
@@ -830,7 +1023,8 @@ class InferenceRunner:
                 # ``read_rgb_raster`` returns RGB. ModelEngine performs the
                 # single conversion required by Ultralytics' BGR ndarray API.
                 batch_images.append(np.ascontiguousarray(tile_img))
-                batch_meta.append((sx0, sy0, sw, sh))
+                batch_meta.append((next_tile_index, row, col, sx0, sy0, sw, sh))
+                next_tile_index += 1
                 if len(batch_images) >= batch_size:
                     flush_batch()
         flush_batch()
@@ -842,6 +1036,22 @@ class InferenceRunner:
             self.log.info(
                 f"source-tile inference skipped {skipped_nodata_count}/{total} all-NoData tiles"
             )
+        np.divide(
+            tile_probability_acc,
+            tile_weight_acc,
+            out=tile_probability_acc,
+            where=tile_weight_acc > 1e-10,
+        )
+        out_mask = _probability_to_mask(
+            tile_probability_acc,
+            threshold=tile_mask_threshold,
+        )
+        preprocessing["primary_mask_pixels"] = int(np.count_nonzero(out_mask))
+        self.log.info(
+            "原始切片概率融合完成: "
+            f"threshold={tile_mask_threshold:.2f}, "
+            f"非零像素={np.count_nonzero(out_mask)}"
+        )
         if context_enabled and context_multiplier > 1:
             context_capture = int(capture_sz * context_multiplier)
             context_overlap = min(
@@ -869,6 +1079,7 @@ class InferenceRunner:
             context_processed = 0
             context_valid = 0
             context_skipped = 0
+            context_tile_index = 0
 
             def flush_context_batch():
                 nonlocal context_images, context_meta, context_processed
@@ -889,7 +1100,7 @@ class InferenceRunner:
                         )
                         if not single:
                             raise RuntimeError(
-                                f"context inference failed at source window ({meta[0]}, {meta[1]})"
+                                f"context inference failed at source window ({meta[3]}, {meta[4]})"
                             )
                         results.append(single[0])
                 results = list(results)
@@ -897,7 +1108,7 @@ class InferenceRunner:
                     raise RuntimeError(
                         "context inference failed: model result count does not match input tiles"
                     )
-                for result, (sx0, sy0, sw, sh) in zip(results, context_meta):
+                for result, (tile_index, row_index, col_index, sx0, sy0, sw, sh) in zip(results, context_meta):
                     if result is None:
                         raise RuntimeError(
                             f"context inference failed at source window ({sx0}, {sy0})"
@@ -946,6 +1157,23 @@ class InferenceRunner:
                             projected_boundary > 0
                         ).astype(np.uint16)
                         coverage_votes[dy0:dy1, dx0:dx1] += 1
+                    preprocessing["context_tile_trace"].append({
+                        "tile_index": int(tile_index),
+                        "row": int(row_index),
+                        "column": int(col_index),
+                        "source_window_xywh": [
+                            int(x0_src + sx0), int(y0_src + sy0), int(sw), int(sh)
+                        ],
+                        "source_crop_window_xywh": [int(sx0), int(sy0), int(sw), int(sh)],
+                        "output_window_xywh": [
+                            int(dx0), int(dy0), int(max(0, dx1 - dx0)), int(max(0, dy1 - dy0))
+                        ],
+                        "accepted_instance_count": int(np.count_nonzero(accepted)),
+                        "max_confidence": float(np.max(confidences)) if confidences.size else 0.0,
+                        "support_pixels": int(np.count_nonzero(tile_support)),
+                        "boundary_pixels": int(np.count_nonzero(tile_boundary)),
+                        "skipped_nodata": False,
+                    })
                     context_processed += 1
                 self._update(
                     inference_progress=(
@@ -975,6 +1203,21 @@ class InferenceRunner:
                         )
                     except EmptyRasterWindowError:
                         context_skipped += 1
+                        preprocessing["context_tile_trace"].append({
+                            "tile_index": int(context_tile_index),
+                            "row": int(row),
+                            "column": int(col),
+                            "source_window_xywh": [
+                                int(x0_src + sx0), int(y0_src + sy0), int(sw), int(sh)
+                            ],
+                            "source_crop_window_xywh": [int(sx0), int(sy0), int(sw), int(sh)],
+                            "accepted_instance_count": 0,
+                            "max_confidence": 0.0,
+                            "support_pixels": 0,
+                            "boundary_pixels": 0,
+                            "skipped_nodata": True,
+                        })
+                        context_tile_index += 1
                         context_processed += 1
                         continue
                     context_valid += 1
@@ -993,7 +1236,8 @@ class InferenceRunner:
                         interpolation=cv2.INTER_AREA,
                     )
                     context_images.append(np.ascontiguousarray(tile_img))
-                    context_meta.append((sx0, sy0, sw, sh))
+                    context_meta.append((context_tile_index, row, col, sx0, sy0, sw, sh))
+                    context_tile_index += 1
                     if len(context_images) >= batch_size:
                         flush_context_batch()
             flush_context_batch()
@@ -1054,10 +1298,39 @@ class InferenceRunner:
             display_h, display_w = [max(1, int(v)) for v in display_shape[:2]]
             pts_display = np.asarray(field_boundary, dtype=np.float64)
             pad_display = 200
-            x0_d = max(0, int(math.floor(float(np.min(pts_display[:, 0])))) - pad_display)
-            y0_d = max(0, int(math.floor(float(np.min(pts_display[:, 1])))) - pad_display)
-            x1_d = min(display_w, int(math.ceil(float(np.max(pts_display[:, 0])))) + 1 + pad_display)
-            y1_d = min(display_h, int(math.ceil(float(np.max(pts_display[:, 1])))) + 1 + pad_display)
+            # DECISION-020: the inference crop window must keep enough outside
+            # context. A field circled tightly (e.g. ~1100 m2 with 25-32
+            # vertices) previously shrank the crop to "field fills the whole
+            # view"; with no soil/edge reference the model fused rows into one
+            # connected blob (行间混连) and mask regularization failed with
+            # "种植带重构失败". The window therefore expands to at least
+            # min_infer_window_display_px (centered on the field bbox, clamped
+            # to the display image). The field mask still clips the result, so
+            # outside context never enters the output.
+            min_window_display_px = max(
+                1,
+                int(
+                    self.cfg.section("model").get(
+                        "min_infer_window_display_px",
+                        4000,
+                    )
+                ),
+            )
+            bmin_d = pts_display.min(axis=0)
+            bmax_d = pts_display.max(axis=0)
+            bcenter_d = (bmin_d + bmax_d) * 0.5
+            half_x = max(
+                (bmax_d[0] - bmin_d[0]) * 0.5 + pad_display,
+                min_window_display_px * 0.5,
+            )
+            half_y = max(
+                (bmax_d[1] - bmin_d[1]) * 0.5 + pad_display,
+                min_window_display_px * 0.5,
+            )
+            x0_d = max(0, int(math.floor(bcenter_d[0] - half_x)))
+            y0_d = max(0, int(math.floor(bcenter_d[1] - half_y)))
+            x1_d = min(display_w, int(math.ceil(bcenter_d[0] + half_x)) + 1)
+            y1_d = min(display_h, int(math.ceil(bcenter_d[1] + half_y)) + 1)
 
             self._update(inference_progress=0.03, status_message="正在读取原始分辨率田块裁剪...")
             with rasterio.open(tif_path) as src:
@@ -1119,7 +1392,48 @@ class InferenceRunner:
                     local_mask_pts[:, 1] -= y0_src
 
             crop_field_mask = np.zeros(crop_img_shape, dtype=np.uint8)
-            cv2.fillPoly(crop_field_mask, [np.rint(local_mask_pts).astype(np.int32)], 255)
+            # DECISION-020: clip the mask to the field polygon EXPANDED
+            # outward so a tightly circled field keeps the surrounding
+            # structure the mask regularization needs.  Band polygons and
+            # centrelines are still clipped to the original boundary in
+            # row_geometry.regularize_crop_mask.
+            analysis_pts = local_mask_pts
+            analysis_expand_m = float(
+                self.cfg.section("model").get(
+                    "field_analysis_expand_m",
+                    6.0,
+                )
+            )
+            # DECISION-020 hardening: the expansion must never be
+            # disabled by a config quirk; clamp a sensible minimum and
+            # report the resulting polygon in the journal.
+            analysis_expand_m = max(4.0, analysis_expand_m)
+            from row_geometry import expand_polygon_px
+
+            transform = getattr(src, "transform", None)
+            if transform is not None:
+                display_mpp = math.hypot(
+                    float(transform.a), float(transform.d)
+                ) * scale_x
+            else:
+                display_mpp = 0.021  # display GSD fallback
+            expand_px = analysis_expand_m / display_mpp
+            analysis_pts = expand_polygon_px(
+                analysis_pts,
+                expand_px,
+                crop_img_shape[0],
+                crop_img_shape[1],
+            )
+            self.log.info(
+                f"mask clip polygon: expand_m={analysis_expand_m:.1f} "
+                f"expand_px={expand_px:.0f} pts_in={len(local_mask_pts)} "
+                f"pts_out={len(analysis_pts)} bbox_out="
+                f"({float(np.min(analysis_pts[:, 0])):.0f},"
+                f"{float(np.min(analysis_pts[:, 1])):.0f},"
+                f"{float(np.max(analysis_pts[:, 0])):.0f},"
+                f"{float(np.max(analysis_pts[:, 1])):.0f})"
+            )
+            cv2.fillPoly(crop_field_mask, [np.rint(analysis_pts).astype(np.int32)], 255)
             self.log.info(
                 f"原始分辨率田块裁剪尺寸: {crop_img_shape[1]}x{crop_img_shape[0]}, "
                 f"display_scale=({scale_x:.9f},{scale_y:.9f})"
@@ -1131,7 +1445,8 @@ class InferenceRunner:
                         status_message=f"原始影像切片推理中... {int(pct * 100)}%",
                     )
 
-                crop_mask_src = TiledInference(self.engine).run(
+                tiled_inference = TiledInference(self.engine)
+                crop_mask_src = tiled_inference.run(
                     crop_img,
                     progress_cb=progress_cb,
                     capture_sz=int(self.cfg.TILE_CAPTURE_SIZE),
@@ -1140,6 +1455,10 @@ class InferenceRunner:
                     conf=float(self.cfg.MODEL_CONF),
                     iou=float(self.cfg.MODEL_IOU),
                     batch_size=configured_inference_batch_size(self.cfg),
+                )
+                preprocessing = dict(preprocessing or {})
+                preprocessing["tiled_inference"] = dict(
+                    getattr(tiled_inference, "_last_diagnostics", {}) or {}
                 )
             if crop_mask_src is not None:
                 self._update(inference_progress=0.92, status_message="正在裁剪田块范围...")
@@ -1227,6 +1546,7 @@ class InferenceRunner:
                 mask_offset_y=y0_d,
                 _mask_overlay_dirty=True,
                 inference_done=True,
+                cache_model_matches_active_engine=True,
                 inference_provenance=inference_provenance,
                 raster_preprocessing=preprocessing,
                 source_sha256=source_sha256,
@@ -1234,6 +1554,9 @@ class InferenceRunner:
                 inference_runtime=inference_runtime,
                 inference_progress=1.0,
                 status_message=f"AI 识别完成，原始影像推理掩膜已保存（非零像素: {non_zero}）。请执行「掩膜处理」。",
+            )
+            self.log.info(
+                f"inference mask commit: nonzero={non_zero} admitted={self._is_active()}"
             )
             if not self._is_active():
                 return
@@ -1286,7 +1609,25 @@ class InferenceRunner:
                 local_pts = pts.copy()
                 local_pts[:, 0] -= x0
                 local_pts[:, 1] -= y0
-                cv2.fillPoly(crop_field_mask, [local_pts], 255)
+                analysis_pts = local_pts
+                analysis_expand_m = float(
+                    self.cfg.section("model").get(
+                        "field_analysis_expand_m",
+                        6.0,
+                    )
+                )
+                if analysis_expand_m > 0:
+                    from row_geometry import expand_polygon_px
+
+                    # Preview path has no exact georeference; use the
+                    # standard display GSD (0.021 m/px) as an approximation.
+                    analysis_pts = expand_polygon_px(
+                        analysis_pts,
+                        analysis_expand_m / 0.021,
+                        crop_img.shape[0],
+                        crop_img.shape[1],
+                    )
+                cv2.fillPoly(crop_field_mask, [np.rint(analysis_pts).astype(np.int32)], 255)
                 H_c, W_c = crop_img.shape[:2]
                 self.log.info(f"田块裁剪尺寸: {W_c}x{H_c}")
 
@@ -1387,6 +1728,7 @@ class InferenceRunner:
                 mask_offset_y=y0,
                 _mask_overlay_dirty=True,
                 inference_done=True,
+                cache_model_matches_active_engine=True,
                 inference_provenance=inference_provenance,
                 model_sha256=model_sha256,
                 inference_runtime={

@@ -3,19 +3,21 @@
   "window": {
     "width": 1500,
     "height": 900,
-    "title": "智能农机规划系统"
+    "title": "农机作业规划系统"
   },
   "model": {
     "conf_threshold": 0.25,
     "iou_threshold": 0.45,
     "tile_overlap": 0.4,
     "tile_capture_size": 640,
-    "orthomosaic_recovery_conf_threshold": 0.1,
+    "orthomosaic_recovery_conf_threshold": 0.2,
+    "orthomosaic_primary_mask_threshold": 0.62,
+    "orthomosaic_tile_edge_weight_floor": 0.05,
     "orthomosaic_context_enabled": true,
     "orthomosaic_context_capture_multiplier": 2,
     "orthomosaic_context_overlap": 0.5,
     "orthomosaic_context_support_ratio": 0.8,
-    "orthomosaic_context_recovery_distance_m": 0.75,
+    "orthomosaic_context_recovery_distance_m": 0.35,
     "orthomosaic_context_separator_ratio": 0.3,
     "orthomosaic_context_separator_min_votes": 2,
     "orthomosaic_context_separator_min_length_m": 1.5,
@@ -47,6 +49,9 @@
     "endpoint_shortfall_min_m": 0.5,
     "endpoint_extension_max_m": 4.0,
     "work_line_endpoint_extension_m": 0.5,
+    "centerline_simplify_max_deviation_m": 0.20,
+    "centerline_simplify_max_heading_change_deg": 8.0,
+    "centerline_simplify_max_points": 8,
     "centerline_endpoint_repair_enabled": true,
     "centerline_endpoint_repair_completion_ratio": 0.85,
     "centerline_endpoint_repair_min_cohort": 3,
@@ -158,7 +163,7 @@
     "route_id": 0,
     "offset_x": "0.00",
     "offset_y": "0.00",
-    "infoline": "$INFM,4,0.7,0.7,0.7,0.7,1,15,254*",
+    "infoline": "$INFM,0,0.7,0.7,0.7,0.7,0,5,0*",
     "machine_compatibility": {
       "protocol": "machine_harvester_straight_turn_v1",
       "route_id": 0,

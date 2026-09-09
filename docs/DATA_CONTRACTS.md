@@ -24,12 +24,22 @@
 | 阶段 | 必须纳入指纹的输入 | 产物 |
 |---|---|---|
 | inference | 源影像 SHA-256、模型 SHA-256、田块边界、切片参数、预处理参数 | 原始掩膜 |
-| mask | 推理指纹、原始掩膜哈希、全部掩膜参数 | 处理后掩膜 |
-| path | 掩膜指纹、农机参数、规划参数、调头策略、必选起点、可选终点和卸粮点 | 路径几何 |
+| mask | 推理指纹、原始掩膜哈希、全部掩膜参数 | 处理后掩膜、作业区域/作业带几何 |
+| path | 掩膜指纹、作业带/作业区域几何、中心线目录及操作员选择、农机参数、规划参数、调头策略、必选起点、可选终点和卸粮点 | 路径几何 |
 
 缓存恢复和正式导出均重新计算并比较这些值。任何缺失或不一致都应失败关闭。
 
 项目缓存中的 `turn_strategy_user_selected` 是调头策略来源标记：只有用户明确展开选择器选择或通过显式策略入口确认时才为 `true`。旧缓存缺少该字段时，不得把其中的非 `contour` 值当作用户意图；恢复为套圈默认，并使与旧策略绑定的路径缓存失效。
+
+## 逐步操作历史（DECISION-025）
+
+- `project_state.json` 是最近完成状态，不是撤销历史；`history/index.json` 分别保存有序 `undo_ids`、`redo_ids`、源影像 identity 和 SHA-256。两者必须具有相同的 `project_generation`、`save_session_id` 和 `save_revision`；同一进程中延迟完成的较旧异步保存不得回写覆盖较新的状态/历史。
+- 每个 `history/snapshots/<history_id>.json` 是一个不可变的操作前状态，至少包含 `kind`、`label`、`created_at` 和 `values`。一个逻辑操作对应一个 ID；新操作清空重做分支。
+- 数值数组不内嵌 JSON。数组以 dtype、shape 和字节内容计算 SHA-256，写入 `history/artifacts/<sha256>.npz`；快照只保存引用。相同原始掩膜或处理层跨多个操作共享同一个产物。
+- 系统历史快照覆盖田块边界、原始掩膜、优化掩膜及语义层、中心线目录/选择、起终点和卸粮点、农机参数、路径、验证/provenance 与导出失效状态，保证一次撤销恢复完整一致的阶段边界。
+- 历史只在源 GeoTIFF identity 与 SHA-256 均一致、快照 schema 正确、数组 dtype/shape/哈希均一致时恢复。损坏处之前的更旧历史不再加载；不得跳过缺口拼接一条看似连续的撤销链。
+- 跨重启恢复到历史路径时保留几何用于审计和继续编辑，但必须设置 `auto_path_valid=false`、`simulation_done=false`、`export_done=false`，并标记 `path_validation.validation_source=history_snapshot`；不得把历史恢复等同于当前正式验证。
+- 撤销栈和重做栈分别最多保留 50 步。索引淘汰后，仅清理当前项目 `history/` 下已无任何快照引用的快照和数组，不删除源数据或正式研究产物。
 
 ## 农机参数来源记录
 
@@ -44,11 +54,13 @@
 - `processed_mask`：经过验证、可作为作物主体和作业线依据的区域。
 - `headland_mask`：方向和位置证据支持的田头作物候选，用于田头碾压统计和全田真实作物碾压并集，不等同于低质量主体；与主体重叠的像素只计一次。生成前先记录规则化主体的连通区域分区；只有通过区域轴向跨度、端部邻接和跨行支持率分类的候选种子才可进入该层。
 - `headland_corridor_mask`：仅在规则化纵向行带的轴向端部、跨越足够多行且具有连续横向证据时重建的完整田头走廊；田头与主体粘连时可记录 `terminal_dense_seed` 作为补充种子来源。接受后的走廊按稳健端点墙在米制最大深度内展开，并与原始作物支持相交，不得填成矩形。端点墙只采纳达到 `headland_terminal_wall_min_axial_span_ratio` 的长跨度横截行，再以分箱 Theil-Sen 趋势替换超过 `headland_terminal_wall_outlier_tolerance_m` 的局部异常端点；候选和种子均不得越过最终端墙进入主体。当统一轴向重构区间把端点量化成直墙时，只允许采用田块多边形中跨行跨度足够长的物理端边恢复墙体斜率，并向田头侧补偿 `band_end_trim_m` 的重构裁边，不能把去噪裁边当成主作业区语义边界。存在规则化纵向主体作为端墙证据时，`headland_corridor_endpoint_margin_m` 的有效主体内切值固定为 0。诊断记录参考跨度、可信/被拒/异常替换行数、田块端边斜率来源、裁边补偿、稳健斜率和有效容差；稀疏纵向行尾、区域分界和内部短片段不得作为田头端点。`diagnostics.region_partition` 保存区域数量、边界框、端部分类、候选支持率和拒绝原因；未经区域分类接受的种子不进入 `headland_mask`。
+- `headland_corridor_mask` 只是田头作物证据与转弯空间校验的辅助图层，不是独立的“通行廊道生成”任务，也不替代作业中心线、作业线或正式路径；用户界面和论文主流程仍以作业带、中心线和转弯连接为主。
 - `uncertain_residual_mask`：不能可靠归属到主体或田头的原始残差，只用于显示和中性场地支撑。
 - `planning_support_mask`：场地支撑并集，只用于越界/支撑判断，不得替代 `processed_mask` 计算作物覆盖或碾压。
 - `forbidden_regions`：用户在显示坐标中确认的禁行多边形；规划时按掩膜偏移栅格化，不得由不确定残差自动生成。
 - `mask_result.diagnostics.profile_gate_basis` 必须为 `run_edge_midpoints`：相邻剖面行带的局部占用门控按 profile run 边界中点分隔，避免宽等距块吞并旁侧四行带的中心线。
-- 当前 `mask_result.diagnostics.algorithm_version` 为 `17`。版本 16 及更早的 `mask_processed`/`mask_result` 不包含田块端边斜率恢复与重构裁边补偿契约，缓存恢复必须使掩膜处理和下游路径失效，不得仅因源影像、模型及数组形状相同而复用。
+- 当前 `mask_result.diagnostics.algorithm_version` 为 `18`。版本 17 及更早的 `mask_processed`/`mask_result` 不包含分离种植区域多候选行向估计契约：全局 PCA 与主要连通轮廓内部主轴必须共同作为候选，再由横向投影周期性评分选择最终行向，区域质心连线不得主导行向。旧缓存恢复必须使掩膜处理和下游路径失效，不得仅因源影像、模型及数组形状相同而复用。
+- 田块圈选同时定义三个不同边界：`mask_raw` 的推理/分析上下文可在圈外保留受控缓冲，供行向与宽窄带重构；前台叠加图层必须只显示原圈选内的副本，绝不能原地裁剪 `mask_raw`；行带轮廓、中心线、`processed_mask`、`planning_support_mask` 与规划路径必须按原圈选边界裁回，圈外分析像素不得成为作业范围。
 
 这些数组与处理后主体保存在同一个原子 NPZ 产物中；项目 JSON 只保存轻量元数据。
 
@@ -66,6 +78,8 @@
 未显式配置 `uniform_zone_min_width_m` 时，默认值为 `4.0 m`。该默认值用于把真实数据中约 `2.5 m` 的完整四行宽窄行带与明显更宽的等距块分开；显式配置仍按配置值和歧义保护带执行，不能用默认值替代人工/上游证据。
 
 - `layout.planting_region_classification` 保存分类器版本、宽度阈值、模糊保护带、逐带宽度/法向位置/结论/理由、分类计数、是否混合田块以及自动规划是否允许。类型只能是 `wide_narrow_rows`、`uniform_block` 或 `ambiguous`。分类器还必须记录 `partition_basis` 和 `wide_narrow_region_count`；当一个 `uniform_block` 的法向位置位于两组宽窄行带之间时，两侧必须形成不同的 `wide_narrow_rows_N`，不能因类型相同而跨区合并。
+- 作业带确定是中心线生成的前置算法步骤，不是新增的用户界面选择入口：宽窄行区域按四行宽行作业带确定，等距区域按割幅划分作业带，窄行只作为识别和分类证据，不直接生成作业线。完成作业带确定后，系统才生成整田候选中心线目录，再由左侧界面选择中心线。
+- `layout.centerline_catalog` 保存由已确定作业带生成的整田候选中心线及稳定 ID；目录生成后才允许操作员选择，取消选择的中心线不得进入正式路径。历史 `work_band_catalog`/`selected_work_band_ids` 仅作为兼容字段，不代表新的界面流程。
 - 当 `profile_width_m` 落入模糊保护带时，只有同时具备上游 `band_type=wide`、低于均匀区下界的局部重构宽度，以及连续中心线跨度证据，才可记录 `borderline_resolution=upstream_band_type_and_continuous_centerline_support` 并归入 `wide_narrow_rows`；缺少任一证据仍必须是 `ambiguous`，不得按田块左右位置猜测。
 - `layout.work_regions` 保存区域标识、类型、来源带、法向位置、作业线数量和来源语义；不得内嵌重复的完整作业线数组。`layout.region_generation_order` 只记录直线生成来源顺序，`layout.region_execution_order` 必须为空，`layout.turn_planning_scope=all_generated_work_lines` 且 `region_boundaries_affect_turns=false`。必选起点在所有已生成直线的全田安全排序候选中优先选择最近可行作业线端点，相邻法向转弯数仅作次级排序；可选终点只参与末段方向参考。被田界阻断而必须收尾的唯一短线从旋转集合中移除后固定追加，不能用固定末线为由缩减其他首线候选；不得把“左区/右区”或区域访问次序写成执行拓扑。
 - UI/项目快照中的带记录用 `planning_contour` 保存最多 256 点的轻量规划边界，原始稠密 `contour` 不进入轻量状态。等距区诊断的 `reference_geometry_source` 必须说明使用 `contour`、`planning_contour` 或历史兼容的 `compact_centerline_and_mask`；当 `profile_width_m` 明显大于该轻量边界时，必须以实测剖面宽度扩展横向规划包络，并记录 `effective_geometry_source=<reference>_expanded_from_profile_width`、`profile_width_px`、`reference_geometry_width_px` 和 `effective_transverse_width_m`，不得静默按窄边界截断等距区。若等距区与宽窄行区相邻，扩展包络仍必须受最近宽窄行中心线的共享边界安全带限制；该中心线归属边界作业带，禁止等距区再生成近重复作业线。
@@ -141,15 +155,26 @@
 
 田头走廊修复必须满足端部位置、跨行连续性、原始田头种子占比和最大主体切入深度四项约束。走廊确认后按规则化主体端点走势建立平滑端墙，只保留真实原始作物支持；主体掩膜、行带轮廓和中心线必须同步裁剪，被移出的原始像素转入田头层，不得丢弃。内部横向结构和稀疏端部碎片不得自动升级为田头走廊。
 
-## 论文实验资料包
+## 自动离线实验包与完整论文证据
+
+`reui.paper-experiment.v1` 是软件中的离线实验 schema，当前默认计划只覆盖掩膜阶段消融。这个实现边界不等于论文研究范围：完整论文证据还包括作业带、中心线、路径、终端导入、无人收获机自主执行和作业后田间调查。统一流程见 [研究、算法、界面与田间验证统一流程](RESEARCH_SYSTEM_WORKFLOW.md)。
+
+### 离线掩膜消融包
 
 - `experiment_manifest.json` 使用 `reui.paper-experiment.v1`，记录冻结输入摘要、实验矩阵、完成/失败计数和逐组参数。
 - `results_long.csv` 是指标长表；`results_wide.csv` 和 `tables/*_comparison.csv` 是论文表格底稿。
 - `cases/<case_id>/` 保存逐组 `result.json`、掩膜和路径预览；`figures/` 保存自动指标图。
 - 掩膜消融组来自同一次正式规则化结果的原始掩膜、`regularized_body_mask`、`body_residual_mask` 和最终 `processed_mask`，不得伪造不存在的阶段开关。
-- 路径策略组共享完整规则化掩膜、田界、农机参数、服务点和禁行区，只改变请求策略。
+- 默认计划的 `path_cases` 必须为空。底层运行器只有在未来显式设计独立路径对照时才接受路径策略组；各组必须共享完整规则化掩膜、田界、农机参数、服务点和禁行区，只改变请求策略。
 - IoU、Dice、Precision、Recall 仅在提供同尺寸人工真值掩膜时输出；无真值时不得以原始预测代替。
 - 失败实验组保留状态和错误原因，不能因局部失败丢弃其余结果。
+
+### 完整软件田间资料包与外场记录
+
+- `reui.field-trial-package.v1` 归档源影像预览、原始/处理后掩膜、路径预览、候选导入路径、同名 manifest、推理/掩膜诊断和软件验证摘要，并由 `package_index.json` 记录文件哈希。
+- 该资料包证明导出对象及其软件证据可追溯，不证明目标终端已接受路径，也不证明无人收获机完成自主作业。
+- 终端导入回读、实际轨迹、执行时长、人工接管或中断、异常位置和作业后碾压调查必须作为外场记录另行保存，并与对应生育期、源影像、模型、中心线选择和路径 manifest 关联。
+- 软件理论足迹与实际碾压调查必须分别保存和统计；没有田间记录时不得把理论几何指标改写为实测结果。
 
 ## `$PATH` 路径契约
 
@@ -164,23 +189,24 @@
 ### 农机强制兼容 `$PATH` 变体
 
 - `machine_harvester_straight_turn_v1` 是独立的终端适配投影，不替换科研路径或当前软件 `$PATH` 契约。
-- 记录固定为 `$PATH,0,index,total,lat,lon,offset_x,offset_y,status*`；第一列固定为 `0`，最后一列只允许 `0`（转弯及其他非作业段）和 `1`（作业段）。
-- 状态码按当前点到下一点的出边解释，末点固定为 `0`；因此状态切换应与示例中的 `1,0,1,0` 交替边界一致。
+- 每条记录必须直接以 `$PATH` 开始，不允许插入独立索引行；严格格式为 `$PATH,0,index,total,lat,lon,offset_x,offset_y,2*`，第一列固定为 `0`，偏移量为纯数字，最后一列固定为 `2`。文件最后一行必须固定为 `$INFM,0,0.7,0.7,0.7,0.7,0,5,0*`，无额外空格；兼容文件使用 LF 换行。
+- `index` 在每个分卷内从 `0` 开始，`total` 为该分卷 `$PATH` 记录数。内部 0/1 出边状态仅用于预览与清单，不得进入机子文件。
 - 连续非作业段（包括真实转弯曲线、`turn_approach`、`turn_reverse`、`turn_aux` 以及进出场段）通常在兼容文件中压缩为上一条作业线终点到下一条作业线起点的一条直线弦；真实曲线仍保留在内部路径、运动学验证和履带评价中。唯一拓扑例外是完整折返上一条已收割作业线的 `turn_reverse`：必须保留该作业线另一端作为第二个状态 `0` 控制点，再以另一条状态 `0` 直线弦连接同田头的下一作业线，不能把两段重新压成跨田斜线。
 - 画布“路径显示”固定区分“连续轨迹”和“农机文件”：前者显示 canonical 连续规划几何并作为模拟/理论评价来源，后者严格按最近一次成功写出的 `$PATH` 控制点、分卷边界和 0/1 出边状态显示。切换只改变显示，不得改写路径、验证或导出数据；跨分卷不得补画连接线。连续规划中的两点退化转弯必须保留 `display_only_connector` 等未验证诊断和原始两点几何，可按实线端点直连显示供人工调整；连续路径中超出已确认田块边界的折线子段以红色高亮，但不能伪造成未经验证的弧线或提升为机器就绪。套圈曲线因边界不足而保留供人工调整时不得压缩为两点，必须保留曲线点列，并由显示层仅将越界子段标红。
 - 当前规划链不因混合种植区域边界生成 `turn_aux` 或整行 `turn_reverse`；历史 manifest 中的区域转场字段只作为旧结果证据读取，不得据此恢复或导出旧拓扑。兼容投影仍必须保留由真实服务点或运动学策略产生的独立 `turn_reverse` 控制点。
-- 路线编辑器显示的 `state.path_points/path_status` 是编辑器与兼容导出共享的唯一控制折线（DECISION-019）。自动结果进入编辑器时，每条主作业线先压缩为起终点；编辑器把连续状态 `1` 边即时派生为可选作业线对象，可从空路线新增，并支持整线平移、删除、调序、反向、端点移动和边语义切换。结构修改在相邻作业线之间重建局部状态 `0` 连接，不能维护第二套隐藏路线。编辑器点数、兼容预览文件点数和 manifest 的 `route_source=shared_route_control_polyline` 必须来自同一组控制点。
+- 路线编辑器显示的 `state.path_points/path_status/path_geometry_modes` 是编辑器与兼容导出共享的唯一有序控制折线（DECISION-019）。相邻控制点构成一条可选边：`path_status` 保留终端兼容的 `1=作业/0=非作业` 语义，`path_geometry_modes` 逐边记录物理预览为 `straight` 或 `turn`，二者不能拆成第二套隐藏路线。自动结果进入编辑器时，每条主作业线先压缩为起终点；编辑器把连续状态 `1` 边即时派生为可选作业线对象，可从空路线新增，并支持整线平移、删除、调序、反向、端点移动、航点增删、边语义切换和直线/转弯几何切换。结构修改在相邻作业线之间重建局部状态 `0` 连接，不能维护第二套隐藏路线。编辑器点数、兼容预览文件点数和 manifest 的 `route_source=shared_route_control_polyline` 必须来自同一组控制点。
 - 起点和终点在编辑覆盖层中与首、末控制点共用颜色、尺寸和交互层级；删除首/末控制点后，起终点引用自动切换到新的首/末控制点。未显式设置终点时不写入独立服务点状态，显示和兼容 TXT 仍使用当前控制折线最后一点作为自动终点。
 - 两点状态 `0` 连接可根据当前最小转弯半径生成稠密连续预览；人工插入到三个及以上点的状态 `0` 点列是显式人工转弯，必须原样进入 canonical 显示、模拟与当前几何验证。结构调序/删除会重建相邻局部连接，但普通拖点和转弯插点不得把人工几何重新压成自动弓形。自动规划的稠密 `auto_path` 与人工重建后的连续 `auto_path` 都是各自当前路线的显示/评价几何，控制折线仍是人工编辑和兼容协议投影的权威来源。
 - 每次人工修改都清空旧 `path_provenance/path_artifact` 和验证有效性。点击“验证人工路线”后，`path_artifact.manual_route.schema=reui.manual-route.v1`，验证必须记录 `route_geometry_source=manual_control_edit_validated`、`manual_route_validated=true`、`automatic_planning_provenance_valid=false`、作业线数、控制点数和 0/1 状态；同一 `validate_path` 使用当前 `processed_mask`、`main_angle`、田界、确认禁行区、农机参数和语义掩膜，人工转弯另记录观测最小局部曲率半径。该记录证明当前软件几何检查已执行，不恢复自动规划阶段指纹，也不是田间执行证据。
-- 路线编辑覆盖层必须叠加在当前 `processed_mask`、`headland_mask`、`uncertain_residual_mask`、田界和禁行区之上；进入编辑以及编辑中重绘不得清空这些前置证据或退回仅显示原始影像。紧凑工具区只常显选择/拖动、新增作业线、添加控制点、切换线段模式和验证人工路线五个入口；添加控制点必须接受作业或转弯边并保留点击几何，低频结构操作由工具区常显的快捷键说明承接。工具区在已展开路径规划卡片中显示/隐藏后必须同步更新卡片最小高度和滚动内容高度，按钮几何不得相交或被卡片边界裁切。
-- 编辑模式下“路径结果”列表由同一 `path_status` 的连续运行段即时派生：每张卡片只保存 `edge_start/edge_end/node_start/node_end/work_index` 等临时索引，不得序列化为另一份路线。卡片单击与画布点选共享 `state.selected_type/selected_idx`；整段语义切换、航点增删、作业线增删和作业线卡片拖拽排序必须调用同一人工编辑函数并刷新 `auto_path`、列表和画布。状态 `0` 转弯卡片不接受独立拖拽；作业线重排后局部转弯按共享端点重建。
+- 路线编辑覆盖层必须叠加在当前 `processed_mask`、`headland_mask`、`uncertain_residual_mask`、田界和禁行区之上；进入编辑以及编辑中重绘不得清空这些前置证据或退回仅显示原始影像。紧凑工具区只常显选择/拖动、新增作业线、添加控制点、切换作业/转弯语义、切换直线/转弯几何和验证人工路线入口；添加控制点必须接受作业或转弯边，在线段上插入时保留原边模式，空白处新增时从当前路线末端追加直线边，低频结构操作由工具区常显的快捷键说明承接。工具区在已展开路径规划卡片中显示/隐藏后必须同步更新卡片最小高度和滚动内容高度，按钮几何不得相交或被卡片边界裁切。
+- 编辑模式下“路径结果”列表由同一 `path_status` 与 `path_geometry_modes` 的连续运行段即时派生：每张卡片只保存 `edge_start/edge_end/node_start/node_end/work_index` 等临时索引，不得序列化为另一份路线。卡片单击与画布点选共享 `state.selected_type/selected_idx`；整段语义切换、直线/转弯几何切换、航点增删、作业线增删和作业线卡片拖拽排序必须调用同一人工编辑函数并刷新 `auto_path`、列表和画布。状态 `0` 转弯卡片不接受独立拖拽；作业线重排后局部转弯按共享端点重建。
 - 兼容投影只在导出副本上清理相邻距离小于 `0.02 m` 的点，并重新计算 `index` 与 `total`；不改变内部路径。
 - 桌面兼容 TXT 的共享控制折线必须包含已确认起点到第一条作业线的状态 `0` 入口边，以及最终作业段沿行进方向的终点延伸；未预先布设终点时由 `include_route_finish_extension` 生成，拖动后使用显式终点坐标。该入口/终点投影不替换连续 canonical 曲线，但必须进入 `001.txt`/`002.txt` 的实际记录。
-- 农机兼容文件每份最多写入 50 条 `$PATH` 记录；超出时从保存目录现有最大三位数字 TXT 编号之后继续生成 `001.txt`、`002.txt`……（已有 `001.txt` 时从 `002.txt` 起）。每个分卷独立从 `index=0` 编号并声明本卷 `total`，manifest 的 `output_files`、`file_count` 和 `points_per_file` 必须记录实际分卷结果。
+- 农机兼容文件每份最多写入 50 条 `$PATH` 记录；超出时从保存目录现有最大三位数字 TXT 编号之后继续生成 `001.txt`、`002.txt`……（已有 `001.txt` 时从 `002.txt` 起）。每个分卷独立从 `index=0` 编号并声明本卷 `total`，manifest 的 `output_files`、`file_count`、`points_per_file` 和 `output_file_integrity` 必须记录实际分卷结果、每个文件的 SHA-256 与点数。
 - 兼容测试投影不解释内部 `turn_reverse`/`turn_aux` 的车辆控制语义；所有 `work` 段压缩为本段两端点，普通非 `work` 连续段压缩为相邻主作业线端点之间的一条直线并输出状态 `0`。仅当 `turn_reverse` 的起终点精确对应上一条作业线的终点和起点时，保留这条已收割行折返边及后续同田头转场边两个状态 `0` 线段。这只改变兼容测试副本，不改变内部路径，也不把该副本宣称为机器执行就绪。
 - 该变体的最后一列语义来自目标终端样例，尚未由终端实机确认；在 `terminal_protocol_validated` 为 `true` 前，manifest 的 `machine_executable` 必须保持 `false`。
 - 界面的“农机兼容测试文件”允许在参数来源、机器就绪和终端协议尚未完成时生成测试文本，但 manifest 必须标记 `preview_only=true`、`machine_executable=false` 和 `COMPATIBILITY_TEST_ONLY_MANUAL_REVIEW`；这不是正式田间试验导出。
+- 兼容 TXT 导出完成前必须回读全部分卷，验证 `output_file_integrity`、`points_per_file`、连续索引、每卷 `total`、固定记录状态码和 `$INFM`。画布切换到“TXT 路径”时再次按 manifest 校验；文件被替换、截断或与清单错配时，清除旧 TXT 预览并要求重新导出。
 ## 分段足迹和田头转弯指标
 
 - `segment_metrics` 与 `turn_segment_metrics` 来自同一 `plan_pose` 采样和 `planar_rigid_footprint_v2` 有向左右履带矩形；每段至少记录 `segment_type`、`length_m`、独占 `track_swept_area_m2`、主体/田头/不确定区/禁行区重叠面积、田界越界面积与 `agronomic_damage_cost_m2`。
