@@ -123,3 +123,12 @@ def test_build_spec_keeps_exe_at_release_root():
     assert 'contents_directory="_internal"' in spec
     assert 'SOURCE_ROOT = ROOT / "src"' in spec
     assert 'SOURCE_ROOT / "frozen_main.py"' in spec
+
+def test_windows_build_verifies_and_cleans_rebuildable_outputs():
+    """build_windows.bat verifies the published EXE against the staging copy
+    (logged in the build output) before removing rebuildable outputs."""
+    script = (ROOT / "build_windows.bat").read_text(encoding="utf-8")
+    assert "Get-FileHash" in script
+    assert "[verify]" in script
+    assert "REUI_CLEAN_DIST" in script
+    assert "rmdir /S /Q dist" in script

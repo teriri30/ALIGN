@@ -51,8 +51,8 @@ Git Bash / Hermes 环境使用 `bash scripts/test.sh -q`，脚本会清理继承
 
 # 交付验证
 
-- 每次修改影响系统运行行为的源码、配置、模型装载或打包文件后，交付前必须运行 `build_windows.bat D:\zhl\anaconda\envs\game\python.exe`，同步生成仓库根目录的 `reUI.exe`、`_internal`、`version.json` 和 `dist\reUI`；不能只交付源码而声称系统已更新。
-- EXE 同步必须实际回读验证：确认根目录与 `dist\reUI\reUI.exe` 的 SHA-256 一致、文件时间晚于本次源码修改，并运行 `dist\reUI\reUI.exe --self-test`；构建、测试或自检失败时，必须明确报告 EXE 未同步。
+- 每次修改影响系统运行行为的源码、配置、模型装载或打包文件后，交付前必须运行 `build_windows.bat D:\zhl\anaconda\envs\game\python.exe`，同步生成仓库根目录的 `reUI.exe`、`_internal`、`version.json`（`dist\reUI` 暂存副本在发布校验后默认清理）；不能只交付源码而声称系统已更新。
+- EXE 同步验证由 `build_windows.bat` 在发布阶段完成并写入构建日志：先比对根目录 `reUI.exe` 与 `dist\reUI\reUI.exe` 的 SHA-256（`[verify]` 行），再对暂存副本运行冻结自检；随后默认删除 `build\`、`dist\`（设 `REUI_CLEAN_DIST=0` 保留供人工回读）。构建、测试或自检失败时，必须明确报告 EXE 未同步。
 - 交付时报告实际修改文件、决策锚点、聚焦测试与完整测试；明确区分 code-green、目标运行时验证、真实数据验证和田间证据。
 - 代码、文档、缓存和导出产物的状态必须可追溯；不要把通过单元测试写成真实农机执行已经验证。
 - 修改后回读关键配置、参数、测试结果和输出路径；遇到 D/E 路径差异、缺失真实数据、缺失模型或外部环境不可用时，如实报告“待核验/需补充”，不得编造结果。
