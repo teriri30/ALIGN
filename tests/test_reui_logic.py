@@ -330,10 +330,10 @@ def test_workflow_separates_centerlines_from_path_planning_and_advanced_settings
 
     advanced_group = next(group for group in STEP_GROUPS if group["label"] == "高级设置")
     centerline_generation_group = next(
-        group for group in STEP_GROUPS if group["label"] == "生成中心线"
+        group for group in STEP_GROUPS if group["label"] == "生成作业线"
     )
     centerline_selection_group = next(
-        group for group in STEP_GROUPS if group["label"] == "选择中心线"
+        group for group in STEP_GROUPS if group["label"] == "选择作业线"
     )
     planning_group = next(group for group in STEP_GROUPS if group["label"] == "路径规划")
 
@@ -452,7 +452,7 @@ def test_centerline_selection_is_rendered_in_its_own_task_card():
     app.processEvents()
 
     centerline_card = next(
-        card for card in panel._step_cards if card._title.text().endswith("选择中心线")
+        card for card in panel._step_cards if card._title.text().endswith("选择作业线")
     )
     advanced_card = next(
         card for card in panel._step_cards if card._title.text().endswith("高级设置")
@@ -614,7 +614,7 @@ def test_mask_processing_start_prompt_defers_service_points_to_path_planning(mon
     window._on_mask_process()
 
     assert messages == [
-        "掩膜处理已开始，完成后请进入“路径规划”确认起点；终点将沿最终作业段自动延伸。"
+        "掩膜优化已开始，完成后请进入“路径规划”确认起点；终点将沿最终作业段自动延伸。"
     ]
 
 
@@ -637,7 +637,7 @@ def test_mask_processing_rejects_historical_mask_without_active_model(monkeypatc
 
     assert messages == [
         "当前掩膜来自历史模型缓存，但该模型尚未加载；"
-        "请先加载同一模型，或重新执行 AI识别后再处理掩膜。"
+        "请先加载同一模型，或重新执行 作物识别后再处理掩膜。"
     ]
     window.close()
 
@@ -1053,9 +1053,9 @@ def test_default_harvester_params_match_the_research_machine_geometry():
 
     params = window._effective_harvester_params()
 
-    assert DEFAULT_HARVESTER_PARAMS["cutter_width_m"] == pytest.approx(2.15)
-    assert DEFAULT_HARVESTER_PARAMS["track_width_m"] == pytest.approx(0.40)
-    assert DEFAULT_HARVESTER_PARAMS["track_gauge_m"] == pytest.approx(1.60)
+    assert DEFAULT_HARVESTER_PARAMS["cutter_width_m"] == pytest.approx(1.80)
+    assert DEFAULT_HARVESTER_PARAMS["track_width_m"] == pytest.approx(0.45)
+    assert DEFAULT_HARVESTER_PARAMS["track_gauge_m"] == pytest.approx(1.30)
     assert DEFAULT_HARVESTER_PARAMS["wheelbase_m"] == pytest.approx(1.80)
     assert DEFAULT_HARVESTER_PARAMS["turn_radius_m"] == pytest.approx(0.90)
     assert params["cutter_forward_offset_m"] == pytest.approx(1.35)

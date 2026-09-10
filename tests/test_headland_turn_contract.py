@@ -183,7 +183,7 @@ def test_headland_turn_candidates_reject_invalid_formal_validation(monkeypatch):
         for reason in item["hard_reasons"]
     )
     assert any(
-        "formal coverage gate failed" in issue
+        isinstance(issue, dict) and issue.get("raw") == "formal coverage gate failed"
         for item in turn_validation["rejected_candidates"]
         for issue in item.get("validation_issues", [])
     )

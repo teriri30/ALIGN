@@ -140,7 +140,7 @@ class HarvesterParamsDialog(QDialog):
         fm = QFormLayout()
         fm.setSpacing(8)
         fm.setContentsMargins(0, 8, 0, 8)
-        self.spin_cutter = self._spin(self._params.get("cutter_width_m", 2.0), 0.5, 6.0, 0.1)
+        self.spin_cutter = self._spin(self._params.get("cutter_width_m", 1.8), 0.5, 6.0, 0.1)
         fm.addRow(QLabel("割台有效割幅:"), self.spin_cutter)
         offset_value = self._params.get("cutter_forward_offset_m")
         self.spin_cutter_offset = self._spin(
@@ -154,7 +154,7 @@ class HarvesterParamsDialog(QDialog):
             "履带接地区域几何中心到割刀切割线的水平前向距离，必须实测"
         )
         fm.addRow(QLabel("割刀前置距离:"), self.spin_cutter_offset)
-        self.spin_track = self._spin(self._params.get("track_width_m", 0.35), 0.1, 1.0, 0.05)
+        self.spin_track = self._spin(self._params.get("track_width_m", 0.45), 0.1, 1.0, 0.05)
         fm.addRow(QLabel("履带宽度:"), self.spin_track)
         self.spin_gauge = self._spin(self._params.get("track_gauge_m", 1.3), 0.5, 3.0, 0.1)
         fm.addRow(QLabel("履带中心距:"), self.spin_gauge)

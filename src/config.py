@@ -12,10 +12,10 @@ class ConfigValidationError(ValueError):
 
 
 DEFAULT_HARVESTER_PARAMS = {
-    "cutter_width_m": 2.15,
+    "cutter_width_m": 1.80,
     "cutter_forward_offset_m": 1.35,
-    "track_width_m": 0.40,
-    "track_gauge_m": 1.60,
+    "track_width_m": 0.45,
+    "track_gauge_m": 1.30,
     "wheelbase_m": 1.80,
     "track_length_m": 1.70,
     "turn_radius_m": 0.90,

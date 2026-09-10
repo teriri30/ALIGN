@@ -749,7 +749,7 @@ def test_segment_allows_fresh_inference_when_restored_cache_model_differs_from_a
         window._on_segment()
 
     assert window.state.cache_model_matches_active_engine is False
-    assert fresh_run_started == ["AI识别"]
+    assert fresh_run_started == ["作物识别"]
     assert any("不会读取历史掩膜" in message for message in messages)
     assert not any(message.startswith("WARN:") for message in messages)
 

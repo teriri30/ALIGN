@@ -6104,7 +6104,7 @@ class MainWindow(QMainWindow):
         centers = [b for b in wide_bands if b.get("centerline")]
 
         # 统计识别结果并提供详细说明
-        all_bands = mask_result.get("all_bands") or []
+        all_bands = processed.get("all_bands") or []
         narrow_count = len([b for b in all_bands if b.get("band_type") == "narrow"])
 
         # 详细友好提示
@@ -6116,7 +6116,7 @@ class MainWindow(QMainWindow):
         message += (
             f"\n   说明：4行主体区用于生成作业线，2行边缘区会被相邻两趟自然收完"
             f"\n   （收割机幅宽1.8m = 左1行+宽行+4行+宽行+右1行）"
-            f"\n   接下来点击"生成作业线""
+            f"\n   接下来点击“生成作业线”"
         )
 
         self.log_panel.success(message)
@@ -8163,7 +8163,7 @@ class MainWindow(QMainWindow):
             "total_length_m": validation.get("total_length_m", 0),
             "area_m2": validation.get("harvest_area_m2", 0),
             "turn_strategy": getattr(self.state, 'turn_strategy', 'auto'),
-            "cutter_width": getattr(self.state, 'harvester_params', {}).get('cutter_width_m', 2.0),
+            "cutter_width": getattr(self.state, 'harvester_params', {}).get('cutter_width_m', 1.8),
         }
         extra = []
         if "crop_mask_geometric_coverage_pct" in validation:
