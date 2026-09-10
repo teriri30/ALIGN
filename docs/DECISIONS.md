@@ -371,7 +371,8 @@
 
 ## DECISION-018：冻结发布包与用户数据必须分离
 
-- 结论：Windows 便携版使用 PyInstaller `onedir` 构建，`reUI.exe` 位于发布目录根部，运行库位于 `_internal`；源码启动入口保留环境检查，冻结入口不得调用 pip、Conda 或环境安装界面。
+- 结论：Windows 便携版使用 PyInstaller `onedir` 构建，`reUI.exe` 位于发布目录根部，运行库位于 `_internal`；依赖检测与一键安装界面已移除，源码启动入口只做运行环境初始化（`PYTHONPATH` 隔离与地理环境配置），冻结入口同样不得调用 pip、Conda 或环境安装界面。
+- v2（2026-09-10 修订）：普通用户统一通过带版本标签的 Release 便携版运行，源码入口不再承担依赖补齐职责；`src/startup.py` 的环境检测与一键安装（Tk 对话框与 pip 子进程）整体删除，v1 的“冻结入口不得调用”约束不变。原因：安装器依赖的 tkinter 界面本就不进入发布包，与“每次发布提供开箱即用便携版”的交付方式重复；源码缺依赖时按 `developer/requirements/` 自行安装。风险变化：源码模式缺少依赖时不再有引导安装，只会以导入错误退出。
 - 原因：普通用户需要解压后直接双击运行；程序更新时不能覆盖农机参数、项目缓存、日志和模型导入记录。
 - 不变量：
   1. 内置 `config.example.json`、模型注册表和模型权重属于只读 bundle 资源；用户配置、缓存、日志、用户模型和更新包写入 `%LOCALAPPDATA%\\reUI`（测试和便携实验可用 `REUI_USER_DATA_DIR` 覆盖）。
@@ -379,7 +380,8 @@
   3. `$PATH`、GeoJSON、CSV、KML 和 manifest 的科学路径验证不因打包而旁路；冻结 manifest 使用构建时生成的提交号和科学代码指纹。
   4. Release 构建必须先通过静态检查、编译、测试、依赖检查和 `reUI.exe --self-test`，失败时不得上传可下载版本。
   5. `update.bat` 只负责开发者将源代码提交/推送到 GitHub，不负责生成或替换用户端 EXE；稳定用户通过带版本标签的 GitHub Release 获取二进制包。
-- 代码锚点：`src/runtime_paths.py`、`src/app_entry.py`、`src/frozen_main.py`、`src/config.Config.load`、`src/cache.CACHE_ROOT`、`src/pyside6_app.main_window.MainWindow._write_export_manifest`。
+  6. 源码入口只允许运行环境初始化，不得恢复依赖检测或安装界面；缺失依赖按 `developer/requirements/` 处理。
+- 代码锚点：`src/runtime_paths.py`、`src/app_entry.py`、`src/frozen_main.py`、`src/startup.py`、`src/main.py`、`src/config.Config.load`、`src/cache.CACHE_ROOT`、`src/pyside6_app.main_window.MainWindow._write_export_manifest`。
 - 测试锚点：`tests/test_runtime_packaging.py`、`tests/test_application_entry.py`。
 - 允许的变更方式：可替换 PyInstaller 版本或 Release 编排，但必须保留根目录 EXE、用户数据隔离、构建指纹、冻结包自检和失败不发布条件。
 

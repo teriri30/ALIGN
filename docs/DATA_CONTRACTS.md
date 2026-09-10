@@ -11,7 +11,7 @@
 
 ## 运行时与发布包（DECISION-018）
 
-- 冻结版发布目录的入口固定为根目录 `reUI.exe`；PyInstaller 支持文件可以位于 `_internal`，不能要求用户调用 Python、Conda 或 pip。
+- 冻结版发布目录的入口固定为根目录 `reUI.exe`；PyInstaller 支持文件可以位于 `_internal`，不能要求用户调用 Python、Conda 或 pip；源码入口只做运行环境初始化，不提供依赖检测或安装界面。
 - `runtime_paths.bundled_resource()` 只解析随程序发布的只读资源；`config.example.json`、`data/models/model_registry.json` 和内置模型不得在运行时直接改写。
 - 用户配置、缓存、日志、用户模型和更新临时文件分别位于 `%LOCALAPPDATA%/reUI/config`、`cache`、`logs`、`models`、`updates`；首次运行从旧版 `config.json` 或内置示例迁移配置，更新不得覆盖这些目录。
 - 冻结包的 `build_info.json` 至少包含版本、提交号、频道、构建时间和科学代码指纹。正式导出 manifest 必须保留这些构建信息；缺失科学代码指纹时不得生成可追溯正式清单。

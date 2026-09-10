@@ -4,21 +4,19 @@
 
 ## 普通用户使用（Windows 便携版）
 
-普通用户请从 [下载最新 Windows 便携版](https://github.com/teriri30/reUI/releases/latest) 获取 ZIP。完整解压后，双击最外层的 `reUI.exe`；不要把 EXE 单独移出 `_internal` 文件夹。便携版已携带 Python 运行库、PySide6、CPU 模型推理依赖、GeoTIFF/坐标依赖和内置模型，不需要安装 Python、Conda、pip、CUDA 或项目依赖；因此下载到普通 Windows 电脑即可运行。开发者本地 CUDA 环境仍保留，GPU 版可按本地构建流程单独生成。
+普通用户请从 [下载最新 Windows 便携版](https://github.com/teriri30/reUI/releases/latest) 获取 ZIP。完整解压后，双击最外层的 `reUI.exe`；不要把它单独移出解压目录（EXE 需要旁边的 `_internal` 文件夹）。便携版已携带 Python 运行库、PySide6、CPU 模型推理依赖、GeoTIFF/坐标依赖和内置模型，不需要安装 Python、Conda、pip、CUDA 或项目依赖；因此下载到普通 Windows 电脑即可运行。开发者本地 CUDA 环境仍保留，GPU 版可按本地构建流程单独生成。
 
 GitHub 的 `Code → Download ZIP` 是源码包，只适合开发者，不包含可直接运行的 EXE。普通用户应下载 Release 中的 `reUI-Windows-x64-<version>.zip`，解压后即可运行整个便携项目。
 
 维护者发布新版本时，可以推送 `v*` 标签，或在 GitHub Actions 的 `build-release` 中填写 `release_tag` 手动发布；工作流会先完成测试、构建和 `reUI.exe --self-test`，通过后才上传 Release。
 
-程序配置、缓存、日志和用户模型保存在 `%LOCALAPPDATA%\\reUI`，更新程序不会覆盖这些数据。开发者运行 `update.bat` 后，脚本会先确认源码分支已推送，再询问是否创建 `v*` 标签；标签触发 Actions 构建并发布完整 Release ZIP。它不是普通用户的 EXE 更新器。
+程序配置、缓存、日志和用户模型保存在 `%LOCALAPPDATA%\reUI`，升级或替换程序文件不会覆盖这些数据。开发者运行 `update.bat` 后，脚本会先确认源码分支已推送，再询问是否创建 `v*` 标签；标签触发 Actions 构建并发布完整 Release ZIP。它不是普通用户的 EXE 更新器。
 
 作为科研软件，模型结果用于记录当前路径的几何指标，具体口径仍是下文所述的理论几何估算。项目数据也不是只保存“最后一个画面”：系统同时保存最近完成状态和最近 50 步逐操作历史；田块圈选、原始掩膜、优化后掩膜、中心线选择、服务点和路径等状态可在重新打开项目后继续逐步撤销/重做。大掩膜按内容哈希独立存储并在多个历史步骤间复用，源 GeoTIFF 发生变化或历史产物校验失败时会拒绝恢复不可信历史。
 
 ## 目录结构
 
-发布后的项目根目录直接包含 `reUI.exe` 和 `_internal/`；应用源码统一位于
-`src/`，PySide6 界面位于 `src/pyside6_app/`，测试、构建脚本、文档和模型数据
-分别位于 `tests/`、`packaging/`、`scripts/`、`docs/`、`data/` 和 `developer/`。
+发布后的项目根目录直接包含 `reUI.exe` 和 `_internal/`；源码仓库中应用源码位于 `src/`，PySide6 界面位于 `src/pyside6_app/`，测试位于 `tests/`，构建脚本位于 `packaging/` 和 `scripts/`，文档位于 `docs/` 和 `developer/`，模型数据位于 `data/`。
 
 掩膜处理统一使用“标准”档位；界面不再提供轻量、增强或强力切换，旧配置中的这些名称会自动归一为标准。
 
@@ -31,33 +29,27 @@ GitHub 的 `Code → Download ZIP` 是源码包，只适合开发者，不包含
 - 当前工具链还包括禁行区确认、起点/终点与卸粮点、路线编辑、混合种植区域处理、农机兼容 `$PATH` 测试文件和掩膜诊断包。
 - 论文实验链覆盖种植带感知、作业带确定、中心线生成、路径生成、终端导入和田间自主执行评价；转弯策略是已实现的固定路径生成方式，只有形成独立对照试验时才报告策略差异，不默认宣称策略优化。
 
-## 运行环境
+## 开发者指引（可选）
 
-已验证环境为 `D:\zhl\anaconda\envs\game`：Python 3.10.20、PyTorch 2.9.1+cu128、CUDA 12.8。完整版本见 `developer/environment.game.yml` 和 `developer/requirements/requirements.txt`。
+普通用户不需要本节，直接使用 Windows 便携版即可。从源码运行与测试需要 Python 3.10 和 `developer/requirements/` 中列出的依赖；已验证环境为 Python 3.10.20、PyTorch 2.9.1+cu128、CUDA 12.8，完整版本见 `developer/environment.game.yml` 和 `developer/requirements/requirements.txt`。源码启动只做运行环境初始化，不提供依赖检测或安装界面；缺少依赖时请按 requirements 文件自行安装。
 
-```powershell
-D:\zhl\anaconda\envs\game\python.exe src\main.py
+```bash
+python src/main.py              # 从源码启动
+python -m compileall -q .       # 语法检查
+python -m pytest -q             # 全量测试
+python -m pip check             # 依赖冲突检查
 ```
 
-## 验证
-
-```powershell
-D:\zhl\anaconda\envs\game\python.exe -m compileall -q .
-D:\zhl\anaconda\envs\game\python.exe -m pytest -q
-D:\zhl\anaconda\envs\game\python.exe -m pip check
-```
-
-在 Git Bash、Hermes 或其他可能注入 Python 环境变量的终端中，使用项目脚本以隔离 `PYTHONPATH`：
+在 Git Bash、Hermes 等可能注入 `PYTHONPATH` 的终端中，使用项目脚本隔离环境；可用 `REUI_PYTHON` 指定解释器：
 
 ```bash
 bash scripts/test.sh -q
-# 或指定解释器：REUI_PYTHON=/d/zhl/anaconda/envs/game/python.exe bash scripts/test.sh -q
 ```
 
 导出后可独立验证路径文件和阶段证据；加入 `--verify-sources` 会重新哈希源 GeoTIFF 和模型：
 
-```powershell
-D:\zhl\anaconda\envs\game\python.exe src\integrity_check.py path_result.csv.manifest.json --verify-sources
+```bash
+python src/integrity_check.py path_result.csv.manifest.json --verify-sources
 ```
 
 ## 数据安全规则

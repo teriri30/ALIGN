@@ -65,6 +65,15 @@ def test_frozen_entry_never_calls_source_environment_installer():
     assert "from app_entry import run_app" in source
 
 
+def test_no_runtime_entry_carries_a_dependency_installer():
+    """DECISION-018 v2: 任何入口都不携带依赖检测或安装界面。"""
+    for relative in ("src/main.py", "src/startup.py", "src/frozen_main.py", "src/app_entry.py"):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "tkinter" not in source, relative
+        assert "pip install" not in source, relative
+        assert "EnvSetupDialog" not in source, relative
+
+
 def test_self_test_flag_is_handled_before_qt_startup(monkeypatch):
     import app_entry
 

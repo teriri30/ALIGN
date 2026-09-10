@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """Source/development entry point.
 
-The source launcher may still offer dependency installation.  The frozen
-launcher is ``frozen_main.py`` and never imports that installer.
+Importing ``startup`` performs the source runtime environment bootstrap
+(``PYTHONPATH`` isolation and geospatial configuration); the frozen launcher
+is ``frozen_main.py``.  See DECISION-018.
 """
 from __future__ import annotations
 
@@ -15,15 +16,10 @@ if REUI_DIR not in sys.path:
 
 
 def main() -> int:
-    try:
-        from startup import ensure_environment
-        if not ensure_environment():
-            return 0
-    except Exception as exc:
-        print(f"环境检查失败，程序已停止: {exc}", file=sys.stderr)
-        return 1
+    import startup  # noqa: F401  导入即初始化运行环境（路径隔离 + 地理环境）
 
     from app_entry import run_app
+
     return run_app()
 
 

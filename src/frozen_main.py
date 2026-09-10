@@ -1,4 +1,4 @@
-"""PyInstaller entry point; deliberately bypasses source dependency setup."""
+"""PyInstaller entry point; bypasses the source launcher entirely (DECISION-018)."""
 from __future__ import annotations
 
 import sys

@@ -70,20 +70,15 @@ def test_startup_removes_foreign_site_packages_instead_of_only_reordering_them(m
     assert "PYTHONPATH" not in os.environ
 
 
-def test_startup_declares_inference_runtime_dependencies():
+def test_source_entry_only_bootstraps_the_runtime_environment():
+    """DECISION-018 v2: 源码入口只做运行环境初始化，不携带依赖检测或安装。"""
+    project_root = Path(__file__).resolve().parents[1]
+    main_source = (project_root / "src" / "main.py").read_text(encoding="utf-8")
+    assert "import startup" in main_source
+    assert "ensure_environment" not in main_source
+
     import startup
 
-    imports = {item[1] for item in startup.DEPENDENCIES}
-    assert {"torch", "torchvision", "ultralytics"} <= imports
-
-
-def test_pip_command_uses_user_site_when_environment_site_is_not_writable(monkeypatch):
-    import startup
-
-    monkeypatch.setattr(startup, "_site_directory_is_writable", lambda path: False)
-
-    command = startup.get_pip_command(["torch==2.9.1+cu128"])
-
-    assert "--user" in command
-    assert "--extra-index-url" in command
-    assert startup.PYTORCH_INDEX_URL in command
+    assert callable(startup._prioritize_active_environment_paths)
+    assert not hasattr(startup, "ensure_environment")
+    assert not hasattr(startup, "check_missing")
