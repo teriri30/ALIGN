@@ -104,4 +104,5 @@ jobs:
         run: |
           $version = (Get-Content build_info.json -Raw | ConvertFrom-Json).version
           if ($env:GITHUB_REF_TYPE -eq "tag") { $releaseTag = $env:GITHUB_REF_NAME } else { $releaseTag = "${{ inputs.release_tag }}" }
-          gh release create $releaseTag ${{ steps.package.outputs.zip }} ${{ steps.package.outputs.sha }} --target $env:GITHUB_SHA --generate-notes --title "reUI $version"
+          $guidance = "**普通用户请下载 ${{ steps.package.outputs.zip }}（完整便携版，解压后双击 reUI.exe 即可运行，无需安装任何环境）。同名的 .sha256 文件是校验值，可不下。下方的“源代码”压缩包仅供开发者，不能直接运行。**"
+          gh release create $releaseTag ${{ steps.package.outputs.zip }} ${{ steps.package.outputs.sha }} --target $env:GITHUB_SHA --generate-notes --title "reUI $version" --notes $guidance
