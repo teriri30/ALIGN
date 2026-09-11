@@ -1,0 +1,18 @@
+# Normalise text files to LF in every checkout so the scientific-code
+# fingerprint (which hashes on-disk bytes) is identical on every machine.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+# Binaries must never be converted.
+*.pt binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.tif binary
+*.tiff binary
+*.zip binary
+*.7z binary
+*.pdf binary
