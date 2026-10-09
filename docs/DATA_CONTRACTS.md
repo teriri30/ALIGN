@@ -223,3 +223,10 @@
 - 混合种植田块先在各分类区域内生成作业直线，再把全部直线展平并执行一次全田半分交错套圈。区域边界不得拥有独立入口、奇偶性、套圈顺序或转场；`contour_ordering.ordered_original_indices` 和 `adjacent_transition_count` 必须针对完整全田直线集合计算。逐线区域来源继续通过 `line_provenance` 保留，以审计不同密度生成规则。
 - 每个固定转弯实现必须携带正式足迹验证的显式 `valid`、`issues`、`track_core_overlap_pct`、`planned_target_geometric_coverage_pct` 和 `track_outside_field_pct`；配置提供 `planning_support_mask`、`uncertain_mask` 或 `forbidden_mask` 时，还必须分别提供对应的履带重叠指标。缺失或其他硬条件超限保留失败原因，核心重叠在 `report_only` 模式下不得单独阻断路径。
 <!-- DECISION-015: segment footprint and headland-turn metric contract. -->
+
+## 人工参考线与中心线评价（DECISION-028）
+
+- 参考线 sidecar 固定在 `<cache>/<project>/reference_lines.json`，schema `centerline-reference-lines-v1`：`{schema, tif_path, station_spacing_hint_m, updated_at, lines:[{id, band_id, band_label, pass, operator, created_at, points:[[x,y]...], fit:{p1,p2,angle_rad}}]}`。`fit` 一律由 `points` 重算，`points` 为全幅显示坐标。
+- 参考线是人工研究证据，不是作业输入：不得进入 `project_state.json`、撤销历史、路径 provenance、导出闸门或缓存恢复校验；桌面端只以独立"参考线（人工）"图层显示，可在图层面板显隐。
+- 离线评价包（`centerline-evaluation` v1，用 `--cache-dir/--tif` 复现）固定包含：`per_line.csv`（逐线 Eθ、平均/最大横向偏差、重叠率、匹配距离与未匹配说明）、`noise_floor.csv`（两遍人工参考线间偏差 = 判读噪声底）、`summary.json`（含 `mask_regularization_version` 与 mpp 溯源）、`reference_lines.json` 副本、`overlay.png`、`boxplot.png`、`README.md`，并打包同名 zip。
+- 横向偏差口径：沿参考线 1 m 等间隔采样到提取中心线（折线）的最短距离；方向角取两线最小二乘方向差（180° 取小）。报告平均与最大，不得只报其一，也不得替换为文献未背书的指标。

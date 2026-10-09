@@ -58,6 +58,12 @@ from runtime_paths import builtin_model_dir
 # ``ImageViewerGroup`` accepts BGR tuples and reverses them before creating a
 # Qt colour.  Keep the field-selection boundary blue at every redraw site.
 FIELD_BOUNDARY_COLOR_BGR = (255, 140, 50)
+# DECISION-028: 人工参考线（中心线评价的基准证据，研究工具）。同 BGR 口径：
+# 参考线橙色（RGB 橙 = BGR (0,160,255)），桩点红橙色。
+REFERENCE_LINE_COLOR_BGR = (0, 160, 255)
+REFERENCE_STATION_COLOR_BGR = (70, 70, 235)
+REFERENCE_DOUBLE_CLICK_SECONDS = 0.45
+REFERENCE_DOUBLE_CLICK_DISTANCE_PX = 12.0
 
 
 class MainWindow(QMainWindow):
@@ -108,6 +114,13 @@ class MainWindow(QMainWindow):
         self._field_pts: List[Tuple[int, int]] = []
         self._forbidden_drawing = False
         self._forbidden_pts: List[Tuple[int, int]] = []
+        # DECISION-028: 参考线标注（中心线评价的人工基准，研究工具）
+        self._reference_drawing = False
+        self._reference_pass = 1
+        self._reference_pts: List[Tuple[float, float]] = []
+        self._reference_last_click = None
+        self._reference_payload = {}
+        self._reference_payload_tif = ""
         self._measure_tool = ""
         self._measure_points: List[Tuple[int, int]] = []
         self._measure_overlay_items = []
@@ -423,6 +436,10 @@ class MainWindow(QMainWindow):
         self._add_action(tm, "绘制禁行区", "Ctrl+Shift+B", self._on_toggle_forbidden_drawing)
         self._add_action(tm, "清除全部禁行区", None, self._on_clear_forbidden_regions)
         self._add_action(tm, "布设起终点与卸粮点", None, self._on_toggle_entry_exit)
+        # DECISION-028: 参考线标注（中心线评价基准，研究工具；默认低调）
+        self._add_action(tm, "参考线标注（第 1 遍）", None, lambda: self._set_reference_mode(1))
+        self._add_action(tm, "参考线标注（第 2 遍·重复性）", None, lambda: self._set_reference_mode(2))
+        self._add_action(tm, "导出参考线 JSON...", None, self._on_export_reference_lines)
         tm.addSeparator()
         self._add_action(tm, "运行", "Ctrl+R", self._on_run)
         self._add_action(tm, "掩膜优化", None, self._on_mask_process)
@@ -2828,6 +2845,7 @@ class MainWindow(QMainWindow):
             or getattr(self.state, "unload_points", [])
             or (has_route and getattr(self.state, "auto_path_planned", False))
         )
+        has_reference = self._reference_lines_present()
         availability = {
             "field_boundary": (has_boundary, has_boundary),
             # Keep the current processed view uncluttered by default, but keep
@@ -2838,6 +2856,7 @@ class MainWindow(QMainWindow):
             "headland_mask": (has_headland, has_headland),
             "uncertain_residual": (has_uncertain, has_uncertain),
             "centerlines": (has_centerlines, has_centerlines),
+            "reference_lines": (has_reference, has_reference),
             "route": (has_route, has_route),
             "forbidden_regions": (has_forbidden, has_forbidden),
             "service_points": (
@@ -2916,6 +2935,7 @@ class MainWindow(QMainWindow):
         else:
             self.image_view.viewer.clear_overlays()
         self._redraw_field_if_any()
+        self._draw_reference_lines_overlay()
 
     @Slot(str)
     def _on_step_deleted(self, tid):
@@ -3321,6 +3341,9 @@ class MainWindow(QMainWindow):
                 self._restore_visual_from_state()
                 self.log_panel.info("已取消本次禁行区绘制")
             return
+        if self._reference_drawing:
+            self._handle_reference_click(x, y, button)
+            return
         if button == 1 and self._begin_service_point_drag(x, y):
             return
         if getattr(self.state, 'entry_exit_mode', False):
@@ -3397,6 +3420,8 @@ class MainWindow(QMainWindow):
             self._redraw_field_overlay(mouse_pos=(x, y))
         elif self._forbidden_drawing and self._forbidden_pts:
             self._redraw_forbidden_overlay(mouse_pos=(x, y))
+        elif self._reference_drawing and self._reference_pts:
+            self._redraw_reference_interaction(mouse_pos=(x, y))
         self.event_bridge.on_mouse_moved(x, y, buttons)
 
     def _field_line_width(self):
@@ -3644,6 +3669,343 @@ class MainWindow(QMainWindow):
             self._draw_field_boundary()
         else:
             self.image_view.viewer.clear_overlay_layer("field_boundary")
+
+    # ── 参考线标注（DECISION-028：中心线评价的人工基准，研究证据） ──
+
+    def _set_reference_mode(self, pass_index):
+        """进入/退出参考线标注模式；与田块/禁行区绘制模式互斥。"""
+        pass_index = int(pass_index)
+        if self._reference_drawing and self._reference_pass == pass_index:
+            self._reference_drawing = False
+            self._reference_pts = []
+            self._reference_last_click = None
+            self.image_view.viewer.clear_overlay_layer("interaction_reference")
+            self._sync_drawing_mode()
+            self.log_panel.info("已退出参考线标注模式")
+            return
+        if not str(getattr(self.state, "tif_path", "") or ""):
+            self.log_panel.warn("请先导入影像，再标注参考线。")
+            return
+        if self._field_drawing:
+            self._field_drawing = False
+            self._field_pts = []
+            self._clear_field_overlay()
+        if self._forbidden_drawing:
+            self._forbidden_drawing = False
+            self._forbidden_pts = []
+            self.image_view.viewer.clear_overlay_layer("interaction_forbidden")
+        if self._reference_drawing:
+            self.image_view.viewer.clear_overlay_layer("interaction_reference")
+        self._reference_drawing = True
+        self._reference_pass = pass_index
+        self._reference_pts = []
+        self._reference_last_click = None
+        # 进入模式时重读 sidecar，保证与磁盘一致（离线工具可能已更新）
+        self._reference_payload = {}
+        self._reference_payload_tif = ""
+        self._sync_drawing_mode()
+        self._draw_reference_lines_overlay()
+        self._sync_display_layer_availability()
+        existing = len(self._reference_lines_payload().get("lines") or [])
+        self.log_panel.info(
+            "参考线标注（第 %d 遍）：左键沿宽行带中心逐点添加桩点（建议每 5 m 一点，"
+            "一条带 10-16 个点），最后一个桩点上双击完成并自动保存；右键取消当前线；"
+            "再次点击同一条菜单退出。当前已有 %d 条参考线。"
+            % (self._reference_pass, existing)
+        )
+
+    def _handle_reference_click(self, x, y, button):
+        """参考线标注模式下的一次点击：左键加桩点，双击收线，右键取消。"""
+        if button == 2:
+            self._reference_pts = []
+            self._reference_last_click = None
+            self.image_view.viewer.clear_overlay_layer("interaction_reference")
+            self.log_panel.info("已取消当前参考线（未保存）")
+            return
+        if button != 1:
+            return
+        point = (float(x), float(y))
+        now = time.monotonic()
+        last = self._reference_last_click
+        if (
+            len(self._reference_pts) >= 2
+            and last is not None
+            and (now - last[0]) <= REFERENCE_DOUBLE_CLICK_SECONDS
+            and math.hypot(point[0] - last[1][0], point[1] - last[1][1])
+            <= REFERENCE_DOUBLE_CLICK_DISTANCE_PX
+        ):
+            # 双击的第二下：视为"完成当前参考线"，不新增桩点。
+            # 绘制模式下点击事件不会经过 event_bridge，双击在此自行检测。
+            self._reference_last_click = None
+            self._finish_reference_line()
+            return
+        self._reference_last_click = (now, point)
+        self._reference_pts.append(point)
+        self._redraw_reference_interaction(mouse_pos=point)
+
+    def _redraw_reference_interaction(self, mouse_pos=None):
+        """绘制进行中的参考线（interaction 层，不触碰已保存图层）。"""
+        viewer = self.image_view.viewer
+        viewer.clear_overlay_layer("interaction_reference")
+        if not self._reference_pts:
+            return
+        viewer.begin_overlay_layer("interaction_reference")
+        pts = self._reference_pts
+        try:
+            for index in range(len(pts) - 1):
+                viewer.draw_line(
+                    pts[index][0], pts[index][1], pts[index + 1][0], pts[index + 1][1],
+                    color=REFERENCE_LINE_COLOR_BGR, width=3,
+                )
+            if mouse_pos:
+                viewer.draw_line(
+                    pts[-1][0], pts[-1][1], mouse_pos[0], mouse_pos[1],
+                    color=REFERENCE_LINE_COLOR_BGR, width=2, style=Qt.DashLine,
+                )
+            for index, point in enumerate(pts):
+                color = (0, 255, 255) if index == 0 else REFERENCE_STATION_COLOR_BGR
+                viewer.draw_circle(point[0], point[1], radius=6, color=color)
+        finally:
+            viewer.end_overlay_layer()
+
+    def _finish_reference_line(self):
+        """拟合并保存当前参考线（缓存目录 sidecar，不进项目状态/撤销历史）。"""
+        import reference_lines
+
+        pts = [[float(x), float(y)] for x, y in self._reference_pts]
+        if len(pts) < 2:
+            self.log_panel.warn("参考线至少需要 2 个桩点（当前 %d 个）" % len(pts))
+            return False
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            self.log_panel.warn("当前没有打开的项目，无法保存参考线。")
+            return False
+        payload = deepcopy(self._reference_lines_payload() or {})
+        if not payload or payload.get("schema") != reference_lines.SCHEMA:
+            payload = reference_lines.empty_payload(tif)
+        band_id, band_label, band_note = self._nearest_reference_band(pts)
+        record = reference_lines.new_line_record(
+            pts,
+            band_id=band_id,
+            band_label=band_label,
+            pass_index=self._reference_pass,
+        )
+        replaced = False
+        if band_id in (None, ""):
+            replaced = self._reference_replace_nearest(payload, record)
+        if not replaced:
+            reference_lines.upsert_line(payload, record)
+        payload["tif_path"] = str(payload.get("tif_path") or tif)
+        payload["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        try:
+            import cache
+
+            cache.save_reference_lines(tif, payload)
+        except Exception as exc:  # OSError 等：保存失败必须显式报告
+            self.log_panel.error("参考线保存失败：%s" % exc)
+            return False
+        self._reference_payload = payload
+        self._reference_payload_tif = tif
+        self._reference_pts = []
+        self._reference_last_click = None
+        self.image_view.viewer.clear_overlay_layer("interaction_reference")
+        self._draw_reference_lines_overlay()
+        self._sync_display_layer_availability()
+        band_part = ""
+        if band_id not in (None, ""):
+            band_part = "，匹配 %s" % (band_label or band_id)
+        elif band_note:
+            band_part = "，%s" % band_note
+        self.log_panel.success(
+            "参考线已保存（%s%s）：第 %d 遍，%d 个桩点%s"
+            % (
+                "替换 " if replaced else "",
+                record.get("id", ""),
+                self._reference_pass,
+                len(pts),
+                band_part,
+            )
+        )
+        coverage = self._reference_coverage_hint(pts)
+        if coverage is not None and coverage < 0.6:
+            self.log_panel.warn(
+                "参考线落膜覆盖率约 %.0f%%，疑似偏离行带主体，建议放大复核。"
+                % (coverage * 100.0)
+            )
+        return True
+
+    def _reference_lines_payload(self):
+        """读取参考线 sidecar（按 tif 路径记忆，避免频繁读盘）。"""
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            return {}
+        if getattr(self, "_reference_payload_tif", "") != tif:
+            import cache
+
+            loaded = cache.load_reference_lines(tif)
+            if loaded:
+                try:
+                    import reference_lines
+
+                    loaded = reference_lines.normalize_payload(loaded)
+                except ValueError:
+                    loaded = {}
+            self._reference_payload = loaded if isinstance(loaded, dict) else {}
+            self._reference_payload_tif = tif
+        return self._reference_payload or {}
+
+    def _reference_lines_present(self):
+        return bool(self._reference_lines_payload().get("lines"))
+
+    def _reference_px_to_m(self, px, x, y):
+        """显示像素 → 米（借用 GeoUtils）；不可用时返回 None。"""
+        try:
+            if self.geo.is_ready():
+                value = float(self.geo.meters_per_pixel(x, y))
+                if value > 0:
+                    return float(px) * value
+        except Exception:
+            pass
+        return None
+
+    def _nearest_reference_band(self, pts):
+        """把参考线匹配到目录中最接近的中心线（信息列，非硬门槛）。"""
+        import reference_lines
+
+        catalog = (
+            getattr(self.state, "centerline_catalog", None)
+            or getattr(self.state, "work_band_catalog", {})
+            or {}
+        )
+        items = [
+            item for item in (catalog.get("items") or []) if isinstance(item, dict)
+        ]
+        if not items:
+            return None, "", "目录中没有可匹配的中心线"
+        fit = reference_lines.fit_line(pts)
+        samples = reference_lines.sample_along_line(fit["p1"], fit["p2"], 40.0)
+        best = None
+        for item in items:
+            disp = self._centerline_display_points(item)
+            if len(disp) < 2:
+                continue
+            dists = reference_lines.polyline_distances(samples, disp)
+            mean_px = float(np.mean(dists))
+            if best is None or mean_px < best[0]:
+                best = (mean_px, item)
+        if best is None:
+            return None, "", "目录中没有可匹配的中心线"
+        mean_px, item = best
+        mean_m = self._reference_px_to_m(mean_px, pts[0][0], pts[0][1])
+        if mean_m is not None and mean_m > 1.5:
+            return None, "", "最近中心线距离 %.2f m（未匹配）" % mean_m
+        label = str(item.get("label") or item.get("id") or "")
+        note = "" if mean_m is None else "最近中心线距离 %.2f m" % mean_m
+        return str(item.get("id") or ""), label, note
+
+    def _reference_replace_nearest(self, payload, record):
+        """无带身份时，与同遍旧参考线近似重合则原位替换，避免重复追加。"""
+        import reference_lines
+
+        fit_new = record.get("fit") or {}
+        if not fit_new:
+            return False
+        anchor = record["points"][0]
+        mpp = self._reference_px_to_m(1.0, anchor[0], anchor[1])
+        limit_px = (0.75 / mpp) if mpp else 40.0
+        samples = reference_lines.sample_along_line(
+            fit_new["p1"], fit_new["p2"], max(10.0, limit_px / 2.0)
+        )
+        lines = payload.get("lines") or []
+        for index, item in enumerate(lines):
+            if int(item.get("pass", 1) or 1) != int(record.get("pass", 1) or 1):
+                continue
+            if str(item.get("band_id") or "").strip() not in ("", "None", "null"):
+                continue
+            try:
+                old_fit = reference_lines.reference_fit(item)
+                dists = reference_lines.polyline_distances(
+                    samples, [old_fit["p1"], old_fit["p2"]]
+                )
+            except Exception:
+                continue
+            if float(np.mean(dists)) <= limit_px:
+                record["id"] = str(item.get("id") or "") or str(record.get("id") or "")
+                lines[index] = record
+                return True
+        return False
+
+    def _reference_coverage_hint(self, pts):
+        """参考线落在原始行带掩膜内的采样比例（自动质检提示，不拦截保存）。"""
+        import reference_lines
+
+        raw = getattr(self.state, "mask_raw", None)
+        if not isinstance(raw, np.ndarray):
+            return None
+        try:
+            fit = reference_lines.fit_line(pts)
+            ox = float(getattr(self.state, "mask_offset_x", 0) or 0)
+            oy = float(getattr(self.state, "mask_offset_y", 0) or 0)
+            local = {
+                "p1": [fit["p1"][0] - ox, fit["p1"][1] - oy],
+                "p2": [fit["p2"][0] - ox, fit["p2"][1] - oy],
+            }
+            return reference_lines.line_inside_mask_fraction(local, raw, 20.0)
+        except Exception:
+            return None
+
+    def _draw_reference_lines_overlay(self, viewer=None):
+        """绘制已保存的参考线到 reference_lines 图层（可在图层面板显隐）。"""
+        import reference_lines
+
+        viewer = viewer if viewer is not None else self.image_view.viewer
+        if not hasattr(viewer, "clear_overlay_layer"):
+            return
+        viewer.clear_overlay_layer("reference_lines")
+        lines = list(self._reference_lines_payload().get("lines") or [])
+        if not lines:
+            return
+        viewer.begin_overlay_layer("reference_lines")
+        try:
+            for line in lines:
+                fit = reference_lines.reference_fit(line)
+                p1, p2 = fit["p1"], fit["p2"]
+                viewer.draw_line(
+                    p1[0], p1[1], p2[0], p2[1],
+                    color=REFERENCE_LINE_COLOR_BGR, width=3, style=Qt.DashLine,
+                )
+                for point in line.get("points") or []:
+                    viewer.draw_circle(
+                        point[0], point[1], radius=5,
+                        color=REFERENCE_STATION_COLOR_BGR,
+                    )
+        finally:
+            viewer.end_overlay_layer()
+
+    def _on_export_reference_lines(self):
+        """导出当前项目的参考线 JSON 副本（用于归档/离线评价）。"""
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        payload = self._reference_lines_payload() if tif else {}
+        if not payload or not payload.get("lines"):
+            self.log_panel.warn("当前项目还没有参考线，先标注再导出。")
+            return
+        stem = os.path.splitext(os.path.basename(tif))[0] or "reference_lines"
+        default_path = os.path.join(
+            os.path.expanduser("~"), "reference_lines_%s.json" % stem
+        )
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "导出参考线 JSON", default_path, "JSON 文件 (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            self.log_panel.error("导出失败：%s" % exc)
+            return
+        self.log_panel.success("参考线已导出：%s" % path)
+
 
     def _route_service_anchor(self, kind):
         """Return the visible route endpoint for a service-point marker.
@@ -6635,6 +6997,7 @@ class MainWindow(QMainWindow):
             "headland_mask",
             "uncertain_residual",
             "centerlines",
+            "reference_lines",
             "field_boundary",
             "forbidden_regions",
             "service_points",
@@ -6751,6 +7114,7 @@ class MainWindow(QMainWindow):
             self._draw_processed_mask_layers(viewer, processed)
 
         self._draw_centerline_overlay(viewer)
+        self._draw_reference_lines_overlay(viewer)
         self._draw_field_boundary()
         if len(getattr(self.state, "field_boundary", []) or []) < 3:
             self._draw_forbidden_regions(clear_first=False)
@@ -10170,6 +10534,7 @@ class MainWindow(QMainWindow):
         active = (
             self._field_drawing
             or self._forbidden_drawing
+            or self._reference_drawing
             or bool(self._measure_tool)
             or getattr(self.state, 'entry_exit_mode', False)
             or self._route_edit_active
@@ -10191,6 +10556,11 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("请先完成影像导入和田块圈选")
         elif self._forbidden_drawing:
             self.lbl_status.setText("禁行区绘制：点击首点闭合，右键取消")
+        elif self._reference_drawing:
+            self.lbl_status.setText(
+                "参考线标注（第 %d 遍）：左键加桩点，双击完成，右键取消"
+                % self._reference_pass
+            )
         elif self._measure_tool == "point":
             self.lbl_status.setText("点选测量：左键选择点，下一次左键替换")
         elif self._measure_tool == "line":

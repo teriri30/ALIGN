@@ -130,6 +130,40 @@ def _image_cache_meta_path(tif_path: str) -> str:
     return os.path.join(_cache_dir(tif_path), "image_bgr.json")
 
 
+def project_cache_dir(tif_path: str) -> str:
+    """Public accessor for the per-project cache directory (DECISION-028)."""
+    return _cache_dir(tif_path)
+
+
+def reference_lines_path(tif_path: str) -> str:
+    """参考线（人工参考线）sidecar 路径。
+
+    DECISION-028：参考线是中心线评价的人工基准证据，不属于作业状态，
+    不进入撤销历史与 project_state.json；读写走独立 sidecar 文件。
+    """
+    return os.path.join(_cache_dir(tif_path), "reference_lines.json")
+
+
+def load_reference_lines(tif_path: str) -> Dict[str, Any]:
+    path = reference_lines_path(tif_path)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_reference_lines(tif_path: str, payload: Dict[str, Any]) -> str:
+    path = reference_lines_path(tif_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with _project_lock(tif_path):
+        _atomic_write_json(path, payload)
+    return path
+
+
 def _history_dir(tif_path: str) -> str:
     return os.path.join(_cache_dir(tif_path), "history")
 

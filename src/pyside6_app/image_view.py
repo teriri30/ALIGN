@@ -37,6 +37,7 @@ DISPLAY_LAYER_KEYS = (
     "headland_mask",
     "uncertain_residual",
     "centerlines",
+    "reference_lines",
     "route",
     "forbidden_regions",
     "service_points",
@@ -1121,6 +1122,7 @@ class ImageViewerGroup(QWidget):
         ):
             make_item(label, key, mask_group)
         make_item("中心线（已选）", "centerlines")
+        make_item("参考线（人工）", "reference_lines")
         make_item("路径（当前显示）", "route")
         make_item("禁行区", "forbidden_regions")
         make_item("起终点 / 卸粮点", "service_points")

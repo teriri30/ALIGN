@@ -521,3 +521,19 @@
 - 测试锚点：`tests/test_mask_strategy.py`（排名包装等价、组合条带计数、近平分切换/维持、退化门槛）、`tests/test_research_integrity.py`（版本断言）。
 
 <!-- DECISION-027: near-tied row angles resolve by transverse comb evidence; degenerate rebuilds fail closed. -->
+
+## DECISION-028：人工参考线作为中心线评价的外部基准（sidecar 存储、离线评价）
+
+- 日期：2026-10-09
+- 背景：论文承诺对"宽行带中心线提取"给出量化评价（方向角偏差与横向偏差），但源码此前只有掩膜层四级消融（`paper_experiments.py`），没有"提取中心线 vs 人工参考线"的评价链路。已核验文献（Ou 2025、Yun 2025、肖延伟、张艳超、董静等）范式高度一致：人工绘制参考线为基准，统计方向角偏差与横向偏差（沿参考线采样到提取线的最短距离，报平均与最大）。参考线属于人工研究证据，不是作业状态。
+- 决策：新增两块能力并分层落位——① 桌面端"参考线标注"研究工具（工具菜单）：沿宽行带中心逐点添加桩点（建议桩距约 5 m、每带 10-16 桩），双击收线后最小二乘拟合并即时保存；② 离线评价工具 `src/centerline_evaluation.py`：读取参考线 sidecar 与项目缓存，重跑当前掩膜处理，输出逐线指标表、人工重复性（第 2 遍）、叠加图/箱线图与 zip 评价包。两者共享纯几何模块 `src/reference_lines.py`（拟合、采样、偏差度量、payload 校验）。
+- 不变量：
+  1. 参考线以 sidecar `reference_lines.json` 保存在项目缓存目录，schema 为 `centerline-reference-lines-v1`；不进入 `project_state.json`、撤销历史、缓存恢复校验与导出闸门，删除该文件不得影响项目恢复或路径导出。
+  2. 坐标口径为全幅显示坐标（等同掩膜局部坐标 + `mask_offset`）；评价前必须转换为掩膜局部坐标再与提取中心线比较。
+  3. 指标口径：方向角偏差 Eθ 为两条直线方向差（180° 取小）；横向偏差 Elat 为沿参考线按 1 m 等间隔采样到提取中心线（折线）最短距离的平均/最大（cm）；另报重叠率与采样数。不引入文献无背书的指标（P95、组合加权精度 A%、实车跟踪偏差等）。
+  4. 每带两遍参考线之间的同口径偏差作为人工判读噪声底，与算法偏差同表报告；参考线落膜覆盖率低时只提示复核、不阻断保存。
+  5. 标注模式与田块圈选/禁行区绘制互斥；双击第二下仅收线、不新增桩点；保存失败必须显式报错。
+- 代码锚点：`reference_lines`（纯几何与契约）、`centerline_evaluation`（离线评价与评价包）、`cache.reference_lines_path/load_reference_lines/save_reference_lines/project_cache_dir`、`pyside6_app.main_window.MainWindow._set_reference_mode/_handle_reference_click/_finish_reference_line/_draw_reference_lines_overlay/_on_export_reference_lines`、`pyside6_app.image_view.DISPLAY_LAYER_KEYS` 的 `reference_lines` 图层。
+- 测试锚点：`tests/test_centerline_evaluation.py`（拟合/度量口径、payload 校验、匹配、评价包与图形）、`tests/test_reference_lines_ui.py`（模式互斥、加桩点与双击收线、右键取消、两遍并存、图层绘制）。
+
+<!-- DECISION-028: manual reference lines as external ground truth for centerline evaluation; sidecar storage and offline evaluation package. -->
