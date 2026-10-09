@@ -59,7 +59,7 @@
 - `planning_support_mask`：场地支撑并集，只用于越界/支撑判断，不得替代 `processed_mask` 计算作物覆盖或碾压。
 - `forbidden_regions`：用户在显示坐标中确认的禁行多边形；规划时按掩膜偏移栅格化，不得由不确定残差自动生成。
 - `mask_result.diagnostics.profile_gate_basis` 必须为 `run_edge_midpoints`：相邻剖面行带的局部占用门控按 profile run 边界中点分隔，避免宽等距块吞并旁侧四行带的中心线。
-- 当前 `mask_result.diagnostics.algorithm_version` 为 `18`。版本 17 及更早的 `mask_processed`/`mask_result` 不包含分离种植区域多候选行向估计契约：全局 PCA 与主要连通轮廓内部主轴必须共同作为候选，再由横向投影周期性评分选择最终行向，区域质心连线不得主导行向。旧缓存恢复必须使掩膜处理和下游路径失效，不得仅因源影像、模型及数组形状相同而复用。
+- 当前 `mask_result.diagnostics.algorithm_version` 为 `19`。版本 18 及更早的 `mask_processed`/`mask_result` 不包含行向估计近平分决胜契约与重建退化门槛：top1 与 top2 行向候选得分差低于 `angle_tiebreak_margin_ratio`（默认 0.05）时必须取前 4 个角度家族做 ±1.5°（步长 0.5°）横剖扫描，以宽度在 0.25–4.0 m 的“组合条带数”比较，仅当挑战家族领先 ≥ max(2, 当前家族 25%) 时才允许切换行向；候选带数 ≥8 而重建带数不足 40% 候选的退化重建必须显式失败（`种植带重建疑似退化`），不得静默输出塌陷几何。版本 17 及更早的 `mask_processed`/`mask_result` 还不包含分离种植区域多候选行向估计契约：全局 PCA 与主要连通轮廓内部主轴必须共同作为候选，再由横向投影周期性评分选择最终行向，区域质心连线不得主导行向。旧缓存恢复必须使掩膜处理和下游路径失效，不得仅因源影像、模型及数组形状相同而复用。
 - 田块圈选同时定义三个不同边界：`mask_raw` 的推理/分析上下文可在圈外保留受控缓冲，供行向与宽窄带重构；前台叠加图层必须只显示原圈选内的副本，绝不能原地裁剪 `mask_raw`；行带轮廓、中心线、`processed_mask`、`planning_support_mask` 与规划路径必须按原圈选边界裁回，圈外分析像素不得成为作业范围。
 
 这些数组与处理后主体保存在同一个原子 NPZ 产物中；项目 JSON 只保存轻量元数据。

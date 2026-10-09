@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-MASK_REGULARIZATION_VERSION = 18
+MASK_REGULARIZATION_VERSION = 19
 
 
 def odd_size(value: float, minimum: int = 3) -> int:
@@ -1739,12 +1739,12 @@ def rotate_bound(
     return rotated, matrix
 
 
-def estimate_row_angle(mask: np.ndarray) -> float:
-    """Estimate crop-row direction from global and major-region PCA seeds."""
+def _rank_row_angles(mask: np.ndarray) -> List[Tuple[float, float]]:
+    """Score row-direction candidates and return them sorted by score (desc)."""
     binary = (np.asarray(mask) > 0).astype(np.uint8)
     ys, xs = np.where(binary > 0)
     if xs.size < 100:
-        return 0.0
+        return [(0.0, 0.0)]
 
     step = max(1, xs.size // 400000)
     sample_x = xs[::step].astype(np.float64)
@@ -1793,8 +1793,7 @@ def estimate_row_angle(mask: np.ndarray) -> float:
             coarse_candidates.append(candidate)
 
     coords = np.column_stack([sample_x, sample_y])
-    best_angle = global_coarse
-    best_score = -1.0
+    scored: List[Tuple[float, float]] = []
     for coarse in coarse_candidates:
         for angle in np.linspace(
             coarse - math.radians(12),
@@ -1809,10 +1808,209 @@ def estimate_row_angle(mask: np.ndarray) -> float:
             trend = smooth_1d(histogram, max(5, bins // 80))
             high_frequency = histogram - trend
             score = float(np.std(high_frequency)) / max(float(np.mean(histogram)), 1.0)
-            if score > best_score:
-                best_score = score
-                best_angle = angle % math.pi
-    return best_angle
+            scored.append((float(angle % math.pi), float(score)))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored
+
+
+def estimate_row_angle(mask: np.ndarray) -> float:
+    """Estimate crop-row direction as the highest-scoring candidate angle."""
+    return _rank_row_angles(mask)[0][0]
+
+
+def _comb_run_quality(
+    work: np.ndarray,
+    angle_deg: float,
+    work_mpp: float,
+    cfg: Dict[str, Any],
+) -> int:
+    """Count band-like transverse runs for one candidate row angle.
+
+    The detector score is a histogram-energy proxy that a wrong near-tied
+    direction can still win.  In the row-aligned frame a correct direction
+    keeps separate band runs in the transverse occupancy profile, so this
+    counts runs whose width falls inside the comb window; broad uniform
+    blocks and tiny fragments are excluded so fake periodicities cannot
+    masquerade as bands.
+    """
+    comb_min_m = float(cfg.get("angle_tiebreak_comb_min_m", 0.25))
+    comb_max_m = float(cfg.get("angle_tiebreak_comb_max_m", 4.0))
+    rotated, _ = rotate_bound(
+        (np.asarray(work) > 0).astype(np.uint8) * 255,
+        float(angle_deg),
+        cv2.INTER_NEAREST,
+    )
+    support_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (
+            odd_size(float(cfg.get("support_close_along_m", 1.2)) / work_mpp),
+            odd_size(float(cfg.get("support_close_across_m", 1.6)) / work_mpp),
+        ),
+    )
+    support = cv2.morphologyEx(rotated, cv2.MORPH_CLOSE, support_kernel) > 0
+    support_counts = support.sum(axis=1).astype(np.float64)
+    row_counts = (rotated > 0).sum(axis=1).astype(np.float64)
+    profile = np.divide(
+        row_counts,
+        np.maximum(support_counts, 1.0),
+        out=np.zeros_like(row_counts),
+        where=support_counts > 0,
+    )
+    profile = smooth_1d(profile, float(cfg.get("profile_smooth_m", 0.06)) / work_mpp)
+    valid = support_counts > max(10, rotated.shape[1] * 0.08)
+    if not bool(np.any(valid)):
+        return 0
+    profile_u8 = np.clip(profile[valid] * 255.0, 0, 255).astype(np.uint8)
+    otsu, _ = cv2.threshold(profile_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    threshold = float(np.clip(
+        otsu / 255.0,
+        float(cfg.get("profile_threshold_min", 0.25)),
+        float(cfg.get("profile_threshold_max", 0.72)),
+    ))
+    runs = _merge_close_runs(
+        _runs(profile >= threshold),
+        max(1, int(round(float(cfg.get("merge_gap_m", 0.08)) / work_mpp))),
+    )
+    min_width_px = max(3, int(round(float(cfg.get("min_band_width_m", 0.16)) / work_mpp)))
+    comb = 0
+    for start, end in runs:
+        if end - start < min_width_px:
+            continue
+        if comb_min_m <= (end - start) * work_mpp <= comb_max_m:
+            comb += 1
+    return comb
+
+
+def _resolve_row_angle(
+    work: np.ndarray,
+    work_mpp: float,
+    cfg: Dict[str, Any],
+) -> Tuple[float, Dict[str, Any]]:
+    """Pick the row angle, breaking score near-ties with band evidence.
+
+    The histogram score can near-tie between a correct and a wrong row
+    direction (observed on real masks, flips with tiny input changes).  When
+    the top two scores are within ``angle_tiebreak_margin_ratio``, candidate
+    angle families are compared by :func:`_comb_run_quality` on a local
+    angular scan, and the winner is switched only when a challenger family
+    beats the current family by a clear margin.  The full decision trail is
+    returned so every run stays auditable.
+    """
+    ranked = _rank_row_angles(work)
+    best_angle, best_score = ranked[0]
+    diagnostics: Dict[str, Any] = {
+        "top_scores": [
+            {"angle_deg": round(math.degrees(angle), 2), "score": round(score, 5)}
+            for angle, score in ranked[:6]
+        ],
+        "tie_triggered": False,
+        "switched": False,
+        "chosen_deg": round(math.degrees(best_angle), 2),
+        "reason": "clear_winner",
+        "scans": {},
+        "family_best": [],
+    }
+    if len(ranked) < 2:
+        diagnostics["reason"] = "single_candidate"
+        return best_angle, diagnostics
+    second_score = ranked[1][1]
+    margin_ratio = (best_score - second_score) / max(best_score, 1e-9)
+    diagnostics["margin_ratio"] = round(float(margin_ratio), 4)
+    if second_score < best_score * (1.0 - float(cfg.get("angle_tiebreak_margin_ratio", 0.05))):
+        return best_angle, diagnostics
+    diagnostics["tie_triggered"] = True
+    try:
+        max_families = max(2, int(cfg.get("angle_tiebreak_families", 4)))
+        family_radius_deg = float(cfg.get("angle_tiebreak_family_radius_deg", 2.0))
+        families: List[Tuple[float, float]] = []
+        for angle, score in ranked:
+            deg = math.degrees(angle)
+            if all(abs(deg - entry[0]) > family_radius_deg for entry in families):
+                families.append((deg, score))
+            if len(families) >= max_families:
+                break
+        scan_range_deg = float(cfg.get("angle_tiebreak_scan_range_deg", 1.5))
+        scan_step_deg = max(0.1, float(cfg.get("angle_tiebreak_scan_step_deg", 0.5)))
+        scan_offsets = np.arange(
+            -scan_range_deg,
+            scan_range_deg + scan_step_deg * 0.5,
+            scan_step_deg,
+        )
+        family_records: List[Dict[str, Any]] = []
+        for family_deg, _family_score in families:
+            points = []
+            for offset in scan_offsets:
+                scan_deg = round(family_deg + float(offset), 3)
+                points.append({
+                    "deg": scan_deg,
+                    "comb": int(_comb_run_quality(work, scan_deg, work_mpp, cfg)),
+                })
+            best_point = max(
+                points,
+                key=lambda item: (item["comb"], -abs(item["deg"] - family_deg)),
+            )
+            family_records.append({
+                "deg": round(family_deg, 2),
+                "points": points,
+                "best_deg": best_point["deg"],
+                "best_comb": best_point["comb"],
+            })
+        diagnostics["scans"] = {
+            str(record["deg"]): record["points"] for record in family_records
+        }
+        diagnostics["family_best"] = [
+            {
+                "deg": record["deg"],
+                "best_deg": record["best_deg"],
+                "best_comb": record["best_comb"],
+            }
+            for record in family_records
+        ]
+        current_comb = family_records[0]["best_comb"]
+        challengers = family_records[1:]
+        if not challengers:
+            diagnostics["reason"] = "single_family"
+            return best_angle, diagnostics
+        challenger = max(challengers, key=lambda record: record["best_comb"])
+        required = current_comb + max(2, math.ceil(0.25 * max(current_comb, 1)))
+        if challenger["best_comb"] >= required:
+            diagnostics["switched"] = True
+            diagnostics["chosen_deg"] = float(challenger["best_deg"])
+            diagnostics["reason"] = (
+                f"family_{challenger['best_deg']}_comb_"
+                f"{challenger['best_comb']}_vs_{current_comb}"
+            )
+            return math.radians(float(challenger["best_deg"])), diagnostics
+        diagnostics["reason"] = f"no_family_beats_current(need={required})"
+    except Exception as exc:  # 保守回退：决胜失败时仍返回评分冠军
+        diagnostics["reason"] = f"tiebreak_error:{type(exc).__name__}"
+    return best_angle, diagnostics
+
+
+def _degenerate_rebuild_reason(
+    candidates: int,
+    rebuilt: int,
+    cfg: Dict[str, Any],
+) -> Optional[str]:
+    """Return a failure reason when a rebuild collapsed, else ``None``.
+
+    A profile with many candidate runs but very few reconstructed bands
+    normally means the row direction or the mask evidence is broken.
+    Silently returning the collapsed geometry would poison every downstream
+    centerline and path, so callers must fail closed on a non-None reason.
+    """
+    min_candidates = max(1, int(cfg.get("degenerate_candidates_min", 8)))
+    min_ratio = float(cfg.get("degenerate_rebuild_ratio_min", 0.40))
+    if int(candidates) < min_candidates:
+        return None
+    ratio = int(rebuilt) / max(int(candidates), 1)
+    if ratio >= min_ratio:
+        return None
+    return (
+        "种植带重建疑似退化（疑似行向估计或掩膜质量异常），拒绝静默输出："
+        f"candidates={int(candidates)} rebuilt={int(rebuilt)}"
+        f" ratio={ratio:.3f} threshold={min_ratio:.2f}"
+    )
 
 
 def _runs(binary: np.ndarray) -> List[Tuple[int, int]]:
@@ -2335,7 +2533,7 @@ def regularize_crop_mask(
 
     report(0.08, "稻行方向估计")
     abort_if_cancelled()
-    angle = estimate_row_angle(work)
+    angle, angle_diagnostics = _resolve_row_angle(work, work_mpp, cfg)
     abort_if_cancelled()
     rotated, matrix = rotate_bound(work, math.degrees(angle), cv2.INTER_NEAREST)
     inverse = cv2.invertAffineTransform(matrix)
@@ -2824,6 +3022,16 @@ def regularize_crop_mask(
             f" runs={len(runs)} bands={len(bands)} skipped={len(skipped_bands)}"
             f" skip_detail={[{'id': s.get('id'), 'reason': s.get('reason'), 'obs': s.get('observations'), 'span': round(float(s.get('span_ratio', 0.0)), 3), 'extent_m': round(float(s.get('extent_m', 0.0)), 2)} for s in skipped_bands]}"
         )
+    # Fail closed when the rebuild collapses: many candidate runs but far
+    # fewer reconstructed bands means the row direction or the mask evidence
+    # is broken; silently returning the collapsed geometry would poison every
+    # downstream centerline and path.
+    degenerate_reason = _degenerate_rebuild_reason(len(runs), len(bands), cfg)
+    if degenerate_reason is not None:
+        raise RuntimeError(
+            degenerate_reason
+            + f" skip_detail={[{'id': s.get('id'), 'reason': s.get('reason'), 'obs': s.get('observations'), 'span': round(float(s.get('span_ratio', 0.0)), 3), 'extent_m': round(float(s.get('extent_m', 0.0)), 2)} for s in skipped_bands]}"
+        )
 
     report(0.82, "几何回写")
     abort_if_cancelled()
@@ -2939,6 +3147,8 @@ def regularize_crop_mask(
         "candidate_band_count": len(runs),
         "profile_gate_basis": "run_edge_midpoints",
         "rebuilt_band_count": len(bands),
+        "rebuild_ratio": float(len(bands) / max(len(runs), 1)),
+        "angle_diagnostics": angle_diagnostics,
         "skipped_bands": skipped_bands,
         "wide_profile_width_m": class_widths.get("wide"),
         "narrow_profile_width_m": class_widths.get("narrow"),

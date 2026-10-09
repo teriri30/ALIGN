@@ -265,3 +265,147 @@ def test_default_row_gap_repair_bridges_visible_internal_breaks():
     repaired = repair_row_gaps(raw, main_angle=0.0, meters_per_px=0.1, config={})
 
     assert repaired[37, 88] == 255
+
+
+def test_row_angle_rank_lists_sorted_candidates_and_wrapper_keeps_contract():
+    """排名接口按得分降序返回全候选；estimate_row_angle 保持既有契约。"""
+    from row_geometry import _rank_row_angles, estimate_row_angle
+
+    mask = np.zeros((420, 640), dtype=np.uint8)
+    for y_value in range(30, 391, 30):
+        mask[y_value:y_value + 12, 20:620] = 255
+
+    ranked = _rank_row_angles(mask)
+
+    assert len(ranked) >= 2
+    scores = [score for _angle, score in ranked]
+    assert scores == sorted(scores, reverse=True)
+    assert estimate_row_angle(mask) == ranked[0][0]
+
+
+def test_comb_run_quality_counts_bands_but_not_broad_uniform_blocks():
+    """组合条带数只统计 0.25~4 m 的横向条带，6 m 宽等距块必须被排除。"""
+    from row_geometry import _comb_run_quality
+
+    mask = np.zeros((1600, 600), dtype=np.uint8)
+    y_value = 0
+    for _ in range(10):
+        mask[y_value:y_value + 50, :] = 255
+        y_value += 100
+    mask[y_value:y_value + 600, :] = 255
+
+    assert _comb_run_quality(mask, 0.0, 0.01, {}) == 10
+
+
+def test_row_angle_tiebreak_keeps_clear_winner_without_quality_scan(monkeypatch):
+    """清晰胜出时不得触发任何横剖质量扫描。"""
+    import math
+
+    import row_geometry
+
+    scan_calls = {"count": 0}
+
+    def fake_quality(work, angle_deg, work_mpp, cfg):
+        scan_calls["count"] += 1
+        return 0
+
+    monkeypatch.setattr(
+        row_geometry,
+        "_rank_row_angles",
+        lambda mask: [(math.radians(20.0), 0.10), (math.radians(50.0), 0.05)],
+    )
+    monkeypatch.setattr(row_geometry, "_comb_run_quality", fake_quality)
+
+    angle, diagnostics = row_geometry._resolve_row_angle(
+        np.zeros((10, 10), dtype=np.uint8), 0.01, {}
+    )
+
+    assert abs(math.degrees(angle) - 20.0) < 1e-6
+    assert diagnostics["tie_triggered"] is False
+    assert diagnostics["reason"] == "clear_winner"
+    assert scan_calls["count"] == 0
+
+
+def test_row_angle_tiebreak_switches_when_challenger_family_has_clear_band_evidence(monkeypatch):
+    """近平分时，挑战家族组合条带数达到 max(2, 25%) 优势才允许切换。"""
+    import math
+
+    import row_geometry
+
+    monkeypatch.setattr(
+        row_geometry,
+        "_rank_row_angles",
+        lambda mask: [
+            (math.radians(112.77), 0.0685),
+            (math.radians(112.27), 0.0679),
+            (math.radians(108.77), 0.0635),
+        ],
+    )
+    monkeypatch.setattr(
+        row_geometry,
+        "_comb_run_quality",
+        lambda work, angle_deg, work_mpp, cfg: (
+            10 if 107.5 <= angle_deg <= 108.55 else 4
+        ),
+    )
+
+    angle, diagnostics = row_geometry._resolve_row_angle(
+        np.zeros((10, 10), dtype=np.uint8), 0.01, {}
+    )
+
+    assert diagnostics["tie_triggered"] is True
+    assert diagnostics["switched"] is True
+    assert 107.5 <= math.degrees(angle) <= 108.55
+    assert diagnostics["scans"]
+    assert diagnostics["family_best"]
+
+
+def test_row_angle_tiebreak_keeps_winner_on_marginal_quality_advantage(monkeypatch):
+    """挑战家族未达优势门槛时不得切换行向。"""
+    import math
+
+    import row_geometry
+
+    monkeypatch.setattr(
+        row_geometry,
+        "_rank_row_angles",
+        lambda mask: [
+            (math.radians(112.77), 0.0685),
+            (math.radians(108.77), 0.0679),
+        ],
+    )
+    monkeypatch.setattr(
+        row_geometry,
+        "_comb_run_quality",
+        lambda work, angle_deg, work_mpp, cfg: (
+            8
+            if abs(angle_deg - 112.77) <= 1.5 or abs(angle_deg - 108.77) <= 1.5
+            else 4
+        ),
+    )
+
+    angle, diagnostics = row_geometry._resolve_row_angle(
+        np.zeros((10, 10), dtype=np.uint8), 0.01, {}
+    )
+
+    assert diagnostics["tie_triggered"] is True
+    assert diagnostics["switched"] is False
+    assert abs(math.degrees(angle) - 112.77) < 1e-9
+
+
+def test_degenerate_rebuild_gate_flags_collapsed_rebuild_only():
+    """候选≥8 且重建<40% 必须给出显式失败理由；正常与小型圈选不得误报。"""
+    from row_geometry import _degenerate_rebuild_reason
+
+    reason = _degenerate_rebuild_reason(12, 2, {})
+    assert reason is not None
+    assert "candidates=12" in reason
+    assert "rebuilt=2" in reason
+    assert _degenerate_rebuild_reason(12, 11, {}) is None
+    assert _degenerate_rebuild_reason(5, 1, {}) is None
+    assert _degenerate_rebuild_reason(
+        20, 5, {"degenerate_rebuild_ratio_min": 0.3}
+    ) is not None
+    assert _degenerate_rebuild_reason(
+        6, 1, {"degenerate_candidates_min": 5}
+    ) is not None

@@ -505,3 +505,19 @@
 - 允许的变更方式：可调整具体哪些指标属于硬错误/软警告，但必须保持"田界越界/禁行区冲突/曲率不足永远是硬错误"原则，不得让用户绕过物理安全约束。
 
 <!-- DECISION-026: manual route edit validation separates hard errors from soft warnings. -->
+
+## DECISION-027：行向候选近平分必须以下游条带证据决胜，重建退化必须显式失败
+
+- 日期：2026-10-09
+- 背景：真实缓存案例（5.27 田5 三模式 12m）中 `estimate_row_angle` 的直方图能量评分在正确方向（≈108.0°）与错误方向（≈112.8°）之间形成近平分（差距约 1%，沙箱复跑 0.9%~1.9%），错误方向胜出时横向剖面塌陷为 2/12 条带（IoU 0.35）且无任何门槛拦截；外扩像素或工作分辨率的微小变化即可在两个方向之间翻转（刀锋敏感）。沙箱验证还表明单纯"横剖 run 数"判据会被假周期骗过（错误角度可获得 5~6 条假条带），因此决胜判据必须使用"组合条带数"（宽度在 0.25–4.0 m 的横向 run 数，排除宽等距块与碎片）。
+- 决策：行向估计保留原候选与评分机制，另增近平分决胜——top1 与 top2 得分差低于 `angle_tiebreak_margin_ratio`（默认 0.05）时，取前 4 个角度家族（去重 2°），每家族在 ±1.5°（步长 0.5°）内以 `_comb_run_quality` 扫描；仅当挑战家族最优组合条带数 ≥ 当前家族 + max(2, 当前 25%) 时才切换行向，否则维持评分冠军。另设重建退化门槛：候选带数 ≥8 且重建带数不足 40% 候选时抛出 `种植带重建疑似退化`（附 skip_detail），不得静默输出塌陷几何。全过程写入 `diagnostics.angle_diagnostics` 与 `diagnostics.rebuild_ratio`。
+- 不变量：
+  1. 清晰胜出（得分差 ≥ 5%）的行向结果必须与旧版逐位一致；决胜逻辑仅在近平分时生效。
+  2. 决胜切换必须保守：挑战家族证据未达优势门槛时不得切换；切换后行向必须等于该家族扫描最优点。
+  3. 退化门槛必须失败关闭且携带可诊断明细；`degenerate_candidates_min`/`degenerate_rebuild_ratio_min` 可调但不得删除。
+  4. `angle_diagnostics`（候选排名、家族扫描表、决策与理由）必须随掩膜诊断持久化，供论文复现与审计。
+- 缓存：`MASK_REGULARIZATION_VERSION` 升至 `19`，版本 18 及更早处理产物必须重跑。
+- 代码锚点：`row_geometry._rank_row_angles`、`row_geometry._comb_run_quality`、`row_geometry._resolve_row_angle`、`row_geometry._degenerate_rebuild_reason`、`row_geometry.regularize_crop_mask`。
+- 测试锚点：`tests/test_mask_strategy.py`（排名包装等价、组合条带计数、近平分切换/维持、退化门槛）、`tests/test_research_integrity.py`（版本断言）。
+
+<!-- DECISION-027: near-tied row angles resolve by transverse comb evidence; degenerate rebuilds fail closed. -->
