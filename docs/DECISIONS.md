@@ -537,3 +537,19 @@
 - 测试锚点：`tests/test_centerline_evaluation.py`（拟合/度量口径、payload 校验、匹配、评价包与图形）、`tests/test_reference_lines_ui.py`（模式互斥、加桩点与双击收线、右键取消、两遍并存、图层绘制）。
 
 <!-- DECISION-028: manual reference lines as external ground truth for centerline evaluation; sidecar storage and offline evaluation package. -->
+
+## DECISION-029：行带级三项指标由独立离线评测模块复算（band-eval-v1）
+
+- 日期：2026-10-13
+- 背景：专利代理批注 #18 要求明确"行带识别完整率／行带分类正确率／中心线可用率"三项指标的获取方式，材料历史口径只有名称；系统此前没有任何对应统计代码（全仓检索完整率/正确率/可用率零命中）。三项指标需要可复算实现，供论文评价章节与答复材料引用。
+- 决策：新增独立离线工具 `src/band_evaluation.py`（版本标识 band-eval-v1），纯只读复算：`centerline_evaluation.load_project_inputs` 重建缓存环境（tif 路径自动重映射）→ `process_mask` → 镜像 `pyside6_app.workers` 的 path_planning 配置快照与语义掩膜注入 → `path_planner.prepare_operator_centerline_plan`（与 plan_path 同一步"生成全部候选中心线"）→ 逐条中心线 `footprint_planner.validate_footprints`（同函数同阈值）→ 输出评价包（summary.json / per_band.csv / per_truth.csv / README.md / overlay.png）。指标分三口径：①主口径中心线可用率＝生成作业路径的宽行带中心线数 ÷ 提线（宽行带）总数（全自动）；②严格口径＝叠加逐线履带足迹门禁无问题（越界/支撑区/不确定区/禁行区）；③通道包含判据对照列＝按相邻行带边界配对推导净宽并计算履带接地投影余量（冠层级实测，与 `machine_recommendation._corridor_geometry` 同口径）。完整率/正确率以 labelme/AnyLabeling 多边形真值（标签宽行带/窄行带或 wide/narrow，IoU≥0.5 贪心匹配）计算；无真值时如实记"待实测"。
+- 不变量：
+  1. 本模块不改动工程代码与缓存内作业数据：不写 `project_state.json`、`mask_*.npz` 等状态文件，不影响导出闸门与任何规划行为；评价包默认写入缓存目录下独立子目录 `band_eval/<时间戳>`（`--out` 可指定），不落工程目录。
+  2. 指标数值必须使用与规划器相同的函数与阈值口径（`validate_footprints`、validation_profile 取自 path_planning 配置）；不得另行发明近似公式。
+  3. 机具几何统一取仓库默认（实机实测 2.0/0.35/1.3）；不将缓存内历史 harvester_params 快照注入评测状态。
+  4. "主口径/严格口径/通道包含判据"三个数字必须同时输出并各自注明口径；不得把严格门禁数字当作唯一可用率对外表述（系统对门禁问题的处理是记录＋人工确认＋正式导出闸门，研究导出不阻断）。
+  5. 无真值时必须显式输出"待实测（未提供真值）"，不得猜测或补造完整率/正确率。
+- 代码锚点：`band_evaluation`（管线复算、三口径指标、真值匹配、评价包写出）、`centerline_evaluation.load_project_inputs`（共享缓存/tif 重建口径）、`path_planner.prepare_operator_centerline_plan`、`footprint_planner.validate_footprints`、`machine_recommendation._corridor_geometry`（通道净宽同口径）。
+- 测试锚点：`tests/test_band_evaluation.py`（通道几何余量数学、多边形 IoU 与真值匹配、标签归一化）。
+
+<!-- DECISION-029: band-level three metrics computed by an offline evaluation module (band-eval-v1); read-only re-run with the planner's own validation functions. -->
