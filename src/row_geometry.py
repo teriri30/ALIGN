@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-MASK_REGULARIZATION_VERSION = 19
+MASK_REGULARIZATION_VERSION = 20
 
 
 def odd_size(value: float, minimum: int = 3) -> int:
@@ -2448,6 +2448,130 @@ def classify_band_widths(
     return wide, narrow, threshold
 
 
+def _adhesion_width_profile(foreground: np.ndarray) -> np.ndarray:
+    """距离变换宽度包络：逐横向位置记录该剖面的最大内部距离（几何"半宽"）。"""
+    fg_u8 = (np.asarray(foreground) > 0).astype(np.uint8)
+    dist = cv2.distanceTransform(fg_u8, cv2.DIST_L2, 5)
+    return dist.max(axis=1).astype(np.float64)
+
+
+def _split_adhesion_runs(
+    runs,
+    profile,
+    threshold,
+    work_mpp,
+    min_band_px,
+    cfg,
+    foreground=None,
+    width_profile=None,
+):
+    """DECISION-030：把疑似两条行带被合并的剖面 run 在粘连瓶颈处一分为二。
+
+    触发条件（全部满足才切）：
+    - run 宽度落在 [adhesion_split_min_width_m(1.35), adhesion_split_max_width_m(2.6)] m
+      （正常宽行带约 0.95 m；更宽的等距块由下游细分机制处理，不得在此误切）；
+    - 距离变换宽度包络在该 run 内部存在瓶颈鞍点：鞍点/平台比 ≤
+      adhesion_split_dist_ratio（默认 0.90），对应交底书 S3 的"距离变换分析粘连体宽度瓶颈"；
+    - 鞍点切口两侧各自落在 [adhesion_split_min_half_m(0.45), adhesion_split_max_child_m(1.5)] m。
+    未触发的 run 原样保留（逐位不变）；本函数只返回新的 runs 列表，不改任何掩膜数组。
+    """
+    enabled = bool(cfg.get("adhesion_split_enabled", True))
+    runs = list(runs or [])
+    report = {
+        "algorithm_version": "adhesion-bottleneck-split-v1",
+        "enabled": enabled,
+        "input_run_count": len(runs),
+        "candidate_count": 0,
+        "split_count": 0,
+        "candidates": [],
+        "splits": [],
+        "output_run_count": len(runs),
+    }
+    if not enabled or not runs:
+        return runs, report
+    if width_profile is None and foreground is not None:
+        width_profile = _adhesion_width_profile(foreground)
+    if width_profile is None:
+        return runs, report
+
+    split_min_m = float(cfg.get("adhesion_split_min_width_m", 1.35))
+    dist_ratio_limit = float(cfg.get("adhesion_split_dist_ratio", 0.90))
+    min_half_m = float(cfg.get("adhesion_split_min_half_m", 0.45))
+    max_split_m = float(cfg.get("adhesion_split_max_width_m", 2.6))
+    max_child_m = float(cfg.get("adhesion_split_max_child_m", 1.5))
+    guard_px = max(
+        2, int(round(float(cfg.get("adhesion_split_edge_guard_m", 0.25)) / work_mpp))
+    )
+    cut_px = max(1, int(round(float(cfg.get("adhesion_split_cut_m", 0.06)) / work_mpp)))
+
+    width_profile = np.asarray(width_profile, dtype=np.float64)
+    out = []
+    for start, end in runs:
+        width_m = (end - start) * work_mpp
+        if width_m < split_min_m:
+            out.append((start, end))
+            continue
+        seg_occ = np.asarray(profile[start:end], dtype=np.float64)
+        seg_w = width_profile[start:end]
+        inner_lo = guard_px
+        inner_hi = len(seg_w) - guard_px
+        if inner_hi - inner_lo < max(2, 2 * min_band_px):
+            out.append((start, end))
+            continue
+        saddle_idx = inner_lo + int(np.argmin(seg_w[inner_lo:inner_hi]))
+        saddle_abs = start + saddle_idx
+        d_saddle = float(seg_w[saddle_idx])
+        left_w = seg_w[inner_lo:saddle_idx]
+        right_w = seg_w[saddle_idx + 1:inner_hi]
+        left_o = seg_occ[inner_lo:saddle_idx]
+        right_o = seg_occ[saddle_idx + 1:inner_hi]
+        d_left = float(np.median(left_w)) if left_w.size else d_saddle
+        d_right = float(np.median(right_w)) if right_w.size else d_saddle
+        d_plateau = min(d_left, d_right)
+        o_saddle = float(seg_occ[saddle_idx])
+        o_left = float(np.median(left_o)) if left_o.size else o_saddle
+        o_right = float(np.median(right_o)) if right_o.size else o_saddle
+        half_left_m = saddle_idx * work_mpp
+        half_right_m = (end - start - saddle_idx) * work_mpp
+        record = {
+            "run": [int(start), int(end)],
+            "width_m": round(float(width_m), 3),
+            "saddle_offset": int(saddle_abs),
+            "dist_saddle_px": round(d_saddle, 2),
+            "dist_plateau_min_px": round(d_plateau, 2),
+            "dist_ratio": (round(d_saddle / d_plateau, 3) if d_plateau > 0 else None),
+            "occ_saddle": round(o_saddle, 4),
+            "occ_ratio": (
+                round(o_saddle / min(o_left, o_right), 3)
+                if min(o_left, o_right) > 0 else None
+            ),
+            "half_left_m": round(float(half_left_m), 3),
+            "half_right_m": round(float(half_right_m), 3),
+        }
+        trigger = bool(
+            width_m <= max_split_m
+            and d_plateau > 0
+            and (d_saddle / d_plateau) <= dist_ratio_limit
+            and min_half_m <= half_left_m <= max_child_m
+            and min_half_m <= half_right_m <= max_child_m
+        )
+        record["trigger"] = trigger
+        report["candidates"].append(record)
+        if not trigger:
+            out.append((start, end))
+            continue
+        cut_lo = max(start + 1, saddle_abs - cut_px)
+        cut_hi = min(end - 1, saddle_abs + cut_px)
+        out.append((start, cut_lo))
+        out.append((cut_hi, end))
+        report["splits"].append({**record, "cut": [int(cut_lo), int(cut_hi)]})
+
+    report["candidate_count"] = len(report["candidates"])
+    report["split_count"] = len(report["splits"])
+    report["output_run_count"] = len(out)
+    return out, report
+
+
 def regularize_crop_mask(
     mask: np.ndarray,
     geo=None,
@@ -2656,6 +2780,18 @@ def regularize_crop_mask(
                 cfg,
             )
             body_diagnostics.update(refined_body_diagnostics)
+
+    # ── DECISION-030：粘连带瓶颈切割——仅将疑似合并 run 在瓶颈处一分为二，
+    # 未触发 run 与正常案例逐位保留（零改动）──
+    runs, adhesion_report = _split_adhesion_runs(
+        runs,
+        profile,
+        threshold,
+        work_mpp,
+        min_band_px,
+        cfg,
+        foreground=foreground,
+    )
 
     # Gate each profile run by its *run edges*, not by the midpoint of the
     # neighbouring centres.  A broad uniform block next to a normal four-row
@@ -3146,6 +3282,7 @@ def regularize_crop_mask(
         "body_interval": body_diagnostics,
         "candidate_band_count": len(runs),
         "profile_gate_basis": "run_edge_midpoints",
+        "adhesion_split": adhesion_report,
         "rebuilt_band_count": len(bands),
         "rebuild_ratio": float(len(bands) / max(len(runs), 1)),
         "angle_diagnostics": angle_diagnostics,

@@ -143,7 +143,10 @@
     "residual_body_attach_m": 0.12,
     "residual_body_min_attach_ratio": 0.02,
     "residual_body_max_angle_deg": 22.5,
-    "residual_body_min_elongation": 2.2
+    "residual_body_min_elongation": 2.2,
+    "adhesion_split_enabled": true,
+    "adhesion_split_min_width_m": 1.35,
+    "adhesion_split_dist_ratio": 0.90
   },
   "raster_preprocessing": {
     "mode": "percentile_per_band",

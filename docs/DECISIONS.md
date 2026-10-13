@@ -553,3 +553,19 @@
 - 测试锚点：`tests/test_band_evaluation.py`（通道几何余量数学、多边形 IoU 与真值匹配、标签归一化）。
 
 <!-- DECISION-029: band-level three metrics computed by an offline evaluation module (band-eval-v1); read-only re-run with the planner's own validation functions. -->
+
+## DECISION-030：粘连带瓶颈切割（主流程内局部几何切割，默认开启）
+
+- 日期：2026-10-13
+- 背景：交底书 S3 承诺"对粘连较严重、剖面仍连通的相邻行带，可进一步采用沿法向的线性结构元执行定向开运算以断开细桥接，并以距离变换分析粘连体的宽度瓶颈，将距离值低的位置切开"。此前主流程只有横向占据剖面分离；旧版 `mask_processor.cut_adhesions`（定向开运算 + 全局距离变换 0.3×max 切割）会整体侵蚀所有带宽，只能留在兼容回退层。六个真实案例缓存中不存在真实两带合并（疑似宽块均为等距区或"带+窄附件"结构），用合成粘连桥完成能力验证。
+- 决策：在 `row_geometry.regularize_crop_mask` 主流程内新增局部、按需的瓶颈切割 `_split_adhesion_runs`：只对宽度在 [1.35, 2.6] m 的疑似合并剖面 run，用距离变换宽度包络找鞍点，满足全部条件才在鞍点处按 0.06 m 切口一分为二；未触发 run 逐位保留。报告挂载于 `mask_result.diagnostics.adhesion_split`。
+- 不变量：
+  1. 三层保护必须同时生效且可配置：宽度窗 [1.35, 2.6] m、鞍点/平台比 ≤ 0.90（默认）、切口两侧各 ∈ [0.45, 1.5] m；不得为切割调整 `profile_threshold` 或绕过保护条件。
+  2. 未触发 run 与正常案例必须逐位零改动（六案例安全对照逐位一致；合成粘连桥 19→20 带恢复）。
+  3. 本切割只改剖面 run 区间，不得改掩膜数组本体；候选与切割明细必须随掩膜诊断持久化（论文复现与审计）。
+  4. 全填充通道（无几何腰）的切口位置天然欠定、子带宽度为近似值；不得据其对外声明精确带宽恢复。
+- 缓存：`MASK_REGULARIZATION_VERSION` 升至 `20`，版本 19 及更早处理产物必须重跑。
+- 代码锚点：`row_geometry._adhesion_width_profile`、`row_geometry._split_adhesion_runs`、`row_geometry.regularize_crop_mask`。
+- 测试锚点：`tests/test_mask_strategy.py`（合成瓶颈分割、保护条件拦截、禁用开关）、`tests/test_research_integrity.py`（版本断言）。
+
+<!-- DECISION-030: adhesion bottleneck split inside the main row-band pipeline; local geometric cut only for suspected merged runs, zero change otherwise. -->

@@ -409,3 +409,97 @@ def test_degenerate_rebuild_gate_flags_collapsed_rebuild_only():
     assert _degenerate_rebuild_reason(
         6, 1, {"degenerate_candidates_min": 5}
     ) is not None
+
+
+def test_adhesion_split_splits_merged_run_at_bottleneck():
+    """DECISION-030：疑似合并 run 在距离瓶颈鞍点一分为二；正常带不候选、超宽块不切。"""
+    import numpy as np
+
+    from row_geometry import _split_adhesion_runs
+
+    work_mpp = 0.02
+    runs = [(100, 185), (300, 320), (400, 550)]
+    profile = np.ones(600, dtype=np.float64)
+    width_profile = np.zeros(600, dtype=np.float64)
+    width_profile[100:185] = 40.0
+    width_profile[140] = 22.0
+    width_profile[300:320] = 18.0
+    width_profile[400:550] = 90.0
+    width_profile[470] = 25.0
+
+    out, report = _split_adhesion_runs(
+        runs, profile, 0.30, work_mpp, 4, {}, width_profile=width_profile
+    )
+
+    assert out == [(100, 137), (143, 185), (300, 320), (400, 550)]
+    assert report["candidate_count"] == 2
+    assert report["split_count"] == 1
+    split = report["splits"][0]
+    assert split["run"] == [100, 185]
+    assert 0.45 <= split["half_left_m"] <= 1.50
+    assert 0.45 <= split["half_right_m"] <= 1.50
+
+
+def test_adhesion_split_protections_block_unsafe_cuts():
+    """DECISION-030：子带过窄、鞍点过平、保护带内低谷与总开关关闭都必须拦截切割。"""
+    import numpy as np
+
+    from row_geometry import _split_adhesion_runs
+
+    work_mpp = 0.02
+    profile = np.ones(400, dtype=np.float64)
+
+    too_narrow = np.zeros(400, dtype=np.float64)
+    too_narrow[100:190] = 40.0
+    too_narrow[175] = 18.0
+    out, report = _split_adhesion_runs(
+        [(100, 190)], profile, 0.30, work_mpp, 4, {}, width_profile=too_narrow
+    )
+    assert out == [(100, 190)]
+    assert report["candidate_count"] == 1
+    assert report["split_count"] == 0
+
+    too_flat = np.zeros(400, dtype=np.float64)
+    too_flat[100:190] = 40.0
+    too_flat[145] = 38.0
+    out, report = _split_adhesion_runs(
+        [(100, 190)], profile, 0.30, work_mpp, 4, {}, width_profile=too_flat
+    )
+    assert out == [(100, 190)]
+    assert report["split_count"] == 0
+
+    edge_dip = np.zeros(400, dtype=np.float64)
+    edge_dip[100:190] = 40.0
+    edge_dip[105] = 10.0
+    out, report = _split_adhesion_runs(
+        [(100, 190)], profile, 0.30, work_mpp, 4, {}, width_profile=edge_dip
+    )
+    assert out == [(100, 190)]
+    assert report["split_count"] == 0
+
+    out, report = _split_adhesion_runs(
+        [(100, 185)],
+        profile,
+        0.30,
+        work_mpp,
+        4,
+        {"adhesion_split_enabled": False},
+        width_profile=too_flat,
+    )
+    assert out == [(100, 185)]
+    assert report["enabled"] is False
+    assert report["split_count"] == 0
+
+
+def test_adhesion_width_profile_reads_half_width_envelope():
+    """DECISION-030：宽度包络为逐剖面最大内部距离（几何半宽）。"""
+    import numpy as np
+
+    from row_geometry import _adhesion_width_profile
+
+    mask = np.zeros((60, 40), dtype=np.uint8)
+    mask[20:40, :] = 255
+    width_profile = _adhesion_width_profile(mask)
+    assert width_profile.shape == (60,)
+    assert width_profile[0] == 0.0
+    assert abs(float(width_profile.max()) - 10.0) <= 1.0
