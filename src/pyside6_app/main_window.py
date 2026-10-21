@@ -774,6 +774,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _clear_background_worker_refs(self):
         was_cancelled = bool(getattr(self, '_task_cancel_requested', False))
+        finished_thread = self._worker_thread
         self._worker_thread = None
         self._worker = None
         self._task_cancel_requested = False
@@ -787,6 +788,12 @@ class MainWindow(QMainWindow):
             self._close_cancel_started_at = 0.0
             self._close_cancel_warning_shown = False
             QTimer.singleShot(0, self.close)
+        # QThread(self) 的 parent 是主窗口：只把 Python 引用置空，Qt 对象仍留在
+        # 主窗口的 children 列表里，每跑一次后台任务就泄漏一个线程对象（连同
+        # 线程栈）。worker 本身已经在 finished/error 时 deleteLater，这里补上
+        # 线程自己的。此槽由 thread.finished 触发，线程已结束，排队删除安全。
+        if finished_thread is not None:
+            finished_thread.deleteLater()
 
     def _warn_close_cancel_still_running(self):
         if (
