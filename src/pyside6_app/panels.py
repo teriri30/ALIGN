@@ -214,12 +214,14 @@ class TaskRow(QWidget):
             self._status.setText(self._status_text)
             self.refresh_theme()
 
-    def set_status(self, done=False, enabled=True, in_progress=False, progress_pct=-1, text=None, status="pending"):
+    def set_status(self, done=False, enabled=True, in_progress=False, progress_pct=-1, text=None, status="pending", clickable=None):
+        if clickable is None:
+            clickable = enabled
         self._done = bool(done)
         self._in_progress = bool(in_progress)
         self._status_key = status
         self._progress_pct = progress_pct
-        self.setEnabled(bool(enabled))
+        self.setEnabled(bool(clickable))
         self._action_btn.setEnabled(bool(enabled))
         if text:
             display_text = str(text)
@@ -1008,6 +1010,9 @@ class TaskPanel(QWidget):
             # 每一行都复述一遍。
             row.flash_blocker(row._blocker)
             return
+        if getattr(row, "_status_key", "") == "pending":
+            row.flash_blocker(getattr(row, "_blocker", "") or "请先完成前置步骤")
+            return
         sig = mapping.get(tid)
         if sig:
             if tid in {"entry", "exit", "unload"}:
@@ -1084,6 +1089,7 @@ class TaskPanel(QWidget):
         row.set_status(
             done=status == "done",
             enabled=status in ("available", "in_progress", "done", "failed"),
+            clickable=True,
             in_progress=status == "in_progress",
             progress_pct=progress_pct,
             text=text,
