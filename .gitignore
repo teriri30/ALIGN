@@ -54,6 +54,10 @@ data/tif/
 src/**/*.bak
 src/**/*.bak_*
 
+# Generated run artifacts and ad-hoc backups
+outputs/
+_backup/
+
 # IDE / OS
 .idea/
 .vscode/

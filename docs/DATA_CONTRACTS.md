@@ -61,6 +61,7 @@
 - `mask_result.diagnostics.profile_gate_basis` 必须为 `run_edge_midpoints`：相邻剖面行带的局部占用门控按 profile run 边界中点分隔，避免宽等距块吞并旁侧四行带的中心线。
 - 当前 `mask_result.diagnostics.algorithm_version` 为 `20`。版本 19 及更早的 `mask_processed`/`mask_result` 不包含粘连带瓶颈切割契约：宽度在 `adhesion_split_min_width_m`（默认 1.35 m）至 `adhesion_split_max_width_m`（默认 2.6 m）之间的疑似合并剖面 run，只有在距离变换宽度包络鞍点/平台比 ≤ `adhesion_split_dist_ratio`（默认 0.90）且切口两侧各自落在 `adhesion_split_min_half_m`（默认 0.45 m）与 `adhesion_split_max_child_m`（默认 1.5 m）之间时，才在鞍点处一分为二；未触发 run 必须逐位保留，正常案例不得改变行带几何；诊断记录于 `mask_result.diagnostics.adhesion_split`。版本 18 及更早的 `mask_processed`/`mask_result` 不包含行向估计近平分决胜契约与重建退化门槛：top1 与 top2 行向候选得分差低于 `angle_tiebreak_margin_ratio`（默认 0.05）时必须取前 4 个角度家族做 ±1.5°（步长 0.5°）横剖扫描，以宽度在 0.25–4.0 m 的“组合条带数”比较，仅当挑战家族领先 ≥ max(2, 当前家族 25%) 时才允许切换行向；候选带数 ≥8 而重建带数不足 40% 候选的退化重建必须显式失败（`种植带重建疑似退化`），不得静默输出塌陷几何。版本 17 及更早的 `mask_processed`/`mask_result` 还不包含分离种植区域多候选行向估计契约：全局 PCA 与主要连通轮廓内部主轴必须共同作为候选，再由横向投影周期性评分选择最终行向，区域质心连线不得主导行向。旧缓存恢复必须使掩膜处理和下游路径失效，不得仅因源影像、模型及数组形状相同而复用。
 - 田块圈选同时定义三个不同边界：`mask_raw` 的推理/分析上下文可在圈外保留受控缓冲，供行向与宽窄带重构；前台叠加图层必须只显示原圈选内的副本，绝不能原地裁剪 `mask_raw`；行带轮廓、中心线、`processed_mask`、`planning_support_mask` 与规划路径必须按原圈选边界裁回，圈外分析像素不得成为作业范围。
+- 田块边界必须是一个简单环（`field-boundary-geometry-v1`）。在闭合顶点上重复点击会在首点附近追加顶点，使环自相交；此时所有 shapely 判定都返回无效，中心线田界门禁会把**每一条**候选线判为越界，界面最终只显示"无有效中心线"。因此 `row_geometry.field_polygon_local` 统一经 `sanitize_field_polygon` 修复：连续重复顶点直接去除，自相交环用 `make_valid` 取最大连通多边形，**且仅当被丢弃面积不超过 2%（`FIELD_BOUNDARY_REPAIR_MAX_DROPPED_RATIO`）时才接受**。真实交叉（画成"8"字）会丢掉田块的真实部分，必须拒绝并让用户重画，不得猜测哪一瓣才是本意。修复结果写入 `layout.field_boundary_geometry`（`repaired`、`reason`、`dropped_area_ratio`、`duplicate_vertex_count`），并在圈选、缓存恢复、生成作业线三处写入日志。无法修复时 `layout.centerline_hard_reasons` 必须写明是田块边界几何问题，不得报成"作业线在田界外"。
 
 这些数组与处理后主体保存在同一个原子 NPZ 产物中；项目 JSON 只保存轻量元数据。
 
@@ -225,6 +226,11 @@
 <!-- DECISION-015: segment footprint and headland-turn metric contract. -->
 
 ## 人工参考线与中心线评价（DECISION-028）
+
+### 中心线输出简化（DECISION-017/024）
+
+`centerline-adaptive-polyline-v3` 把 `centerline_simplify_max_points`（默认 8）作为软预算、`centerline_simplify_hard_max_points`（默认 64）作为硬上限：达到软预算后只对仍不满足横向偏差或局部方向条件的区间继续加点，直到满足或到硬上限；硬上限仍不满足时才保留简化前完整的平滑点列。软预算点列作为端点修复锚点，额外加点不移动端点；一条带仍只生成一个候选目录项。`layout.centerline_simplification.point_budget_policy=soft_budget_then_hard_cap_then_smoothed_trace` 记录该规则，逐带记录输入/输出点数及 `budget_exceeded`、`hard_cap_reached`、`dense_fallback`。该变化只控制简化的附加误差，不证明相对人工真值的误差改善。路径算法版本为 `footprint-path-v33`，旧路径缓存重新规划；掩膜处理版本仍为 20。
+
 
 - 参考线 sidecar 固定在 `<cache>/<project>/reference_lines.json`，schema `centerline-reference-lines-v1`：`{schema, tif_path, station_spacing_hint_m, updated_at, lines:[{id, band_id, band_label, pass, operator, created_at, points:[[x,y]...], fit:{p1,p2,angle_rad}}]}`。`fit` 一律由 `points` 重算，`points` 为全幅显示坐标。
 - 参考线是人工研究证据，不是作业输入：不得进入 `project_state.json`、撤销历史、路径 provenance、导出闸门或缓存恢复校验；桌面端只以独立"参考线（人工）"图层显示，可在图层面板显隐。

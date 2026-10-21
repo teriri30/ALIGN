@@ -125,14 +125,20 @@ def _field_support(mask: np.ndarray, state=None) -> np.ndarray:
     support = np.zeros(mask.shape[:2], dtype=np.uint8)
     boundary = getattr(state, "field_boundary", None) if state is not None else None
     if boundary and len(boundary) >= 3:
-        offset_x = int(getattr(state, "mask_offset_x", 0))
-        offset_y = int(getattr(state, "mask_offset_y", 0))
-        points = np.asarray(boundary, dtype=np.float64)
-        points[:, 0] -= offset_x
-        points[:, 1] -= offset_y
-        cv2.fillPoly(support, [np.round(points).astype(np.int32)], 255)
-        if np.count_nonzero(support) > 0:
-            return support
+        from row_geometry import sanitize_field_polygon
+
+        # Fill the same simple ring the planner gates on: a self-intersecting
+        # outline would otherwise rasterize its closing loop with even-odd fill.
+        ring = sanitize_field_polygon(boundary)
+        if ring is not None:
+            offset_x = int(getattr(state, "mask_offset_x", 0))
+            offset_y = int(getattr(state, "mask_offset_y", 0))
+            points = np.asarray(ring, dtype=np.float64)
+            points[:, 0] -= offset_x
+            points[:, 1] -= offset_y
+            cv2.fillPoly(support, [np.round(points).astype(np.int32)], 255)
+            if np.count_nonzero(support) > 0:
+                return support
 
     points = cv2.findNonZero((mask > 0).astype(np.uint8))
     if points is None or len(points) < 3:

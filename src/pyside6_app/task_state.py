@@ -64,6 +64,17 @@ class TaskStatus:
     status: str = "pending"  # pending, available, in_progress, done, failed
     text: Optional[str] = None
     action: Optional[str] = None
+    #: Optional steps never block downstream work but still change its result
+    #: (exit point changes the return leg, unload points add detours), so the
+    #: UI marks them instead of locking them.
+    optional: bool = False
+    #: What must happen first, kept separate from ``text`` so the row can show a
+    #: short state ("待处理") and only surface the reason when the user clicks.
+    blocker: Optional[str] = None
+
+
+#: Steps that may be skipped but still affect the planned route.
+OPTIONAL_TASKS = ("exit", "unload")
 
 
 def _has_harvester_base_params(params: Any) -> bool:
@@ -97,12 +108,33 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     """
     statuses = {tid: TaskStatus() for tid in TASK_ORDER}
 
+    # Each stage is only "done" while its own input still exists. Checking the
+    # whole prerequisite chain (not just the stage's own flag) keeps a stale
+    # artifact from surviving an upstream rollback or field change: downstream
+    # work then reads pending, never done.
     image_loaded = bool(has_image or getattr(state, "tif_path", ""))
-    field_done = bool(getattr(state, "field_boundary", None))
+    field_done = bool(image_loaded and getattr(state, "field_boundary", None))
     inference_running = bool(getattr(state, "inference_running", False))
-    inference_done = bool(getattr(state, "inference_done", False) and getattr(state, "mask_raw", None) is not None)
+    # A stage is done when the image it was computed from is still loaded and
+    # its own artifact still exists. The field polygon is deliberately NOT part
+    # of this test: invalidation is triggered by the *action* that changes an
+    # upstream artifact (``_finish_field_polygon`` calls
+    # ``_invalidate_analysis_from("inference")``), so inferring staleness from
+    # an empty polygon would also demote a project whose cache is only
+    # partially restored. Cache entries store ``field_boundary`` and
+    # ``inference_done`` together, so a mask without a polygon is a corrupt
+    # archive, not a normal state.
+    inference_done = bool(
+        image_loaded
+        and getattr(state, "inference_done", False)
+        and getattr(state, "mask_raw", None) is not None
+    )
     process_running = bool(getattr(state, "mask_processing_running", False))
-    process_done = bool(getattr(state, "mask_processed", False) and getattr(state, "mask_result", None) is not None)
+    process_done = bool(
+        inference_done
+        and getattr(state, "mask_processed", False)
+        and getattr(state, "mask_result", None) is not None
+    )
     plan_running = bool(getattr(state, "plan_running", False))
     harvester_params = getattr(state, "harvester_params", {})
     params_ready = _has_harvester_base_params(harvester_params)
@@ -116,14 +148,20 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     centerline_catalog = getattr(state, "centerline_catalog", None) or getattr(
         state, "work_band_catalog", {}
     ) or {}
-    centerline_items = list(centerline_catalog.get("items") or [])
+    # A catalog built from an older mask is stale: treat it as absent so the
+    # next step reads "regenerate" instead of silently planning on old lines.
+    centerline_items = list(centerline_catalog.get("items") or []) if process_done else []
     centerline_ids = {
         str(item.get("id")) for item in centerline_items if item.get("id") is not None
     }
-    selected_centerlines = list(
-        getattr(state, "selected_centerline_ids", None)
-        or getattr(state, "selected_work_band_ids", [])
-        or []
+    selected_centerlines = (
+        list(
+            getattr(state, "selected_centerline_ids", None)
+            or getattr(state, "selected_work_band_ids", [])
+            or []
+        )
+        if centerline_items
+        else []
     )
     centerlines_selected = bool(
         centerline_ids.intersection(str(value) for value in selected_centerlines)
@@ -131,33 +169,88 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     sim_done = bool(getattr(state, "simulation_done", False))
     export_done = bool(getattr(state, "export_done", False))
 
-    statuses["import_img"] = TaskStatus("done" if image_loaded else "available", action="重选" if image_loaded else "导入")
+    statuses["import_img"] = TaskStatus(
+        "done" if image_loaded else "available",
+        action="重选" if image_loaded else "导入",
+    )
+    # 锁定原因必须指向"最上游那个真正缺的步骤"，不能一律说紧邻的上一步。
+    # 只导入影像、还没圈选田块时，点"掩膜优化"应提示"先圈选田块"，
+    # 而不是"先完成作物识别"——后者在田块都没圈的时候是误导。
+    def _first_missing_blocker():
+        if not image_loaded:
+            return "先导入影像"
+        if not field_done:
+            return "先圈选田块"
+        if not inference_done:
+            return "先完成作物识别"
+        if not process_done:
+            return "先完成掩膜优化"
+        return None
+
+    if not image_loaded:
+        for tid in ("draw_field", "segment", "process"):
+            statuses[tid] = TaskStatus("pending", blocker="先导入影像")
+    if image_loaded and not field_done and not inference_done:
+        statuses["segment"] = TaskStatus("pending", blocker="先圈选田块")
+    if image_loaded and not inference_done:
+        statuses["process"] = TaskStatus(
+            "pending", blocker=_first_missing_blocker()
+        )
     if image_loaded:
-        statuses["draw_field"] = TaskStatus("done" if field_done else "available", action="重选" if field_done else "圈选")
-    if field_done:
-        statuses["segment"] = TaskStatus("done" if inference_done else "available", action="重跑" if inference_done else "运行")
+        statuses["draw_field"] = TaskStatus(
+            "done" if field_done else "available",
+            action="重选" if field_done else "圈选",
+        )
+    if field_done or inference_done:
+        statuses["segment"] = TaskStatus(
+            "done" if inference_done else "available",
+            "已识别" if inference_done else "待识别",
+            action="重跑" if inference_done else "运行",
+        )
     if inference_running:
         statuses["segment"] = TaskStatus("in_progress", "识别中")
     if inference_done:
-        statuses["process"] = TaskStatus("done" if process_done else "available", action="重做" if process_done else "处理")
+        statuses["process"] = TaskStatus(
+            "done" if process_done else "available",
+            action="重做" if process_done else "处理",
+        )
+    elif not image_loaded:
+        statuses["process"] = TaskStatus("pending", blocker="先导入影像")
     if process_running:
         statuses["process"] = TaskStatus("in_progress", "处理中")
+
     if process_done:
+        # Harvester parameters only matter once a mask exists: before that the
+        # card is a locked step, not an "optional" one.
         if params_done and params_confirmed:
-            statuses["params"] = TaskStatus("done")
+            statuses["params"] = TaskStatus("done", action="修改")
         elif params_done:
             statuses["params"] = TaskStatus("available", "待确认", action="确认")
         elif params_ready:
             statuses["params"] = TaskStatus("available", "缺割刀前置", action="补填")
         else:
-            statuses["params"] = TaskStatus("available")
+            statuses["params"] = TaskStatus("available", action="设置")
+    else:
+        statuses["params"] = TaskStatus("pending", blocker="先完成掩膜优化")
 
-        if not centerline_items:
-            statuses["centerline_generate"] = TaskStatus(
-                "available", "待生成", action="生成"
+    lines_ready = bool(centerline_items and centerlines_selected)
+    if not process_done:
+        for tid, why in (
+            ("centerline_generate", "先完成掩膜优化"),
+            ("centerline_select", "先完成掩膜优化"),
+            ("entry", "先完成掩膜优化"),
+            ("exit", "先完成掩膜优化"),
+            ("unload", "先完成掩膜优化"),
+        ):
+            statuses[tid] = TaskStatus(
+                "pending", optional=tid in OPTIONAL_TASKS, blocker=why
             )
+    else:
+        if not centerline_items:
+            statuses["centerline_generate"] = TaskStatus("available", "待生成", action="生成")
+            statuses["centerline_select"] = TaskStatus("pending", blocker="先生成作业线")
         else:
-            statuses["centerline_generate"] = TaskStatus("done")
+            statuses["centerline_generate"] = TaskStatus("done", action="重新生成")
             selected_count = len(
                 centerline_ids.intersection(str(value) for value in selected_centerlines)
             )
@@ -168,13 +261,12 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
                 else "待选择",
                 action="调整" if selected_count else "选择",
             )
-        if not centerline_items:
-            statuses["centerline_select"] = TaskStatus("pending", "先生成中心线")
 
-        if not centerline_items or not centerlines_selected:
-            statuses["entry"] = TaskStatus("pending", "先选择中心线")
-            statuses["exit"] = TaskStatus("pending", "先选择中心线")
-            statuses["unload"] = TaskStatus("pending", "可选；先选择中心线")
+        if not lines_ready:
+            blocker = "先生成作业线" if not centerline_items else "先选择作业线"
+            statuses["entry"] = TaskStatus("pending", blocker=blocker)
+            statuses["exit"] = TaskStatus("pending", optional=True, blocker=blocker)
+            statuses["unload"] = TaskStatus("pending", optional=True, blocker=blocker)
         else:
             if entry:
                 locked = bool(getattr(state, "entry_point_locked", False))
@@ -184,20 +276,23 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
                     action="调整" if locked else "确认",
                 )
             else:
-                statuses["entry"] = TaskStatus("available", "待设置")
-            if exit_point:
-                locked = bool(getattr(state, "exit_point_locked", False))
-                statuses["exit"] = TaskStatus(
-                    "done" if locked else "available",
-                    "已确认（可选）" if locked else "待确认（可选）",
-                    action="调整" if locked else "确认",
-                )
-            else:
-                statuses["exit"] = TaskStatus("done", "自动延伸", action="调整")
-            if unload_points:
-                statuses["unload"] = TaskStatus("done", f"{len(unload_points)} 个")
-            else:
-                statuses["unload"] = TaskStatus("done", "可选")
+                statuses["entry"] = TaskStatus("available", "待布设起点")
+            # Optional steps stay actionable (they can still change the route)
+            # but are flagged optional so the card reads "选填" instead of
+            # looking like unfulfilled required work.
+            statuses["exit"] = TaskStatus(
+                "done",
+                "已设置" if exit_point else "未设置（自动延伸）",
+                action="调整" if exit_point else "布设", optional=True,
+            )
+            # Unset optional points are a valid final state ("skipped"), not an
+            # unfinished step: they read done + optional, with the text saying
+            # the default that will be used instead.
+            statuses["unload"] = TaskStatus(
+                "done",
+                f"已设置 {len(unload_points)} 个" if unload_points else "未设置",
+                action="布设", optional=True,
+            )
 
     ready_to_plan = bool(
         process_done
@@ -207,18 +302,27 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
         and _has_points(entry)
         and getattr(state, "entry_point_locked", False)
     )
-    if process_done and not centerline_items:
-        statuses["plan"] = TaskStatus("pending", "先生成中心线")
-    elif process_done and centerline_items and not centerlines_selected:
-        statuses["plan"] = TaskStatus("pending", "先选择中心线")
-    elif process_done and centerlines_selected and not params_confirmed:
-        statuses["plan"] = TaskStatus("pending", "先确认高级设置")
-    elif process_done and centerlines_selected and not getattr(
-        state, "entry_point_locked", False
-    ):
-        statuses["plan"] = TaskStatus("pending", "先设置并确认起点")
+    if not image_loaded:
+        statuses["plan"] = TaskStatus("pending", blocker="先导入影像")
+    elif not field_done and not inference_done:
+        # 田块都没圈时，说"先完成作物识别"是误导：识别本身就跑不了。
+        statuses["plan"] = TaskStatus("pending", blocker="先圈选田块")
+    elif not inference_done:
+        statuses["plan"] = TaskStatus("pending", blocker="先完成作物识别")
+    elif not process_done:
+        statuses["plan"] = TaskStatus("pending", blocker="先完成掩膜优化")
+    elif not centerline_items:
+        statuses["plan"] = TaskStatus("pending", blocker="先生成作业线")
+    elif not centerlines_selected:
+        statuses["plan"] = TaskStatus("pending", blocker="先选择作业线")
+    elif not params_confirmed:
+        statuses["plan"] = TaskStatus("pending", blocker="先确认高级设置")
+    elif not getattr(state, "entry_point_locked", False):
+        statuses["plan"] = TaskStatus("pending", blocker="先设置并确认起点")
     elif ready_to_plan:
-        statuses["plan"] = TaskStatus("done" if path_done else "available", action="重算" if path_done else "生成")
+        statuses["plan"] = TaskStatus(
+            "done" if path_done else "available", action="重算" if path_done else "生成"
+        )
     if plan_running:
         statuses["plan"] = TaskStatus("in_progress", "规划中")
     if path_done:

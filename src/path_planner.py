@@ -27,7 +27,13 @@ from footprint_planner import (
     summarize_work_line_footprint,
     validate_footprints,
 )
-from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
+from row_geometry import (
+    FIELD_BOUNDARY_GEOMETRY_VERSION,
+    field_polygon_local,
+    field_polygon_local_report,
+    meters_per_pixel,
+    smooth_1d,
+)
 from headland_turn_validation import (
     build_turn_corridor_mask,
     has_non_degenerate_curve,
@@ -36,7 +42,7 @@ from headland_turn_validation import (
 )
 
 
-PATH_PLANNING_VERSION = "footprint-path-v31"
+PATH_PLANNING_VERSION = "footprint-path-v33"
 
 
 def _adjacent_snake_order_work_lines(
@@ -775,10 +781,21 @@ def _centerline_simplification_settings(config: Dict) -> Dict[str, float | int]:
     except (TypeError, ValueError):
         max_points = 8
     max_points = max(2, min(max_points, 64))
+
+    try:
+        hard_max_points = int(
+            cfg.get("centerline_simplify_hard_max_points", 64)
+        )
+    except (TypeError, ValueError):
+        hard_max_points = 64
+    # The hard ceiling is what accuracy may spend; it can never sit below the
+    # soft budget, otherwise the budget would silently win over the tolerance.
+    hard_max_points = max(max_points, min(hard_max_points, 256))
     return {
         "max_deviation_m": max_deviation_m,
         "max_heading_change_deg": max_heading_change_deg,
         "max_points": max_points,
+        "hard_max_points": hard_max_points,
     }
 
 
@@ -786,6 +803,8 @@ def _simplify_centerline_polyline(
     points: List[Tuple[float, float]],
     mpp: float,
     config: Dict,
+    *,
+    diagnostics: Optional[Dict] = None,
 ) -> List[Tuple[float, float]]:
     """Keep endpoints and add vertices only where a band bends materially.
 
@@ -814,7 +833,8 @@ def _simplify_centerline_polyline(
         return [(float(x), float(y)) for x, y in values[[0, -1]]]
     deviation_px = float(settings["max_deviation_m"]) / meters_per_pixel_value
     heading_limit = float(settings["max_heading_change_deg"])
-    max_points = int(settings["max_points"])
+    soft_max_points = int(settings["max_points"])
+    hard_max_points = int(settings["hard_max_points"])
 
     def segment_heading(start: int, end: int) -> Optional[float]:
         dx = float(values[end, 0] - values[start, 0])
@@ -886,28 +906,66 @@ def _simplify_centerline_polyline(
         candidate = max(start + 1, min(end - 1, int(candidate)))
         return candidate, max(deviation_score, heading_score)
 
+    def grow(kept: set, pending: List[Tuple[int, int]], limit: int):
+        """Split the worst offending interval until tolerances hold or limit."""
+        while pending and len(kept) < limit:
+            best = None
+            for start, end in pending:
+                error = range_error(start, end)
+                candidate, score = split_index(start, end, error)
+                if candidate is None:
+                    continue
+                if best is None or score > best[0]:
+                    best = (score, start, end, candidate)
+            if best is None:
+                break
+            _score, start, end, candidate = best
+            pending.remove((start, end))
+            kept.add(candidate)
+            pending.extend(((start, candidate), (candidate, end)))
+        return kept, pending
+
     kept = {0, values.shape[0] - 1}
     pending = [(0, values.shape[0] - 1)]
-    while pending and len(kept) < max_points:
-        best = None
-        for start, end in pending:
-            error = range_error(start, end)
-            candidate, score = split_index(start, end, error)
-            if candidate is None:
-                continue
-            if best is None or score > best[0]:
-                best = (score, start, end, candidate)
-        if best is None:
-            break
-        _score, start, end, candidate = best
-        pending.remove((start, end))
-        kept.add(candidate)
-        pending.extend(((start, candidate), (candidate, end)))
-
-    return [
+    kept, pending = grow(kept, pending, soft_max_points)
+    soft_compact = [
         (float(values[index, 0]), float(values[index, 1]))
         for index in sorted(kept)
     ]
+
+    # DECISION-017: the soft budget is a compactness target, never permission
+    # to discard an observed bend. Spend extra vertices only on intervals that
+    # still miss a tolerance, up to the hard ceiling; fall back to the full
+    # smoothed trace only when even that ceiling cannot represent the bend.
+    # One band still owns one catalog item.
+    kept, pending = grow(kept, pending, hard_max_points)
+    indices = sorted(kept)
+    compact = [
+        (float(values[index, 0]), float(values[index, 1]))
+        for index in indices
+    ]
+    unmet = any(
+        split_index(start, end, range_error(start, end))[0] is not None
+        for start, end in zip(indices, indices[1:])
+    )
+    budget_exceeded = len(compact) > len(soft_compact)
+    if diagnostics is not None:
+        # compact_reference is the soft-budget line that endpoint repair used
+        # before this policy existed. Keeping it as the repair anchor means
+        # extra detail never relocates an endpoint; it is not an executable
+        # work line.
+        diagnostics["compact_reference"] = soft_compact
+        diagnostics["soft_point_budget"] = soft_max_points
+        diagnostics["hard_point_budget"] = hard_max_points
+        diagnostics["budget_exceeded"] = bool(budget_exceeded)
+        diagnostics["hard_cap_reached"] = bool(
+            unmet and len(indices) >= hard_max_points
+        )
+        diagnostics["dense_fallback"] = bool(unmet)
+        diagnostics["detail_preserved"] = bool(budget_exceeded)
+    if unmet:
+        return [(float(x), float(y)) for x, y in values]
+    return compact
 
 
 def _smooth_band_centerline(
@@ -915,6 +973,8 @@ def _smooth_band_centerline(
     main_angle: float,
     mpp: float,
     config: Dict,
+    *,
+    simplification_diagnostics: Optional[Dict] = None,
 ) -> List[Tuple[float, float]]:
     """Fit one band centerline in row-aligned coordinates without overshoot."""
     values = np.asarray(points, dtype=np.float64)
@@ -1000,7 +1060,11 @@ def _smooth_band_centerline(
         sample_along[:, None] * direction[None, :]
         + sample_lateral[:, None] * normal[None, :]
     )
-    return _simplify_centerline_polyline(fitted, mpp, config)
+    if simplification_diagnostics is None:
+        return _simplify_centerline_polyline(fitted, mpp, config)
+    return _simplify_centerline_polyline(
+        fitted, mpp, config, diagnostics=simplification_diagnostics,
+    )
 
 
 def prepare_band_centerlines(
@@ -1028,20 +1092,29 @@ def prepare_band_centerlines(
     candidates = []
     for band in wide_bands:
         source_centerline = list(band.get("centerline", []))
+        simplification_diagnostics = {}
         centerline = _smooth_band_centerline(
             source_centerline,
             main_angle,
             mpp,
             cfg,
+            simplification_diagnostics=simplification_diagnostics,
         )
+        compact_reference = simplification_diagnostics.get("compact_reference")
         if len(centerline) < 2:
             continue
+        endpoint_reference = (
+            compact_reference
+            if compact_reference and simplification_diagnostics.get("detail_preserved")
+            else centerline
+        )
         points = np.asarray(centerline, dtype=np.float64)
         along = points @ direction
         span_m = float(np.max(along) - np.min(along)) * mpp
         candidates.append({
             "id": int(band.get("id", len(candidates) + 1)),
             "line": centerline,
+            "endpoint_reference": endpoint_reference,
             "normal": float(np.median(points @ normal)),
             "span_m": span_m,
             "declared_span_m": _finite_float(
@@ -1051,6 +1124,19 @@ def prepare_band_centerlines(
                 band.get("observed_span_ratio")
             ),
             "source_point_count": len(source_centerline),
+            # Keep only scalar diagnostics here; compact_reference is an
+            # internal endpoint-repair anchor, not layout payload.
+            "simplification": {
+                key: simplification_diagnostics.get(key)
+                for key in (
+                    "soft_point_budget",
+                    "hard_point_budget",
+                    "budget_exceeded",
+                    "hard_cap_reached",
+                    "dense_fallback",
+                    "detail_preserved",
+                )
+            },
         })
 
     if not candidates:
@@ -1139,6 +1225,14 @@ def prepare_band_centerlines(
                     high = float(np.max(projections))
                     low_extension_m = max(0.0, (low - target_low) * mpp)
                     high_extension_m = max(0.0, (target_high - high) * mpp)
+                    endpoint_points = np.asarray(
+                        item.get("endpoint_reference", line), dtype=np.float64,
+                    )
+                    endpoint_projections = endpoint_points @ direction
+                    endpoint_laterals = endpoint_points @ normal
+                    low_endpoint_index = int(np.argmin(endpoint_projections))
+                    high_endpoint_index = int(np.argmax(endpoint_projections))
+                    endpoint_sample_count = min(5, len(endpoint_points))
                     self_evidence_supported = (
                         item["declared_span_m"] is not None
                         and item["declared_span_m"]
@@ -1161,12 +1255,13 @@ def prepare_band_centerlines(
                     repaired_line = line
                     low_target = None
                     high_target = None
-                    endpoint_sample_count = min(5, len(line))
                     if low_extension_m > 1e-6:
-                        lateral = float(np.median(laterals[:endpoint_sample_count]))
+                        sample_indices = np.argsort(endpoint_projections)[:endpoint_sample_count]
+                        lateral = float(np.median(endpoint_laterals[sample_indices]))
                         low_target = target_low * direction + lateral * normal
+                        low_anchor = endpoint_points[low_endpoint_index]
                         if not segment_within_field_boundary(
-                            [tuple(low_target), tuple(points[0])],
+                            [tuple(low_target), tuple(low_anchor)],
                             field_polygon,
                         ):
                             endpoint_repair_report["rejected"][
@@ -1178,10 +1273,12 @@ def prepare_band_centerlines(
                         else:
                             repaired_line = [tuple(map(float, low_target))] + repaired_line
                     if high_extension_m > 1e-6:
-                        lateral = float(np.median(laterals[-endpoint_sample_count:]))
+                        sample_indices = np.argsort(endpoint_projections)[-endpoint_sample_count:]
+                        lateral = float(np.median(endpoint_laterals[sample_indices]))
                         high_target = target_high * direction + lateral * normal
+                        high_anchor = endpoint_points[high_endpoint_index]
                         if not segment_within_field_boundary(
-                            [tuple(points[-1]), tuple(high_target)],
+                            [tuple(high_anchor), tuple(high_target)],
                             field_polygon,
                         ):
                             endpoint_repair_report["rejected"][
@@ -1231,12 +1328,36 @@ def prepare_band_centerlines(
     accepted.sort(key=lambda item: item["normal"])
 
     simplification = _centerline_simplification_settings(cfg)
-    simplification["algorithm_version"] = "centerline-adaptive-polyline-v1"
+    simplification["algorithm_version"] = "centerline-adaptive-polyline-v3"
+    simplification["point_budget_policy"] = (
+        "soft_budget_then_hard_cap_then_smoothed_trace"
+    )
     simplification["records"] = [
         {
             "band_id": item["id"],
             "source_point_count": int(item.get("source_point_count", 0)),
             "centerline_point_count": int(len(item["line"])),
+            "soft_point_budget": int(
+                (item.get("simplification") or {}).get(
+                    "soft_point_budget", simplification["max_points"]
+                )
+            ),
+            "hard_point_budget": int(
+                (item.get("simplification") or {}).get(
+                    "hard_point_budget", simplification["hard_max_points"]
+                )
+            ),
+            "budget_exceeded": bool(
+                (item.get("simplification") or {}).get("budget_exceeded", False)
+            ),
+            "hard_cap_reached": bool(
+                (item.get("simplification") or {}).get(
+                    "hard_cap_reached", False
+                )
+            ),
+            "dense_fallback": bool(
+                (item.get("simplification") or {}).get("dense_fallback", False)
+            ),
         }
         for item in accepted
     ]
@@ -1340,18 +1461,34 @@ def segment_within_field_boundary(segment, polygon: Optional[np.ndarray]) -> boo
     in-boundary endpoints.  This helper deliberately uses ``covers`` so a
     route exactly on the selected boundary remains valid.
     """
+    covered, _reason = segment_field_boundary_status(segment, polygon)
+    return covered
+
+
+def segment_field_boundary_status(
+    segment,
+    polygon: Optional[np.ndarray],
+) -> Tuple[bool, Optional[str]]:
+    """Return boundary coverage plus why an invalid field outline was refused.
+
+    A self-intersecting outline used to make every gate answer ``False`` with no
+    trace, which surfaced as "无有效中心线" long after the boundary was drawn.
+    Keeping the reason lets the planner report the real cause instead.
+    """
     if polygon is None:
-        return True
+        return True, None
     try:
         boundary_points = [
             (float(point[0]), float(point[1]))
             for point in np.asarray(polygon, dtype=np.float64)
         ]
         if len(boundary_points) < 3:
-            return False
+            return False, "field_boundary_invalid_ring"
         field = Polygon(boundary_points)
-        if field.is_empty or not field.is_valid:
-            return False
+        if field.is_empty:
+            return False, "field_boundary_empty"
+        if not field.is_valid:
+            return False, "field_boundary_self_intersecting"
 
         points = []
         for point in segment or []:
@@ -1359,11 +1496,11 @@ def segment_within_field_boundary(segment, polygon: Optional[np.ndarray]) -> boo
             if not points or current != points[-1]:
                 points.append(current)
         if not points:
-            return False
+            return False, "segment_empty"
         geometry = Point(points[0]) if len(points) == 1 else LineString(points)
-        return bool(field.covers(geometry))
+        return bool(field.covers(geometry)), None
     except (TypeError, ValueError, IndexError):
-        return False
+        return False, "field_boundary_geometry_error"
 
 
 def _segment_inside_field_boundary(segment, polygon: Optional[np.ndarray]) -> bool:
@@ -1399,18 +1536,22 @@ def _filter_generated_centerline_regions_to_field(
         return regions, report
 
     filtered_regions = []
+    boundary_reasons = {}
     for region_order, region in enumerate(regions):
         lines = list(region.get("work_lines") or [])
         kept_indices = []
         for line_index, line in enumerate(lines):
-            if _segment_inside_field_boundary(line, field_polygon):
+            covered, refusal = segment_field_boundary_status(line, field_polygon)
+            if covered:
                 kept_indices.append(line_index)
                 continue
+            reason = refusal or "centerline_outside_field_boundary"
+            boundary_reasons[reason] = boundary_reasons.get(reason, 0) + 1
             report["excluded"].append({
                 "region_id": region.get("region_id"),
                 "region_order": int(region_order),
                 "region_line_index": int(line_index),
-                "reason": "centerline_outside_field_boundary",
+                "reason": reason,
             })
 
         if not kept_indices:
@@ -1437,8 +1578,17 @@ def _filter_generated_centerline_regions_to_field(
         len(region.get("work_lines") or []) for region in filtered_regions
     )
     report["excluded_count"] = len(report["excluded"])
+    report["excluded_reason_counts"] = dict(boundary_reasons)
     if report["excluded"]:
-        report["reason"] = "excluded_lines_outside_field_boundary"
+        geometry_reasons = sorted(
+            reason for reason in boundary_reasons
+            if reason.startswith("field_boundary_")
+        )
+        report["reason"] = (
+            geometry_reasons[0]
+            if geometry_reasons
+            else "excluded_lines_outside_field_boundary"
+        )
     return filtered_regions, report
 
 
@@ -2059,7 +2209,7 @@ TURN_STRATEGY_LABELS = {
     "pear": "梨形转弯",
     "fishtail": "鱼尾折返",
     "alpha": "紧凑α折返",
-    "contour": "套圈收割",
+    "contour": "套圈转弯",
     "auto": "按行距自适应组合",
 }
 
@@ -9328,6 +9478,43 @@ def _apply_operator_centerline_selection(
     return selected_lines, selected_regions, selected_mask, updated_layout
 
 
+def _centerline_hard_reasons(
+    field_geometry: Dict,
+    boundary_filter: Dict,
+    generated_lines,
+) -> List[str]:
+    """Explain an empty centerline catalog in operator terms.
+
+    The catalog is empty only after every generated line failed a hard gate.
+    Naming the gate (and, for an unusable outline, the field itself) is the
+    difference between "the tool found nothing" and "redraw your field".
+    """
+    reasons: List[str] = []
+    geometry_reason = str(field_geometry.get("reason") or "")
+    if not field_geometry.get("present", False):
+        if geometry_reason == "missing_field_boundary":
+            reasons.append("缺少已确认的田块边界，无法校验作业线")
+        elif geometry_reason == "missing_state":
+            reasons.append("缺少项目状态，无法校验田块边界")
+        elif geometry_reason == "field_boundary_self_intersection_too_large":
+            reasons.append(
+                "田块边界自相交且被截掉的面积过大，请重新圈选田块边界"
+            )
+        else:
+            reasons.append("田块边界几何无效，请重新圈选田块边界")
+    elif field_geometry.get("repaired"):
+        reasons.append(
+            "田块边界闭合点重复已被自动修复"
+            f"（丢弃面积 {float(field_geometry.get('dropped_area_ratio', 0.0)) * 100:.4f}%）"
+        )
+    excluded = int(boundary_filter.get("excluded_count", 0) or 0)
+    if excluded and field_geometry.get("present", False):
+        reasons.append(f"{excluded} 条候选作业线整条落在田块边界外")
+    if not reasons and not generated_lines:
+        reasons.append("未生成有效作业线")
+    return reasons
+
+
 def prepare_operator_centerline_plan(
     wide_bands,
     processed_mask,
@@ -9389,11 +9576,21 @@ def prepare_operator_centerline_plan(
         return_regions=True,
     )
     layout = dict(layout or {})
-    field_polygon = (
-        field_polygon_local(state, processed_mask.shape[:2])
-        if state is not None
-        else None
-    )
+    if state is not None:
+        field_polygon, field_geometry = field_polygon_local_report(
+            state, processed_mask.shape[:2]
+        )
+    else:
+        field_polygon, field_geometry = None, {
+            "algorithm_version": FIELD_BOUNDARY_GEOMETRY_VERSION,
+            "boundary_present": False,
+            "present": False,
+            "repaired": False,
+            "reason": "missing_state",
+            "input_vertex_count": 0,
+            "output_vertex_count": 0,
+        }
+    layout["field_boundary_geometry"] = field_geometry
     work_regions, centerline_boundary_filter = (
         _filter_generated_centerline_regions_to_field(
             work_regions,
@@ -9401,6 +9598,12 @@ def prepare_operator_centerline_plan(
         )
     )
     layout["centerline_field_boundary_filter"] = centerline_boundary_filter
+    if not work_regions:
+        # Report the real cause instead of a generic empty catalog: an invalid
+        # field outline used to reject every generated centerline silently.
+        layout["centerline_hard_reasons"] = _centerline_hard_reasons(
+            field_geometry, centerline_boundary_filter, work_lines
+        )
     layout["work_regions"] = [
         {key: value for key, value in region.items() if key != "work_lines"}
         for region in work_regions
@@ -9546,7 +9749,8 @@ def plan_path(wide_bands: List[Dict],
         generation_reasons = list(
             layout.get("region_generation_hard_reasons") or []
         )
-        hard_reasons = classification_reasons + generation_reasons
+        boundary_reasons = list(layout.get("centerline_hard_reasons") or [])
+        hard_reasons = classification_reasons + generation_reasons + boundary_reasons
         if not hard_reasons:
             hard_reasons = ["未生成有效作业线"]
         return {
@@ -9734,12 +9938,26 @@ def plan_path(wide_bands: List[Dict],
             f"阻止 {endpoint_alignment.get('blocked_endpoint_count', 0)} 个端点"
         )
     for decision in turn_assessment.get("turn_decisions", []) or []:
+        # 套圈拓扑的转弯几何由共享田头墙的横向切线实现，底层走 bow 生成器，
+        # 但对外必须报"套圈转弯"：直接打印 bow 会让人以为套圈没生效。
+        is_contour = (
+            str(decision.get("requested_strategy", "")) == "contour"
+            or str(decision.get("ordering_strategy", "")) == "contour"
+        )
+        if is_contour:
+            label = "套圈转弯（两半交错，共享田头墙横向切线）"
+            reason = "套圈收割拓扑"
+        else:
+            label = TURN_STRATEGY_LABELS.get(
+                str(decision.get("strategy", "")), decision.get("strategy", "")
+            )
+            reason = decision.get("reason", "")
         log.info(
             f"转弯 {int(decision.get('transition_index', 0)) + 1}: "
             f"ω={float(decision.get('pass_spacing_m', 0.0)):.2f}m, "
             f"R={float(decision.get('turn_radius_m', 0.0)):.2f}m, "
-            f"策略={TURN_STRATEGY_LABELS.get(str(decision.get('strategy', '')), decision.get('strategy', ''))}, "
-            f"原因={decision.get('reason', '')}"
+            f"策略={label}, "
+            f"原因={reason}"
         )
 
     description = (

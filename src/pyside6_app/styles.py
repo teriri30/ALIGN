@@ -11,37 +11,41 @@ class ThemeMode(Enum):
     SYSTEM = "system"
 
 THEMES = {
+    # Dark palette follows the ZoneDeck convention: blue-black canvas, one
+    # low-saturation panel step above it, 1px cool border, single mint accent.
     "dark": {
-        "bg_darkest": "#1A1A1F", "bg_dark": "#1F1F26", "bg": "#25252D",
-        "bg_light": "#2D2D38", "bg_hover": "#3A3A48", "bg_card": "#2A2A35",
-        "bg_accent": "#203040", "border": "#383848", "border_light": "#48485A",
-        "text": "#E8E8F0", "text_dim": "#90909E", "text_dimmer": "#5E5E6E",
-        "text_bright": "#FFFFFF", "text_accent": "#60CDFF",
-        "accent": "#60CDFF", "accent_hover": "#7FD8FF", "accent_pressed": "#3AAEE0",
-        "accent_bg": "#1A3A4A",
-        "green": "#6CCB6E", "green_bg": "#1A3A1A", "red": "#F17070",
-        "red_bg": "#3A1A1A", "orange": "#F0A050", "orange_bg": "#3A2A1A",
-        "yellow": "#E8D050", "purple": "#B080E0", "teal": "#50D0C0",
-        "btn_default": "#333340", "btn_default_hover": "#404050",
-        "btn_disabled": "#282835", "btn_disabled_text": "#5E5E6E",
-        "scrollbar": "#383848", "scrollbar_hover": "#505060",
-        "success_bg": "#1A3A1A", "pending_bg": "#3A2A1A",
+        "bg_darkest": "#0B0F17", "bg_dark": "#0D1420", "bg": "#111827",
+        "bg_light": "#141B26", "bg_hover": "#1B2433", "bg_card": "#111827",
+        "bg_accent": "#10291F", "border": "#263241", "border_light": "#334155",
+        "text": "#E5E7EB", "text_dim": "#94A3B8", "text_dimmer": "#64748B",
+        "text_bright": "#F8FAFC", "text_accent": "#34D399",
+        "accent": "#34D399", "accent_hover": "#4ADEA8", "accent_pressed": "#22B27D",
+        "accent_bg": "#10291F",
+        "green": "#34D399", "green_bg": "#0F2A20", "red": "#F87171",
+        "red_bg": "#2A1517", "orange": "#FBBF24", "orange_bg": "#2A2110",
+        "yellow": "#FBBF24", "purple": "#A78BFA", "teal": "#2DD4BF",
+        "btn_default": "#141B26", "btn_default_hover": "#1B2433", "on_accent": "#08130E",
+        "btn_disabled": "#182031", "btn_disabled_text": "#4B5563",
+        "scrollbar": "#263241", "scrollbar_hover": "#3A4A5E",
+        "success_bg": "#0F2A20", "pending_bg": "#2A2110",
     },
+    # Light palette follows the Codex++ convention: near-white canvas, white
+    # cards on a cool grey page, single indigo accent.
     "light": {
-        "bg_darkest": "#E8E8ED", "bg_dark": "#F0F0F5", "bg": "#F5F5FA",
-        "bg_light": "#FFFFFF", "bg_hover": "#E0E0E8", "bg_card": "#FFFFFF",
-        "bg_accent": "#E8F0FA", "border": "#C8C8D0", "border_light": "#D8D8E0",
-        "text": "#1A1A2E", "text_dim": "#606070", "text_dimmer": "#909098",
-        "text_bright": "#000000", "text_accent": "#0078D4",
-        "accent": "#0078D4", "accent_hover": "#106EBE", "accent_pressed": "#005A9E",
-        "accent_bg": "#DEEBFA",
-        "green": "#107C10", "green_bg": "#DFF6DD", "red": "#D13438",
-        "red_bg": "#FDE7E9", "orange": "#D05A00", "orange_bg": "#FFF3E8",
+        "bg_darkest": "#EEF1F6", "bg_dark": "#F7F8FA", "bg": "#FFFFFF",
+        "bg_light": "#FFFFFF", "bg_hover": "#EEF1FF", "bg_card": "#FFFFFF",
+        "bg_accent": "#EEF0FF", "border": "#E5E7EE", "border_light": "#D7DBE6",
+        "text": "#1F2937", "text_dim": "#6B7280", "text_dimmer": "#9AA1AE",
+        "text_bright": "#0F172A", "text_accent": "#3B5BFF",
+        "accent": "#3B5BFF", "accent_hover": "#2F4BE0", "accent_pressed": "#2539C4",
+        "accent_bg": "#EEF0FF",
+        "green": "#16A34A", "green_bg": "#ECFDF3", "red": "#DC2626",
+        "red_bg": "#FEF2F2", "orange": "#B45309", "orange_bg": "#FFF7ED",
         "yellow": "#8A6D00", "purple": "#744DA9", "teal": "#038387",
-        "btn_default": "#FFFFFF", "btn_default_hover": "#E0E0E8",
-        "btn_disabled": "#E0E0E0", "btn_disabled_text": "#A0A0A8",
-        "scrollbar": "#C8C8D0", "scrollbar_hover": "#A0A0A8",
-        "success_bg": "#DFF6DD", "pending_bg": "#FFF3E8",
+        "btn_default": "#FFFFFF", "btn_default_hover": "#F1F3F9", "on_accent": "#FFFFFF",
+        "btn_disabled": "#F1F3F9", "btn_disabled_text": "#A8AEBB",
+        "scrollbar": "#D7DBE6", "scrollbar_hover": "#B7BECD",
+        "success_bg": "#ECFDF3", "pending_bg": "#FFF7ED",
     },
 }
 
@@ -96,7 +100,7 @@ def build_stylesheet(colors=None):
     _ = lambda n: c.get(n, "#FFFFFF")
     return f"""
 QMainWindow {{ background: {_('bg_dark')}; }}
-QWidget {{ color: {_('text')}; font-size: 13px; font-family: "Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif; }}
+QWidget {{ color: {_('text')}; font-size: 14px; font-family: "Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif; }}
 QWidget#central {{ background: {_('bg_dark')}; }}
 QMenuBar {{ background: {_('bg_darkest')}; border-bottom: 1px solid {_('border')}; padding: 2px 4px; }}
 QMenuBar::item {{ padding: 4px 14px; border-radius: 4px; }}
@@ -108,7 +112,7 @@ QMenu::separator {{ height: 1px; background: {_('border')}; margin: 4px 12px; }}
 QPushButton {{ background: {_('btn_default')}; color: {_('text')}; border: 1px solid {_('border')}; border-radius: 6px; padding: 6px 18px; min-height: 28px; }}
 QPushButton:hover {{ background: {_('btn_default_hover')}; }}
 QPushButton:disabled {{ background: {_('btn_disabled')}; color: {_('btn_disabled_text')}; }}
-QPushButton#primary {{ background: {_('accent')}; color: {_('btn_default')}; font-weight: bold; border: none; border-radius: 8px; padding: 10px 24px; font-size: 14px; }}
+QPushButton#primary {{ background: {_('accent')}; color: {_('on_accent')}; font-weight: bold; border: none; border-radius: 8px; padding: 10px 24px; font-size: 15px; }}
 QPushButton#primary:hover {{ background: {_('accent_hover')}; }}
 QToolButton {{ background: transparent; color: {_('text')}; border: 1px solid transparent; border-radius: 6px; padding: 5px 12px; }}
 QToolButton:hover {{ background: {_('bg_hover')}; }}
@@ -116,15 +120,15 @@ QToolButton:checked {{ background: {_('accent_bg')}; border-color: {_('accent')}
 QToolButton:disabled {{ color: {_('btn_disabled_text')}; }}
 QGroupBox {{ border: 1px solid {_('border')}; border-radius: 8px; margin-top: 14px; padding: 16px 12px 12px; }}
 QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 14px; padding: 0 8px; }}
-QLabel#title {{ font-size: 18px; font-weight: 600; color: {_('text_bright')}; }}
-QLabel#dim {{ color: {_('text_dim')}; font-size: 11px; }}
-QTextEdit {{ background: {_('bg_darkest')}; border: 1px solid {_('border')}; border-radius: 6px; font-family: "Cascadia Code","Consolas",monospace; font-size: 12px; padding: 6px; }}
+QLabel#title {{ font-size: 19px; font-weight: 600; color: {_('text_bright')}; }}
+QLabel#dim {{ color: {_('text_dim')}; font-size: 12px; }}
+QTextEdit {{ background: {_('bg_darkest')}; border: 1px solid {_('border')}; border-radius: 6px; font-family: "Cascadia Code","Consolas",monospace; font-size: 13px; padding: 6px; }}
 QProgressBar {{ background: {_('bg_light')}; border: none; border-radius: 3px; text-align: center; height: 6px; }}
 QProgressBar::chunk {{ background: {_('accent')}; border-radius: 3px; }}
 QSlider::groove:horizontal {{ background: {_('bg_light')}; height: 4px; border-radius: 2px; }}
 QSlider::handle:horizontal {{ background: {_('accent')}; width: 18px; height: 18px; margin: -7px 0; border-radius: 9px; }}
 QSlider::sub-page:horizontal {{ background: {_('accent')}; border-radius: 2px; }}
-QStatusBar {{ background: {_('bg_darkest')}; border-top: 1px solid {_('border')}; font-size: 12px; color: {_('text_dim')}; }}
+QStatusBar {{ background: {_('bg_darkest')}; border-top: 1px solid {_('border')}; font-size: 13px; color: {_('text_dim')}; }}
 QTabWidget::pane {{ border: none; }}
 QTabBar::tab {{ background: transparent; color: {_('text_dim')}; padding: 8px 20px; border-bottom: 2px solid transparent; }}
 QTabBar::tab:hover {{ background: {_('bg_light')}; color: {_('text')}; }}

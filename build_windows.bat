@@ -87,7 +87,10 @@ robocopy "dist\reUI" "." /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
 if errorlevel 8 exit /b 1
 rem Verify the published root EXE against the staging copy; the [verify]
 rem lines are part of the build log evidence kept after cleanup.
-powershell -NoProfile -Command "$a=(Get-FileHash -LiteralPath 'reUI.exe' -Algorithm SHA256).Hash; $b=(Get-FileHash -LiteralPath 'dist\reUI\reUI.exe' -Algorithm SHA256).Hash; Write-Output ('[verify] root EXE  sha256: ' + $a); Write-Output ('[verify] dist copy sha256: ' + $b); if ($a -ne $b) { exit 1 }"
+rem Hash with the build interpreter, not PowerShell: Get-FileHash needs module
+rem autoloading, and a host with a broken PSModulePath returned two empty
+rem strings for a mismatched pair, so the comparison silently passed.
+"%PYTHON%" -c "import hashlib,sys;a=hashlib.sha256(open('reUI.exe','rb').read()).hexdigest();b=hashlib.sha256(open(r'dist\reUI\reUI.exe','rb').read()).hexdigest();print('[verify] root EXE  sha256: '+a);print('[verify] dist copy sha256: '+b);sys.exit(0 if a==b else 1)"
 if errorlevel 1 (
   echo [ERROR] Published EXE and dist staging copy differ; dist kept for inspection.
   exit /b 1

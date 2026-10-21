@@ -5,8 +5,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from shapely.geometry import Polygon as ShapelyPolygon
+
+try:  # shapely >= 2.0
+    from shapely import make_valid as shapely_make_valid
+except ImportError:  # pragma: no cover - shapely 1.8 fallback
+    from shapely.validation import make_valid as shapely_make_valid
 
 MASK_REGULARIZATION_VERSION = 20
+
+FIELD_BOUNDARY_GEOMETRY_VERSION = "field-boundary-geometry-v1"
+# A self-intersecting field outline is repaired only when the discarded parts
+# are provably slivers (double-click loops at the closing vertex).  A genuine
+# crossing outline loses a real piece of field, so it must be redrawn instead of
+# being silently reshaped; the threshold keeps that decision auditable.
+FIELD_BOUNDARY_REPAIR_MAX_DROPPED_RATIO = 0.02
 
 
 def odd_size(value: float, minimum: int = 3) -> int:
@@ -33,6 +46,56 @@ def field_polygon_local(
     shape: Tuple[int, int],
 ) -> Optional[np.ndarray]:
     """Return the selected field polygon in mask-local coordinates."""
+    polygon, _report = field_polygon_local_report(state, shape)
+    return polygon
+
+
+def field_polygon_local_report(
+    state,
+    shape: Tuple[int, int],
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Return the ring the boundary gates must use, plus its geometry report.
+
+    ``present`` is True only when the outline is usable (already simple, or
+    repaired within the allowed discarded area).  When the drawn outline is
+    self-intersecting and cannot be repaired without changing the selected
+    field, the RAW ring is returned on purpose: every boundary gate then keeps
+    failing closed instead of the project silently behaving like one without a
+    field boundary.  The report says why.
+
+    The report is persisted in ``layout.field_boundary_geometry`` so a repaired
+    outline is auditable evidence, not a silent rewrite of the operator's field.
+    """
+    points = _field_boundary_local_points(state, shape)
+    if points is None:
+        return None, {
+            "algorithm_version": FIELD_BOUNDARY_GEOMETRY_VERSION,
+            "boundary_present": False,
+            "present": False,
+            "repaired": False,
+            "reason": "missing_field_boundary",
+            "input_vertex_count": 0,
+            "output_vertex_count": 0,
+        }
+    polygon, repair = sanitize_field_polygon_report(points)
+    report = {
+        "algorithm_version": FIELD_BOUNDARY_GEOMETRY_VERSION,
+        "boundary_present": True,
+        "present": polygon is not None,
+        "input_vertex_count": int(np.asarray(points).reshape(-1, 2).shape[0]),
+        "output_vertex_count": (
+            0 if polygon is None else int(np.asarray(polygon).shape[0])
+        ),
+    }
+    report.update(repair)
+    return (points if polygon is None else polygon), report
+
+
+def _field_boundary_local_points(
+    state,
+    shape: Tuple[int, int],
+) -> Optional[np.ndarray]:
+    """Return the raw field boundary in mask-local coordinates."""
     boundary = getattr(state, "field_boundary", None) if state is not None else None
     if not boundary or len(boundary) < 3:
         return None
@@ -50,6 +113,98 @@ def field_polygon_local(
     ):
         return None
     return points
+
+
+def sanitize_field_polygon(
+    points,
+) -> Optional[np.ndarray]:
+    """Return a simple field ring, or ``None`` when that would change the field."""
+    polygon, _report = sanitize_field_polygon_report(points)
+    return polygon
+
+
+def sanitize_field_polygon_report(
+    points,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Repair a self-intersecting field outline into one simple ring.
+
+    A double click on the closing vertex appends a second vertex a few pixels
+    from the first one, which turns the ring into a bow-tie: every shapely
+    operation then reports ``is_valid == False`` and the field-boundary gates
+    reject every centerline and route segment.  Such a loop encloses a sliver,
+    so ``make_valid`` only has to discard a negligible area and the repaired
+    ring is the operator's own outline.  A real crossing (a drawn ``8``) drops
+    a genuine part of the field and stays invalid on purpose: the caller then
+    fails closed and the operator redraws it.
+
+    Returns ``(repaired_ring_or_None, report)``.
+    """
+    report: Dict[str, Any] = {
+        "repaired": False,
+        "reason": None,
+        "dropped_area_ratio": 0.0,
+        "duplicate_vertex_count": 0,
+        "repair_limit_ratio": FIELD_BOUNDARY_REPAIR_MAX_DROPPED_RATIO,
+    }
+    array = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if array.shape[0] < 3 or not np.all(np.isfinite(array)):
+        report["reason"] = "field_boundary_too_few_vertices"
+        return None, report
+    # Drop consecutive duplicate vertices before shapely sees the ring.
+    keep = [0]
+    for index in range(1, array.shape[0]):
+        if not np.allclose(array[index], array[keep[-1]], atol=1e-9):
+            keep.append(index)
+    report["duplicate_vertex_count"] = int(array.shape[0] - len(keep))
+    array = array[keep]
+    if array.shape[0] > 3 and np.allclose(array[0], array[-1], atol=1e-9):
+        array = array[:-1]
+        report["duplicate_vertex_count"] += 1
+    if array.shape[0] < 3:
+        report["reason"] = "field_boundary_too_few_vertices"
+        return None, report
+    ring = ShapelyPolygon([tuple(point) for point in array])
+    if ring.is_empty:
+        report["reason"] = "field_boundary_empty"
+        return None, report
+    if ring.is_valid:
+        return array, report
+    repaired = shapely_make_valid(ring)
+    pieces = sorted(
+        (
+            piece for piece in getattr(repaired, "geoms", [repaired])
+            if piece.geom_type == "Polygon" and not piece.is_empty
+        ),
+        key=lambda piece: piece.area,
+        reverse=True,
+    )
+    if not pieces:
+        report["reason"] = "field_boundary_unrepairable"
+        return None, report
+    largest = pieces[0]
+    # Measure the discarded part against the repaired total, not against the
+    # ring's own shoelace area: an invalid ring's area is meaningless (a
+    # symmetric bow-tie even reports 0), while the sum of the repaired pieces is
+    # the field the outline actually encloses.
+    total_area = float(sum(piece.area for piece in pieces))
+    if total_area <= 0.0:
+        report["reason"] = "field_boundary_unrepairable"
+        return None, report
+    dropped_ratio = max(0.0, 1.0 - float(largest.area) / total_area)
+    report["dropped_area_ratio"] = float(dropped_ratio)
+    if dropped_ratio > FIELD_BOUNDARY_REPAIR_MAX_DROPPED_RATIO:
+        # A genuine crossing removes a real part of the selected field.  Refuse
+        # it: guessing which lobe the operator meant would silently plan a
+        # different field.
+        report["reason"] = "field_boundary_self_intersection_too_large"
+        return None, report
+    exterior = np.asarray(largest.exterior.coords, dtype=np.float64)
+    if exterior.shape[0] < 4:
+        report["reason"] = "field_boundary_unrepairable"
+        return None, report
+    report["repaired"] = True
+    report["reason"] = "field_boundary_closing_loop_removed"
+    return exterior[:-1], report
 
 
 def clip_mask_to_polygon_stripes(

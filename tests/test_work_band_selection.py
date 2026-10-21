@@ -648,6 +648,134 @@ def test_checkbox_change_refreshes_only_centerline_overlay(monkeypatch):
     window.close()
 
 
+def test_centerline_plan_keeps_lines_when_only_the_closing_loop_is_broken():
+    """Regression for 生成作业线 -> 无有效中心线 (2026-10-21 field project)."""
+    from path_planner import prepare_operator_centerline_plan
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 1.0
+
+    class State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+        # Bow-tie closing loop: the extra vertices straddle the first corner, as
+        # when the closing double click lands a few pixels past the first vertex.
+        field_boundary = [
+            (10.0, 10.0), (190.0, 10.0), (190.0, 90.0), (10.0, 90.0),
+            (9.0, 12.0), (12.0, 8.0),
+        ]
+        harvester_params = {
+            "cutter_width_m": 4.0,
+            "track_width_m": 0.4,
+            "track_gauge_m": 1.6,
+            "turn_radius_m": 1.0,
+        }
+
+    bands = [
+        {
+            "id": band_id,
+            "profile_width_m": 1.0,
+            "width_m": 1.0,
+            "band_type": "wide",
+            "centerline": [(20.0, float(y)), (180.0, float(y))],
+            "contour": [
+                (18.0, y - 2.0), (182.0, y - 2.0),
+                (182.0, y + 2.0), (18.0, y + 2.0),
+            ],
+        }
+        for band_id, y in ((4, 30.0), (6, 50.0), (8, 70.0))
+    ]
+    mask = np.full((100, 200), 255, dtype=np.uint8)
+
+    prepared = prepare_operator_centerline_plan(
+        bands,
+        mask,
+        0.0,
+        geo=Geo(),
+        state=State(),
+        config={
+            "validation_profile": "field_trial",
+            "work_line_mode": "band_centerline",
+            "planning_support_mask": mask,
+        },
+        all_bands=bands,
+    )
+
+    assert prepared["catalog"]["count"] == 3
+    geometry = prepared["layout"]["field_boundary_geometry"]
+    assert geometry["repaired"] is True
+    assert geometry["reason"] == "field_boundary_closing_loop_removed"
+    assert prepared["layout"]["centerline_field_boundary_filter"]["kept_line_count"] == 3
+
+
+def test_centerline_plan_names_an_unrepairable_field_outline():
+    """An unusable outline must not be reported as 'lines outside the field'."""
+    from path_planner import prepare_operator_centerline_plan
+
+    class Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 1.0
+
+    class State:
+        mask_offset_x = 0
+        mask_offset_y = 0
+        # A drawn "8": two comparable lobes, so the repair is ambiguous.
+        field_boundary = [
+            (10.0, 10.0), (190.0, 90.0), (190.0, 10.0), (10.0, 90.0),
+        ]
+        harvester_params = {
+            "cutter_width_m": 4.0,
+            "track_width_m": 0.4,
+            "track_gauge_m": 1.6,
+            "turn_radius_m": 1.0,
+        }
+
+    bands = [
+        {
+            "id": 4,
+            "profile_width_m": 1.0,
+            "width_m": 1.0,
+            "band_type": "wide",
+            "centerline": [(30.0, 50.0), (170.0, 50.0)],
+            "contour": [
+                (28.0, 48.0), (172.0, 48.0), (172.0, 52.0), (28.0, 52.0),
+            ],
+        }
+    ]
+    mask = np.full((100, 200), 255, dtype=np.uint8)
+
+    prepared = prepare_operator_centerline_plan(
+        bands,
+        mask,
+        0.0,
+        geo=Geo(),
+        state=State(),
+        config={
+            "validation_profile": "field_trial",
+            "work_line_mode": "band_centerline",
+            "planning_support_mask": mask,
+        },
+        all_bands=bands,
+    )
+
+    assert prepared["catalog"]["count"] == 0
+    assert prepared["layout"]["field_boundary_geometry"]["present"] is False
+    reasons = " ".join(prepared["layout"]["centerline_hard_reasons"])
+    assert "自相交" in reasons
+    assert "落在田块边界外" not in reasons
+
+
 def test_centerline_selection_unlocks_service_points_only_after_catalog_choice():
     from state import AppState
     from pyside6_app.task_state import derive_task_statuses

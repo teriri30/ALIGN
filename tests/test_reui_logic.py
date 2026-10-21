@@ -395,6 +395,15 @@ def test_planning_card_fully_expands_in_scroll_area_without_overlap():
     for other in panel._step_cards:
         if other is not card:
             other.set_expanded(False)
+    # 展开是 220 ms 的高度动画（表头不动、内容向下长出），几何断言必须
+    # 等动画跑完，否则量到的是中间帧。
+    from PySide6.QtCore import QAbstractAnimation
+    import time as _time
+    deadline = _time.time() + 2.0
+    while _time.time() < deadline:
+        app.processEvents()
+        if card._expand_group.state() != QAbstractAnimation.Running:
+            break
     app.processEvents()
 
     rows = [panel._task_widgets["params"]]
@@ -428,6 +437,15 @@ def test_edit_mode_does_not_inject_a_duplicate_tool_grid_into_planning_card():
     for other in panel._step_cards:
         if other is not card:
             other.set_expanded(False)
+    # 展开是 220 ms 的高度动画（表头不动、内容向下长出），几何断言必须
+    # 等动画跑完，否则量到的是中间帧。
+    from PySide6.QtCore import QAbstractAnimation
+    import time as _time
+    deadline = _time.time() + 2.0
+    while _time.time() < deadline:
+        app.processEvents()
+        if card._expand_group.state() != QAbstractAnimation.Running:
+            break
     app.processEvents()
     height_before = card.height()
 
@@ -462,8 +480,8 @@ def test_centerline_selection_is_rendered_in_its_own_task_card():
     )
     assert not centerline_card._expanded
     assert not advanced_card._expanded
-    assert panel._task_widgets["exit"]._label.text() == "终点（可选）"
-    assert panel._task_widgets["unload"]._label.text() == "卸粮点（可选）"
+    assert panel._task_widgets["exit"]._label.text() == "终点（选填）"
+    assert panel._task_widgets["unload"]._label.text() == "卸粮点（选填）"
     assert panel._task_widgets["params"].parentWidget() is advanced_card._content
     assert panel.route_edit_btn.parentWidget() is advanced_card._content
     assert panel.route_edit_btn.parentWidget() is not planning_card._content
@@ -1053,8 +1071,8 @@ def test_default_harvester_params_match_the_research_machine_geometry():
 
     params = window._effective_harvester_params()
 
-    assert DEFAULT_HARVESTER_PARAMS["cutter_width_m"] == pytest.approx(1.80)
-    assert DEFAULT_HARVESTER_PARAMS["track_width_m"] == pytest.approx(0.45)
+    assert DEFAULT_HARVESTER_PARAMS["cutter_width_m"] == pytest.approx(2.00)
+    assert DEFAULT_HARVESTER_PARAMS["track_width_m"] == pytest.approx(0.35)
     assert DEFAULT_HARVESTER_PARAMS["track_gauge_m"] == pytest.approx(1.30)
     assert DEFAULT_HARVESTER_PARAMS["wheelbase_m"] == pytest.approx(1.80)
     assert DEFAULT_HARVESTER_PARAMS["turn_radius_m"] == pytest.approx(0.90)
@@ -1243,16 +1261,27 @@ def test_cached_auto_path_rebuilds_pipeline_result_for_restore():
 
 
 def test_task_panel_accordion_keeps_only_one_card_expanded():
+    """手风琴：同时只展开一张；再点同一张表头则收起。
+
+    旧断言把"点已展开的卡片"当成"保持展开"，与用户要求的
+    "展开后再次点击可以收回"相反，因此这里按新语义验证。
+    """
     window = _window()
     panel = window.task_panel
+    for card in panel._step_cards:
+        card.set_expanded(False, animate=False)
+    panel._manual_step = None
+    panel._user_collapsed = False
 
-    panel._step_cards[0].set_expanded(True)
     panel._on_card_toggled(0)
-    panel._step_cards[1].set_expanded(True)
-    panel._on_card_toggled(1)
+    assert [i for i, c in enumerate(panel._step_cards) if c._expanded] == [0]
 
-    expanded = [i for i, card in enumerate(panel._step_cards) if card._expanded]
-    assert expanded == [1]
+    panel._on_card_toggled(1)
+    assert [i for i, c in enumerate(panel._step_cards) if c._expanded] == [1]
+
+    # 再点同一张：收起，且不留下任何展开的卡片
+    panel._on_card_toggled(1)
+    assert [i for i, c in enumerate(panel._step_cards) if c._expanded] == []
 
 
 def test_task_panel_does_not_expose_internal_usage_mode_selector():
@@ -1361,7 +1390,8 @@ def test_mask_completion_stops_at_parameter_confirmation_before_path_planning():
     statuses = derive_task_statuses(state, has_image=True)
     assert statuses["params"].status == "available"
     assert statuses["entry"].status == "available"
-    assert statuses["exit"].status == "available"
+    assert statuses["exit"].status == "done"
+    assert statuses["exit"].optional is True
     assert statuses["plan"].status == "pending"
 
 
@@ -1401,7 +1431,7 @@ def test_path_planning_unlocks_after_parameters_and_start_are_confirmed():
     assert statuses["params"].status == "done"
     assert statuses["entry"].status == "done"
     assert statuses["exit"].status == "done"
-    assert statuses["exit"].text == "自动延伸"
+    assert "自动延伸" in statuses["exit"].text
     assert statuses["plan"].status == "available"
 
 
@@ -1691,6 +1721,9 @@ def test_cache_restore_reenables_confirmed_parameters_after_processed_mask(monke
 
     row = window.task_panel._task_widgets["params"]
     assert window.state.harvester_params_confirmed is True
+    # A restored project keeps its mask-derived steps: invalidation is driven by
+    # the action that changes an upstream artifact, not inferred from an empty
+    # polygon (see tests/test_task_chain.py::test_deleting_field_polygon...).
     assert row._done is True
     assert row._action_btn.isEnabled()
 

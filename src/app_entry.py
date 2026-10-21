@@ -132,7 +132,10 @@ def run_app(argv: Sequence[str] | None = None) -> int:
     font = QFont("Microsoft YaHei UI", 10)
     if hasattr(font, "setFamilies"):
         font.setFamilies(["Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "Segoe UI"])
-    font.setStyleStrategy(QFont.PreferAntialias)
+    # 不设 setStyleStrategy(PreferAntialias)：它会让 Windows 退回灰度抗锯齿，
+    # 中文小字号笔画发虚。改用 hinting 偏好让笔画对齐像素，渲染交给系统
+    # 默认的 DirectWrite / ClearType。
+    font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
     app.setFont(font)
     try:
         window = MainWindow()

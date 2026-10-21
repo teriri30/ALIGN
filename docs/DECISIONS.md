@@ -360,9 +360,9 @@
   10. 漏线恢复算法保留用于 `research` 模式的显式手动复现；`field_trial` 和 `machine_candidate` 仍强制关闭自动恢复。缓存中存在 `planning_recovered=true` 的作业带时，结果必须保留该标记；严格 `fail_closed` 模式拒绝导出，研究导出不再弹窗或阻断。
   11. 种植类型相同不代表属于同一物理生成区。若等距区的主航线法向位置位于两组宽窄行四行带之间，分类器必须把两侧宽窄行拆成独立且连续的 `wide_narrow_rows_N` 区域，以保留各自来源带和生成密度；生成完成后的直线仍进入同一个全田转弯集合。分区依据和区域数量必须写入分类诊断。
   12. `layout.work_regions` 与 `layout.region_generation_order` 保存区域生成来源；`layout.region_execution_order` 必须为空，`turn_planning_scope=all_generated_work_lines`。`turn_assessment.contour_ordering` 必须记录 `execution_scope`、全田直线数、逐线区域 provenance 和 `region_boundaries_affect_turns=false`；`region_routes`、`region_transfers` 必须为空，并进入路径阶段指纹。
-  13. 每个最终候选中心线目录项必须绑定一整条种植带的有序折线。直带默认只保留首尾 2 点；只有横向弦偏离或局部航向变化超过显式阈值时才增加有限折点。折点不得拆成多个可勾选条目，选择、覆盖栅格和路径规划必须按同一目录 ID 整体处理，并记录逐带输入/输出点数。
+  13. 每个最终候选中心线目录项必须绑定一整条种植带的有序折线。直带默认只保留首尾 2 点；只有横向弦偏离或局部航向变化超过显式阈值时才增加有限折点。折点不得拆成多个可勾选条目，选择、覆盖栅格和路径规划必须按同一目录 ID 整体处理，并记录逐带输入/输出点数。点数预算不能覆盖横向偏差/方向条件：`centerline_simplify_max_points`（默认 8）只是软预算，达到后只对仍不满足条件的区间继续加点，直到满足或达到硬上限 `centerline_simplify_hard_max_points`（默认 64）；硬上限仍不满足时才返回简化前完整的平滑点列。软预算点列同时作为端点修复锚点，额外加点不得移动端点。该保证只消除简化附加误差，不等于人工真值精度已经提高。对应 `centerline-adaptive-polyline-v3`、`footprint-path-v33`；旧路径缓存重新规划，原掩膜不失效。
 - 代码锚点：`MainWindow._compact_mask_result_for_ui`、`row_geometry.resolve_terminal_headland_overlap`、`path_planner._centerline_simplification_settings`、`path_planner._simplify_centerline_polyline`、`path_planner.prepare_band_centerlines`、`path_planner.build_band_mask`、`path_planner._uniform_zone_reference_geometry`、`path_planner._classify_planting_regions`、`path_planner._recover_lattice_supported_work_bands`、`path_planner._prepare_work_line_layout`、`path_planner._connect_work_regions`、`path_planner._connect_work_lines`、`path_planner._build_exit_service_route`、`path_planner.plan_path`。
-- 测试锚点：`tests/test_mixed_region_strategy.py`、`tests/test_contour_strategy.py`、`tests/test_path_boundary.py::test_centerline_simplification_keeps_a_straight_band_to_two_points`、`tests/test_path_boundary.py::test_curved_centerline_keeps_extra_points_but_one_checkbox_item`、`test_compact_mask_result_keeps_small_planning_contour`。
+- 测试锚点：`tests/test_mixed_region_strategy.py`、`tests/test_contour_strategy.py`、`tests/test_path_boundary.py::test_centerline_simplification_keeps_a_straight_band_to_two_points`、`tests/test_path_boundary.py::test_curved_centerline_keeps_extra_points_but_one_checkbox_item`、`tests/test_path_boundary.py::test_soft_budget_spends_extra_points_before_dense_fallback`、`tests/test_path_boundary.py::test_hard_cap_falls_back_to_smoothed_trace`、`test_compact_mask_result_keeps_small_planning_contour`。
 - 允许的变更方式：可用人工标注的宽窄行/等距区样本重新标定宽度阈值、模糊带、异常间距或直线生成规则，但必须版本化分类器与补线器、保存逐带证据、维持不按左右硬编码、先完成全部直线生成再统一转弯和不确定时失败关闭。
 
 默认 `uniform_zone_min_width_m=4.0 m`，用于避免真实约 `2.5 m` 的完整四行带落入默认歧义保护带；显式阈值、逐带证据和缺证据时失败关闭规则保持不变。
@@ -569,3 +569,165 @@
 - 测试锚点：`tests/test_mask_strategy.py`（合成瓶颈分割、保护条件拦截、禁用开关）、`tests/test_research_integrity.py`（版本断言）。
 
 <!-- DECISION-030: adhesion bottleneck split inside the main row-band pipeline; local geometric cut only for suspected merged runs, zero change otherwise. -->
+
+## DECISION-031：演示动画视觉层与足迹校验模型分离（harvester-visual-v1）
+
+- 日期：2026-10-19
+- 背景：动画原先直接用 `planar_geometry_m` 的抽象足迹绘制蓝色机体；该足迹的机身长度取 `max(轴距, 接地长)=1.8 m`，服务的是足迹/碾压校验，不是整机外形。把整机真实外形塞进 `planar_geometry_m` 会改变足迹、转弯与碾压评价口径。
+- 决策：新增 `pyside6_app.harvester_visual.HarvesterItem(QGraphicsItem)`，局部坐标以米为单位（+x 前进、+y 机组右侧、原点在履带接地中心），通过 `setPos/setRotation/setScale(px_per_m)` 放置；`_render_anim_frame` 只替换视觉层，位姿、分段速度、转弯圆弧、进度跳转仍由 `AnimationEngine` 提供。已割带用 `QGraphicsPathItem` 沿 work 段绘制，笔宽=割幅×`px_per_m`，终点按割刀前伸量延伸到割刀位置。
+- 机型修正与视觉修正（2026-10-19）：实机为星光 **4LZZ-4.5Z** 再生稻低碾压联合收获样机（双 Z），不是普通 4LZ-4.5Z；此前按普通机型建模，型号与后部比例都不对。初版粮箱 2.68 m 一直拖到机尾，按实机照片重画为：总长 3.57 m、后悬 0.80 m、粮箱 1.05 m、后部发动机/清选舱 0.55 m。上述后悬与总长为照片估算，待实机测量确认；`harvester_params` 的割幅、履带、轨距、接地长保留实测值。
+- 不变量：
+  1. `planar_geometry_m`、`footprint_planner` 与碾压/足迹校验口径不因视觉层改动；`_draw_harvester_pose` 保留为校验用抽象位姿与测试锚点。
+  2. 视觉尺寸只取 `harvester_params` 实测值（割幅 2.0、割刀前伸 1.35、履带 0.35、轨距 1.30、轴距 1.80、接地长 1.70、转弯半径 0.90）与按照片比例推导的机身包络；不得把官网通用型号参数冒充实机实测。
+  3. 视觉层不参与导出、路径校验或任何规划数值；停止/异常/完成动画时从场景移除，不污染工程图。
+  4. 严格正交俯视，不使用透视或等轴测。
+- 代码锚点：`pyside6_app.harvester_visual.HarvesterItem`、`pyside6_app.main_window.MainWindow._update_harvester_item/_update_cut_swath/_dispose_harvester_item/_render_anim_frame`。
+- 测试锚点：`tests/test_harvester_visual.py`（包围盒覆盖整机、离屏绘制非空、旋转后包围盒方向）、`tests/test_animation_controls.py`（动画控制与失败回滚不回归）。
+
+## DECISION-032：界面图标改为统一矢量绘制，配色收敛为「一主色 + 状态色」（ui-icons-v1）
+
+- 日期：2026-10-20
+- 背景：顶栏撤回/恢复用 `↩`/`↪`、设置用 `⚙`、主题用 `☀`/`☾`，任务卡片用 `▸`/`▾`/`✓`，测量用 `•`/`/`/`□`，缩放用 `＋`/`−`。这些字符的字形、粗细、基线随字体变化，无法做严格镜像，放大后是手绘感；同时 13 个任务各带一种专属色（绿、棕、红、橄榄），等于没有强调色。
+- 决策：新增 `pyside6_app.ui_icons`，在 20 单位网格上用 QPainter 以 1.7 px 圆头描边绘制全部界面图标，按主题色渲染并支持禁用态；撤回与恢复共用一条路径水平镜像。配色改为：主操作统一 `accent`，次级操作为透明底 + `border_light` 描边，任务状态方块按状态取 green/accent/red/border_light。
+- 不变量：
+  1. 界面不再用字符或 emoji 充当图标；新增图标一律进 `ui_icons`，不在业务代码里写图形字符。
+  2. 图标颜色必须来自 `COLORS`，不得硬编码十六进制，保证深/浅主题都跟随。
+  3. 任务主按钮不再使用任务专属色；`TASK_DEFS` 的 `color` 仅保留为历史字段，不再驱动按钮。
+  4. 次级按钮（回退）不得用高饱和填充色，避免与主操作争夺注意力。
+- 代码锚点：`pyside6_app.ui_icons`（`undo_icon`/`redo_icon`/`theme_icon`/`settings_icon`/`chevron_icon`/`check_icon`/`point_icon`/`line_icon`/`area_icon`/`plus_icon`/`minus_icon`）、`top_bar.TopToolbar`、`panels.TaskRow._update_badge/_secondary_button_style`、`panels.StepCard`、`image_view.ImageViewerGroup`。
+- 测试锚点：`tests/test_reui_logic.py`（任务面板与视图控件不回归）、`tests/test_system_history.py`（撤回/恢复可用态）。
+
+## DECISION-033：界面图标采用 Lucide 网格，配色对齐 ZoneDeck / Codex++ 参考（ui-icons-v2）
+
+- 日期：2026-10-20
+- 背景：第一版图标在 20 单位网格上自行画曲线，撤回/恢复看起来仍是手绘；同时深色主题用青蓝、浅色主题用系统蓝，两套主题没有统一的设计语言。
+- 决策：图标统一到 Lucide 的 24×24 网格、2.0px 圆头描边（`undo-2`/`redo-2`/`moon`/`sliders-horizontal`/`chevron`/`check`/`plus`/`minus`/`search`/`refresh-cw`/`trash-2`/`info`），撤回与恢复由同一条路径水平镜像；深色主题取 ZoneDeck 的蓝黑底 + 薄荷绿强调，浅色主题取 Codex++ 的近白底 + 靛蓝强调；新增 `on_accent` 令牌承载强调色底上的文字色。
+- 不变量：
+  1. 图标必须在 24 单位网格上绘制，线宽 2.0px、圆头圆角，不得再出现字体字符或 emoji。
+  2. 撤回/恢复必须由同一路径镜像产生，不得分别手画。
+  3. 每套主题只允许一个强调色；状态色（成功/失败/警告）不得用于装饰。
+  4. 强调色底上的文字必须用 `on_accent`，不得用 `btn_default`。
+- 代码锚点：`pyside6_app.ui_icons`、`pyside6_app.styles.THEMES`、`panels.StepCard.refresh_state/set_active`、`panels.TaskRow._update_badge/_secondary_button_style`。
+- 测试锚点：`tests/test_reui_logic.py`、`tests/test_system_history.py`。
+
+## DECISION-034：侧栏卡片采用「状态竖条 + 可提亮高亮面」的自绘卡片（step-card-v2）
+
+- 日期：2026-10-20
+- 背景：参考实现（Codex++ / ZoneDeck）的侧栏列表项由两层构成——透明的行本体 + `::before` 高亮面；悬停与选中复用同一层，只切换 background token（`row-surface` = 文字色 3.5%，`row-selected` = 强调色 8.5%），过渡 160–180 ms，选中项另有 outline 与左侧竖条。Qt 没有伪元素，原先用 `setStyleSheet` 的 `border-left` 无法同时表达悬停浮起与圆角裁剪。
+- 决策：`StepCard` 改为在 `paintEvent` 中自绘三层（圆角高亮面、1 px 描边、3 px 状态竖条），悬停强度 `_hover` 用 160 ms 补间；状态由 `_active` / `_done` 决定竖条与底色。
+- 不变量：
+  1. 高亮面必须用圆角 `QPainterPath` 裁剪，不得靠 `setStyleSheet` 的 `border-radius` 间接实现。
+  2. 悬停与选中必须复用同一层填充，只换颜色，不得各画一套。
+  3. 悬停时长固定 160 ms，与参考实现的 `opacity 160ms` 对齐。
+  4. `paintEvent` 中访问的实例属性必须有默认值（`_done`/`_active`/`_hover`），自绘异常会导致进程级崩溃而非 Python 异常。
+- 代码锚点：`panels.StepCard.paintEvent/_chrome/_set_hover`、`panels.StepCard.set_active`、`ui_motion.tween_value`。
+- 测试锚点：`tests/test_reui_logic.py`（手风琴展开、卡片宽度与不重叠）。
+
+## DECISION-035：动效分三层——短过渡、少量过冲、循环提示（motion-v1）
+
+- 日期：2026-10-20
+- 背景：参考实现（Codex++ WebView2 / ZoneDeck Tauri）的"灵动"不是单一动画，而是三层规则：①绝大多数交互为 100–260 ms 过渡；②只有容器展开与箭头旋转带过冲（`cubic-bezier(.34,1.56,.64,1)`，`.22s`）；③运行态用无限循环提示（状态点呼吸 1.2 s、进度高光 1.8 s、完成光束 1.6 s 仅一次）。
+- 决策：reUI 动效按同三层实现，集中在 `pyside6_app/ui_motion.py`：
+  - 过渡层：`BACK_OUT`/`SOFT_OUT`/`EASE_IN_OUT` 三条自解贝塞尔曲线，时长常量 `FAST_MS=120 / BASE_MS=220 / SLOW_MS=300`。
+  - 过冲层：只用于 `StepCard` 手风琴与 `ChevronToggle` 旋转，其他位置一律单调缓动。
+  - 循环层：`BreathingDot`（1.2 s 呼吸）与 `ShimmerBar`（1.8 s 高光扫过）只在"进行中"启动，静止状态必须停表。
+- 不变量：
+  1. 循环动画必须有明确的关闭路径，禁止在空闲态常驻定时器。
+  2. 状态点四态语义固定：`idle` 灰、`busy` 强调色呼吸、`ready` 绿、`error` 红，不得新增第五种。
+  3. 自绘控件的 `paintEvent` 不得抛异常；Qt 绘制回调异常会导致进程级崩溃，需为所有实例属性设默认值。
+  4. 子控件必须加入父控件自身的布局；加到第二个独立布局会落在父矩形之外并被裁剪。
+  5. 折叠卡片的汇总状态只统计带 `_status_key` 的真实任务行，并同时接受 `done=True` 与 `status="success"` 两种完成标记。
+- 代码锚点：`ui_motion.BreathingDot/ShimmerBar/cubic_bezier_curve/tween_value`、`panels.TaskRow._update_badge`、`panels.StepCard.collapsed_status_dot`、`main_window.set_status_text`。
+
+## DECISION-036：工作流步骤按整链校验，选填项以行名标注（chain-v1）
+
+- 日期：2026-10-20
+- 背景：审计 12 组缺失前置的状态组合，发现四处缺陷——①`segment`/`process` 只校验自身标志位，上游被删后仍可显示 done；②`process` 不检查 `inference_done`；③`centerline_catalog` 不跟随掩膜，旧目录会让下游按过期作业线规划；④`plan` 的锁定条件不覆盖影像/田块/识别/掩膜缺失。
+- 决策：
+  1. `derive_task_statuses` 改为整链校验：`field_done = image_loaded ∧ boundary`，`inference_done = image_loaded ∧ flag ∧ mask_raw`，`process_done = inference_done ∧ field_done ∧ flag ∧ mask_result`；`process_done` 为假时 `centerline_items` 与 `selected_centerlines` 一律视为空。
+  2. 每个被锁定的步骤必须给出原因文本（先导入影像／先圈选田块／先完成作物识别／先完成掩膜优化／先生成作业线／先选择作业线／先确认高级设置／先设置并确认起点）。
+  3. 选填项固定为 `exit`、`unload`（`OPTIONAL_TASKS`）。选填项缺失时状态为 done（不阻塞下游），但被修改时必须触发 `_invalidate_analysis_from("path")`。
+  4. 选填标识只允许写在行名（`终点（选填）` / `卸粮点（选填）` / `起点（必选）`）+ 行名强调色 + 状态文字 + tooltip；**禁止**再加独立小标签控件（320 px 紧凑面板下会裁断行名）。
+  5. 卡片完成瞬间允许触发一次 `CompletionBeam`（1600 ms、仅一次），生成中允许 `BobIcon` 循环（920 ms）；两者都必须有明确的停止路径。
+- 代码锚点：`pyside6_app/task_state.derive_task_statuses/OPTIONAL_TASKS/TaskStatus.optional`、`panels.TASK_DEFS[].optional`、`panels.TaskRow.set_status/refresh_theme`、`ui_motion.CompletionBeam/BobIcon`。
+- 测试锚点：`tests/test_task_chain.py`（10 条，含"done 蕴含前置全 done"的顺序不变量）。
+
+## DECISION-037：动效只保留交互反馈，移除完成扫光（motion-v2）
+
+- 日期：2026-10-20
+- 背景：`CompletionBeam`（1600 ms 旋转渐变扫光）在卡片完成时播放，但一旦 `_active` 变假而控件仍可见，旋转的渐变条会以斜向半透明块的形式残留在卡片上，观感极差且被误认为"平行四边形阴影"；用户明确表示**不需要光效，只要交互反馈**。
+- 决策：删除 `CompletionBeam` 及其在 `StepCard` 中的触发、几何同步与单次燃烧逻辑，完成状态只由「绿色对勾 + 状态点」表达。
+- 保留的交互反馈：悬停浮起（160 ms）、按钮按下内缩回弹（`SpringButton`）、箭头旋转过冲（`ChevronToggle`）、手风琴展开过冲、状态点呼吸（1.2 s）、进度条高光（1.8 s）。
+- 不变量：
+  1. 卡片不得叠加任何会遮挡或改变底色的覆盖层；状态只用对勾、状态点、3 px 竖条和描边表达。
+  2. 任何一次性动画结束必须 `hide()` 自身，不允许以"不可见状态仍可见控件"的方式收尾。
+  3. 明令禁止装饰性光效（扫光、霓虹、呼吸光晕），只允许表达"进行中/完成/失败"的功能性反馈。
+- 代码锚点：`panels.StepCard.refresh_state/_chrome/paintEvent`、`ui_motion`（`BreathingDot`/`ShimmerBar`/`SpringButton`/`ChevronToggle`）。
+
+## DECISION-038：步骤完成判定为「影像 + 自身产物」，失效由动作触发（chain-v2）
+
+- 日期：2026-10-20
+- 背景：DECISION-036 曾把 `field_done` 写进 `inference_done` / `process_done` 的五重条件，导致只要田块边界缺省（缓存部分恢复、异步恢复窗口），掩膜、农机参数、作业线就会被整体降级，用户看到"步骤突然都退了"。而缓存白名单（`_restore_cache_payload`）本来就把 `field_boundary` 与 `inference_done`、`mask_processed` 成对恢复，正常项目不会出现"有掩膜无边界"。
+- 决策：
+  1. `inference_done = image_loaded ∧ inference_done ∧ mask_raw`；`process_done = inference_done ∧ mask_processed ∧ mask_result`。**不再要求田块边界**。
+  2. 田块不是识别的硬前置：`segment` 在"已圈选或已有掩膜"时可操作；边界缺失只让 `draw_field` 退回可重选，不连坐下游。
+  3. 失效由**动作**触发：重画/删除田块调用 `_finish_field_polygon → _invalidate_analysis_from("inference")` 清空整条下游；状态机不得从"边界为空"推断掩膜过期。
+  4. `plan` 的锁链不再包含田块（识别已产出掩膜即可继续）；其余锁链保持严格：掩膜→参数确认→作业线→选线→起点锁定。
+- 代价与取舍：若真是"边界被外部清空但掩膜仍在"的损坏存档，界面会允许在旧掩膜上继续规划。这是有意的取舍——用可恢复的宽容换掉不可恢复的"整套降级"，且这种存档本身不可能由本程序产生。
+- 测试锚点：`tests/test_task_chain.py::test_mask_derived_steps_survive_a_partially_restored_cache`、`::test_deleting_field_polygon_invalidates_every_downstream_step`、`tests/test_reui_logic.py::test_cache_restore_reenables_confirmed_parameters_after_processed_mask`（断言恢复为 done）。
+
+## DECISION-039：进度只由真实任务驱动；卡片展开改为内容区高度动画（motion-v3）
+
+- 日期：2026-10-20
+- 缺陷一（进度）：`_on_progress` 末尾有 `pct < 30 → segment / < 70 → process / else plan` 三段**按百分比猜步骤**的兜底。任何一次进度事件（含启动时加载模型）都会把"作物识别"标成"处理中 25%"，即使用户还没圈选田块、没点过处理。任务行状态必须来自 `state` 的 `inference_running` / `mask_processing_running` / `plan_running` / 中心线 token；模型加载等非流水线阶段只更新状态栏与进度条。
+- 缺陷二（展开）：旧实现只动画卡片自身的 `minimumHeight`，内容区瞬间 `setVisible(True)`，导致内容先撑开再回缩、卡片高度挤压相邻卡片。
+- 决策（按 `qt-collapsible-section`，Qt Wiki 的经典 Section 实现）：
+  1. 内容区垂直 `Fixed`、初始 `maximumHeight=0`、默认隐藏；
+  2. 展开/收起用 `QParallelAnimationGroup` 三个并行动画：内容区 `maximumHeight` 0↔内容高度、卡片 `minimumHeight`/`maximumHeight` 折叠高度↔折叠+内容高度；
+  3. 表头固定在布局第一行，内容在第二行，**标题相对位置全程不变**；
+  4. 时长 220 ms、`OutCubic`。内容高度本身在变，不再叠加过冲（会让底部先空一块再收回）。
+- 不变量：
+  1. 卡片高度只能通过 `minimumHeight` 与 `maximumHeight` 成对设置，禁止只设其中一个。
+  2. 展开动画期间表头不得移动；任何让表头位移的实现视为缺陷。
+  3. 任务行进度只允许由真实运行标志驱动，禁止从百分比区间推断当前步骤。
+- 代码锚点：`panels.StepCard._collapsed_height/_content_height/_apply_expanded_state/_animate_expansion/_on_expand_finished`、`main_window._on_progress`。
+- 测试锚点：`tests/test_reui_logic.py::test_planning_card_fully_expands_in_scroll_area_without_overlap`（等待动画结束后再量几何）。
+
+## DECISION-040：行高随内容自适应、步骤推进自动换焦点、字号与 hinting 调整（layout-v1）
+
+- 日期：2026-10-20
+- 缺陷一（进度条压按钮）：`TaskRow` 行高写死 56 px，但"标题 16 + 状态/按钮 30 + 进度条 4 + 间距边距"需要 66 px；进度条显示时被挤到按钮矩形上。改为 `_sync_row_height()`：布局 `invalidate/activate` 后取 `sizeHint().height()`，`max(56, hint)` 作最小高度；进度条可见性每次变化都调用。
+- 缺陷二（步骤不自动切换）：`_refresh_cards` 里自动展开受 `_manual_step` / `_user_collapsed` 抑制，用户点过一次卡片后就再也不自动推进。改为**步骤推进（`first` 变化）时无条件清除这两个标记**，收起旧卡片、展开新卡片，符合"识别完成→自动进入下一步"。
+- 缺陷三（字体发虚）：`app_entry` 设了 `QFont.PreferAntialias`，在 Windows 上会退回灰度抗锯齿，中文小字号笔画发糊；且全局最小字号 10–11 px 偏小。改为 `setHintingPreference(PreferFullHinting)`（渲染交回 DirectWrite/ClearType），并把全部 QSS 字号整体上调一档（10→11、11→12、12→13、13→14、15→16、16→17、18→19）。
+- 不变量：
+  1. 任何含可变高度子控件（进度条等）的行，行高必须由布局 `sizeHint` 驱动，不得写死常量。
+  2. 步骤推进必须自动切换展开焦点；只有"用户在当前步骤内手动开合"才允许保持用户选择。
+  3. 字号调整后必须验证无横向滚动（`_scroll.horizontalScrollBar().maximum() == 0`）且无标签/按钮越界。
+- 代码锚点：`panels.TaskRow._sync_row_height/_update_badge`、`panels.TaskPanel._refresh_cards`、`app_entry` 字体初始化、`styles.py` 全局 QSS 字号。
+
+## DECISION-041：田块边界必须是简单环，闭合重复点击自动修复而非静默失败（field-boundary-geometry-v1）
+
+- 日期：2026-10-21
+- 背景：现场项目 `result.tif` 在"生成作业线"步骤报 **无有效中心线**，日志只有 `正在生成全部候选中心线… / 当前没有可供选择的有效中心线`。实测缓存（`%LOCALAPPDATA%\reUI\cache\4cf071d37373`）：`wide_bands=15`、`all_bands=30`、`main_angle=1.9076`、掩膜 `5129×3769` 全部正常，`_prepare_work_line_layout` 也正常生成 **15 条**作业线，但 `centerline_field_boundary_filter` 把这 15 条**全部**判为 `centerline_outside_field_boundary`。
+- 根因：`field_boundary` 有 6 个顶点，其中第 5、6 点距首点仅 29.47 px（两次闭合点击追加的顶点），环自相交（shapely `Self-intersection[1591.76 345.15]`、`is_simple=False`）。`segment_within_field_boundary` 在 `not field.is_valid` 时一律 `return False`，于是田界门禁对任何折线都答"越界"。判定与作业线几何无关：这 15 条线的 `covers` 在修复后的环上全部为 True。
+- 结论：田块边界在进入任何门禁前必须归一化为简单环。`row_geometry.sanitize_field_polygon` 去除连续重复顶点，对自相交环取 `make_valid` 的最大连通多边形，**仅当被丢弃面积 ≤ 2%** 才接受（闭合双点的 sliver 通常 < 1e-4）；`field_polygon_local` 统一走该修复，圈选完成、缓存恢复、生成作业线三处都写入日志。
+- 不变量：
+  1. 不得用"放宽田界判定"或"跳过田界检查"掩盖无效边界；修复对象是边界本身，门禁语义不变。
+  2. 真实交叉（画成"8"字，丢弃面积 > 2%）必须拒绝并提示重画，不得猜测哪一瓣是本意——猜错会静默规划出另一块田。
+  3. 空目录必须报出真实原因：`layout.centerline_hard_reasons` 区分"田块边界几何无效"与"作业线在田界外"，不得只显示"无有效中心线"。
+  4. 修复证据写入 `layout.field_boundary_geometry`（`repaired`/`reason`/`dropped_area_ratio`/`duplicate_vertex_count`），属于可审计状态，不改变田块面积口径以外的任何语义。
+- 实测（同一真实缓存）：修复前 `work_lines=0 / catalog_items=0`，修复后 `work_lines=15 / catalog_items=15`、`kept_line_count=15`；被丢弃面积为 0.0008%（最大片 9361921.3 px² vs 总 9361995.9 px²）。
+- 代码锚点：`row_geometry.sanitize_field_polygon(_report)`、`row_geometry.field_polygon_local(_report)`、`path_planner.segment_field_boundary_status`、`path_planner._centerline_hard_reasons`、`MainWindow._finish_field_polygon/_normalise_field_boundary/_restore_cache_payload`。
+- 测试锚点：`tests/test_path_boundary.py::test_field_boundary_closing_loop_is_repaired_instead_of_rejecting_everything`、`::test_genuine_field_boundary_crossing_still_fails_closed`、`::test_invalid_field_outline_reports_its_own_reason`。
+
+## DECISION-042：套圈转弯的诊断标签必须报拓扑名，不报底层几何生成器名
+
+- 日期：2026-10-21
+- 现象：`state.turn_strategy` 默认已是 `contour`，日志首行也打印 `转弯=contour`，但每条转弯却打印"策略=弓形转弯, 原因=用户指定"，被误判为"套圈没生效、退回了弓形"。
+- 根因：`TURN_STRATEGIES["contour"] = _turn_bow`——套圈的转弯几何由弓形生成器实现（DECISION-016 的"共享田头墙横向切线"）；`selected_strategy` 又把 `contour` 改写成 `bow` 存入 `turn_decisions[-1]["strategy"]`，日志按该字段查 `TURN_STRATEGY_LABELS`，于是把拓扑名换成了几何名。
+- 修正：日志按 `requested_strategy == "contour"` 或 `ordering_strategy == "contour"` 判定，输出 `套圈转弯（两半交错，共享田头墙横向切线）`、原因 `套圈收割拓扑`；`TURN_STRATEGY_LABELS["contour"]` 由 `套圈收割` 改为 `套圈转弯`。
+- 不变量：
+  1. 面向人的诊断字段必须表达**用户选择的拓扑**；底层复用哪个几何生成器属于实现细节，不得出现在策略标签里。
+  2. `turn_decisions` 必须同时保留 `requested_strategy`、`ordering_strategy`、`effective_strategy` 三个字段，禁止只留 `strategy`。
+- 口径确认（2026-10-21，用户选定）：保留两半交错拓扑。跨度 14–16 m 是"每条作业线跨半田去对面那条"的必然结果，不是普通行距，也不是弓形退化；不做相邻顺序紧凑掉头，不做闭合轮廓螺旋套圈。
+- 代码锚点：`path_planner.TURN_STRATEGY_LABELS`、`path_planner` 转弯日志段、`_contour_order_work_lines`。

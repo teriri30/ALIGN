@@ -12,9 +12,15 @@ class ConfigValidationError(ValueError):
 
 
 DEFAULT_HARVESTER_PARAMS = {
-    "cutter_width_m": 1.80,
+    # 幅宽 2.0 m 为实机实测值。原默认 1.80 m 与实机不符：1.80 m 是按
+    # 「轨距 + 履带宽 + 两侧余量」反推的名义匹配值（履带 0.45 时得 1.90 m），
+    # 属推算值，不能作为实机参数。
+    "cutter_width_m": 2.00,
     "cutter_forward_offset_m": 1.35,
-    "track_width_m": 0.45,
+    # 履带宽度实测值 0.35 m。原默认 0.45 m 与实机不符：按通道宽 0.45 m、
+    # 轨距 1.30 m 核算，0.45 m 时履带外缘超出通道外缘 3.7 cm（碾压宽行带），
+    # 0.35 m 时外侧余量 +1.3 cm 方可通过「履带完整落入通道」判据。
+    "track_width_m": 0.35,
     "track_gauge_m": 1.30,
     "wheelbase_m": 1.80,
     "track_length_m": 1.70,
@@ -207,6 +213,10 @@ def validate_config(raw: dict) -> dict:
     _validated_number(
         planning, "centerline_simplify_max_points",
         minimum=2.0, maximum=64.0,
+    )
+    _validated_number(
+        planning, "centerline_simplify_hard_max_points",
+        minimum=2.0, maximum=256.0,
     )
     _validated_number(planning, "centerline_endpoint_repair_completion_ratio",
                       minimum=0.5, maximum=1.0)

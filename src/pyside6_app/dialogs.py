@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QComboBox, QMessageBox
 )
 from pyside6_app.styles import COLORS
-from config import save_json_atomic
+from config import save_json_atomic, DEFAULT_HARVESTER_PARAMS
 from runtime_paths import user_config_path
 import os
 
@@ -20,14 +20,14 @@ class LoadingProgress(QDialog):
         lo = QVBoxLayout(self)
         lo.setSpacing(12)
         self.lbl_message = QLabel(message)
-        self.lbl_message.setStyleSheet(f"font-size:13px;color:{COLORS['text']};")
+        self.lbl_message.setStyleSheet(f"font-size:14px;color:{COLORS['text']};")
         lo.addWidget(self.lbl_message)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         lo.addWidget(self.progress)
         self.lbl_detail = QLabel("")
-        self.lbl_detail.setStyleSheet(f"font-size:11px;color:{COLORS['text_dim']};")
+        self.lbl_detail.setStyleSheet(f"font-size:12px;color:{COLORS['text_dim']};")
         lo.addWidget(self.lbl_detail)
 
     def set_progress(self, val, detail=""):
@@ -135,12 +135,19 @@ class HarvesterParamsDialog(QDialog):
             "宽窄行中心线仍以掩膜/行带几何为准。"
         )
         lbl.setWordWrap(True)
-        lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
+        lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;")
         lo.addWidget(lbl)
         fm = QFormLayout()
         fm.setSpacing(8)
         fm.setContentsMargins(0, 8, 0, 8)
-        self.spin_cutter = self._spin(self._params.get("cutter_width_m", 1.8), 0.5, 6.0, 0.1)
+        self.spin_cutter = self._spin(
+            self._params.get(
+                "cutter_width_m", DEFAULT_HARVESTER_PARAMS["cutter_width_m"]
+            ),
+            0.5,
+            6.0,
+            0.1,
+        )
         fm.addRow(QLabel("割台有效割幅:"), self.spin_cutter)
         offset_value = self._params.get("cutter_forward_offset_m")
         self.spin_cutter_offset = self._spin(
@@ -154,11 +161,32 @@ class HarvesterParamsDialog(QDialog):
             "履带接地区域几何中心到割刀切割线的水平前向距离，必须实测"
         )
         fm.addRow(QLabel("割刀前置距离:"), self.spin_cutter_offset)
-        self.spin_track = self._spin(self._params.get("track_width_m", 0.45), 0.1, 1.0, 0.05)
+        self.spin_track = self._spin(
+            self._params.get(
+                "track_width_m", DEFAULT_HARVESTER_PARAMS["track_width_m"]
+            ),
+            0.1,
+            1.0,
+            0.05,
+        )
         fm.addRow(QLabel("履带宽度:"), self.spin_track)
-        self.spin_gauge = self._spin(self._params.get("track_gauge_m", 1.3), 0.5, 3.0, 0.1)
+        self.spin_gauge = self._spin(
+            self._params.get(
+                "track_gauge_m", DEFAULT_HARVESTER_PARAMS["track_gauge_m"]
+            ),
+            0.5,
+            3.0,
+            0.1,
+        )
         fm.addRow(QLabel("履带中心距:"), self.spin_gauge)
-        self.spin_track_length = self._spin(self._params.get("track_length_m", 1.7), 0.5, 6.0, 0.1)
+        self.spin_track_length = self._spin(
+            self._params.get(
+                "track_length_m", DEFAULT_HARVESTER_PARAMS["track_length_m"]
+            ),
+            0.5,
+            6.0,
+            0.1,
+        )
         fm.addRow(QLabel("履带接地长度:"), self.spin_track_length)
         self.spin_turn = self._spin(self._params.get("turn_radius_m", 2.0), 0.5, 6.0, 0.1)
         fm.addRow(QLabel("最小转弯半径:"), self.spin_turn)
@@ -215,7 +243,7 @@ class MachineRecommendationDialog(QDialog):
         lo = QVBoxLayout(self)
         lo.setSpacing(10)
         title = QLabel(self._recommendation.get("title", "启发式农机参数候选"))
-        title.setStyleSheet(f"font-size:15px;font-weight:600;color:{COLORS['text_bright']};")
+        title.setStyleSheet(f"font-size:16px;font-weight:600;color:{COLORS['text_bright']};")
         lo.addWidget(title)
 
         edit = QTextEdit()

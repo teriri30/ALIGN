@@ -18,6 +18,7 @@ from config import (
     Config,
     AppLogger,
     save_json_atomic,
+    DEFAULT_HARVESTER_PARAMS,
     HARVESTER_PARAM_KEYS,
     HARVESTER_PARAM_SOURCE_LABELS,
     MASK_PROCESSING_STRENGTH,
@@ -26,6 +27,7 @@ from state import AppState, AutoPathSegment, PathPoint
 from geo import GeoUtils
 from inference import ModelEngine, scan_model_dir
 from pyside6_app.image_view import DISPLAY_LAYER_KEYS, ImageViewerGroup
+from pyside6_app.harvester_visual import HarvesterItem
 from pyside6_app.panels import (
     TASK_PANEL_COMPACT_MIN_WIDTH,
     TaskPanel,
@@ -33,6 +35,7 @@ from pyside6_app.panels import (
     LogPanel,
     RouteInfoPanel,
 )
+from pyside6_app.ui_motion import BreathingDot
 from pyside6_app.top_bar import TopToolbar
 from pyside6_app.workers import (
     PipelineWorker, MaskProcessWorker, CenterlineCatalogWorker, PlanWorker, TifLoadWorker,
@@ -109,6 +112,10 @@ class MainWindow(QMainWindow):
         self._anim_engine: Optional[AnimationEngine] = None
         self._anim_timer: Optional[QTimer] = None
         self._anim_overlay_items = []
+        # 真实机器视觉层（与足迹校验模型分离）
+        self._harvester_item: Optional[HarvesterItem] = None
+        self._cut_swath_item = None
+        self._anim_phase = 0.0
         # 田块边界绘制状态
         self._field_drawing = False
         self._field_pts: List[Tuple[int, int]] = []
@@ -564,8 +571,26 @@ class MainWindow(QMainWindow):
         self.image_view.animation_seek_requested.connect(self._on_animation_seek)
         self.image_view.animation_speed_requested.connect(self._on_animation_speed)
 
+    def set_status_text(self, text, tone="idle"):
+        """Single entry point for the status bar text + its tone dot."""
+        self.lbl_status.setText(str(text))
+        dot = getattr(self, "status_dot", None)
+        if dot is not None:
+            tone_colors = {
+                "busy": COLORS.get("accent", "#34D399"),
+                "ready": COLORS.get("green", "#34D399"),
+                "error": COLORS.get("red", "#E85D63"),
+                "idle": COLORS.get("text_dim", "#94A3B8"),
+            }
+            dot.set_tone(tone, tone_colors.get(tone, COLORS.get("text_dim", "#94A3B8")))
+
     def _build_statusbar(self):
         self.status_bar = QStatusBar()
+        # Runtime dot in front of the status text. Reference behaviour: the
+        # dot breathes (1.2 s) while a job runs, is solid green when ready and
+        # red on failure — the text alone reads as static.
+        self.status_dot = BreathingDot(7)
+        self.status_dot.set_tone("idle", COLORS.get("text_dim", "#94A3B8"))
         self.lbl_status = QLabel("就绪")
         self.lbl_speed = QLabel("")
         self.progress_bar = QProgressBar(); self.progress_bar.setMaximumWidth(180)
@@ -577,6 +602,7 @@ class MainWindow(QMainWindow):
         self.btn_cancel_task.setFixedHeight(22)
         self.btn_cancel_task.hide()
         self.btn_cancel_task.clicked.connect(self._cancel_background_worker)
+        self.status_bar.addWidget(self.status_dot)
         self.status_bar.addWidget(self.lbl_status, 1)
         self.status_bar.addPermanentWidget(self.lbl_speed)
         self.status_bar.addPermanentWidget(self.btn_cancel_task)
@@ -699,7 +725,7 @@ class MainWindow(QMainWindow):
             self.task_panel.set_task_status("plan", "available", text="已取消")
         if self._worker and hasattr(self._worker, 'cancel'):
             self._worker.cancel()
-        self.lbl_status.setText("正在取消当前任务...")
+        self.set_status_text("正在取消当前任务...", "busy")
         self.log_panel.info("已请求取消当前任务")
         if hasattr(self, 'btn_cancel_task'):
             self.btn_cancel_task.setEnabled(False)
@@ -740,7 +766,7 @@ class MainWindow(QMainWindow):
             self.btn_cancel_task.setEnabled(True)
         self.top_toolbar.set_progress(0)
         self.top_toolbar.set_worker_cancel_visible(False)
-        self.lbl_status.setText("已取消，可重试")
+        self.set_status_text("已取消，可重试", "idle")
         self.log_panel.info("当前任务已取消，可重新执行")
         self._sync_task_statuses()
         self.top_toolbar.refresh_actions(self.state)
@@ -772,7 +798,7 @@ class MainWindow(QMainWindow):
             return
         self._close_cancel_warning_shown = True
         message = "后台任务仍在取消中，请等待当前计算阶段安全退出后自动关闭。"
-        self.lbl_status.setText(message)
+        self.set_status_text(message, "busy")
         self.log_panel.info(message)
         self._log.info(message)
 
@@ -853,7 +879,7 @@ class MainWindow(QMainWindow):
         self.top_toolbar.set_progress(0)
         self.top_toolbar.set_worker_cancel_visible(False)
         title, message = self._task_error_message(msg)
-        self.lbl_status.setText(title)
+        self.set_status_text(title, "error")
         self.log_panel.error(f"{title}: {msg[:300]}")
         if self._worker_thread:
             self._worker_thread.quit()
@@ -901,6 +927,14 @@ class MainWindow(QMainWindow):
             self.task_panel.set_task_status(
                 "centerline_generate", "failed", text="无有效中心线"
             )
+            layout = dict(result.get("layout") or {})
+            geometry = dict(layout.get("field_boundary_geometry") or {})
+            if geometry.get("repaired"):
+                self.log_panel.warn(
+                    "田块边界闭合点重复，已自动修复后继续生成作业线"
+                )
+            for reason in layout.get("centerline_hard_reasons") or []:
+                self.log_panel.warn(str(reason))
             self.log_panel.warn("当前没有可供选择的有效中心线")
             self._clear_task_token_if_current("centerline", payload)
             return
@@ -941,6 +975,12 @@ class MainWindow(QMainWindow):
             "请在’选择作业线’步骤勾选；取消勾选的作业线会隐藏且不进入路径，"
             "选好后再设置起点并生成作业路线"
         )
+        geometry = dict((result.get("layout") or {}).get("field_boundary_geometry") or {})
+        if geometry.get("repaired"):
+            self.log_panel.info(
+                "田块边界闭合点重复，已按圈选轮廓自动修复"
+                f"（丢弃面积 {float(geometry.get('dropped_area_ratio', 0.0)) * 100:.4f}%）"
+            )
         self._persist_centerline_selection()
         self._clear_task_token_if_current("centerline", payload)
 
@@ -1671,6 +1711,21 @@ class MainWindow(QMainWindow):
             }
             restored_state.update(self._cache_model_identity_updates(saved))
             restored_state.update(path_restore["state_updates"])
+            # A cache written before the closing-loop repair can still hold a
+            # self-intersecting outline.  Repair it on restore as well, so an
+            # existing project is usable without redrawing the field; an
+            # unrepairable outline is kept verbatim and fails closed downstream.
+            cached_boundary = list(restored_state.get('field_boundary') or [])
+            if len(cached_boundary) >= 3:
+                boundary_points, boundary_report = self._normalise_field_boundary(
+                    cached_boundary
+                )
+                if boundary_points is not None:
+                    restored_state['field_boundary'] = boundary_points
+                    if boundary_report.get("repaired"):
+                        self.log_panel.info(
+                            "缓存中的田块边界闭合点重复，已自动修复"
+                        )
             # Cache schema before this marker could not distinguish a deliberate
             # popup selection from an accidental wheel mutation. Migrate such a
             # non-contour value back to the documented default and invalidate
@@ -3464,7 +3519,14 @@ class MainWindow(QMainWindow):
         if len(self._field_pts) < 3:
             self.log_panel.error("至少需要 3 个点")
             return
-        area_m2 = self._field_area_m2(self._field_pts)
+        points, geometry_report = self._normalise_field_boundary(self._field_pts)
+        if points is None:
+            self.log_panel.error(
+                "田块边界自相交，且截掉的面积超过允许范围，无法在不改变圈选范围的前提下修复；"
+                "请重新圈选田块边界"
+            )
+            return
+        area_m2 = self._field_area_m2(points)
         had_analysis = bool(
             getattr(self.state, "inference_done", False)
             or getattr(self.state, "mask_processed", False)
@@ -3472,7 +3534,7 @@ class MainWindow(QMainWindow):
         )
         self._save_system_undo("田块圈选")
         self.state.safe_update(
-            field_boundary=list(self._field_pts),
+            field_boundary=list(points),
             field_area_m2=area_m2,
             forbidden_regions=[],
             forbidden_regions_confirmed=False,
@@ -3485,12 +3547,37 @@ class MainWindow(QMainWindow):
         self._field_drawing = False
         self._sync_drawing_mode()
         self._draw_field_boundary()
-        area_info = self._estimate_field_area(self._field_pts)
-        self.log_panel.success(f"田块已设置: {len(self._field_pts)} 个顶点 | 面积 = {area_info}")
-        self._journal.info(f"田块已设置: {len(self._field_pts)} 个顶点, 面积={area_info}")
+        area_info = self._estimate_field_area(points)
+        if geometry_report.get("repaired"):
+            self.log_panel.info(
+                "田块边界闭合处存在重复点击形成的自相交，已按圈选轮廓自动修复"
+                f"（丢弃面积 {float(geometry_report.get('dropped_area_ratio', 0.0)) * 100:.4f}%）"
+            )
+        self.log_panel.success(f"田块已设置: {len(points)} 个顶点 | 面积 = {area_info}")
+        self._journal.info(f"田块已设置: {len(points)} 个顶点, 面积={area_info}")
         self.task_panel.set_task_status("draw_field", "done")
         self._sync_task_statuses()
         WorkflowUpdater.advance(self.state, "BOUNDARY_SET")
+
+    @staticmethod
+    def _normalise_field_boundary(points):
+        """Return a simple field ring plus the repair report, or ``(None, report)``.
+
+        A double click on the closing vertex appends duplicate vertices a few
+        pixels from the first one and turns the ring into a bow-tie.  Every
+        shapely-based boundary gate then rejects everything, which surfaced much
+        later as "无有效中心线".  Repair that closing loop here so the stored
+        boundary is the ring the operator actually meant.
+
+        The result stays a plain list of ``(x, y)`` tuples: ``field_boundary`` is
+        persisted, undone and compared as ordinary JSON-like data.
+        """
+        from row_geometry import sanitize_field_polygon_report
+
+        polygon, report = sanitize_field_polygon_report(points)
+        if polygon is None:
+            return None, report
+        return [(float(point[0]), float(point[1])) for point in polygon], report
 
     @staticmethod
     def _polygon_area_px(pts):
@@ -4982,11 +5069,18 @@ class MainWindow(QMainWindow):
         self._on_segment()
     @Slot(int, str)
     def _on_progress(self, pct, msg):
-        self.progress_bar.setValue(pct); self.top_toolbar.set_progress(pct, msg); self.lbl_status.setText(msg)
-        if getattr(self, '_model_load_in_progress', False):
-            # Model construction is not a scientific pipeline stage.  Keep
-            # the AI row visibly busy without pretending that inference has
-            # started or that a mask exists.
+        """进度只由**真实在跑的任务**驱动，绝不按百分比猜步骤。
+
+        旧实现末尾有 `pct < 30 -> segment / < 70 -> process / else plan`
+        三段兜底：任何一次进度事件（包括启动时加载模型）都会把"作物识别"
+        标成"处理中 25%"，即使还没圈选田块、也没点过处理。任务行状态必须
+        来自 state 里的运行标志，进度条只负责显示数值。
+        """
+        self.progress_bar.setValue(pct)
+        self.top_toolbar.set_progress(pct, msg)
+        self.set_status_text(msg, "busy")
+        if getattr(self.state, 'inference_running', False):
+            self.state.inference_progress = max(0.0, min(1.0, pct / 100.0))
             self.task_panel.set_task_status("segment", "in_progress", pct)
         elif getattr(self.state, 'mask_processing_running', False):
             self.state.mask_processing_progress = max(0.0, min(1.0, pct / 100.0))
@@ -4998,12 +5092,7 @@ class MainWindow(QMainWindow):
             self.task_panel.set_task_status(
                 "centerline_generate", "in_progress", pct, text="生成作业线"
             )
-        elif pct < 30:
-            self.task_panel.set_task_status("segment", "in_progress", pct)
-        elif pct < 70:
-            self.task_panel.set_task_status("process", "in_progress", pct)
-        else:
-            self.task_panel.set_task_status("plan", "in_progress", pct)
+        # 模型加载等非流水线阶段：只更新状态栏和进度条，不碰任务行。
 
     @staticmethod
     def _coerce_points(points):
@@ -5534,20 +5623,25 @@ class MainWindow(QMainWindow):
         field_boundary = getattr(self.state, "field_boundary", None) or []
         if len(field_boundary) >= 3:
             from path_planner import segment_within_field_boundary
+            from row_geometry import sanitize_field_polygon
 
-            polygon = np.asarray(field_boundary, dtype=np.float64)
-            for segment_index, segment in enumerate(full_path):
-                segment_type = (
-                    segment_types[segment_index]
-                    if segment_index < len(segment_types)
-                    else ("work" if segment_index % 2 == 0 else "turn")
-                )
-                if not segment_within_field_boundary(segment, polygon):
-                    self._confirm_export_risk(
-                        "导出确认",
-                        "route segment leaves field boundary; formal export is blocked: "
-                        f"segment={segment_index}, type={segment_type}",
+            # Same geometry the planner gates on: a self-intersecting outline
+            # would otherwise reject every segment (fail closed for the wrong
+            # reason) instead of the repaired ring the operator drew.
+            polygon = sanitize_field_polygon(field_boundary)
+            if polygon is not None:
+                for segment_index, segment in enumerate(full_path):
+                    segment_type = (
+                        segment_types[segment_index]
+                        if segment_index < len(segment_types)
+                        else ("work" if segment_index % 2 == 0 else "turn")
                     )
+                    if not segment_within_field_boundary(segment, polygon):
+                        self._confirm_export_risk(
+                            "导出确认",
+                            "route segment leaves field boundary; formal export is blocked: "
+                            f"segment={segment_index}, type={segment_type}",
+                        )
         if manual_compatibility_route:
             # A dragged control route is intentionally no longer the untouched
             # output of the automatic planner, so its old path-stage
@@ -6470,7 +6564,7 @@ class MainWindow(QMainWindow):
         narrow_count = len([b for b in all_bands if b.get("band_type") == "narrow"])
 
         # 详细友好提示
-        message = f"✅ 掩膜优化完成\n"
+        message = f"掩膜优化完成\n"
         message += f"   识别结果：{len(wide_bands)} 条4行主体区"
         if narrow_count > 0:
             message += f" + {narrow_count} 条2行边缘区"
@@ -7431,6 +7525,7 @@ class MainWindow(QMainWindow):
         self.image_view.set_animation_controls_visible(False)
         self.lbl_speed.clear()
         self._clear_anim_overlay()
+        self._dispose_harvester_item()
         try:
             if path:
                 self._show_path(path)
@@ -7456,6 +7551,7 @@ class MainWindow(QMainWindow):
             self.image_view.set_animation_controls_visible(False)
             self.lbl_speed.clear()
             self.log_panel.info("已结束演示")
+            self._dispose_harvester_item()
             self._show_path(
                 self._path_result_from_state()
                 or (self._pipeline_result or {}).get("path", {})
@@ -7482,6 +7578,8 @@ class MainWindow(QMainWindow):
         if continuous_path:
             self._show_path(continuous_path)
         try:
+            self._dispose_harvester_item()
+            self._anim_phase = 0.0
             self._anim_engine = AnimationEngine(self.state, self.geo)
             self._anim_engine.setup(segments)
             # 首帧立即绘制，既让用户看到演示已经接管画布，也把几何/参数
@@ -7551,6 +7649,7 @@ class MainWindow(QMainWindow):
                 self.image_view.set_animation_controls_visible(False)
                 self.lbl_speed.clear()
                 self.log_panel.info("演示完成")
+                self._dispose_harvester_item()
                 report = self._anim_engine._gen_report()
                 if report:
                     self.log_panel.info(report)
@@ -7619,12 +7718,9 @@ class MainWindow(QMainWindow):
         else:
             point, heading = pos
             px, py = point
-        viewer = self.image_view.viewer
-        self._clear_anim_overlay()
-        before = len(viewer._overlay_group)
-        ix, iy = int(px), int(py)
-        self._draw_harvester_pose(ix, iy, heading)
-        self._anim_overlay_items = list(viewer._overlay_group[before:])
+        if not getattr(self.state, "anim_paused", False):
+            self._anim_phase += 0.033
+        self._update_harvester_item(px, py, heading)
 
     def _draw_harvester_pose(self, x, y, heading):
         """Draw the same canonical planar geometry used by footprint validation."""
@@ -7690,6 +7786,105 @@ class MainWindow(QMainWindow):
             color=(255, 255, 0),
             scene_scaled=True,
         )
+
+    def _update_harvester_item(self, x, y, heading):
+        """Place the detailed visual machine at the animation pose."""
+        viewer = self.image_view.viewer
+        scene = getattr(viewer, "_scene", None)
+        if scene is None:
+            return
+        if self._harvester_item is None:
+            stale = True
+        else:
+            try:
+                stale = self._harvester_item.scene() is not scene
+            except RuntimeError:
+                stale = True
+        if stale:
+            self._dispose_harvester_item()
+            params = self._effective_harvester_params(
+                getattr(self.state, "harvester_params", {}) or {}
+            )
+            self._harvester_item = HarvesterItem(params)
+            scene.addItem(self._harvester_item)
+        try:
+            ppm = self.geo.pixels_per_meter(x, y) if self.geo.is_ready() else 20.0
+        except Exception:
+            ppm = 20.0
+        ppm = max(2.0, float(ppm))
+        self._harvester_item.set_pose(x, y, heading, ppm, self._anim_phase)
+        self._update_cut_swath(viewer, x, y, heading, ppm)
+
+    def _update_cut_swath(self, viewer, x, y, heading, ppm):
+        """Draw the already-cut swath as a wide stroke along the worked path."""
+        from PySide6.QtGui import QColor, QPainterPath, QPen
+        from PySide6.QtWidgets import QGraphicsPathItem
+
+        scene = getattr(viewer, "_scene", None)
+        if scene is None:
+            return
+        if self._cut_swath_item is None:
+            stale = True
+        else:
+            try:
+                stale = self._cut_swath_item.scene() is not scene
+            except RuntimeError:
+                stale = True
+        if stale:
+            self._cut_swath_item = QGraphicsPathItem()
+            self._cut_swath_item.setZValue(18)
+            scene.addItem(self._cut_swath_item)
+
+        pts = list(getattr(self.state, "anim_all_pts", []) or [])
+        types = list(getattr(self.state, "anim_all_types", []) or [])
+        frame = int(getattr(self.state, "anim_frame", 0) or 0)
+        if not pts:
+            return
+        end = min(len(pts), frame + 1)
+        step = max(1, end // 700)
+        indices = list(range(0, end, step))
+        if indices and indices[-1] != end - 1:
+            indices.append(end - 1)
+        path = QPainterPath()
+        started = False
+        for index in indices:
+            if types and index < len(types) and types[index] != "work":
+                started = False
+                continue
+            px, py = pts[index]
+            if not started:
+                path.moveTo(float(px), float(py))
+                started = True
+            else:
+                path.lineTo(float(px), float(py))
+        if types and 0 <= frame < len(types) and types[frame] == "work":
+            import math
+            offset = float(self._harvester_item.cutter_x)
+            path.lineTo(
+                float(x) + math.cos(heading) * offset,
+                float(y) + math.sin(heading) * offset,
+            )
+
+        pen = QPen(QColor(214, 205, 130, 150))
+        pen.setWidthF(max(2.0, float(self._harvester_item.cw) * ppm))
+        pen.setCapStyle(Qt.FlatCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        self._cut_swath_item.setPen(pen)
+        self._cut_swath_item.setPath(path)
+
+    def _dispose_harvester_item(self):
+        """Remove the visual machine and cut swath from the scene."""
+        for attr in ("_harvester_item", "_cut_swath_item"):
+            item = getattr(self, attr, None)
+            if item is None:
+                continue
+            try:
+                scene = item.scene()
+                if scene is not None:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+            setattr(self, attr, None)
 
     def _on_export_geojson(self):
         path, _ = QFileDialog.getSaveFileName(self, "导出 GeoJSON", "path_result.geojson", "GeoJSON (*.geojson)")
@@ -8527,7 +8722,9 @@ class MainWindow(QMainWindow):
             "total_length_m": validation.get("total_length_m", 0),
             "area_m2": validation.get("harvest_area_m2", 0),
             "turn_strategy": getattr(self.state, 'turn_strategy', 'auto'),
-            "cutter_width": getattr(self.state, 'harvester_params', {}).get('cutter_width_m', 1.8),
+            "cutter_width": getattr(self.state, 'harvester_params', {}).get(
+                'cutter_width_m', DEFAULT_HARVESTER_PARAMS["cutter_width_m"]
+            ),
         }
         extra = []
         if "crop_mask_geometric_coverage_pct" in validation:

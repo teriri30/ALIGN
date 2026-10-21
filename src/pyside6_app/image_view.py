@@ -2,7 +2,7 @@
 image_view.py — 可缩放/平移/覆盖绘制的图像显示控件
 """
 import numpy as np
-from PySide6.QtCore import Qt, QRectF, QPoint, QPointF, Signal
+from PySide6.QtCore import Qt, QRectF, QPoint, QPointF, Signal, QSize
 from PySide6.QtGui import (
     QPainter, QPen, QColor, QBrush, QPixmap, QImage,
     QWheelEvent, QMouseEvent, QKeyEvent, QTransform, QFont,
@@ -16,6 +16,9 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
 )
 from pyside6_app.styles import COLORS
+from pyside6_app.ui_icons import (
+    point_icon, line_icon, area_icon, chevron_icon, plus_icon, minus_icon,
+)
 
 
 def _is_dark_theme():
@@ -831,7 +834,7 @@ class ImageViewerGroup(QWidget):
         return (
             f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
             f"border:1px solid {COLORS['border']};border-radius:4px;"
-            f"padding:2px 4px;font-size:11px;min-height:20px;}}"
+            f"padding:2px 4px;font-size:12px;min-height:20px;}}"
             f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
             f"QPushButton:pressed{{background:{COLORS['accent_bg']};}}"
         )
@@ -909,17 +912,24 @@ class ImageViewerGroup(QWidget):
         tbar.addWidget(bf); self._tb_buttons.append(bf)
 
         # 缩放
-        bz = QPushButton("\uff0b")
+        bz = QPushButton()
+        bz.setIcon(plus_icon(COLORS['text']))
+        bz.setIconSize(QSize(14, 14))
         bz.setFixedWidth(30)
+        bz.setToolTip("放大")
         bz.setStyleSheet(style)
         bz.clicked.connect(self.viewer.zoom_in)
         tbar.addWidget(bz); self._tb_buttons.append(bz)
 
-        bo = QPushButton("\u2212")
+        bo = QPushButton()
+        bo.setIcon(minus_icon(COLORS['text']))
+        bo.setIconSize(QSize(14, 14))
         bo.setFixedWidth(30)
+        bo.setToolTip("缩小")
         bo.setStyleSheet(style)
         bo.clicked.connect(self.viewer.zoom_out)
         tbar.addWidget(bo); self._tb_buttons.append(bo)
+        self._zoom_buttons = (bz, bo)
 
         # 分隔
         self._tb_sep = QFrame()
@@ -982,7 +992,8 @@ class ImageViewerGroup(QWidget):
         self.display_toggle_button = QToolButton()
         self.display_toggle_button.setObjectName("displayToggleButton")
         self.display_toggle_button.setText("显示")
-        self.display_toggle_button.setArrowType(Qt.RightArrow)
+        self.display_toggle_button.setIcon(chevron_icon(False, COLORS['text']))
+        self.display_toggle_button.setIconSize(QSize(12, 12))
         self.display_toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.display_toggle_button.setFixedWidth(58)
         self.display_toggle_button.setToolTip("展开或收起图层显示开关")
@@ -990,12 +1001,14 @@ class ImageViewerGroup(QWidget):
         tbar.addWidget(self.display_toggle_button)
 
         self._measure_buttons = {}
-        for text, tool, tip in [
-            ("•", "point", "点选查看经纬度"),
-            ("/", "line", "两点测量长度"),
-            ("□", "area", "闭合多边形测量面积"),
+        for icon_fn, tool, tip in [
+            (point_icon, "point", "点选查看经纬度"),
+            (line_icon, "line", "两点测量长度"),
+            (area_icon, "area", "闭合多边形测量面积"),
         ]:
-            btn = QPushButton(text)
+            btn = QPushButton()
+            btn.setIcon(icon_fn(COLORS['text']))
+            btn.setIconSize(QSize(16, 16))
             btn.setFixedWidth(30)
             btn.setCheckable(True)
             btn.setStyleSheet(style)
@@ -1010,7 +1023,7 @@ class ImageViewerGroup(QWidget):
 
         # 坐标
         self.lbl_coord = QLabel("x:0  y:0")
-        self.lbl_coord.setStyleSheet(f"color:{COLORS['text_dim']};font-size:11px;")
+        self.lbl_coord.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
         tbar.addWidget(self.lbl_coord)
         tbar.addStretch()
 
@@ -1151,11 +1164,11 @@ class ImageViewerGroup(QWidget):
         self.display_layers_panel.move(anchor)
         self.display_layers_panel.show()
         self.display_layers_panel.raise_()
-        self.display_toggle_button.setArrowType(Qt.DownArrow)
+        self.display_toggle_button.setIcon(chevron_icon(True, COLORS['text']))
 
     def _on_display_layers_popup_hidden(self):
         if hasattr(self, "display_toggle_button"):
-            self.display_toggle_button.setArrowType(Qt.RightArrow)
+            self.display_toggle_button.setIcon(chevron_icon(False, COLORS['text']))
 
     def _resize_display_layers_popup(self):
         """Fit the popup to visible tree rows, not to unavailable placeholders."""
@@ -1465,6 +1478,19 @@ class ImageViewerGroup(QWidget):
         style = self._tb_btn_style()
         for btn in self._tb_buttons:
             btn.setStyleSheet(style)
+        measure_icons = {"point": point_icon, "line": line_icon, "area": area_icon}
+        for tool, button in getattr(self, "_measure_buttons", {}).items():
+            icon_fn = measure_icons.get(tool)
+            if icon_fn is not None:
+                button.setIcon(icon_fn(COLORS['text']))
+        zoom_in, zoom_out = getattr(self, "_zoom_buttons", (None, None))
+        if zoom_in is not None:
+            zoom_in.setIcon(plus_icon(COLORS['text']))
+        if zoom_out is not None:
+            zoom_out.setIcon(minus_icon(COLORS['text']))
+        if hasattr(self, "display_toggle_button"):
+            self.display_toggle_button.setIcon(
+                chevron_icon(self.display_layers_panel.isVisible(), COLORS['text']))
         if hasattr(self, '_tb_sep'):
             self._tb_sep.setStyleSheet(f"background:{COLORS['border']};max-width:1px;")
         if hasattr(self, '_tb_sep_tools'):
@@ -1473,7 +1499,7 @@ class ImageViewerGroup(QWidget):
             self.display_toggle_button.setStyleSheet(
                 f"QToolButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
                 f"border:1px solid {COLORS['border']};border-radius:4px;"
-                f"padding:2px 4px;font-size:11px;min-height:20px;}}"
+                f"padding:2px 4px;font-size:12px;min-height:20px;}}"
                 f"QToolButton:hover{{background:{COLORS['bg_hover']};}}"
             )
         if hasattr(self, 'display_layers_panel'):
@@ -1486,14 +1512,14 @@ class ImageViewerGroup(QWidget):
             for button in getattr(self, '_display_panel_buttons', []):
                 button.setStyleSheet(self._tb_btn_style())
         if hasattr(self, 'lbl_coord'):
-            self.lbl_coord.setStyleSheet(f"color:{COLORS['text_dim']};font-size:11px;")
+            self.lbl_coord.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
         if hasattr(self, 'animation_bar'):
             self.animation_bar.setStyleSheet(
                 f"QWidget#animationBar{{background:{COLORS['bg_dark']};"
                 f"border-top:1px solid {COLORS['border']};}}"
             )
             self.anim_progress_label.setStyleSheet(
-                f"color:{COLORS['text_dim']};font-size:11px;"
+                f"color:{COLORS['text_dim']};font-size:12px;"
             )
         if hasattr(self, 'route_display_bar'):
             self.route_display_bar.setStyleSheet(
@@ -1501,7 +1527,7 @@ class ImageViewerGroup(QWidget):
                 f"border-top:1px solid {COLORS['border']};}}"
             )
             self.route_display_info_label.setStyleSheet(
-                f"color:{COLORS['text_dim']};font-size:11px;"
+                f"color:{COLORS['text_dim']};font-size:12px;"
             )
         # 更新 ImageViewer 背景
         if hasattr(self.viewer, '_scene'):

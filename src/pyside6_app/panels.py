@@ -1,7 +1,10 @@
 import math
 import time
-from PySide6.QtCore import Qt, Signal, QMimeData
-from PySide6.QtGui import QDrag, QFont
+from PySide6.QtCore import (
+    Qt, Signal, QMimeData, QSize, QEasingCurve, QParallelAnimationGroup,
+    QPropertyAnimation, QRectF, QTimer,
+)
+from PySide6.QtGui import QDrag, QFont, QPainter, QColor, QPen, QBrush, QPainterPath
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QScrollArea, QFrame, QTextEdit, QToolButton, QMenu,
@@ -9,6 +12,11 @@ from PySide6.QtWidgets import (
 )
 from pyside6_app.styles import COLORS
 from pyside6_app.task_state import TASK_ORDER
+from pyside6_app.ui_icons import chevron_icon, check_icon
+from pyside6_app.ui_motion import (
+    BACK_OUT, BobIcon, BreathingDot, ChevronToggle, ShimmerBar,
+    SpringButton, tween_value,
+)
 
 UI_FONT = '"Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif'
 
@@ -43,12 +51,13 @@ TASK_DEFS = [
     {"id": "entry", "label": "起点（必选）", "hint": "可自由布设或拖动；规划必须从离起点最近的作业线端点开始。", "color": "#589C94", "action": "布设"},
     {
         "id": "exit",
-        "label": "终点（可选）",
+        "label": "终点（选填）",
         "hint": "默认沿最终作业段延伸并写入终端文件；可在画布上拖动调整。",
         "color": "#C76B6B",
         "action": "调整",
+        "optional": True,
     },
-    {"id": "unload", "label": "卸粮点（可选）", "hint": "按需要添加一个或多个卸粮点，可为空。", "color": "#C9A64A", "action": "布设"},
+    {"id": "unload", "label": "卸粮点（选填）", "hint": "按需要添加一个或多个卸粮点，可为空。", "color": "#C9A64A", "action": "布设", "optional": True},
     {"id": "plan", "label": "路径规划", "hint": "生成完整收割路径（含转弯、进出场）。", "color": "#589862", "action": "生成"},
     {"id": "simulate", "label": "模拟演示", "hint": "沿规划路径模拟农机运动，检验可行性。", "color": "#4C8C7C", "action": "演示"},
     {
@@ -86,56 +95,130 @@ class TaskRow(QWidget):
         super().__init__(parent)
         self.setObjectName("taskRow")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setMinimumHeight(44)
         self.setStyleSheet("#taskRow{background:transparent;}")
         self.tid = task_def["id"]
         self._color = task_def["color"]
         self._done = False
+        self._status_key = "pending"
+        self._in_progress = False
         self._status_text = "待处理"
-        lo = QHBoxLayout(self)
-        lo.setContentsMargins(8, 3, 8, 3)
-        lo.setSpacing(7)
+        self._blocker = ""
+        self._flash = ""           # 点击后短暂显示的阻塞原因
+        self._flash_until = 0.0    # monotonic 时间戳
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._clear_flash)
+        # 两行结构：第一行标题，第二行"状态 + 按钮"。
+        # 之前把按钮放到第三行，44 px 的行高装不下，按钮被卡片边界裁掉；
+        # 现在固定两行，行高由 sizeHint 决定，所有子控件都在布局里。
         self._badge = QLabel("")
         self._badge.setFixedSize(14, 14)
-        self._badge.setStyleSheet(f"background:{task_def['color']};border-radius:3px;")
-        lo.addWidget(self._badge)
+        self._badge.setVisible(False)   # replaced by the breathing status dot
         self._label = QLabel(task_def["label"])
         self._label.setFont(QFont("Microsoft YaHei UI", 10))
-        self._label.setStyleSheet(f"color:{COLORS['text']};font-size:13px;font-family:{UI_FONT};")
+        self._optional = bool(task_def.get("optional", False))
+        # Optional steps carry their marking in the label itself ("（选填）")
+        # plus an accent tone: a separate chip overflowed the compact panel.
+        self._label.setStyleSheet(
+            f"color:{COLORS.get('text_accent', COLORS['text']) if self._optional else COLORS['text']};"
+            f"font-size:14px;font-family:{UI_FONT};"
+        )
         self._label.setMinimumWidth(0)
+        self._optional_tip = "选填步骤：可以跳过，但一旦设置会改变生成的路径结果"
         self._label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        lo.addWidget(self._label, 1)
+
         self._status = QLabel(self._status_text)
         self._status.setFont(QFont("Microsoft YaHei UI", 9))
-        self._status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._status.setMinimumWidth(0)
-        self._status.setStyleSheet(f"color:{COLORS['text_dim']};font-size:11px;font-family:{UI_FONT};")
-        lo.addWidget(self._status)
-        self._action_btn = QPushButton(task_def["action"])
-        self._action_btn.setMinimumSize(58, 28)
-        self._action_btn.setMaximumHeight(30)
+        self._status.setStyleSheet(
+            f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};"
+        )
+
+        self._action_btn = SpringButton(task_def["action"])
+        self._action_btn.setFixedSize(58, 28)
         self._action_btn.setStyleSheet(
-            f"QPushButton{{background:{task_def['color']};color:white;border:none;"
-            f"border-radius:6px;font-size:12px;font-weight:600;padding:0;font-family:{UI_FONT};}}"
+            f"QPushButton{{background:{COLORS['accent']};color:{COLORS['on_accent']};"
+            f"border:none;border-radius:6px;font-size:13px;font-weight:600;padding:0;"
+            f"font-family:{UI_FONT};}}"
+            f"QPushButton:hover{{background:{COLORS['accent_hover']};}}"
         )
         self._action_btn.clicked.connect(lambda: self.clicked.emit(self.tid))
-        lo.addWidget(self._action_btn)
-        self._delete_btn = QPushButton("回退")
-        self._delete_btn.setMinimumSize(52, 28)
-        self._delete_btn.setMaximumHeight(30)
+
+        self._delete_btn = SpringButton("回退")
+        self._delete_btn.setFixedSize(52, 28)
         self._delete_btn.setToolTip("回退到此步骤之前，并清除后续结果")
-        self._delete_btn.setStyleSheet(
-            "QPushButton{background:#7A4D3B;color:white;border:none;"
-            f"border-radius:6px;font-size:12px;font-weight:600;padding:0;font-family:{UI_FONT};}}"
-            "QPushButton:hover{background:#9A654D;}"
-        )
+        self._delete_btn.setStyleSheet(self._secondary_button_style())
         self._delete_btn.clicked.connect(lambda: self.delete_clicked.emit(self.tid))
-        lo.addWidget(self._delete_btn)
+
+        self._busy = BreathingDot(8)
+        self._busy.setVisible(False)
+        self._progress = ShimmerBar()
+        self._progress.setVisible(False)
+        self._progress.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(6)
+        title_row.addWidget(self._busy)
+        title_row.addWidget(self._label, 1)
+
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(6)
+        action_row.addWidget(self._status, 1)
+        action_row.addWidget(self._action_btn)
+        action_row.addWidget(self._delete_btn)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 4, 8, 4)
+        outer.setSpacing(4)
+        outer.addLayout(title_row)
+        outer.addLayout(action_row)
+        outer.addWidget(self._progress)
+        # 行高由布局实际 sizeHint 决定：进度条显示/隐藏时高度会变，
+        # 写死一个数值就会出现"进度条压住按钮"或"按钮被裁"。
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self._sync_row_height()
+        self._update_badge()
+
+    def _sync_row_height(self):
+        """按当前子控件（含进度条）的实际高度重算行高。"""
+        lay = self.layout()
+        if lay is None:
+            return
+        lay.invalidate()
+        lay.activate()
+        self.setMinimumHeight(max(56, int(lay.sizeHint().height())))
+
+    def flash_blocker(self, message):
+        """在一行内就地显示"为什么现在不能做"，2.6 秒后自动复原。"""
+        self._flash = str(message or "")
+        if not self._flash:
+            return
+        self._flash_timer.start(2600)
+        self._render_flash()
+
+    def _clear_flash(self):
+        self._flash = ""
+        self._render_flash()
+
+    def _render_flash(self):
+        if self._flash:
+            self._status.setText(self._flash)
+            self._status.setStyleSheet(
+                f"color:{COLORS.get('orange', '#E8A33D')};font-size:12px;"
+                f"font-family:{UI_FONT};font-weight:600;"
+            )
+        else:
+            self._status.setText(self._status_text)
+            self.refresh_theme()
 
     def set_status(self, done=False, enabled=True, in_progress=False, progress_pct=-1, text=None, status="pending"):
         self._done = bool(done)
         self._in_progress = bool(in_progress)
         self._status_key = status
+        self._progress_pct = progress_pct
         self.setEnabled(bool(enabled))
         self._action_btn.setEnabled(bool(enabled))
         if text:
@@ -158,15 +241,30 @@ class TaskRow(QWidget):
             color = COLORS.get('red', '#E85D63')
         else:
             color = COLORS.get('text_dim', '#8B909A')
-        self._status.setText(display_text)
-        self._status.setStyleSheet(f"color:{color};font-size:11px;font-family:{UI_FONT};")
-        opacity = "1.0" if enabled else "0.55"
-        self._label.setStyleSheet(f"color:{COLORS['text']};font-size:13px;font-family:{UI_FONT};")
-        self._action_btn.setStyleSheet(
-            f"QPushButton{{background:{self._color};color:white;border:none;"
-            f"border-radius:6px;font-size:12px;font-weight:600;padding:0;font-family:{UI_FONT};}}"
-            f"QPushButton:disabled{{background:{COLORS.get('bg_light', '#3A3A44')};color:{COLORS.get('text_dim', '#8B909A')};}}"
+        if getattr(self, "_optional", False):
+            self.setToolTip(getattr(self, "_optional_tip", ""))
+            label_color = COLORS.get("text_accent", COLORS["text"])
+        else:
+            label_color = COLORS["text"]
+        self._label.setStyleSheet(
+            f"color:{label_color};font-size:14px;font-family:{UI_FONT};"
         )
+        self._status_text = display_text
+        if not self._flash:
+            self._status.setText(display_text)
+            self._status.setStyleSheet(
+                f"color:{color};font-size:12px;font-family:{UI_FONT};"
+            )
+        opacity = "1.0" if enabled else "0.55"
+        self._action_btn.setStyleSheet(
+            f"QPushButton{{background:{COLORS['accent']};color:{COLORS['on_accent']};"
+            f"border:none;border-radius:6px;font-size:13px;font-weight:600;padding:0;"
+            f"font-family:{UI_FONT};}}"
+            f"QPushButton:hover{{background:{COLORS['accent_hover']};}}"
+            f"QPushButton:disabled{{background:{COLORS.get('bg_light', '#3A3A44')};"
+            f"color:{COLORS.get('text_dim', '#8B909A')};}}"
+        )
+        self._update_badge()
         self.setStyleSheet(f"#taskRow{{background:transparent;opacity:{opacity};}}")
 
     def refresh_theme(self):
@@ -181,19 +279,77 @@ class TaskRow(QWidget):
         else:
             color = COLORS.get('text_dim', '#8B909A')
         opacity = "1.0" if self.isEnabled() else "0.55"
-        self._status.setStyleSheet(f"color:{color};font-size:11px;font-family:{UI_FONT};")
-        self._label.setStyleSheet(f"color:{COLORS['text']};font-size:13px;font-family:{UI_FONT};")
+        self._status.setStyleSheet(f"color:{color};font-size:12px;font-family:{UI_FONT};")
+        label_color = (
+            COLORS.get("text_accent", COLORS["text"])
+            if getattr(self, "_optional", False)
+            else COLORS["text"]
+        )
+        self._label.setStyleSheet(
+            f"color:{label_color};font-size:14px;font-family:{UI_FONT};"
+        )
         self._action_btn.setStyleSheet(
-            f"QPushButton{{background:{self._color};color:white;border:none;"
-            f"border-radius:6px;font-size:12px;font-weight:600;padding:0;font-family:{UI_FONT};}}"
-            f"QPushButton:disabled{{background:{COLORS.get('bg_light', '#3A3A44')};color:{COLORS.get('text_dim', '#8B909A')};}}"
+            f"QPushButton{{background:{COLORS['accent']};color:{COLORS['on_accent']};"
+            f"border:none;border-radius:6px;font-size:13px;font-weight:600;padding:0;"
+            f"font-family:{UI_FONT};}}"
+            f"QPushButton:hover{{background:{COLORS['accent_hover']};}}"
+            f"QPushButton:disabled{{background:{COLORS.get('bg_light', '#3A3A44')};"
+            f"color:{COLORS.get('text_dim', '#8B909A')};}}"
         )
-        self._delete_btn.setStyleSheet(
-            "QPushButton{background:#7A4D3B;color:white;border:none;"
-            f"border-radius:6px;font-size:12px;font-weight:600;padding:0;font-family:{UI_FONT};}}"
-            "QPushButton:hover{background:#9A654D;}"
-        )
+        self._delete_btn.setStyleSheet(self._secondary_button_style())
+        self._update_badge()
         self.setStyleSheet(f"#taskRow{{background:transparent;opacity:{opacity};}}")
+
+    def _update_badge(self):
+        """Status dot: green done, accent in progress, dim pending."""
+        if getattr(self, "_done", False):
+            color = COLORS.get("green", "#6CCB6E")
+        elif getattr(self, "_in_progress", False) or getattr(self, "_status_key", "") == "available":
+            color = COLORS.get("accent", "#60CDFF")
+        elif getattr(self, "_status_key", "") == "failed":
+            color = COLORS.get("red", "#F17070")
+        else:
+            color = COLORS.get("border_light", "#48485A")
+        self._badge.setStyleSheet(
+            f"background:{color};border-radius:4px;")
+        busy = bool(
+            getattr(self, "_in_progress", False)
+            or getattr(self, "_status_key", "") in ("available", "running"))
+        dot = getattr(self, "_busy", None)
+        if dot is not None:
+            dot.setVisible(True)
+            if getattr(self, "_done", False) or getattr(self, "_status_key", "") == "success":
+                dot.set_tone("ready", COLORS.get("green", "#34D399"))
+            elif getattr(self, "_status_key", "") == "failed":
+                dot.set_tone("error", COLORS.get("red", "#E85D63"))
+            elif busy:
+                dot.set_tone("busy", COLORS.get("accent", "#34D399"))
+            else:
+                dot.set_tone("idle", COLORS.get("border_light", "#334155"))
+        bar = getattr(self, "_progress", None)
+        if bar is not None:
+            pct = int(getattr(self, "_progress_pct", -1))
+            bar.setVisible(pct >= 0)
+            if pct >= 0:
+                bar.set_ratio(pct / 100.0 if pct > 1 else float(pct))
+            bar.set_colors(COLORS.get("accent", "#34D399"),
+                           COLORS.get("border", "#263241"))
+            # 进度条出现/消失会改变行高，必须同步，否则它会压住按钮。
+            self._sync_row_height()
+
+    @staticmethod
+    def _secondary_button_style():
+        """Neutral secondary action: same geometry as the primary button,
+        outline style instead of a saturated brown fill."""
+        return (
+            f"QPushButton{{background:transparent;color:{COLORS['text_dim']};"
+            f"border:1px solid {COLORS['border_light']};border-radius:6px;"
+            f"font-size:13px;font-weight:600;padding:0;font-family:{UI_FONT};}}"
+            f"QPushButton:hover{{background:{COLORS['bg_hover']};color:{COLORS['text']};"
+            f"border-color:{COLORS['accent']};}}"
+            f"QPushButton:disabled{{color:{COLORS['btn_disabled_text']};"
+            f"border-color:{COLORS['border']};}}"
+        )
 
 
 class StepCard(QWidget):
@@ -208,78 +364,178 @@ class StepCard(QWidget):
         # 压扁，内容互相覆盖（任务行被后面的智能推荐/禁行区/调头方式盖住）。
         self._rows = rows
         self._expanded = False
+        self._hover = 0.0
+        self._active = False
+        self._done = False
+        self.setMouseTracking(True)
         lo = QVBoxLayout(self)
         lo.setContentsMargins(7, 6, 7, 6)
         lo.setSpacing(5)
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(6)
-        self._toggle = QToolButton(); self._toggle.setText("▸"); self._toggle.setFixedSize(24, 28)
+        # Rotating chevron instead of swapping two icons, so the expand/collapse
+        # reads as one continuous motion.
+        self._toggle = ChevronToggle()
         self._title = QLabel(title)
         self._title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._title.setFont(QFont("Microsoft YaHei UI", 10))
-        self._title.setStyleSheet(f"color:{COLORS['text']};font-size:13px;font-weight:600;font-family:{UI_FONT};")
+        self._title.setStyleSheet(f"color:{COLORS['text']};font-size:14px;font-weight:600;font-family:{UI_FONT};")
+        # Status dot on the header so a collapsed card still reports its state.
+        self._status_dot = BreathingDot(8)
+        self._status_dot.set_tone("idle", COLORS.get("border_light", "#334155"))
+        self._status_dot.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._mark = QLabel("")
         self._mark.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self._mark.setFixedSize(24, 28)
+        self._mark.setFixedSize(16, 28)
         self._mark.setAlignment(Qt.AlignCenter)
-        head.addWidget(self._toggle); head.addWidget(self._title, 1); head.addWidget(self._mark)
+        self._mark.setVisible(False)
+        head.addWidget(self._toggle)
+        head.addWidget(self._status_dot)
+        head.addWidget(self._title, 1)
+        head.addWidget(self._mark)
         lo.addLayout(head)
+        # 内容区是独立一层：垂直方向 Fixed + maximumHeight 动画，
+        # 这样表头永远在卡片顶部不动，内容从 0 高度向下长出来。
+        # 参考 qt-collapsible-section（Qt Wiki 的经典 Section 实现）：
+        # 内容区与 Section 本体的 maximumHeight 并行动画。
         self._content = QWidget()
         self._content.setAttribute(Qt.WA_StyledBackground, True)
         self._content.setStyleSheet("background:transparent;")
+        self._content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         cl = QVBoxLayout(self._content); cl.setContentsMargins(10, 2, 0, 0); cl.setSpacing(2)
         for row in rows: cl.addWidget(row)
+        self._content.setMaximumHeight(0)
+        self._content.setVisible(False)
         lo.addWidget(self._content)
+        # 展开/收起用并行动画组：内容区高度 + 卡片 min/max 高度同时变。
+        self._expand_group = QParallelAnimationGroup(self)
+        self._expand_duration = 220
+        self._expand_group.finished.connect(self._on_expand_finished)
         self._toggle.clicked.connect(self._toggle_expanded)
-        self.set_expanded(False)
+        self.set_expanded(False, animate=False)
         self.refresh_state()
 
     def _toggle_expanded(self):
-        self.set_expanded(not self._expanded)
+        """只发信号，由 TaskPanel 统一决定展开还是收起。
+
+        旧实现先 `set_expanded(not self._expanded)` 再 emit，于是
+        `_on_card_toggled` 读到的是**已经切换过**的状态，又把它切回去，
+        表现为"点表头没反应"。
+        """
         self.toggled.emit()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and event.position().y() <= 40:
+        # 只有点在表头区域才切换展开状态；点内容区不应误收起。
+        if event.button() == Qt.LeftButton and event.position().y() <= self._collapsed_height():
             self._toggle_expanded()
             event.accept()
             return
         super().mousePressEvent(event)
 
-    def set_expanded(self, expanded):
-        self._expanded = bool(expanded)
-        self._content.setVisible(self._expanded)
-        self._toggle.setText("▾" if self._expanded else "▸")
-        self._sync_minimum_height()
+    # ------------------------------------------------------------------ 高度
+    def _collapsed_height(self):
+        """折叠高度 = 表头那一行的高度（含卡片内边距）。"""
+        layout = self.layout()
+        if layout is None:
+            return 40
+        head = layout.itemAt(0)
+        head_h = 28
+        if head is not None and head.layout() is not None:
+            head_h = head.layout().sizeHint().height()
+        m = layout.contentsMargins()
+        return max(40, int(head_h + m.top() + m.bottom()))
+
+    def _content_height(self):
+        """内容区完整展开时的高度（含它自己的内边距）。"""
+        cl = self._content.layout()
+        if cl is None:
+            return 0
+        cl.invalidate()
+        cl.activate()
+        return max(0, int(cl.sizeHint().height()))
+
+    def set_expanded(self, expanded, animate=True):
+        expanded = bool(expanded)
+        changed = expanded != self._expanded
+        self._expanded = expanded
+        self._toggle.set_expanded(expanded, animate_motion=changed)
+        if not changed or not animate or not self.isVisible():
+            self._apply_expanded_state(expanded)
+            return
+        self._animate_expansion(expanded)
+
+    def _apply_expanded_state(self, expanded):
+        """无动画地把卡片切到目标高度（初始化和打断时用）。"""
+        collapsed = self._collapsed_height()
+        content_h = self._content_height()
+        self._expand_group.stop()
+        if expanded:
+            self._content.setVisible(True)
+            self._content.setMaximumHeight(content_h)
+            self.setMinimumHeight(collapsed + content_h)
+            self.setMaximumHeight(collapsed + content_h)
+        else:
+            self._content.setMaximumHeight(0)
+            self._content.setVisible(False)
+            self.setMinimumHeight(collapsed)
+            self.setMaximumHeight(collapsed)
+        self.updateGeometry()
+        self.update()
+
+    def _animate_expansion(self, expanded):
+        """表头不动，内容从 0 高度向下展开（或反向收起）。
+
+        三个动画并行：
+          * 内容区 maximumHeight 0 <-> 内容高度
+          * 卡片 minimumHeight / maximumHeight 折叠高度 <-> 折叠+内容高度
+        表头在布局第一行，内容在第二行，所以标题的相对位置全程不变。
+        """
+        collapsed = self._collapsed_height()
+        content_h = self._content_height()
+        target_h = collapsed + content_h
+        group = self._expand_group
+        group.stop()
+        for anim in list(group.animationAt(i) for i in range(group.animationCount())):
+            group.removeAnimation(anim)
+
+        if expanded:
+            self._content.setVisible(True)
+            start_content = max(0, self._content.maximumHeight())
+            start_total = max(collapsed, self.minimumHeight())
+        else:
+            start_content = max(0, self._content.height())
+            start_total = max(collapsed, self.height())
+
+        content_anim = QPropertyAnimation(self._content, b"maximumHeight", self)
+        content_anim.setStartValue(start_content)
+        content_anim.setEndValue(content_h if expanded else 0)
+        content_anim.setDuration(self._expand_duration)
+        group.addAnimation(content_anim)
+
+        for prop in (b"minimumHeight", b"maximumHeight"):
+            anim = QPropertyAnimation(self, prop, self)
+            anim.setStartValue(start_total)
+            anim.setEndValue(target_h if expanded else collapsed)
+            anim.setDuration(self._expand_duration)
+            group.addAnimation(anim)
+
+        # 标准缓动：内容高度本身就在变，再加过冲会让底部先空一块再收回。
+        for i in range(group.animationCount()):
+            group.animationAt(i).setEasingCurve(QEasingCurve.OutCubic)
+        group.start()
+
+    def _on_expand_finished(self):
+        """收起动画结束后把内容彻底隐藏，避免它继续参与布局。"""
+        if not self._expanded:
+            self._content.setVisible(False)
+            self._content.setMaximumHeight(0)
+        self.updateGeometry()
+        self.update()
 
     def _sync_minimum_height(self):
-        """展开时把显式最小高度设为内容高度，折叠时回到表头高度。
-
-        QScrollArea 内布局只按各卡片的最小高度分配纵向空间
-        （QLayout::doResize 依据的也是显式最小值），如果展开的卡片
-        最小高度仍是表头高度，卡片会被压扁，内容互相覆盖。
-        """
-        if self._expanded:
-            # A child can become visible after the card was expanded (route
-            # editing does this).  Drop the stale explicit minimum before
-            # asking the layouts for a new hint, otherwise the QScrollArea
-            # keeps the old height and clips the newly visible controls.
-            self.setMinimumHeight(0)
-            content_layout = self._content.layout()
-            if content_layout is not None:
-                content_layout.invalidate()
-                content_layout.activate()
-            own_layout = self.layout()
-            if own_layout is not None:
-                own_layout.invalidate()
-                own_layout.activate()
-                hint_height = own_layout.sizeHint().height()
-            else:
-                hint_height = self.sizeHint().height()
-            self.setMinimumHeight(max(40, int(hint_height)))
-        else:
-            self.setMinimumHeight(40)
-        self.updateGeometry()
+        """无动画地把高度对齐到当前展开状态（运行时子控件可见性变化后调用）。"""
+        self._apply_expanded_state(self._expanded)
 
     def refresh_content_geometry(self):
         """Recompute an expanded card after a runtime child visibility change."""
@@ -288,26 +544,186 @@ class StepCard(QWidget):
         if parent is not None:
             parent.updateGeometry()
 
-    def refresh_state(self):
-        task_rows = [row for row in self._rows if hasattr(row, "_done")]
-        done = bool(task_rows) and all(row._done for row in task_rows)
-        self._title.setStyleSheet(f"color:{COLORS['text']};font-size:13px;font-weight:600;font-family:{UI_FONT};")
+    def _chrome(self):
+        """Colours for the painted card surface (see ``paintEvent``).
+
+        Mirrors the reference sidebar rows: the row itself is transparent and
+        two layers do the work — a 3 px accent rail marking the current step
+        and a soft tinted surface that lights up on hover or selection.
+        """
+        done = bool(getattr(self, "_done", False))
         if done:
-            bg = COLORS.get("success_bg", "#1A3A1A")
-            border = COLORS.get("green", "#6CCB6E")
-            self._mark.setText("✓")
-            self._mark.setStyleSheet(f"color:{border};font-weight:bold;font-size:14px;")
+            # Done cards keep the plain surface AND no rail: a coloured rail
+            # plus tinted fill plus coloured border read as a second, skewed
+            # layer behind the card. Only the header check marks completion.
+            rail = COLORS.get("bg_card", "#111827")
+            surface = COLORS.get("bg_card", "#111827")
+            border = COLORS.get("border", "#263241")
+        elif getattr(self, "_active", False):
+            # Only a rail + border mark the current step; the surface stays the
+            # plain card colour. Blending a solid accent_bg (teal) over the card
+            # produced a visibly different block that read as a second layer.
+            rail = COLORS.get("accent", "#34D399")
+            surface = COLORS.get("bg_card", "#111827")
+            border = COLORS.get("accent", "#34D399")
         else:
-            bg = COLORS.get("bg_card", "#2A2A35")
-            border = COLORS.get("border", "#383848")
-            self._mark.setText("")
+            rail = COLORS.get("border_light", "#334155")
+            surface = COLORS.get("bg_card", "#111827")
+            border = COLORS.get("border", "#263241")
+        return rail, surface, border
+
+    def paintEvent(self, event):
+        """Paint card chrome with a rounded clip so a hover fill cannot spill."""
+        from PySide6.QtGui import QBrush, QPainterPath
+        rail, surface, border = self._chrome()
+        hover = max(0.0, min(1.0, getattr(self, "_hover", 0.0)))
+        active = bool(getattr(self, "_active", False)) or bool(getattr(self, "_done", False))
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(0.5, 1.5, -0.5, -1.5)
+        radius = 8.0
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, radius, radius)
+        painter.setClipPath(clip)
+
+        fill = QColor(surface)
+        if hover > 0.01 and not active:
+            lift = QColor(COLORS.get("bg_hover", "#1B2433"))
+            fill = QColor(
+                int(fill.red() + (lift.red() - fill.red()) * hover),
+                int(fill.green() + (lift.green() - fill.green()) * hover),
+                int(fill.blue() + (lift.blue() - fill.blue()) * hover),
+            )
+        # Always opaque: a translucent card let the scroll canvas bleed through
+        # and read as a skewed shadow behind the rounded rect.
+        fill.setAlpha(255)
+        painter.fillPath(clip, QBrush(fill))
+
+        painter.setClipping(False)
+        edge = QColor(border)
+        edge.setAlpha(int(90 + 120 * hover) if not active else 190)
+        painter.setPen(QPen(edge, 1.0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(rect, radius, radius)
+
+        # 3 px status rail on the left edge, inside the rounded corner.
+        rail_color = QColor(rail)
+        if not active:
+            rail_color.setAlpha(int(70 + 150 * hover))
+        rail_rect = QRectF(rect.left() + 0.5, rect.top() + 3.0,
+                           3.0, max(0.0, rect.height() - 6.0))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(rail_color)
+        painter.drawRoundedRect(rail_rect, 1.5, 1.5)
+        painter.end()
+
+    def enterEvent(self, event):
+        self._set_hover(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._set_hover(0.0)
+        super().leaveEvent(event)
+
+    def _set_hover(self, target):
+        """Hover lights up with the same curve as the reference rows (160 ms)."""
+        from pyside6_app.ui_motion import EASE_IN_OUT, tween_value
+        if not self.isVisible():
+            self._hover = target
+            self.update()
+            return
+        tween_value(self, "_hover", target, 160, EASE_IN_OUT,
+                    lambda: self.update())
+
+    def refresh_state(self):
+        """Card emphasis follows the workflow state, not the task colour.
+
+        Active card: accent 3 px rail on the left edge. Completed card: mint
+        check and a hairline success border. Idle card: plain surface, no
+        ornament, so ten stacked cards stay quiet until they matter.
+        """
+        # A row may report completion either through _done or through the
+        # status key "done"/"success"; checking only _done let a completed card
+        # sit on "not done", re-firing the completion sweep on every refresh.
+        task_rows = [
+            row for row in self._rows
+            if hasattr(row, "_done") or hasattr(row, "_status_key")
+        ]
+        done = bool(task_rows) and all(
+            bool(getattr(row, "_done", False))
+            or str(getattr(row, "_status_key", "")) in ("done", "success")
+            for row in task_rows
+        )
+        active = bool(getattr(self, "_active", False)) and not done
+        self._title.setStyleSheet(
+            f"color:{COLORS['text_bright'] if active else COLORS['text']};"
+            f"font-size:14px;font-weight:{600 if active else 500};"
+            f"font-family:{UI_FONT};")
+        if done:
+            border = COLORS.get("green", "#34D399")
+            self._mark.setPixmap(check_icon(border).pixmap(QSize(14, 14)))
+            self._mark.setVisible(True)
+        else:
+            self._mark.clear()
+            self._mark.setVisible(False)
+        # Collapsed cards hide their rows, so the header owns the status dot.
+        dot = getattr(self, "_status_dot", None)
+        if dot is not None:
+            tone, color = self.collapsed_status_dot()
+            dot.set_tone(tone, color)
+        # 完成只靠对勾 + 状态点表达，不再播放扫光（用户要求只要交互反馈）。
+        # Keep the card's own flag in sync: TaskPanel._step_cards[i]._done is
+        # read elsewhere (activation logic, tests) and used to drift.
+        self._done = done
+        self._was_done = done
+        # Chrome (surface, border, rail) is painted in paintEvent so the hover
+        # fill and the rail can share one rounded clip.
         self.setStyleSheet(
-            f"#stepCard{{background:{bg};border:1px solid {border};"
-            "border-radius:7px;margin:1px 0;}"
+            f"#stepCard{{background:transparent;border:none;}}"
             f"#stepCard QLabel{{font-family:{UI_FONT};}}"
-            f"QToolButton{{background:transparent;color:{COLORS['text_dim']};border:none;font-family:{UI_FONT};}}"
+            f"QToolButton{{background:transparent;color:{COLORS['text_dim']};"
+            f"border:none;font-family:{UI_FONT};}}"
             f"QToolButton:hover{{background:{COLORS['bg_hover']};border-radius:4px;}}"
         )
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+    def collapsed_status_dot(self):
+        """Return (tone, color) summarising the rows for the collapsed header.
+
+        Collapsed cards hide their rows, so a running or failed row would
+        otherwise be invisible; the header carries the dot instead.
+        """
+        # Only real task rows carry a status; labels/combos live in the same
+        # list and must not be counted as pending work.
+        rows = [r for r in self._rows if hasattr(r, "_status_key")]
+        if not rows:
+            return "idle", COLORS.get("border_light", "#334155")
+        keys = [str(getattr(r, "_status_key", "pending")) for r in rows]
+        if "failed" in keys:
+            return "error", COLORS.get("red", "#E85D63")
+        if any(getattr(r, "_in_progress", False) for r in rows):
+            return "busy", COLORS.get("accent", "#34D399")
+        # Callers pass either done=True or status="success"; accept both.
+        finished = [
+            getattr(r, "_done", False) or str(getattr(r, "_status_key", "")) == "success"
+            for r in rows
+        ]
+        if all(finished):
+            return "ready", COLORS.get("green", "#34D399")
+        if "available" in keys:
+            return "busy", COLORS.get("accent", "#34D399")
+        return "idle", COLORS.get("border_light", "#334155")
+
+    def set_active(self, active):
+        """Mark this card as the workflow's current step."""
+        if getattr(self, "_active", False) == bool(active):
+            return
+        self._active = bool(active)
+        self.refresh_state()
 
 
 class TaskPanel(QWidget):
@@ -346,6 +762,7 @@ class TaskPanel(QWidget):
         self._step_cards = []
         self._current_step = 0
         self._manual_step = None
+        self._user_collapsed = False
         self._forbidden_count = 0
         self._forbidden_confirmed = False
         self._build_ui()
@@ -355,7 +772,7 @@ class TaskPanel(QWidget):
         lo = QVBoxLayout(self); lo.setContentsMargins(6, 8, 6, 8); lo.setSpacing(6)
         self._title = QLabel("任务清单")
         self._title.setFont(QFont("Microsoft YaHei UI", 12, QFont.Weight.DemiBold))
-        self._title.setStyleSheet(f"font-size:16px;font-weight:600;color:{COLORS['text_bright']};font-family:{UI_FONT};")
+        self._title.setStyleSheet(f"font-size:17px;font-weight:600;color:{COLORS['text_bright']};font-family:{UI_FONT};")
         lo.addWidget(self._title)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
@@ -370,13 +787,13 @@ class TaskPanel(QWidget):
                 rows.append(row)
                 if tid == "process":
                     self._mask_strength_label = QLabel("处理强度")
-                    self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
+                    self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;font-family:{UI_FONT};padding-left:8px;")
                     self.mask_strength_value_label = QLabel("标准（固定）")
                     self.mask_strength_value_label.setToolTip(
                         "掩膜处理统一使用标准参数，保证不同任务的处理口径一致"
                     )
                     self.mask_strength_value_label.setStyleSheet(
-                        f"color:{COLORS['text']};font-size:12px;font-family:{UI_FONT};"
+                        f"color:{COLORS['text']};font-size:13px;font-family:{UI_FONT};"
                         f"padding:4px 8px;border:1px solid {COLORS['border']};"
                         "border-radius:4px;"
                     )
@@ -439,7 +856,7 @@ class TaskPanel(QWidget):
                     forbidden_layout.setSpacing(6)
                     self.forbidden_status_label = QLabel("禁行区：未确认")
                     self.forbidden_status_label.setStyleSheet(
-                        f"color:{COLORS['orange']};font-size:12px;font-family:{UI_FONT};"
+                        f"color:{COLORS['orange']};font-size:13px;font-family:{UI_FONT};"
                     )
                     self.confirm_no_forbidden_btn = QPushButton("确认无")
                     self.draw_forbidden_btn = QPushButton("绘制")
@@ -463,7 +880,7 @@ class TaskPanel(QWidget):
                     turn_layout.setContentsMargins(8, 0, 8, 0)
                     turn_layout.setSpacing(6)
                     turn_label = QLabel("调头方式")
-                    turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};")
+                    turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;font-family:{UI_FONT};")
                     self.turn_combo = ExplicitPopupComboBox()
                     self.turn_combo.setToolTip(
                         "点击展开后选择调头/转弯方式；未展开时滚轮只滚动面板，不会改策略"
@@ -578,7 +995,18 @@ class TaskPanel(QWidget):
             "export": self.export_machine_compatibility_requested,
         }
         if tid == "centerline_select":
+            row = self._task_widgets.get(tid)
+            if row is not None and getattr(row, "_blocker", ""):
+                row.flash_blocker(row._blocker)
+                return
             self._expand_card_for_task(tid)
+            return
+        row = self._task_widgets.get(tid)
+        if row is not None and getattr(row, "_blocker", ""):
+            # 上一步未完成：不执行动作，只在这一行就地提示原因，几秒后复原。
+            # 这样"先完成X"只出现在用户真正想往前走的那个位置，而不是
+            # 每一行都复述一遍。
+            row.flash_blocker(row._blocker)
             return
         sig = mapping.get(tid)
         if sig:
@@ -599,30 +1027,45 @@ class TaskPanel(QWidget):
         for i, group in enumerate(STEP_GROUPS):
             if any(not self._task_widgets[tid]._done for tid in group["tasks"]):
                 first = i; break
-        expanded = self._manual_step if self._manual_step is not None else first
+        # 状态刷新只更新状态与高亮，**不覆盖用户的展开/收起选择**。
+        # 旧实现在这里无条件 set_expanded(i == expanded)，于是用户刚收起的
+        # 卡片会在下一次状态推送时被强行展开，表现为"点了没反应"。
+        step_changed = first != getattr(self, "_last_first_step", -1)
+        self._last_first_step = first
         for i, card in enumerate(self._step_cards):
+            card.set_active(i == first)
             card.refresh_state()
-            # Accordion behaviour: only one card owns vertical space at a time.
-            # Keeping both the current workflow card and a manually opened card
-            # expanded can make the two content areas collide/cover each other in
-            # the narrow left splitter, especially after project restore.
-            card.set_expanded(i == expanded)
         self._current_step = first
-        # 展开的卡片（如“路径规划”，内容较多）可能比可视区更高，
-        # 滚动到展开卡片，避免步骤推进时活动步骤被挤出可视区。
-        self._ensure_card_visible(expanded)
+        # 步骤推进（某一步完成）时自动把焦点交给下一步：旧步骤收起、新步骤
+        # 展开。这里必须清掉用户手动选择，否则推进后仍停留在旧卡片上，
+        # 用户还得手动关一个再开一个。
+        if step_changed:
+            self._manual_step = None
+            self._user_collapsed = False
+            for i, card in enumerate(self._step_cards):
+                card.set_expanded(i == first)
+            self._ensure_card_visible(first)
 
     def _on_card_toggled(self, index):
+        """点击表头：展开这张卡，或把它收起来。
+
+        旧实现只在"已展开"分支里收起**其他**卡片，唯独不收自己，所以展开
+        之后再点同一张卡没有任何反应。收起后还要记住用户意图，否则下一次
+        状态刷新会把当前步骤卡片又自动展开。
+        """
         card = self._step_cards[index]
         if card._expanded:
-            self._manual_step = None if index == self._current_step else index
-            for i, other in enumerate(self._step_cards):
-                if i != index:
-                    other.set_expanded(False)
-            self._ensure_card_visible(index)
-        else:
+            card.set_expanded(False)
             self._manual_step = None
-            self._refresh_cards()
+            self._user_collapsed = True
+            return
+        self._user_collapsed = False
+        self._manual_step = index
+        for i, other in enumerate(self._step_cards):
+            if i != index:
+                other.set_expanded(False)
+        card.set_expanded(True)
+        self._ensure_card_visible(index)
 
     def _ensure_card_visible(self, index):
         """Scroll the selected accordion card into view after expansion."""
@@ -631,9 +1074,13 @@ class TaskPanel(QWidget):
             return
         scroll.ensureWidgetVisible(self._step_cards[index], 0, 8)
 
-    def set_task_status(self, tid, status, progress_pct=-1, text=None):
+    def set_task_status(self, tid, status, progress_pct=-1, text=None,
+                        optional=None, blocker=None):
         row = self._task_widgets.get(tid)
         if not row: return
+        if optional is not None:
+            row._optional = bool(optional)
+        row._blocker = str(blocker or "")
         row.set_status(
             done=status == "done",
             enabled=status in ("available", "in_progress", "done", "failed"),
@@ -652,7 +1099,11 @@ class TaskPanel(QWidget):
                 st = statuses.get(tid)
                 if not st:
                     continue
-                self.set_task_status(tid, st.status, text=st.text)
+                self.set_task_status(
+                    tid, st.status, text=st.text,
+                    optional=bool(getattr(st, "optional", False)),
+                    blocker=getattr(st, "blocker", None),
+                )
                 if st.action:
                     self.set_task_action(tid, st.action)
                 else:
@@ -722,7 +1173,7 @@ class TaskPanel(QWidget):
             color = COLORS["orange"]
         self.forbidden_status_label.setText(text)
         self.forbidden_status_label.setStyleSheet(
-            f"color:{color};font-size:12px;font-family:{UI_FONT};"
+            f"color:{color};font-size:13px;font-family:{UI_FONT};"
         )
 
     def set_mask_diagnostic_available(self, available):
@@ -775,13 +1226,13 @@ class TaskPanel(QWidget):
 
     def refresh_theme(self):
         self.setStyleSheet(f"background:{COLORS['bg']};")
-        self._title.setStyleSheet(f"font-size:16px;font-weight:600;color:{COLORS['text_bright']};font-family:{UI_FONT};")
+        self._title.setStyleSheet(f"font-size:17px;font-weight:600;color:{COLORS['text_bright']};font-family:{UI_FONT};")
         combo_style = (
             f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
             f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
         )
         if hasattr(self, "_mask_strength_label"):
-            self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
+            self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;font-family:{UI_FONT};padding-left:8px;")
         for combo_name in ("model_combo", "turn_combo"):
             combo = getattr(self, combo_name, None)
             if combo:
@@ -855,6 +1306,7 @@ class RouteSegmentRow(QWidget):
         self._segment_type = str(segment_type or ("work" if is_work else "turn"))
         self._edit_meta = dict(edit_meta or {})
         self._edit_selected = False
+        self._hover = 0.0
         self._drag_start = None
         self.setMinimumHeight(28)
         self.setAcceptDrops(bool(self._edit_meta and self._is_work))
@@ -893,22 +1345,59 @@ class RouteSegmentRow(QWidget):
             "turn_reverse": "#A85A5A", "turn_aux": "#8A6E9E", "entry": "#4F8790",
             "exit": "#6A7780", "unload": "#8C7353",
         }.get(self._segment_type, "#6A7780")
-        self._badge.setStyleSheet(f"background:{color};color:white;border-radius:2px;font-size:10px;")
-        self._label.setStyleSheet(f"color:{COLORS['text']};font-size:12px;")
+        self._badge.setStyleSheet(f"background:{color};color:white;border-radius:2px;font-size:11px;")
+        self._label.setStyleSheet(f"color:{COLORS['text']};font-size:13px;")
         if self._point_count is not None:
             self._point_count.setStyleSheet(
-                f"color:{COLORS['text_dim']};font-size:10px;"
+                f"color:{COLORS['text_dim']};font-size:11px;"
             )
         if self._geometry is not None:
             self._geometry.setStyleSheet(
-                f"color:{COLORS['accent']};font-size:10px;"
+                f"color:{COLORS['accent']};font-size:11px;"
             )
         self._dist.setStyleSheet(f"color:{COLORS['text_dim']};font-family:Consolas;")
+        # Surface is painted (paintEvent) so hover can fade in like the
+        # reference rows; QSS only carries the text colours.
         self.setStyleSheet(
-            f"RouteSegmentRow{{background:{COLORS['bg_accent'] if self._edit_selected else COLORS['bg']};"
-            f"border:1px solid {COLORS['accent'] if self._edit_selected else 'transparent'};"
-            "border-radius:4px;}}"
+            f"RouteSegmentRow{{background:transparent;border:none;}}"
         )
+        self.update()
+
+    def paintEvent(self, event):
+        selected = bool(getattr(self, "_edit_selected", False))
+        hover = max(0.0, min(1.0, getattr(self, "_hover", 0.0)))
+        if selected:
+            fill = QColor(COLORS.get("bg_accent", "#10291F"))
+        else:
+            base = QColor(COLORS.get("bg", "#0B0F17"))
+            lift = QColor(COLORS.get("bg_hover", "#1B2433"))
+            fill = QColor(
+                int(base.red() + (lift.red() - base.red()) * hover),
+                int(base.green() + (lift.green() - base.green()) * hover),
+                int(base.blue() + (lift.blue() - base.blue()) * hover),
+            )
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath(); path.addRoundedRect(rect, 4.0, 4.0)
+        painter.fillPath(path, fill)
+        edge = QColor(COLORS.get("accent", "#34D399"))
+        edge.setAlpha(200 if selected else int(70 * hover))
+        if selected or hover > 0.02:
+            painter.setPen(QPen(edge, 1.0)); painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(rect, 4.0, 4.0)
+        painter.end()
+
+    def enterEvent(self, event):
+        self._set_hover(1.0); super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._set_hover(0.0); super().leaveEvent(event)
+
+    def _set_hover(self, target):
+        if not hasattr(self, "_hover"):
+            self._hover = 0.0
+        tween_value(self, "_hover", target, 160, None, lambda: self.update())
 
     def set_edit_selected(self, selected):
         self._edit_selected = bool(selected)
@@ -1052,6 +1541,8 @@ class CenterlineSelectionRow(QWidget):
         label = str(item.get("label") or f"中心线 {sequence}")
         source = str(item.get("line_source") or item.get("kind") or "识别中心线")
         self.setMinimumHeight(28)
+        self._hover = 0.0
+        self.setMouseTracking(True)
         lo = QHBoxLayout(self)
         lo.setContentsMargins(8, 2, 8, 2)
         lo.setSpacing(6)
@@ -1065,17 +1556,43 @@ class CenterlineSelectionRow(QWidget):
         self._label = QLabel(label)
         self._label.setMinimumWidth(0)
         self._label.setStyleSheet(
-            f"font-size:12px;color:{COLORS['text']};font-family:{UI_FONT};"
+            f"font-size:13px;color:{COLORS['text']};font-family:{UI_FONT};"
         )
         self._source = QLabel(source)
         self._source.setMinimumWidth(0)
         self._source.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._source.setStyleSheet(
-            f"font-size:10px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+            f"font-size:11px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
         )
         lo.addWidget(self.checkbox)
         lo.addWidget(self._label, 1)
         lo.addWidget(self._source)
+
+    def paintEvent(self, event):
+        hover = max(0.0, min(1.0, getattr(self, "_hover", 0.0)))
+        if hover <= 0.01:
+            return
+        base = QColor(COLORS.get("bg", "#0B0F17"))
+        lift = QColor(COLORS.get("bg_hover", "#1B2433"))
+        fill = QColor(
+            int(base.red() + (lift.red() - base.red()) * hover),
+            int(base.green() + (lift.green() - base.green()) * hover),
+            int(base.blue() + (lift.blue() - base.blue()) * hover),
+        )
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 4.0, 4.0)
+        painter.fillPath(path, fill)
+        painter.end()
+
+    def enterEvent(self, event):
+        tween_value(self, "_hover", 1.0, 160, None, lambda: self.update())
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        tween_value(self, "_hover", 0.0, 160, None, lambda: self.update())
+        super().leaveEvent(event)
 
     def set_checked(self, checked):
         self.checkbox.blockSignals(True)
@@ -1084,10 +1601,10 @@ class CenterlineSelectionRow(QWidget):
 
     def refresh_theme(self):
         self._label.setStyleSheet(
-            f"font-size:12px;color:{COLORS['text']};font-family:{UI_FONT};"
+            f"font-size:13px;color:{COLORS['text']};font-family:{UI_FONT};"
         )
         self._source.setStyleSheet(
-            f"font-size:10px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+            f"font-size:11px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
         )
 
 
@@ -1108,7 +1625,7 @@ class CenterlineSelectionPanel(QWidget):
         header.setContentsMargins(0, 0, 0, 0)
         self._count_label = QLabel("已选择 0/0 条")
         self._count_label.setStyleSheet(
-            f"font-size:12px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+            f"font-size:13px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
         )
         header.addWidget(self._count_label)
         header.addStretch()
@@ -1119,7 +1636,7 @@ class CenterlineSelectionPanel(QWidget):
         )
         self._hint.setWordWrap(True)
         self._hint.setStyleSheet(
-            f"font-size:10px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+            f"font-size:11px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
         )
         lo.addWidget(self._hint)
 
@@ -1136,7 +1653,7 @@ class CenterlineSelectionPanel(QWidget):
         self._empty_label = QLabel("尚未生成中心线，请先点击上一步“生成中心线”。")
         self._empty_label.setWordWrap(True)
         self._empty_label.setStyleSheet(
-            f"font-size:11px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+            f"font-size:12px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
         )
         lo.addWidget(self._empty_label)
         self.clear_centerline_selection()
@@ -1194,13 +1711,13 @@ class CenterlineSelectionPanel(QWidget):
 
     def refresh_theme(self):
         self._count_label.setStyleSheet(
-            f"font-size:12px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+            f"font-size:13px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
         )
         self._hint.setStyleSheet(
-            f"font-size:10px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+            f"font-size:11px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
         )
         self._empty_label.setStyleSheet(
-            f"font-size:11px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+            f"font-size:12px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
         )
         self._container.setStyleSheet(f"background:{COLORS['bg']};")
         self._scroll.setStyleSheet(
@@ -1222,18 +1739,18 @@ class RouteInfoPanel(QWidget):
         self._build_ui()
     def _build_ui(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(0,0,0,0); lo.setSpacing(0)
-        self._title_hdr = QLabel("路径结果"); self._title_hdr.setStyleSheet(f"font-size:13px;font-weight:600;color:{COLORS['text']};padding:8px 14px 2px;")
+        self._title_hdr = QLabel("路径结果"); self._title_hdr.setStyleSheet(f"font-size:14px;font-weight:600;color:{COLORS['text']};padding:8px 14px 2px;")
         self._summary = QLabel("作业线 0 / 转弯段 0")
         self._summary.setWordWrap(True)
         self._summary.setMinimumWidth(0)
-        self._summary.setStyleSheet(f"font-size:11px;color:{COLORS['text_dim']};padding:2px 14px 4px;")
+        self._summary.setStyleSheet(f"font-size:12px;color:{COLORS['text_dim']};padding:2px 14px 4px;")
         self._safety = QLabel("路径状态：未评估")
         self._safety.setWordWrap(True)
-        self._safety.setStyleSheet(f"font-size:11px;color:{COLORS['orange']};padding:2px 14px 6px;")
+        self._safety.setStyleSheet(f"font-size:12px;color:{COLORS['orange']};padding:2px 14px 6px;")
         self._edit_hint = QLabel("单击联动画布｜右击编辑或验证｜拖动作业线排序")
         self._edit_hint.setWordWrap(True)
         self._edit_hint.setStyleSheet(
-            f"font-size:10px;color:{COLORS['text_accent']};padding:0 14px 6px;"
+            f"font-size:11px;color:{COLORS['text_accent']};padding:0 14px 6px;"
         )
         self._edit_hint.setVisible(False)
         lo.addWidget(self._title_hdr); lo.addWidget(self._summary); lo.addWidget(self._safety)
@@ -1241,7 +1758,7 @@ class RouteInfoPanel(QWidget):
         sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
         self._scroll = sc
         self._list_container = QWidget(); self._list_layout = QVBoxLayout(self._list_container); self._list_layout.setContentsMargins(8,0,8,0); self._list_layout.setSpacing(2)
-        self._empty_label = QLabel("尚无路径结果。"); self._empty_label.setStyleSheet(f"font-size:12px;color:{COLORS['text_dimmer']};padding:8px;")
+        self._empty_label = QLabel("尚无路径结果。"); self._empty_label.setStyleSheet(f"font-size:13px;color:{COLORS['text_dimmer']};padding:8px;")
         self._list_layout.addWidget(self._empty_label); self._list_layout.addStretch(); sc.setWidget(self._list_container); lo.addWidget(sc,1)
     def _clear_list(self):
         while self._list_layout.count():
@@ -1440,13 +1957,13 @@ class RouteInfoPanel(QWidget):
         )
         self._scroll.viewport().setStyleSheet(f"background:{COLORS['bg']};")
         self._list_container.setStyleSheet(f"background:{COLORS['bg']};")
-        self._title_hdr.setStyleSheet(f"font-size:13px;font-weight:600;color:{COLORS['text']};padding:8px 14px 2px;")
-        self._summary.setStyleSheet(f"font-size:11px;color:{COLORS['text_dim']};padding:2px 14px 4px;")
-        self._safety.setStyleSheet(f"font-size:11px;color:{COLORS['orange']};padding:2px 14px 6px;")
+        self._title_hdr.setStyleSheet(f"font-size:14px;font-weight:600;color:{COLORS['text']};padding:8px 14px 2px;")
+        self._summary.setStyleSheet(f"font-size:12px;color:{COLORS['text_dim']};padding:2px 14px 4px;")
+        self._safety.setStyleSheet(f"font-size:12px;color:{COLORS['orange']};padding:2px 14px 6px;")
         self._edit_hint.setStyleSheet(
-            f"font-size:10px;color:{COLORS['text_accent']};padding:0 14px 6px;"
+            f"font-size:11px;color:{COLORS['text_accent']};padding:0 14px 6px;"
         )
-        self._empty_label.setStyleSheet(f"font-size:12px;color:{COLORS['text_dimmer']};padding:8px;")
+        self._empty_label.setStyleSheet(f"font-size:13px;color:{COLORS['text_dimmer']};padding:8px;")
         for row in self.findChildren(RouteSegmentRow):
             row.refresh_theme()
     @staticmethod
@@ -1463,7 +1980,7 @@ class LogPanel(QTextEdit):
         self.setStyleSheet(
             f"QTextEdit{{background:{COLORS['bg_darkest']};color:{COLORS['text']};"
             f"border:1px solid {COLORS['border']};border-radius:6px;"
-            "font-family:'Cascadia Code','Consolas',monospace;font-size:12px;padding:6px;}"
+            "font-family:'Cascadia Code','Consolas',monospace;font-size:13px;padding:6px;}"
         )
     def _append(self, level, msg):
         ts = time.strftime("%H:%M:%S")
