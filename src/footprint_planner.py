@@ -85,7 +85,7 @@ def translate_validation_issue(description: str, severity: str = "error") -> str
                             result = f"{metric_name} {metric_value}%（限制：{limit_value}%）"
                         elif "低于最低要求" in result:
                             result = f"{metric_name} {metric_value}%（最低要求：{limit_value}%）"
-        except:
+        except Exception:
             pass  # 保持原始格式
 
     # 3. 添加图标

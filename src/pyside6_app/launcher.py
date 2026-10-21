@@ -15,12 +15,12 @@ def load_recent():
     try:
         if os.path.exists(RECENT_FILE):
             with open(RECENT_FILE,"r",encoding="utf-8") as f: return json.load(f)
-    except: pass
+    except Exception: pass
     return []
 def save_recent(recent):
     try:
         with open(RECENT_FILE,"w",encoding="utf-8") as f: json.dump(recent[:20],f,ensure_ascii=False,indent=2)
-    except: pass
+    except Exception: pass
 
 def project_entries():
     """Return the stable built-in test image followed by valid recent files."""
