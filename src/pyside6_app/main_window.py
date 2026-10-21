@@ -5420,24 +5420,31 @@ class MainWindow(QMainWindow):
         return str(mode or "confirm").strip().lower() or "confirm"
 
     def _confirm_export_risk(self, title: str, detail: str) -> None:
-        """Apply the export gate: abort in ``fail_closed``, pass in ``confirm``.
+        """Apply the export gate: abort in ``fail_closed``, notify in ``confirm``.
 
-        ``confirm`` (default) lets the export proceed and keeps the computed
-        detail in the path result / manifest for later review; it does NOT
-        pop up a dialog and does NOT block the write.  ``fail_closed`` raises
-        ``ValueError(detail)`` and aborts the export.  Callers must therefore
-        word their message as "fail_closed 模式将中止导出" rather than
-        "禁止导出", otherwise the prompt contradicts the default behaviour.
+        ``confirm`` (default) lets the export proceed but must leave a
+        user-visible notice in the log panel — the operator asked for
+        "放行 + 有提醒", so silently returning would hide a real risk.
+        ``fail_closed`` raises ``ValueError(detail)`` and aborts the export.
+        Callers must word their message as "fail_closed 模式将中止导出"
+        rather than "禁止导出", otherwise the prompt contradicts the default.
         """
         if self._export_gate_mode() != "confirm":
             raise ValueError(detail)
-        # Research export keeps the detail in validation/manifest fields.  Do
-        # not turn a computed scientific metric into a popup or warning log.
-        return
+        notice = f"{title}：{detail}"
+        if not hasattr(self, "_export_risk_notices"):
+            self._export_risk_notices = []
+        if notice not in self._export_risk_notices:
+            self._export_risk_notices.append(notice)
+        panel = getattr(self, "log_panel", None)
+        if panel is not None:
+            panel.warn(f"{notice}（已放行；fail_closed 模式下会中止导出）")
 
     def _record_compatibility_preview_risk(self, detail: str) -> None:
-        """Keep compatibility diagnostics in the manifest without UI noise."""
-        return
+        """Surface compatibility diagnostics in the log without blocking."""
+        panel = getattr(self, "log_panel", None)
+        if panel is not None:
+            panel.info(f"预览提示：{detail}")
 
     @staticmethod
     def _layout_has_planning_recovery(layout) -> bool:

@@ -197,7 +197,14 @@ def test_manual_route_edit_can_export_current_compatibility_control_route(
     window.close()
 
 
-def test_confirm_gate_exports_metric_failure_without_warning_block(monkeypatch):
+def test_confirm_gate_exports_metric_failure_with_warning_notice(monkeypatch):
+    """confirm 模式放行导出，但必须留下一条可见提醒。
+
+    契约变更（2026-10-21，用户决定）：原先这里断言 ``warnings == []``，
+    即研究输出保持完全静默。用户明确要求「导出肯定放行，只需要有相应的
+    提醒」，因此 confirm 模式改为放行 + 在日志面板留一条 WARN，提醒内容
+    必须说明「已放行」和 fail_closed 会中止，避免用户误以为已被拦住。
+    """
     QApplication.instance() or QApplication([])
     window = MainWindow()
     window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)
@@ -226,10 +233,14 @@ def test_confirm_gate_exports_metric_failure_without_warning_block(monkeypatch):
 
     _result, points = window._geo_export_payload()
 
+    # 仍然放行：点必须照常导出
     assert len(points) == 2
     assert points[0]["pixel_x"] == 1.0
     assert points[1]["pixel_x"] == 10.0
-    assert warnings == []
+    # 但必须提醒一次，且措辞不能让人以为被拦住了
+    assert len(warnings) == 1
+    assert "已放行" in warnings[0]
+    assert "fail_closed" in warnings[0]
     window.close()
 
 
