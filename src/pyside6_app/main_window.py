@@ -5413,10 +5413,14 @@ class MainWindow(QMainWindow):
         return str(mode or "confirm").strip().lower() or "confirm"
 
     def _confirm_export_risk(self, title: str, detail: str) -> None:
-        """Enforce strict mode while keeping research output silent.
+        """Apply the export gate: abort in ``fail_closed``, pass in ``confirm``.
 
-        In ``confirm`` mode the computed detail remains in the path result and
-        manifest, but it does not become a popup or warning log.
+        ``confirm`` (default) lets the export proceed and keeps the computed
+        detail in the path result / manifest for later review; it does NOT
+        pop up a dialog and does NOT block the write.  ``fail_closed`` raises
+        ``ValueError(detail)`` and aborts the export.  Callers must therefore
+        word their message as "fail_closed 模式将中止导出" rather than
+        "禁止导出", otherwise the prompt contradicts the default behaviour.
         """
         if self._export_gate_mode() != "confirm":
             raise ValueError(detail)
@@ -5483,14 +5487,14 @@ class MainWindow(QMainWindow):
         if unverified:
             self._confirm_export_risk(
                 "导出确认",
-                "农机参数来源未完成实测记录，禁止田间试验/机器候选正式导出："
+                "农机参数来源未完成实测记录，fail_closed 模式将中止导出："
                 + ", ".join(unverified)
             )
         if self._layout_has_planning_recovery(path_result.get("layout", {})):
             self._confirm_export_risk(
                 "导出确认",
                 "当前缓存路径包含 planning_recovered=True 的自动恢复作业带，"
-                "禁止正式导出；请重新规划或逐条人工确认后再导出"
+                "fail_closed 模式将中止导出；请重新规划或逐条人工确认后再导出"
             )
 
     def _geo_export_payload(self, *, formal=True):
@@ -5526,7 +5530,7 @@ class MainWindow(QMainWindow):
             if formal:
                 self._confirm_export_risk(
                     "导出确认",
-                    detail + "，禁止正式导出",
+                    detail + "，fail_closed 模式将中止导出",
                 )
             else:
                 self._record_compatibility_preview_risk(detail)
@@ -5547,7 +5551,7 @@ class MainWindow(QMainWindow):
             else:
                 self._confirm_export_risk(
                     "导出确认",
-                    f"路径未通过安全验证，禁止正式导出：{detail}",
+                    f"路径未通过安全验证，fail_closed 模式将中止导出：{detail}",
                 )
 
         planned_harvester = (
@@ -5639,7 +5643,7 @@ class MainWindow(QMainWindow):
                     if not segment_within_field_boundary(segment, polygon):
                         self._confirm_export_risk(
                             "导出确认",
-                            "route segment leaves field boundary; formal export is blocked: "
+                            "route segment leaves field boundary; fail_closed mode will abort export: "
                             f"segment={segment_index}, type={segment_type}",
                         )
         if manual_compatibility_route:
