@@ -601,7 +601,7 @@ class Config:
     @property
     def INFO_BAR_H(self) -> int: return 120   # 左侧面板底部信息枢纽高度
     @property
-    def TITLE(self) -> str: return self._get("window", "title", default="智能农机规划系统")
+    def TITLE(self) -> str: return self._get("window", "title", default="农机作业规划系统")
 
     @property
     def CV2_WIN_ID(self) -> str:

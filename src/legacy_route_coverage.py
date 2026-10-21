@@ -1,4 +1,4 @@
-"""智能农机规划系统 - 物理运动学与拓扑规划模块"""
+"""农机作业规划系统 - 物理运动学与拓扑规划模块"""
 import math
 from typing import List, Tuple, Optional, Dict
 import numpy as np

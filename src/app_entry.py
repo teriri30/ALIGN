@@ -124,7 +124,7 @@ def run_app(argv: Sequence[str] | None = None) -> int:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication([sys.argv[0], *args])
-    app.setApplicationName("智能农机规划系统")
+    app.setApplicationName("农机作业规划系统")
     build_info = load_build_info()
     app.setApplicationVersion(str(build_info.get("version") or APP_VERSION))
     app.setOrganizationName("ZHL")

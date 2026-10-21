@@ -1,5 +1,5 @@
 """
-pyside6_app — 智能农机规划系统 PySide6 桌面版 UI 包
+pyside6_app — 农机作业规划系统 PySide6 桌面版 UI 包
 
 使用方式：
     python src/main.py [path/to/ortho.tif]
