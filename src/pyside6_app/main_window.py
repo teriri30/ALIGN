@@ -5438,7 +5438,7 @@ class MainWindow(QMainWindow):
             self._export_risk_notices.append(notice)
         panel = getattr(self, "log_panel", None)
         if panel is not None:
-            panel.warn(f"{notice}（已放行；fail_closed 模式下会中止导出）")
+            panel.warn(f"{notice}（已放行）")
 
     def _record_compatibility_preview_risk(self, detail: str) -> None:
         """Surface compatibility diagnostics in the log without blocking."""
