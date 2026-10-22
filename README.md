@@ -95,8 +95,8 @@ build_windows.bat D:\zhl\anaconda\envs\game\python.exe
 发布新版本只要打个 tag，Actions 会自动跑测试、构建、生成安装包和便携包、发 Release：
 
 ```bash
-git tag -a v0.1.3 -m "ALIGN 0.1.3"
-git push origin v0.1.3
+git tag -a vX.Y.Z -m "ALIGN X.Y.Z"
+git push origin vX.Y.Z
 ```
 
 安装包脚本是 `packaging/align_setup.iss`（Inno Setup 6，装到当前用户、免管理员），图标由 `packaging/make_icon.py` 生成。
