@@ -12,7 +12,7 @@ from pyside6_app.ui_icons import (
     undo_icon, redo_icon, theme_icon, settings_icon,
 )
 
-UI_FONT = '"Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif'
+# 字体统一由 build_app_font() 提供，这里不要写 font-family（DECISION-046）。
 
 class FluentToolButton(QToolButton):
     def __init__(self, text, action_id, accent=False, parent=None):
@@ -27,10 +27,10 @@ class FluentToolButton(QToolButton):
         self._update_style()
     def _update_style(self):
         if self._accent:
-            self.setStyleSheet(f"QToolButton{{background:{COLORS['accent']};color:{COLORS['on_accent']};border:none;border-radius:4px;padding:5px 16px;font-size:13px;font-weight:bold;font-family:{UI_FONT};}}QToolButton:hover{{background:{COLORS['accent_hover']};}}QToolButton:disabled{{background:{COLORS['btn_disabled']};color:{COLORS['btn_disabled_text']};}}")
+            self.setStyleSheet(f"QToolButton{{background:{COLORS['accent']};color:{COLORS['on_accent']};border:none;border-radius:4px;padding:5px 16px;font-size:13px;font-weight:bold;}}QToolButton:hover{{background:{COLORS['accent_hover']};}}QToolButton:disabled{{background:{COLORS['btn_disabled']};color:{COLORS['btn_disabled_text']};}}")
             pal = self.palette(); pal.setColor(QPalette.ButtonText, QColor(COLORS['on_accent'])); self.setPalette(pal)
         else:
-            self.setStyleSheet(f"QToolButton{{background:{COLORS['bg_light']};color:{COLORS['text']};border:1px solid {COLORS['border']};border-radius:6px;padding:5px 14px;font-size:13px;font-family:{UI_FONT};}}QToolButton:hover{{background:{COLORS['bg_hover']};border-color:{COLORS['border_light']};}}QToolButton:disabled{{background:{COLORS['btn_disabled']};color:{COLORS['btn_disabled_text']};border-color:transparent;}}")
+            self.setStyleSheet(f"QToolButton{{background:{COLORS['bg_light']};color:{COLORS['text']};border:1px solid {COLORS['border']};border-radius:6px;padding:5px 14px;font-size:13px;}}QToolButton:hover{{background:{COLORS['bg_hover']};border-color:{COLORS['border_light']};}}QToolButton:disabled{{background:{COLORS['btn_disabled']};color:{COLORS['btn_disabled_text']};border-color:transparent;}}")
             pal = self.palette(); pal.setColor(QPalette.ButtonText, QColor(COLORS['text'])); self.setPalette(pal)
     def action_id(self):
         return self._action_id
@@ -60,7 +60,7 @@ class TopToolbar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(38)
+        self.setFixedHeight(46)
         self.setObjectName("topToolbar")
         self.setStyleSheet(f"QWidget#topToolbar{{background:{COLORS['bg_dark']};border-bottom:1px solid {COLORS['border']};}}")
         self._action_buttons = {}
@@ -68,8 +68,8 @@ class TopToolbar(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self); layout.setContentsMargins(10,2,12,2); layout.setSpacing(0)
-        row1 = QHBoxLayout(); row1.setSpacing(4)
+        layout = QVBoxLayout(self); layout.setContentsMargins(10,6,12,6); layout.setSpacing(0)
+        row1 = QHBoxLayout(); row1.setSpacing(6)
         self._tb_btns = []
         self._seps = []
         # undo/redo 放左上角
@@ -80,8 +80,8 @@ class TopToolbar(QWidget):
             btn = QToolButton()
             btn.setToolTip(tip)
             btn.setAccessibleName(tip)
-            btn.setFixedSize(32, 28)
-            btn.setIconSize(QSize(24, 24))
+            btn.setFixedSize(34, 34)
+            btn.setIconSize(QSize(22, 22))
             btn.setIcon(icon_fn(COLORS['text'], COLORS['text_dim']))
             btn.setStyleSheet(self._history_button_style())
             btn.clicked.connect(lambda checked, a=aid: self.action_clicked.emit(a))
@@ -93,13 +93,13 @@ class TopToolbar(QWidget):
         sep0.setStyleSheet(f"background:{COLORS['border']};max-width:1px;max-height:24px;")
         sep0.setFixedHeight(24); row1.addWidget(sep0); self._seps.append(sep0)
         self._title_lbl = QLabel("ALIGN 农机作业规划系统")
-        self._title_lbl.setStyleSheet(f"font-size:16px;font-weight:600;color:{COLORS['text_bright']};padding:0 8px;font-family:{UI_FONT};")
+        self._title_lbl.setStyleSheet(f"font-size:16px;font-weight:600;color:{COLORS['text_bright']};padding:0 8px;")
         row1.addWidget(self._title_lbl)
         sep = QFrame(); sep.setFrameShape(QFrame.VLine)
         sep.setStyleSheet(f"background:{COLORS['border']};max-width:1px;max-height:24px;")
         sep.setFixedHeight(24); row1.addWidget(sep); self._seps.append(sep)
         self.lbl_filename = QLabel("")
-        self.lbl_filename.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;padding:0 8px;font-family:{UI_FONT};")
+        self.lbl_filename.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;padding:0 8px;")
         self.lbl_filename.setFixedWidth(180); row1.addWidget(self.lbl_filename)
         row1.addStretch()
         self._theme_btn = None
@@ -107,22 +107,26 @@ class TopToolbar(QWidget):
         # settings/theme 放右侧
         for aid in ("SETTINGS", "THEME"):
             btn = QToolButton()
-            btn.setFixedSize(32, 28)
+            # 34x34 的可点区域 + 淡底描边：原来的 32x28 无底色，深色主题下几乎看不见
+            btn.setFixedSize(38, 34)
             btn.setIconSize(QSize(24, 24))
+            btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(
-                f"QToolButton{{background:transparent;color:{COLORS['text']};"
-                f"border:none;border-radius:4px;}}"
-                f"QToolButton:hover{{background:{COLORS['bg_hover']};}}"
+                f"QToolButton{{background:{COLORS['bg_light']};color:{COLORS['text_bright']};"
+                f"border:1px solid {COLORS['border']};border-radius:8px;}}"
+                f"QToolButton:hover{{background:{COLORS['bg_hover']};"
+                f"border-color:{COLORS['border_light']};}}"
+                f"QToolButton:pressed{{background:{COLORS['border']};}}"
             )
             if aid == "THEME":
                 btn.setToolTip("切换深色/浅色主题")
-                btn.setIcon(theme_icon(ThemeManager.instance().current_theme(), COLORS['text']))
+                btn.setIcon(theme_icon(ThemeManager.instance().current_theme(), COLORS['text_bright']))
                 btn.clicked.connect(self.theme_toggle.emit)
                 self._theme_btn = btn
             else:
                 btn.setToolTip("设置")
                 btn.setAccessibleName("设置")
-                btn.setIcon(settings_icon(COLORS['text']))
+                btn.setIcon(settings_icon(COLORS['text_bright']))
                 btn.clicked.connect(lambda checked, a=aid: self.action_clicked.emit(a))
                 self._settings_btn = btn
             row1.addWidget(btn); self._tb_btns.append(btn)
@@ -138,7 +142,7 @@ class TopToolbar(QWidget):
             "light": "当前: 浅色 → 点击切换深色",
         }
         if self._theme_btn:
-            self._theme_btn.setIcon(theme_icon(theme_name, COLORS['text']))
+            self._theme_btn.setIcon(theme_icon(theme_name, COLORS['text_bright']))
             self._theme_btn.setToolTip(tips.get(theme_name, "切换主题"))
 
     def refresh_theme(self):
@@ -158,10 +162,10 @@ class TopToolbar(QWidget):
         # 标题和文件名
         if hasattr(self, '_title_lbl'):
             self._title_lbl.setStyleSheet(
-                f"font-size:16px;font-weight:600;color:{COLORS['text_bright']};padding:0 8px;font-family:{UI_FONT};")
+                f"font-size:16px;font-weight:600;color:{COLORS['text_bright']};padding:0 8px;")
         if hasattr(self, 'lbl_filename'):
             self.lbl_filename.setStyleSheet(
-                f"color:{COLORS['text_dim']};font-size:12px;padding:0 8px;font-family:{UI_FONT};")
+                f"color:{COLORS['text_dim']};font-size:12px;padding:0 8px;")
         # 分隔线
         for sep in getattr(self, '_seps', []):
             sep.setStyleSheet(f"background:{COLORS['border']};max-width:1px;max-height:24px;")
@@ -205,7 +209,7 @@ class TopToolbar(QWidget):
     def _history_button_style():
         return (
             f"QToolButton{{background:transparent;color:{COLORS['text']};border:none;"
-            f"border-radius:4px;font-size:15px;font-family:{UI_FONT};}}"
+            f"border-radius:4px;font-size:15px;}}"
             f"QToolButton:hover{{background:{COLORS['bg_hover']};}}"
             f"QToolButton:disabled{{background:transparent;color:{COLORS['btn_disabled_text']};}}"
         )

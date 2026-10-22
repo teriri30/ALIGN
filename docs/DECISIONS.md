@@ -802,3 +802,14 @@
 - 观感说明：14px 下新罗马的衬线只有 1px，缩略看接近无衬线；放大或大字号（比例尺、标题）才明显。这是字号问题，不是字体没生效。
 - 代码锚点：`src/pyside6_app/styles.py::FONT_FAMILIES/FONT_FAMILY_CSS/ui_font/build_stylesheet`、`src/app_entry.py::build_app_font`、`src/pyside6_app/panels.py`（移除全部内联 font-family）、`src/pyside6_app/image_view.py::_scale_bar_font`。
 - 测试锚点：`tests/test_device_runtime.py::test_ui_font_is_times_new_roman_with_yahei_fallback`（断言族列表顺序，并断言 QSS 里不再出现 Times New Roman，防止有人把 font-family 写回样式表）。
+
+## DECISION-047：顶栏图标按钮的可点面积与可见性（2026-10-22）
+
+- 背景：用户反馈右上角「设置」「切换主题」"太小了，都快看不见"。原实现是 32x28 的透明 QToolButton + 24px 线性图标，图标色用 `COLORS['text']`（深色主题下偏暗）。
+- 做法：按钮 38x34、`bg_light` 淡底 + `border` 描边 + 8px 圆角；图标色改 `text_bright`；hover 用 `bg_hover` + `border_light`，pressed 用 `border`；光标改手型。顶栏高度 38 → 46，撤销/重做同步 34x34，四个按钮同一中线。
+- 不变量：
+  1. 顶栏图标按钮的最小可点面积 ≥ 36x32，图标 ≥ 22px（`tests/test_top_bar_affordance.py` 断言），不要再回到"透明底 + 24px 图标"的写法。
+  2. 顶栏高度必须比最高的按钮至少高 8px，否则按钮被裁。
+  3. 顶栏不得写 `font-family`（与 DECISION-046 一致）。
+- 代码锚点：`src/pyside6_app/top_bar.py::TopToolbar._build_ui`（右侧按钮样式、`setFixedHeight(46)`）、`ui_icons.theme_icon/settings_icon`（颜色参数）。
+- 测试锚点：`tests/test_top_bar_affordance.py`（3 条：可点面积与手型光标、可见底色与亮色图标、顶栏高度）。
