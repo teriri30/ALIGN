@@ -100,39 +100,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
         shell: pwsh
         run: |
-          # GitHub Actions 的 pwsh 默认 $ErrorActionPreference=stop：原生命令往 stderr
-          # 写一行就会把整个 step 掐断，所以这里显式放宽，并把全部输出写进文件。
-          $ErrorActionPreference = "Continue"
-          $version = (Get-Content build_info.json -Raw | ConvertFrom-Json).version
-          if ($env:GITHUB_REF_TYPE -eq "tag") { $releaseTag = $env:GITHUB_REF_NAME } else { $releaseTag = "${{ inputs.release_tag }}" }
-          $guidance = "**普通用户请下载 ${{ steps.package.outputs.zip }}（完整便携版，解压后双击 reUI.exe 即可运行，无需安装任何环境）。同名的 .sha256 文件是校验值，可不下。下方的“源代码”压缩包仅供开发者，不能直接运行。**"
-          "version=$version tag=$releaseTag sha=$env:GITHUB_SHA" | Out-File -FilePath publish-output.txt -Encoding utf8
-          try {
-            # gh 不允许 --notes 与 --generate-notes 同时使用，所以先建 release（自动 notes），
-            # 再把自定义说明前置到正文。
-            gh release create $releaseTag ${{ steps.package.outputs.zip }} ${{ steps.package.outputs.sha }} --target $env:GITHUB_SHA --generate-notes --title "reUI $version" *>> publish-output.txt
-            $code = $LASTEXITCODE
-            if ($code -ne 0) { throw "gh release create 退出码 $code" }
-            $body = gh release view $releaseTag --json body --jq .body
-            $combined = $guidance + "`n`n" + $body
-            $combined | Out-File -FilePath release-notes.md -Encoding utf8
-            gh release edit $releaseTag --notes-file release-notes.md *>> publish-output.txt
-            $code = $LASTEXITCODE
-            if ($code -ne 0) { throw "gh release edit 退出码 $code" }
-            Get-Content publish-output.txt | Write-Host
-          } catch {
-            "STEP FAILED: $($_.Exception.Message)" | Out-File -Append -FilePath publish-output.txt -Encoding utf8
-            Get-Content publish-output.txt | Write-Host
-            exit 1
-          }
-      - name: Publish failure annotations
-        if: always()
-        shell: pwsh
-        run: |
-          if (-not (Test-Path publish-output.txt)) { exit 0 }
-          foreach ($line in (Get-Content publish-output.txt | Where-Object { $_.Trim().Length -gt 0 } | Select-Object -Last 20)) {
-            $safe = $line.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
-            Write-Host "::error title=Release publish::$safe"
-          }
+          # 发布逻辑放在 py 里：gh CLI 在 pwsh 下的参数/退出码行为难排查，
+          # 脚本自己会打印 ::error:: 注解，失败原因直接出现在 check-run。
+          $env:GITHUB_REF_NAME = "$env:RELEASE_TAG"
+          python scripts/publish_release.py "${{ steps.package.outputs.zip }}" "${{ steps.package.outputs.sha }}"
