@@ -70,8 +70,6 @@ def test_complete_chain_unlocks_planning():
          ("centerline_select", "entry", "plan")),
         (lambda s: setattr(s, "selected_centerline_ids", []),
          ("entry", "plan")),
-        (lambda s: setattr(s, "harvester_params_confirmed", False),
-         ("plan",)),
         (lambda s: (setattr(s, "entry_point", None),
                     setattr(s, "entry_point_locked", False)),
          ("plan",)),
@@ -93,13 +91,11 @@ def test_upstream_change_locks_every_downstream_step(breakup, blocked):
 def test_upstream_change_never_leaves_a_later_step_done():
     """The ordering invariant: done implies all predecessors are done."""
     state = _state()
-    upstream = ("import_img", "draw_field", "segment", "process", "params",
+    upstream = ("import_img", "draw_field", "segment", "process",
                 "centerline_generate", "centerline_select", "entry")
     for broken in upstream:
         state = _state()
-        if broken == "params":
-            state.harvester_params_confirmed = False
-        elif broken == "entry":
+        if broken == "entry":
             state.entry_point_locked = False
             state.entry_point = None
         else:
@@ -127,6 +123,18 @@ def test_optional_steps_are_flagged_and_never_block_planning():
         assert "选填" not in (statuses[tid].text or ""), statuses[tid]
     # Skipping both optional points must not stop the route from being built.
     assert statuses["plan"].status == "available"
+
+
+def test_advanced_settings_defaults_never_block_planning():
+    """高级设置可动可不动：不确认也照常规划（参数来源在导出阶段才校验）。"""
+    state = _state()
+    state.harvester_params_confirmed = False
+    statuses = _statuses(state)
+    assert statuses["params"].status == "done"
+    assert statuses["params"].optional is True
+    assert "默认参数" in statuses["params"].text
+    assert statuses["plan"].status == "available"
+    assert not statuses["plan"].blocker
 
 
 def test_mask_derived_steps_survive_a_partially_restored_cache():

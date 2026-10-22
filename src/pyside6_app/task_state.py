@@ -74,23 +74,8 @@ class TaskStatus:
 
 
 #: Steps that may be skipped but still affect the planned route.
-OPTIONAL_TASKS = ("exit", "unload")
-
-
-def _has_harvester_base_params(params: Any) -> bool:
-    return bool(
-        isinstance(params, dict)
-        and params.get("cutter_width_m")
-        and params.get("track_width_m")
-        and params.get("track_gauge_m")
-        and params.get("wheelbase_m")
-        and params.get("track_length_m")
-        and params.get("turn_radius_m")
-    )
-
-
-def _has_cutter_forward_offset(params: Any) -> bool:
-    return bool(isinstance(params, dict) and params.get("cutter_forward_offset_m"))
+#: 「高级设置」也是可选：默认参数来自配置，未确认同样能规划。
+OPTIONAL_TASKS = ("exit", "unload", "params")
 
 
 def _has_points(value: Any) -> bool:
@@ -136,10 +121,6 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
         and getattr(state, "mask_result", None) is not None
     )
     plan_running = bool(getattr(state, "plan_running", False))
-    harvester_params = getattr(state, "harvester_params", {})
-    params_ready = _has_harvester_base_params(harvester_params)
-    cutter_offset_ready = _has_cutter_forward_offset(harvester_params)
-    params_done = bool(params_ready and cutter_offset_ready)
     params_confirmed = bool(getattr(state, "harvester_params_confirmed", False))
     entry = getattr(state, "entry_point", None)
     exit_point = getattr(state, "exit_point", None)
@@ -165,6 +146,17 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     )
     centerlines_selected = bool(
         centerline_ids.intersection(str(value) for value in selected_centerlines)
+    )
+    selection_report = getattr(state, "centerline_selection_report", {}) or {}
+    selection_origin = str(selection_report.get("selection_origin") or "")
+    # "default_all" 只是生成后的自动全选建议，用户还没看过；把它当成已确认
+    # 会让「选择作业线」卡片刚展开就被状态推进跳到下一步。
+    # 显式确认记在 selection_confirmed（勾选动作不会把它改回 False）；
+    # 老缓存没有该字段时按 origin 推断，保持既有项目行为。
+    selection_confirmed = bool(
+        selection_report.get(
+            "selection_confirmed", selection_origin != "default_all"
+        )
     )
     sim_done = bool(getattr(state, "simulation_done", False))
     export_done = bool(getattr(state, "export_done", False))
@@ -220,18 +212,18 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
         statuses["process"] = TaskStatus("in_progress", "处理中")
 
     if process_done:
-        # Harvester parameters only matter once a mask exists: before that the
-        # card is a locked step, not an "optional" one.
-        if params_done and params_confirmed:
-            statuses["params"] = TaskStatus("done", action="修改")
-        elif params_done:
-            statuses["params"] = TaskStatus("available", "待确认", action="确认")
-        elif params_ready:
-            statuses["params"] = TaskStatus("available", "缺割刀前置", action="补填")
-        else:
-            statuses["params"] = TaskStatus("available", action="设置")
+        # 高级设置是「可动可不动」的一步：默认参数由配置提供，未确认也能规划；
+        # 确认只是把参数来源标成用户录入/实测（正式导出仍按 provenance 校验）。
+        statuses["params"] = TaskStatus(
+            "done",
+            "已确认" if params_confirmed else "默认参数（可修改）",
+            action="修改",
+            optional=True,
+        )
     else:
-        statuses["params"] = TaskStatus("pending", blocker="先完成掩膜优化")
+        statuses["params"] = TaskStatus(
+            "pending", blocker="先完成掩膜优化", optional=True
+        )
 
     lines_ready = bool(centerline_items and centerlines_selected)
     if not process_done:
@@ -254,12 +246,20 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
             selected_count = len(
                 centerline_ids.intersection(str(value) for value in selected_centerlines)
             )
+            if not selected_count:
+                selection_text = "待选择"
+            elif selection_confirmed:
+                selection_text = f"已选择 {selected_count}/{len(centerline_ids)} 条"
+            else:
+                selection_text = f"已选择 {selected_count}/{len(centerline_ids)} 条（待确认）"
             statuses["centerline_select"] = TaskStatus(
-                "done" if selected_count else "available",
-                f"已选择 {selected_count}/{len(centerline_ids)} 条"
-                if selected_count
-                else "待选择",
-                action="调整" if selected_count else "选择",
+                "done" if selected_count and selection_confirmed else "available",
+                selection_text,
+                action=(
+                    "调整"
+                    if selected_count and selection_confirmed
+                    else ("确认" if selected_count else "选择")
+                ),
             )
 
         if not lines_ready:
@@ -297,8 +297,6 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     ready_to_plan = bool(
         process_done
         and centerlines_selected
-        and params_ready
-        and params_confirmed
         and _has_points(entry)
         and getattr(state, "entry_point_locked", False)
     )
@@ -315,8 +313,6 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
         statuses["plan"] = TaskStatus("pending", blocker="先生成作业线")
     elif not centerlines_selected:
         statuses["plan"] = TaskStatus("pending", blocker="先选择作业线")
-    elif not params_confirmed:
-        statuses["plan"] = TaskStatus("pending", blocker="先确认高级设置")
     elif not getattr(state, "entry_point_locked", False):
         statuses["plan"] = TaskStatus("pending", blocker="先设置并确认起点")
     elif ready_to_plan:

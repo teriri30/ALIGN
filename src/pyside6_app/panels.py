@@ -76,6 +76,8 @@ STEP_GROUPS = [
     {"label": "掩膜优化", "tasks": ["process"]},
     {"label": "生成作业线", "tasks": ["centerline_generate"]},
     {"label": "选择作业线", "tasks": ["centerline_select"]},
+    # 高级设置是可选步骤（默认参数即来自配置），不再作为规划前置条件，
+    # 因此放回流程末尾附近，避免让人以为"必须先设置"。
     {"label": "路径规划", "tasks": ["entry", "exit", "unload", "plan"]},
     {"label": "高级设置", "tasks": ["params"]},
     {"label": "模拟演示", "tasks": ["simulate"]},
@@ -89,6 +91,10 @@ def _task_def(tid):
 
 class TaskRow(QWidget):
     clicked = Signal(str)
+    #: 只有「操作按钮」被按下时发这个信号；行本身只发 ``clicked``。
+    #: 两者分开，是因为「选择作业线」这类步骤点行只应该展开卡片，
+    #: 点按钮才应该确认选择（否则用户想打开卡片看一眼就直接被确认了）。
+    action_clicked = Signal(str)
     delete_clicked = Signal(str)
 
     def __init__(self, task_def, parent=None):
@@ -143,7 +149,7 @@ class TaskRow(QWidget):
             f"font-family:{UI_FONT};}}"
             f"QPushButton:hover{{background:{COLORS['accent_hover']};}}"
         )
-        self._action_btn.clicked.connect(lambda: self.clicked.emit(self.tid))
+        self._action_btn.clicked.connect(lambda: self.action_clicked.emit(self.tid))
 
         self._delete_btn = SpringButton("回退")
         self._delete_btn.setFixedSize(52, 28)
@@ -154,7 +160,9 @@ class TaskRow(QWidget):
         self._busy = BreathingDot(8)
         self._busy.setVisible(False)
         self._progress = ShimmerBar()
-        self._progress.setVisible(False)
+        # 进度条位置常驻（4 px）：运行时只把轨道显示出来，不改变行高，
+        # 这样卡片高度从头到尾是稳定的，不会出现"进度条一出现就压住下一行"。
+        self._progress.set_idle(True)
         self._progress.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         title_row = QHBoxLayout()
@@ -171,8 +179,8 @@ class TaskRow(QWidget):
         action_row.addWidget(self._delete_btn)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 4, 8, 4)
-        outer.setSpacing(4)
+        outer.setContentsMargins(10, 6, 10, 6)
+        outer.setSpacing(6)
         outer.addLayout(title_row)
         outer.addLayout(action_row)
         outer.addWidget(self._progress)
@@ -189,7 +197,36 @@ class TaskRow(QWidget):
             return
         lay.invalidate()
         lay.activate()
-        self.setMinimumHeight(max(56, int(lay.sizeHint().height())))
+        target = max(56, int(lay.sizeHint().height()))
+        if target == int(getattr(self, "_synced_height", 0) or 0):
+            return
+        self._synced_height = target
+        self.setMinimumHeight(target)
+        self._notify_card_height_change()
+
+    def _notify_card_height_change(self):
+        """行高变了，让外层折叠卡片按真实内容重算高度。
+
+        卡片展开时会把内容区的 maximumHeight 固定成「展开那一刻」的高度。
+        进度条是运行中才出现的，行因此变高；不同步卡片的话，卡片仍按旧高度
+        分配空间，进度条就会压住下面的「处理强度」标签（截图里的文字遮挡）。
+        """
+        parent = self.parentWidget()
+        depth = 0
+        while parent is not None and depth < 8:
+            refresh = getattr(parent, "refresh_content_geometry", None)
+            if callable(refresh):
+                refresh()
+                return
+            parent = parent.parentWidget()
+            depth += 1
+
+    def mousePressEvent(self, event):
+        """整行可点：pending 行的操作按钮是禁用的，点击必须由行本身转成 clicked，
+        否则 _on_task_clicked 里的 blocker 提示永远走不到（P1）。"""
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.tid)
+        super().mousePressEvent(event)
 
     def flash_blocker(self, message):
         """在一行内就地显示"为什么现在不能做"，2.6 秒后自动复原。"""
@@ -217,10 +254,22 @@ class TaskRow(QWidget):
     def set_status(self, done=False, enabled=True, in_progress=False, progress_pct=-1, text=None, status="pending", clickable=None):
         if clickable is None:
             clickable = enabled
+        # 状态没变就直接返回：勾选作业线时每次都会重算全表状态，13 行各写一遍
+        # 样式表（Qt 每次都要重新解析 CSS）是勾选卡顿的主要来源。
+        signature = (
+            bool(done), bool(enabled), bool(clickable), bool(in_progress),
+            int(progress_pct), text, str(status),
+        )
+        if signature == getattr(self, "_status_signature", None) and not self._flash:
+            return
+        self._status_signature = signature
         self._done = bool(done)
         self._in_progress = bool(in_progress)
         self._status_key = status
         self._progress_pct = progress_pct
+        # 「能不能点」与「看起来是否可用」是两件事：pending 行可点，但不该因此失去灰态。
+        # 灰按 enabled 记下来，refresh_theme 不能再拿 isEnabled() 反推（P1 附带缺陷）。
+        self._enabled_visual = bool(enabled)
         self.setEnabled(bool(clickable))
         self._action_btn.setEnabled(bool(enabled))
         if text:
@@ -280,7 +329,7 @@ class TaskRow(QWidget):
             color = COLORS.get('red', '#E85D63')
         else:
             color = COLORS.get('text_dim', '#8B909A')
-        opacity = "1.0" if self.isEnabled() else "0.55"
+        opacity = "1.0" if getattr(self, "_enabled_visual", True) else "0.55"
         self._status.setStyleSheet(f"color:{color};font-size:12px;font-family:{UI_FONT};")
         label_color = (
             COLORS.get("text_accent", COLORS["text"])
@@ -331,13 +380,12 @@ class TaskRow(QWidget):
         bar = getattr(self, "_progress", None)
         if bar is not None:
             pct = int(getattr(self, "_progress_pct", -1))
-            bar.setVisible(pct >= 0)
+            bar.set_idle(pct < 0)
             if pct >= 0:
                 bar.set_ratio(pct / 100.0 if pct > 1 else float(pct))
             bar.set_colors(COLORS.get("accent", "#34D399"),
                            COLORS.get("border", "#263241"))
-            # 进度条出现/消失会改变行高，必须同步，否则它会压住按钮。
-            self._sync_row_height()
+            # 位置常驻，行高不随进度条出现而变化（见 __init__ 的说明）。
 
     @staticmethod
     def _secondary_button_style():
@@ -371,8 +419,9 @@ class StepCard(QWidget):
         self._done = False
         self.setMouseTracking(True)
         lo = QVBoxLayout(self)
-        lo.setContentsMargins(7, 6, 7, 6)
-        lo.setSpacing(5)
+        # 浮岛式卡片：内外都要留白，堆太密看着累（用户明确要求）。
+        lo.setContentsMargins(12, 10, 12, 10)
+        lo.setSpacing(8)
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(6)
@@ -405,7 +454,7 @@ class StepCard(QWidget):
         self._content.setAttribute(Qt.WA_StyledBackground, True)
         self._content.setStyleSheet("background:transparent;")
         self._content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        cl = QVBoxLayout(self._content); cl.setContentsMargins(10, 2, 0, 0); cl.setSpacing(2)
+        cl = QVBoxLayout(self._content); cl.setContentsMargins(12, 8, 4, 6); cl.setSpacing(8)
         for row in rows: cl.addWidget(row)
         self._content.setMaximumHeight(0)
         self._content.setVisible(False)
@@ -532,6 +581,10 @@ class StepCard(QWidget):
         if not self._expanded:
             self._content.setVisible(False)
             self._content.setMaximumHeight(0)
+        else:
+            # 展开过程中子控件高度可能变化（进度条出现、选填分组展开），
+            # 动画目标是开始时算的旧高度；结束后按真实内容收口一次。
+            self._sync_minimum_height()
         self.updateGeometry()
         self.update()
 
@@ -638,12 +691,14 @@ class StepCard(QWidget):
         tween_value(self, "_hover", target, 160, EASE_IN_OUT,
                     lambda: self.update())
 
-    def refresh_state(self):
+    def refresh_state(self, force=False):
         """Card emphasis follows the workflow state, not the task colour.
 
         Active card: accent 3 px rail on the left edge. Completed card: mint
         check and a hairline success border. Idle card: plain surface, no
         ornament, so ten stacked cards stay quiet until they matter.
+
+        ``force`` 供换主题时使用：状态没变但颜色变了，必须重刷样式。
         """
         # A row may report completion either through _done or through the
         # status key "done"/"success"; checking only _done let a completed card
@@ -658,6 +713,16 @@ class StepCard(QWidget):
             for row in task_rows
         )
         active = bool(getattr(self, "_active", False)) and not done
+        self._done = done
+        self._was_done = done
+        dot = getattr(self, "_status_dot", None)
+        tone_color = self.collapsed_status_dot() if dot is not None else None
+        # 状态刷新在勾选作业线时会被整表重算；样式没变就不要再写一遍
+        # setStyleSheet（Qt 每次都要重新解析 CSS，10 张卡片就是几十毫秒）。
+        key = (bool(done), bool(active), tone_color)
+        if not force and key == getattr(self, "_refresh_key", None):
+            return
+        self._refresh_key = key
         self._title.setStyleSheet(
             f"color:{COLORS['text_bright'] if active else COLORS['text']};"
             f"font-size:14px;font-weight:{600 if active else 500};"
@@ -670,15 +735,11 @@ class StepCard(QWidget):
             self._mark.clear()
             self._mark.setVisible(False)
         # Collapsed cards hide their rows, so the header owns the status dot.
-        dot = getattr(self, "_status_dot", None)
-        if dot is not None:
-            tone, color = self.collapsed_status_dot()
-            dot.set_tone(tone, color)
+        if dot is not None and tone_color is not None:
+            dot.set_tone(tone_color[0], tone_color[1])
         # 完成只靠对勾 + 状态点表达，不再播放扫光（用户要求只要交互反馈）。
         # Keep the card's own flag in sync: TaskPanel._step_cards[i]._done is
         # read elsewhere (activation logic, tests) and used to drift.
-        self._done = done
-        self._was_done = done
         # Chrome (surface, border, rail) is painted in paintEvent so the hover
         # fill and the rail can share one rounded clip.
         self.setStyleSheet(
@@ -728,6 +789,119 @@ class StepCard(QWidget):
         self.refresh_state()
 
 
+class _OptionalHeader(QWidget):
+    """二级折叠分组的表头（整行可点，暗色文字）。"""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class OptionalRowGroup(QWidget):
+    """选填行的二级折叠分组：默认收起，表头暗色，展开后露出子行。
+
+    「终点」「卸粮点」是选填项，和必选的「起点」平铺在一张卡片里时，两整行
+    会让人误以为必须填。折进二级分组后，卡片只展示必选流程；表头用暗色
+    文字报告当前取值（未设置/已设置），需要改的时候再展开。
+    """
+
+    def __init__(self, title, rows, parent=None):
+        super().__init__(parent)
+        self._rows = [row for row in rows if row is not None]
+        self._expanded = False
+        self._title_text = str(title)
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.setSpacing(2)
+
+        self._header = _OptionalHeader()
+        self._header.setObjectName("optionalGroupHeader")
+        hl = QHBoxLayout(self._header)
+        hl.setContentsMargins(6, 2, 6, 2)
+        hl.setSpacing(4)
+        self._toggle = ChevronToggle()
+        self._toggle.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._title = QLabel(self._title_text)
+        self._title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._summary = QLabel("")
+        self._summary.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._summary.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        hl.addWidget(self._toggle)
+        hl.addWidget(self._title, 1)
+        hl.addWidget(self._summary)
+        self._header.clicked.connect(self.toggle)
+        lo.addWidget(self._header)
+
+        self._content = QWidget()
+        cl = QVBoxLayout(self._content)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(6)
+        for row in self._rows:
+            cl.addWidget(row)
+        self._content.setVisible(False)
+        lo.addWidget(self._content)
+        self.refresh_theme()
+
+    # ---------------------------------------------------------------- state
+    def is_expanded(self):
+        return bool(self._expanded)
+
+    def toggle(self):
+        self.set_expanded(not self._expanded)
+
+    def set_expanded(self, expanded):
+        expanded = bool(expanded)
+        changed = expanded != self._expanded
+        self._expanded = expanded
+        self._toggle.set_expanded(expanded, animate_motion=changed)
+        self._content.setVisible(expanded)
+        if changed:
+            self._notify_card_height_change()
+
+    def set_summary(self, text):
+        text = str(text or "")
+        if self._summary.text() != text:
+            self._summary.setText(text)
+
+    def _notify_card_height_change(self):
+        parent = self.parentWidget()
+        depth = 0
+        while parent is not None and depth < 8:
+            refresh = getattr(parent, "refresh_content_geometry", None)
+            if callable(refresh):
+                refresh()
+                return
+            parent = parent.parentWidget()
+            depth += 1
+
+    def refresh_theme(self):
+        self._header.setStyleSheet(
+            "#optionalGroupHeader{background:transparent;border-radius:5px;}"
+            f"#optionalGroupHeader:hover{{background:{COLORS.get('bg_hover', '#1B2433')};}}"
+        )
+        self._title.setStyleSheet(
+            f"color:{COLORS.get('text_dim', '#8B909A')};font-size:12px;"
+            f"font-family:{UI_FONT};"
+        )
+        self._summary.setStyleSheet(
+            f"color:{COLORS.get('text_dim', '#8B909A')};font-size:11px;"
+            f"font-family:{UI_FONT};"
+        )
+        self._toggle.setStyleSheet(
+            "QToolButton{background:transparent;border:none;padding:0;margin:0;}"
+        )
+
+
 class TaskPanel(QWidget):
     load_tif_requested = Signal()
     load_model_requested = Signal()
@@ -755,6 +929,7 @@ class TaskPanel(QWidget):
     recommend_service_points_requested = Signal()
     centerline_generate_requested = Signal()
     centerline_selection_changed = Signal(str, bool)
+    centerline_selection_confirm_requested = Signal()
     step_deleted = Signal(str)
 
     def __init__(self, parent=None):
@@ -771,7 +946,7 @@ class TaskPanel(QWidget):
 
     def _build_ui(self):
         self.setStyleSheet(f"background:{COLORS['bg']};")
-        lo = QVBoxLayout(self); lo.setContentsMargins(6, 8, 6, 8); lo.setSpacing(6)
+        lo = QVBoxLayout(self); lo.setContentsMargins(8, 10, 8, 10); lo.setSpacing(6)
         self._title = QLabel("任务清单")
         self._title.setFont(QFont("Microsoft YaHei UI", 12, QFont.Weight.DemiBold))
         self._title.setStyleSheet(f"font-size:17px;font-weight:600;color:{COLORS['text_bright']};font-family:{UI_FONT};")
@@ -779,13 +954,20 @@ class TaskPanel(QWidget):
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
         self._scroll = scroll
-        body = QWidget(); bl = QVBoxLayout(body); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(4)
+        body = QWidget(); bl = QVBoxLayout(body); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(10)
         body.setStyleSheet("background:transparent;")
         for idx, group in enumerate(STEP_GROUPS, start=1):
             rows = []
+            optional_rows = []
             for tid in group["tasks"]:
                 td = _task_def(tid); row = TaskRow(td); self._task_widgets[tid] = row
-                row.clicked.connect(self._on_task_clicked); row.delete_clicked.connect(self.step_deleted.emit)
+                row.clicked.connect(self._on_task_clicked)
+                row.action_clicked.connect(self._on_task_action)
+                row.delete_clicked.connect(self.step_deleted.emit)
+                # 选填行折进二级分组（默认收起、暗色表头），必选流程保持一屏可见。
+                if tid in ("exit", "unload"):
+                    optional_rows.append(row)
+                    continue
                 rows.append(row)
                 if tid == "process":
                     self._mask_strength_label = QLabel("处理强度")
@@ -971,6 +1153,11 @@ class TaskPanel(QWidget):
                     )
                     self.route_edit_action_row.setVisible(False)
                     rows.append(self.route_edit_action_row)
+            if optional_rows:
+                self.optional_group = OptionalRowGroup(
+                    "选填：终点与卸粮点", optional_rows
+                )
+                rows.append(self.optional_group)
             card = StepCard(f"{idx}. {group['label']}", rows)
             card.toggled.connect(lambda _checked=False, i=idx - 1: self._on_card_toggled(i))
             self._step_cards.append(card); bl.addWidget(card)
@@ -1019,6 +1206,24 @@ class TaskPanel(QWidget):
                 self.entry_exit_toggle.emit(tid)
             else:
                 sig.emit()
+
+    def _on_task_action(self, tid):
+        """操作按钮与整行点击分流。
+
+        「选择作业线」行只有点按钮（确认）才算采纳当前勾选；点行本身只展开
+        卡片，方便先看一眼、改几条再确认。
+        """
+        if tid == "centerline_select":
+            row = self._task_widgets.get(tid)
+            if row is not None and getattr(row, "_blocker", ""):
+                row.flash_blocker(row._blocker)
+                return
+            if row is not None and getattr(row, "_status_key", "") == "available":
+                self.centerline_selection_confirm_requested.emit()
+                return
+            self._expand_card_for_task(tid)
+            return
+        self._on_task_clicked(tid)
 
     def _expand_card_for_task(self, tid):
         for index, group in enumerate(STEP_GROUPS):
@@ -1096,6 +1301,7 @@ class TaskPanel(QWidget):
             status=status,
         )
         if not getattr(self, "_applying_task_statuses", False):
+            self._sync_optional_summary()
             self._refresh_cards()
 
     def apply_task_statuses(self, statuses):
@@ -1105,8 +1311,13 @@ class TaskPanel(QWidget):
                 st = statuses.get(tid)
                 if not st:
                     continue
+                text = st.text
+                if tid == "plan" and st.status == "pending" and st.blocker:
+                    # 路径规划只有一个按钮，把「为什么还不能规划」直接写在这一行，
+                    # 不用等用户点一下才闪出来（选好起点却规划不了就是这么来的）。
+                    text = st.blocker
                 self.set_task_status(
-                    tid, st.status, text=st.text,
+                    tid, st.status, text=text,
                     optional=bool(getattr(st, "optional", False)),
                     blocker=getattr(st, "blocker", None),
                 )
@@ -1118,15 +1329,36 @@ class TaskPanel(QWidget):
                         self.set_task_action(tid, task_def["action"])
         finally:
             self._applying_task_statuses = False
+        self._sync_optional_summary()
         self._refresh_cards()
+
+    def _sync_optional_summary(self):
+        """选填分组表头显示当前取值，收起时也能一眼看到有没有设。"""
+        group = getattr(self, "optional_group", None)
+        if group is None:
+            return
+        done_parts = []
+        exit_row = self._task_widgets.get("exit")
+        if exit_row is not None and str(getattr(exit_row, "_status_text", "")).startswith("已设置"):
+            done_parts.append("终点已设")
+        unload_row = self._task_widgets.get("unload")
+        if unload_row is not None and str(getattr(unload_row, "_status_text", "")).startswith("已设置"):
+            done_parts.append("卸粮点已设")
+        group.set_summary("、".join(done_parts) if done_parts else "均未设置")
 
     def set_task_action(self, tid, text):
         row = self._task_widgets.get(tid)
-        if row: row._action_btn.setText(str(text))
+        if row and row._action_btn.text() != str(text):
+            row._action_btn.setText(str(text))
 
     def update_centerline_selection(self, catalog, selected_ids=None):
         if hasattr(self, "centerline_selector"):
             self.centerline_selector.update_centerline_selection(catalog, selected_ids)
+
+    def sync_centerline_selection(self, selected_ids=None):
+        """只同步勾选状态，不重建行（勾选/取消的高频路径）。"""
+        if hasattr(self, "centerline_selector"):
+            self.centerline_selector.sync_selection(selected_ids)
 
     def clear_centerline_selection(self):
         if hasattr(self, "centerline_selector"):
@@ -1268,8 +1500,11 @@ class TaskPanel(QWidget):
             row.refresh_theme()
         if hasattr(self, "centerline_selector"):
             self.centerline_selector.refresh_theme()
+        group = getattr(self, "optional_group", None)
+        if group is not None:
+            group.refresh_theme()
         for card in self._step_cards:
-            card.refresh_state()
+            card.refresh_state(force=True)
 
     def set_route_editing_active(self, active):
         active = bool(active)
@@ -1539,13 +1774,22 @@ class CenterlineSelectionRow(QWidget):
 
     toggled = Signal(str, bool)
 
+    #: 行内只显示来源的中文短名：原始标识符（four_row_band_centerlines 等）
+    #: 挤在每行右侧，读起来像日志，和"这是哪条线"无关。
+    _SOURCE_DISPLAY = {
+        "four_row_band_centerlines": "宽窄行",
+        "cutter_width_uniform_swaths": "等距区",
+        "nearest_region_merge_for_non_adjacent_contour": "合并区",
+    }
+
     def __init__(self, item, checked=True, parent=None):
         super().__init__(parent)
         item = dict(item or {})
         self.centerline_id = str(item.get("id") or "")
         sequence = int(item.get("sequence", 0) or 0)
         label = str(item.get("label") or f"中心线 {sequence}")
-        source = str(item.get("line_source") or item.get("kind") or "识别中心线")
+        raw_source = str(item.get("line_source") or item.get("kind") or "")
+        source = self._SOURCE_DISPLAY.get(raw_source, "")
         self.setMinimumHeight(28)
         self._hover = 0.0
         self.setMouseTracking(True)
@@ -1567,6 +1811,8 @@ class CenterlineSelectionRow(QWidget):
         self._source = QLabel(source)
         self._source.setMinimumWidth(0)
         self._source.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._source.setToolTip(raw_source)
+        self._source.setVisible(bool(source))
         self._source.setStyleSheet(
             f"font-size:11px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
         )
@@ -1702,13 +1948,28 @@ class CenterlineSelectionPanel(QWidget):
         self._empty_label.setVisible(False)
 
     def _on_row_toggled(self, centerline_id, checked):
+        self._update_count()
+        self.centerline_selection_changed.emit(centerline_id, bool(checked))
+
+    def _update_count(self):
+        total = len(self._centerline_rows)
         selected_count = sum(
             int(row.checkbox.isChecked()) for row in self._centerline_rows.values()
         )
-        self._count_label.setText(
-            f"已选择 {selected_count}/{len(self._centerline_rows)} 条"
-        )
-        self.centerline_selection_changed.emit(centerline_id, bool(checked))
+        self._count_label.setText(f"已选择 {selected_count}/{total} 条")
+
+    def sync_selection(self, selected_ids=None):
+        """只同步勾选状态与计数，不销毁/重建行控件。
+
+        勾选一条作业线时调用 update_centerline_selection 会把 14 行全部
+        deleteLater 再重建，滚动位置也会回到顶部——点一下卡一下就是这么来的。
+        """
+        if not self._centerline_rows:
+            return
+        selected = {str(value) for value in (selected_ids or [])}
+        for centerline_id, row in self._centerline_rows.items():
+            row.set_checked(centerline_id in selected)
+        self._update_count()
 
     def set_centerline_checked(self, centerline_id, checked):
         row = self._centerline_rows.get(str(centerline_id))

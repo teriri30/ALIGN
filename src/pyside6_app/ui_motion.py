@@ -335,11 +335,25 @@ class ShimmerBar(QWidget):
         self.setFixedHeight(4)
         self._ratio = 0.0
         self._phase = 0.0
+        self._idle = True
         self._fill = QColor("#34D399")
         self._track = QColor(255, 255, 255, 28)
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
+
+    def set_idle(self, idle) -> None:
+        """空闲时占位但不绘制：行高保持恒定，进度条出现不会撑动布局。"""
+        idle = bool(idle)
+        if idle == self._idle:
+            return
+        self._idle = idle
+        if idle:
+            self._ratio = 0.0
+            if self._timer.isActive():
+                self._timer.stop()
+                self._phase = 0.0
+        self.update()
 
     def set_colors(self, fill, track) -> None:
         self._fill = QColor(fill); self._track = QColor(track); self.update()
@@ -358,6 +372,8 @@ class ShimmerBar(QWidget):
         self.update()
 
     def paintEvent(self, event):
+        if getattr(self, "_idle", False):
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         rect = QRectF(self.rect())

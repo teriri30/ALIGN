@@ -341,6 +341,8 @@ def test_workflow_separates_centerlines_from_path_planning_and_advanced_settings
     assert centerline_generation_group["tasks"] == ["centerline_generate"]
     assert centerline_selection_group["tasks"] == ["centerline_select"]
     assert planning_group["tasks"] == ["entry", "exit", "unload", "plan"]
+    # 高级设置是可选步骤（默认参数即可规划），排在规划之后，不再当前置门槛。
+    assert STEP_GROUPS.index(advanced_group) > STEP_GROUPS.index(planning_group)
 
 
 def test_task_rows_stack_actions_below_summary_without_overlap():
@@ -357,6 +359,11 @@ def test_task_rows_stack_actions_below_summary_without_overlap():
     for other in panel._step_cards:
         if other is not card:
             other.set_expanded(False)
+    app.processEvents()
+
+    # 终点/卸粮点是选填项，默认折在二级分组里；要量它们的行几何必须先展开，
+    # 否则量到的是隐藏控件（隐藏控件仍保留旧几何，断言会变成空断言）。
+    panel.optional_group.set_expanded(True)
     app.processEvents()
 
     for tid in ("entry", "exit", "unload", "plan"):
@@ -1352,13 +1359,13 @@ def test_path_planning_action_stays_clickable_when_only_cutter_offset_is_missing
     panel = _window().task_panel
     panel.apply_task_statuses(statuses)
 
-    assert statuses["params"].status == "available"
-    assert statuses["params"].text == "缺割刀前置"
+    assert statuses["params"].status == "done"
+    assert statuses["params"].optional is True
     assert statuses["plan"].status == "available"
     assert panel._task_widgets["plan"]._action_btn.isEnabled()
 
 
-def test_mask_completion_stops_at_parameter_confirmation_before_path_planning():
+def test_mask_completion_does_not_stop_at_optional_advanced_settings():
     from state import AppState
     from pyside6_app.task_state import derive_task_statuses
 
@@ -1388,14 +1395,17 @@ def test_mask_completion_stops_at_parameter_confirmation_before_path_planning():
     state.exit_point = (2, 2)
 
     statuses = derive_task_statuses(state, has_image=True)
-    assert statuses["params"].status == "available"
+    assert statuses["params"].status == "done"
+    assert statuses["params"].optional is True
     assert statuses["entry"].status == "available"
     assert statuses["exit"].status == "done"
     assert statuses["exit"].optional is True
+    # 高级设置不是门槛：规划只等起点确认。
     assert statuses["plan"].status == "pending"
+    assert statuses["plan"].blocker == "先设置并确认起点"
 
 
-def test_path_planning_unlocks_after_parameters_and_start_are_confirmed():
+def test_path_planning_unlocks_after_start_is_confirmed():
     from state import AppState
     from pyside6_app.task_state import derive_task_statuses
 
@@ -3258,3 +3268,97 @@ def test_band_geometry_is_clipped_to_resolved_body_component():
     assert len(clipped) == 1
     assert max(point[0] for point in clipped[0]["centerline"]) < 180
     assert np.max(np.asarray(clipped[0]["contour"])[:, 0]) < 180
+
+
+def test_mask_progress_bar_does_not_cover_strength_label():
+    """回归：掩膜优化运行时进度条出现会把「处理强度」标签压住。
+
+    卡片展开时内容区 maximumHeight 被固定成展开瞬间的高度；进度条是运行中
+    才出现的，行因此变高，但卡片仍按旧高度分配空间，进度条就叠在标签上。
+    """
+    window = _window()
+    window.resize(1200, 900)
+    window.show()
+    app = QApplication.instance()
+    app.processEvents()
+    panel = window.task_panel
+    card = next(c for c in panel._step_cards if c._title.text().endswith("掩膜优化"))
+    for other in panel._step_cards:
+        other.set_expanded(other is card, animate=False)
+    app.processEvents()
+
+    row = panel._task_widgets["process"]
+    app.processEvents()
+    height_idle = row.height()
+    row.set_status(
+        status="in_progress", enabled=True, clickable=True,
+        in_progress=True, progress_pct=39,
+    )
+    app.processEvents()
+
+    # 进度条位置是常驻的：运行时只把它画出来，行高不能变，卡片更不该重排。
+    assert row.height() == height_idle, "行高没有为进度条预留位置"
+    bar = row._progress
+    assert bar.isVisible(), "运行中必须显示进度条"
+    bar_bottom = bar.mapTo(panel, QPoint(0, bar.height())).y()
+    label_top = panel._mask_strength_label.mapTo(panel, QPoint(0, 0)).y()
+    assert label_top >= bar_bottom, "进度条压住了「处理强度」标签"
+    window.close()
+
+
+def test_optional_points_live_in_a_collapsed_secondary_group():
+    """终点/卸粮点是选填项：默认折进二级分组，表头暗色并报告取值。"""
+    from pyside6_app.panels import TaskPanel
+    from pyside6_app.styles import COLORS
+
+    app = QApplication.instance() or QApplication([])
+    panel = TaskPanel()
+    panel.resize(330, 900)
+    panel.show()
+    app.processEvents()
+
+    group = panel.optional_group
+    assert group.is_expanded() is False
+    assert panel._task_widgets["exit"].isVisible() is False
+    assert panel._task_widgets["unload"].isVisible() is False
+    assert COLORS["text_dim"] in group._title.styleSheet(), "选填分组表头应为暗色"
+
+    plan_card = next(
+        c for c in panel._step_cards if c._title.text().endswith("路径规划")
+    )
+    for other in panel._step_cards:
+        other.set_expanded(other is plan_card, animate=False)
+    app.processEvents()
+    height_before = plan_card.height()
+    group.set_expanded(True)
+    app.processEvents()
+    assert panel._task_widgets["exit"].isVisible() is True
+    assert plan_card.height() > height_before, "展开选填分组后卡片必须长高"
+    panel.close()
+
+
+def test_plan_row_shows_why_it_is_still_pending():
+    """起点选好却不能规划时，原因要直接写在路径规划这一行上。"""
+    from pyside6_app.panels import TaskPanel
+    from pyside6_app.task_state import TASK_ORDER, TaskStatus
+
+    app = QApplication.instance() or QApplication([])
+    panel = TaskPanel()
+    panel.show()
+    app.processEvents()
+
+    statuses = {tid: TaskStatus("done") for tid in TASK_ORDER}
+    statuses["plan"] = TaskStatus("pending", blocker="先确认高级设置")
+    panel.apply_task_statuses(statuses)
+    app.processEvents()
+
+    row = panel._task_widgets["plan"]
+    assert row._status_key == "pending"
+    assert row._status.text() == "先确认高级设置"
+    assert row._blocker == "先确认高级设置"
+    # 其他行仍然是「待处理」，不把锁定原因铺满整屏。
+    statuses["process"] = TaskStatus("done")
+    panel.apply_task_statuses(statuses)
+    assert panel._task_widgets["plan"]._status.text() == "先确认高级设置"
+    panel.close()
+
