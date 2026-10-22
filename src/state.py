@@ -412,6 +412,31 @@ class AppState:
     def save_mask_undo(self, label: str = "掩膜操作"):
         self.push_history(self.capture_system_snapshot(label))
 
+    #: 只属于「作业线选择」的字段。勾选/取消是高频操作，每点一次都抓完整
+    #: 系统快照（含 mask_raw / mask_result 等大数组）会明显卡顿，撤销栈也
+    #: 会被撑爆；这里只存选择相关的轻量字段。
+    CENTERLINE_SELECTION_FIELDS = (
+        "centerline_catalog",
+        "selected_centerline_ids",
+        "centerline_selection_report",
+        "work_band_catalog",
+        "selected_work_band_ids",
+        "work_band_selection_report",
+    )
+
+    def capture_centerline_selection_snapshot(self, label: str = "调整作业线选择"):
+        return {
+            "kind": "system",
+            "label": str(label or "调整作业线选择"),
+            "values": {
+                name: self._snapshot_clone(getattr(self, name, None))
+                for name in self.CENTERLINE_SELECTION_FIELDS
+            },
+        }
+
+    def save_centerline_selection_undo(self, label: str = "调整作业线选择"):
+        self.push_history(self.capture_centerline_selection_snapshot(label))
+
     def _snapshot_like(self, kind: str) -> Dict[str, Any]:
         return self.capture_system_snapshot("恢复前状态")
 

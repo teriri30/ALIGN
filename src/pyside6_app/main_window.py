@@ -547,6 +547,9 @@ class MainWindow(QMainWindow):
         self.task_panel.centerline_selection_changed.connect(
             self._on_centerline_selection_changed
         )
+        self.task_panel.centerline_selection_confirm_requested.connect(
+            self._confirm_centerline_selection
+        )
         self.task_panel.centerline_generate_requested.connect(
             self._start_centerline_catalog_generation
         )
@@ -558,6 +561,7 @@ class MainWindow(QMainWindow):
         vw.mouse_moved.connect(self._on_viewer_mouse_moved)
         vw.mouse_dragged.connect(self.event_bridge.on_mouse_dragged)
         vw.set_direct_drag_hit_test(self._service_point_direct_drag_available)
+        vw.view_scale_changed.connect(self._on_view_scale_changed)
         self.image_view.snapshot_requested.connect(self._on_save_snapshot)
         self.image_view.mask_compare_requested.connect(self._on_toggle_mask_compare)
         self.image_view.display_layer_changed.connect(
@@ -960,6 +964,7 @@ class MainWindow(QMainWindow):
         report = {
             "algorithm_version": "operator-centerline-selection-v1",
             "selection_origin": origin,
+            "selection_confirmed": False,
             "selected_ids": list(selected_ids),
             "selected_count": len(selected_ids),
             "selection_mode": "single" if len(selected_ids) == 1 else "multi",
@@ -1000,6 +1005,65 @@ class MainWindow(QMainWindow):
             request_project_state_save(tif_path, self.state, stage="centerline_selection")
         except Exception as exc:
             self._log.info(f"centerline selection cache save failed: {exc}")
+
+    def _schedule_centerline_selection_persist(self, delay_ms=400):
+        """合并连续的勾选/取消，只落一次盘。
+
+        每点一次复选框就同步写一次 project_state.json 会把 UI 线程拖住；
+        勾选是高频操作，用单次定时器合并成一次保存。
+        """
+        timer = getattr(self, "_centerline_persist_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._persist_centerline_selection)
+            self._centerline_persist_timer = timer
+        timer.start(int(delay_ms))
+
+    def _confirm_centerline_selection(self):
+        """采纳当前勾选：把「选择作业线」标成已完成并推进到下一步。
+
+        生成作业线后系统默认全选，但那是建议不是确认；用户要能停在卡片上
+        逐条看，确认后才进入起点设置。
+        """
+        catalog = getattr(self.state, "centerline_catalog", None) or getattr(
+            self.state, "work_band_catalog", {}
+        ) or {}
+        items = list(catalog.get("items") or [])
+        valid_ids = [str(item.get("id")) for item in items]
+        selected = [
+            str(value)
+            for value in (
+                getattr(self.state, "selected_centerline_ids", None)
+                or getattr(self.state, "selected_work_band_ids", [])
+                or []
+            )
+            if str(value) in valid_ids
+        ]
+        if not selected:
+            self.log_panel.warn("当前未勾选任何作业线；请至少保留一条再确认")
+            return
+        report = {
+            "algorithm_version": "operator-centerline-selection-v1",
+            "selection_origin": "operator",
+            "selection_confirmed": True,
+            "selected_ids": list(selected),
+            "selected_count": len(selected),
+            "candidate_count": len(valid_ids),
+            "selection_mode": "single" if len(selected) == 1 else "multi",
+        }
+        # 快照要在改动之前抓，撤销才能回到「未确认」。
+        self.state.save_centerline_selection_undo("确认作业线选择")
+        self.state.safe_update(
+            centerline_selection_report=dict(report),
+            work_band_selection_report=dict(report),
+        )
+        self.top_toolbar.refresh_actions(self.state)
+        self._persist_centerline_selection()
+        self._sync_task_statuses()
+        self.log_panel.success(
+            f"已确认采用 {len(selected)}/{len(valid_ids)} 条作业线；接下来设置起点"
+        )
 
     def _start_centerline_catalog_generation(self):
         """Generate all candidate centerlines once the processed mask is committed."""
@@ -1069,9 +1133,18 @@ class MainWindow(QMainWindow):
             selected = [value for value in selected if value != centerline_id]
         order = {value: index for index, value in enumerate(valid_ids)}
         selected.sort(key=lambda value: order.get(value, 0))
+        previous_report = getattr(self.state, "centerline_selection_report", {}) or {}
+        previous_origin = str(previous_report.get("selection_origin") or "")
+        # 勾选/取消只是「正在调整」：已经确认过的选择不要因为再动一下就退回待确认。
+        still_confirmed = bool(
+            previous_report.get(
+                "selection_confirmed", previous_origin != "default_all"
+            )
+        )
         report = {
             "algorithm_version": "operator-centerline-selection-v1",
             "selection_origin": "operator",
+            "selection_confirmed": still_confirmed,
             "selected_ids": list(selected),
             "selected_count": len(selected),
             "candidate_count": len(valid_ids),
@@ -1081,7 +1154,11 @@ class MainWindow(QMainWindow):
                 else "multi"
             ),
         }
-        self._save_system_undo("调整作业线选择")
+        # 勾选框的撤销只回退「作业线选择」，不抓系统快照：系统快照包含
+        # mask_raw / mask_result 等大数组，每点一次复选框就深拷贝一次，
+        # 14 条线来回勾选会明显卡顿。
+        self.state.save_centerline_selection_undo("调整作业线选择")
+        self.top_toolbar.refresh_actions(self.state)
         self.state.safe_update(
             centerline_catalog=catalog,
             selected_centerline_ids=list(selected),
@@ -1097,19 +1174,17 @@ class MainWindow(QMainWindow):
         # checkbox contract is an immediate visual exclusion, so do not keep
         # that obsolete path as a dashed overlay after the selection changes.
         self._stale_path_preview = None
-        self.task_panel.update_centerline_selection(catalog, selected)
+        self.task_panel.sync_centerline_selection(selected)
         # DECISION-024: the checkbox is a display-level edit.  The formal
         # route remains invalidated above, but only the centerline and route
         # layers need to change on the canvas; the base image and mask
         # evidence stay in place for immediate feedback.
         self._refresh_centerline_selection_overlay()
-        self._persist_centerline_selection()
+        self._schedule_centerline_selection_persist()
         if not selected:
-            self.log_panel.warn("当前未勾选任何中心线；请至少保留一条后再连接掉头")
-        else:
-            self.log_panel.info(
-                f"已采用 {len(selected)}/{len(valid_ids)} 条中心线；请设置起点后生成作业路线"
-            )
+            self.log_panel.warn("当前未勾选任何作业线；请至少保留一条后再生成路线")
+        # 勾选是高频操作：每点一次都往日志里写一行会把日志刷成流水账，
+        # 当前勾选数量已经由面板上的「已选择 N/M 条」实时显示。
 
     def _admit_task_completion(self, task_type, token):
         """Reject cancelled or stale worker output before it mutates project state."""
@@ -4590,7 +4665,6 @@ class MainWindow(QMainWindow):
     def _service_drag_can_auto_replan(self):
         return bool(
             getattr(self.state, "mask_processed", False)
-            and getattr(self.state, "harvester_params_confirmed", False)
             and getattr(self.state, "entry_point", None)
             and getattr(self.state, "entry_point_locked", False)
             and not self._has_background_worker()
@@ -7250,6 +7324,36 @@ class MainWindow(QMainWindow):
         viewer = self.image_view.viewer
         self._draw_centerline_overlay(viewer)
 
+    def _on_view_scale_changed(self, _scale=None):
+        """缩放变化后重排作业线标注。
+
+        标注是按当前缩放的像素间距做碰撞过滤的：放大后间距变大，原本被
+        过滤掉的编号应该重新出现，所以缩放（含滚轮、按钮、适应窗口）后
+        防抖重画一次。
+        """
+        timer = getattr(self, "_centerline_label_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._redraw_centerline_labels)
+            self._centerline_label_timer = timer
+        timer.start(220)
+
+    def _redraw_centerline_labels(self):
+        catalog = getattr(self.state, "centerline_catalog", None) or getattr(
+            self.state, "work_band_catalog", {}
+        ) or {}
+        if not catalog.get("items"):
+            return
+        viewer = self.image_view.viewer
+        if getattr(viewer, "_pixmap", None) is None:
+            return
+        if hasattr(viewer, "overlay_layer_visible") and not viewer.overlay_layer_visible(
+            "centerlines"
+        ):
+            return
+        self._refresh_centerline_selection_overlay()
+
     def _display_mask_clipped_to_field(self, mask, offset_x, offset_y):
         """Return a display-only field clip while preserving analysis arrays."""
         if not isinstance(mask, np.ndarray):
@@ -7288,6 +7392,204 @@ class MainWindow(QMainWindow):
         points[:, 1] += offset_y
         return [(float(x), float(y)) for x, y in points]
 
+    @staticmethod
+    def _point_along_polyline(points, fraction):
+        """Return the point at *fraction* of the polyline's arc length.
+
+        按点序号取整会导致"标签落点"跟实际几何无关（简化后的作业线只有 2–3
+        个点，0.5 会落在中点、0.15 却仍在端点），标签就挤在同一处。
+        """
+        fraction = max(0.0, min(1.0, float(fraction)))
+        if len(points) < 2:
+            return points[0]
+        lengths = []
+        total = 0.0
+        for i in range(len(points) - 1):
+            dx = points[i + 1][0] - points[i][0]
+            dy = points[i + 1][1] - points[i][1]
+            seg = math.hypot(dx, dy)
+            lengths.append(seg)
+            total += seg
+        if total <= 0:
+            return points[0]
+        target = fraction * total
+        acc = 0.0
+        for i, seg in enumerate(lengths):
+            if seg <= 0:
+                continue
+            if acc + seg >= target:
+                ratio = (target - acc) / seg
+                x0, y0 = points[i]
+                x1, y1 = points[i + 1]
+                return (x0 + (x1 - x0) * ratio, y0 + (y1 - y0) * ratio)
+            acc += seg
+        return points[-1]
+
+    @staticmethod
+    def _overlay_text_polygon(viewer, text_item):
+        """Text item 在视口里的四个角（含旋转）。
+
+        文字带 ItemIgnoresTransformations（按 1:1 绘制），所以尺寸要取
+        boundingRect 并按自身旋转角旋转，不能再乘视图缩放。
+        """
+        if text_item is None:
+            return None
+        try:
+            pos = viewer.mapFromScene(text_item.pos())
+            rect = text_item.boundingRect()
+            angle = math.radians(float(text_item.rotation() or 0.0))
+        except Exception:
+            return None
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        corners = []
+        for cx, cy in ((rect.left(), rect.top()), (rect.right(), rect.top()),
+                       (rect.right(), rect.bottom()), (rect.left(), rect.bottom())):
+            corners.append((
+                pos.x() + cx * cos_a - cy * sin_a,
+                pos.y() + cx * sin_a + cy * cos_a,
+            ))
+        return corners
+
+    @staticmethod
+    def _inflate_polygon(corners, margin):
+        """旋转矩形的四角沿自身两轴外扩 margin 像素。
+
+        只判"不重叠"不够：两个编号贴在一起看着就是一团。留出间隙再判，
+        密集时自然会少画几个，放大后自动补齐。
+        """
+        if not corners or margin <= 0:
+            return corners
+        (x0, y0), (x1, y1), (x2, y2), (x3, y3) = corners
+        ux, uy = x1 - x0, y1 - y0
+        vx, vy = x3 - x0, y3 - y0
+        u_len = math.hypot(ux, uy) or 1.0
+        v_len = math.hypot(vx, vy) or 1.0
+        ux, uy = ux / u_len * margin, uy / u_len * margin
+        vx, vy = vx / v_len * margin, vy / v_len * margin
+        return [
+            (x0 - ux - vx, y0 - uy - vy),
+            (x1 + ux - vx, y1 + uy - vy),
+            (x2 + ux + vx, y2 + uy + vy),
+            (x3 - ux + vx, y3 - uy + vy),
+        ]
+
+    def _aligned_label_anchors(self, items, selected, fraction=0.5):
+        """每条已选作业线一个标签落点，全部落在同一条横截线上。
+
+        取统一的主方向投影位置（默认 50%，即各线中点附近），按各自弧长取会
+        因线长不同而高低错落（"一会上一会下"）。
+        """
+        lines = []
+        for item in items:
+            cid = str(item.get("id"))
+            if cid not in selected:
+                continue
+            points = self._centerline_display_points(item)
+            if len(points) >= 2:
+                lines.append((cid, points))
+        if not lines:
+            return {}
+        longest = max(
+            lines,
+            key=lambda row: math.hypot(
+                row[1][-1][0] - row[1][0][0], row[1][-1][1] - row[1][0][1]
+            ),
+        )[1]
+        dx = longest[-1][0] - longest[0][0]
+        dy = longest[-1][1] - longest[0][1]
+        norm = math.hypot(dx, dy) or 1.0
+        ux, uy = dx / norm, dy / norm
+        projections = [
+            [point[0] * ux + point[1] * uy for point in points]
+            for _cid, points in lines
+        ]
+        flat = [value for row in projections for value in row]
+        start = min(flat)
+        span = max(flat) - start
+        # 取所有线都覆盖到的投影区间（交集），保证每条线都在同一位置落点；
+        # 用全局 min/max 会让短线的 5% 落在自身端点附近，标点就散开了。
+        low = max(min(row) for row in projections)
+        high = min(max(row) for row in projections)
+        if high <= low:
+            low, high = start, start + span
+        target = low + (high - low) * max(0.0, min(1.0, float(fraction)))
+        anchors = {}
+        for (cid, points), projs in zip(lines, projections):
+            if projs[0] > projs[-1]:
+                points = list(reversed(points))
+                projs = list(reversed(projs))
+            anchor = points[0]
+            for i in range(len(projs) - 1):
+                a, b = projs[i], projs[i + 1]
+                if b > a and a <= target <= b:
+                    ratio = (target - a) / (b - a)
+                    anchor = (
+                        points[i][0] + (points[i + 1][0] - points[i][0]) * ratio,
+                        points[i][1] + (points[i + 1][1] - points[i][1]) * ratio,
+                    )
+                    break
+                if target > b:
+                    anchor = points[i + 1]
+                elif target < a:
+                    anchor = points[i]
+                    break
+            anchors[cid] = anchor
+        return anchors
+
+    @staticmethod
+    def _polygons_overlap(poly_a, poly_b):
+        """分离轴判定（SAT）：两个凸四边形是否真的相交。
+
+        旋转后的标注用外接矩形判重叠会误杀：两条平行标注沿法向错开 16 px、
+        各自只有 14 px 厚，视觉上并不相交，但轴对齐外接框会大面积重叠。
+        """
+        for poly in (poly_a, poly_b):
+            for i in range(len(poly)):
+                x1, y1 = poly[i]
+                x2, y2 = poly[(i + 1) % len(poly)]
+                axis_x, axis_y = -(y2 - y1), (x2 - x1)
+                norm = math.hypot(axis_x, axis_y) or 1.0
+                ux, uy = axis_x / norm, axis_y / norm
+                proj_a = [px * ux + py * uy for px, py in poly_a]
+                proj_b = [px * ux + py * uy for px, py in poly_b]
+                if max(proj_a) <= min(proj_b) or max(proj_b) <= min(proj_a):
+                    return False
+        return True
+
+    @staticmethod
+    def _centerline_label_size(viewer, anchors):
+        """按当前缩放下相邻编号的间距选字号。
+
+        间距只有十几像素时用 9 pt 会互相压字（旋转后字高就是法向厚度），
+        这里按间距退到 8/7 pt，保证整排编号都放得下。
+        """
+        points = [(float(p[0]), float(p[1])) for p in anchors.values()]
+        if len(points) < 2:
+            return 9
+        nearest = []
+        for i, (x0, y0) in enumerate(points):
+            best = None
+            for j, (x1, y1) in enumerate(points):
+                if i == j:
+                    continue
+                distance = math.hypot(x1 - x0, y1 - y0)
+                if best is None or distance < best:
+                    best = distance
+            if best:
+                nearest.append(best)
+        nearest.sort()
+        median = nearest[len(nearest) // 2]
+        try:
+            scale = float(viewer.transform().m11()) or 1.0
+        except Exception:
+            scale = 1.0
+        pitch_px = median * scale
+        if pitch_px >= 19.0:
+            return 9
+        if pitch_px >= 14.5:
+            return 8
+        return 7
+
     def _draw_centerline_overlay(self, viewer):
         if hasattr(viewer, "clear_overlay_layer"):
             viewer.clear_overlay_layer("centerlines")
@@ -7304,6 +7606,9 @@ class MainWindow(QMainWindow):
         )
         if hasattr(viewer, "begin_overlay_layer"):
             viewer.begin_overlay_layer("centerlines")
+        label_rects = []
+        anchors = self._aligned_label_anchors(items, selected)
+        label_size = self._centerline_label_size(viewer, anchors)
         try:
             for item in items:
                 points = self._centerline_display_points(item)
@@ -7312,15 +7617,65 @@ class MainWindow(QMainWindow):
                 is_selected = str(item.get("id")) in selected
                 if not is_selected:
                     continue
-                viewer.draw_polyline(points, color=(40, 220, 80), width=5)
+                # 线在编号处要断开一小段，所以先建编号、量长度，再画线（见下）。
+                # 线段要有两个端点：只画线时"从哪到哪"看不出来，两条相邻线
+                # 的端头也容易连成一片。端点用固定屏幕半径的圆点，缩放不变形。
+                for end_x, end_y in (points[0], points[-1]):
+                    viewer.draw_circle(end_x, end_y, radius=4, color=(120, 255, 150))
+                # 编号写全称"中心线 N"（用户要求：只写数字信息量不够）；文字带
+                # 描边、线全程连续，被字压住的只有十来个字宽，不影响判断整条线。
                 label = str(item.get("label") or item.get("id") or "中心线")
-                viewer.draw_text(
-                    points[0][0] + 8.0,
-                    points[0][1] + 8.0,
-                    label,
-                    color=(60, 255, 100),
-                    size=11,
+                # 14 条线在同一端头排成一行，横排标签必然互相压字：
+                #   1) 所有编号取同一个相对位置（离端头约一成），排成整齐的一列；
+                #   2) 标注旋转到与作业线同向，密集时按列并排而不是横向叠字；
+                #   3) 最后做像素级碰撞检查，仍重叠的标签不画。
+                angle = math.degrees(
+                    math.atan2(
+                        points[-1][1] - points[0][1],
+                        points[-1][0] - points[0][0],
+                    )
                 )
+                while angle > 90.0:
+                    angle -= 180.0
+                while angle < -90.0:
+                    angle += 180.0
+                # 编号放在各条作业线的中点附近：一条线一个号，落在整排中部比挤在
+                # 端头更好认，也不跟端头的地头/起点标记抢位置。
+                anchor = anchors.get(str(item.get("id"))) or self._point_along_polyline(points, 0.5)
+                # 编号压在线上：文字带描边、无底色；线全程连续（用户要求：
+                # 不许断线，断线会影响"这条线到底从哪到哪"的判断）。
+                draw_label = getattr(viewer, "draw_label", None)
+                if draw_label is not None:
+                    text_item = draw_label(
+                        anchor[0],
+                        anchor[1],
+                        label,
+                        size=label_size,
+                        rotation=angle,
+                        center=True,
+                    )
+                else:
+                    text_item = viewer.draw_text(
+                        anchor[0],
+                        anchor[1],
+                        label,
+                        color=(245, 247, 250),
+                        size=label_size,
+                        rotation=angle,
+                        center=True,
+                    )
+                polygon = self._overlay_text_polygon(viewer, text_item)
+                if polygon is not None:
+                    polygon = self._inflate_polygon(polygon, 2.0)
+                if polygon is not None and any(
+                    self._polygons_overlap(polygon, other) for other in label_rects
+                ):
+                    if hasattr(viewer, "remove_overlays"):
+                        viewer.remove_overlays([text_item])
+                    text_item, polygon = None, None
+                viewer.draw_polyline(points, color=(40, 220, 80), width=5)
+                if polygon is not None:
+                    label_rects.append(polygon)
         finally:
             if hasattr(viewer, "end_overlay_layer"):
                 viewer.end_overlay_layer()

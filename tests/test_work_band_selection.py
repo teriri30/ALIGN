@@ -533,6 +533,7 @@ def test_unchecked_centerline_is_hidden_from_canvas_overlay():
         def __init__(self):
             self.lines = []
             self.labels = []
+            self.endpoints = []
 
         def draw_polyline(self, points, **kwargs):
             self.lines.append((points, kwargs))
@@ -540,11 +541,52 @@ def test_unchecked_centerline_is_hidden_from_canvas_overlay():
         def draw_text(self, *args, **kwargs):
             self.labels.append((args, kwargs))
 
+        def draw_circle(self, x, y, **kwargs):
+            self.endpoints.append((x, y, kwargs))
+
     viewer = Viewer()
     window._draw_centerline_overlay(viewer)
 
     assert len(viewer.lines) == 2
     assert all("30.0" not in str(points) for points, _kwargs in viewer.lines)
+    # 线段直觉：每条已选作业线两个端点都要有标记（2 条线 = 4 个端点）。
+    assert len(viewer.endpoints) == 4
+    window.close()
+
+
+def test_centerline_label_is_a_halo_badge_centered_on_its_line():
+    """编号必须是压在线上、尺寸正常的文字（富文本 span 曾把宽度撑到 1118 px）。"""
+    window = _window()
+    images = _centerline_catalog_with_three_lines()
+    ids = [item["id"] for item in images["items"]]
+    window.state.safe_update(
+        centerline_catalog=images, selected_centerline_ids=ids
+    )
+    viewer = window.image_view.viewer
+    window._draw_centerline_overlay(viewer)
+
+    badges = [
+        item for item in viewer._overlay_layers.get("centerlines", [])
+        if item.__class__.__name__ == "_MapLabelItem"
+    ]
+    assert len(badges) == len(ids)
+    # 编号写全称：只写数字信息量不够（用户要求）；线必须整条不断。
+    assert sorted(item.text() for item in badges) == ["中心线 1", "中心线 2", "中心线 3"]
+    from PySide6.QtWidgets import QGraphicsLineItem
+
+    drawn_lines = [
+        item for item in viewer._overlay_layers.get("centerlines", [])
+        if isinstance(item, QGraphicsLineItem)
+    ]
+    assert len(drawn_lines) == len(ids), "作业线必须整条画出，不得在编号处断开"
+    line_y = {10.0, 30.0, 50.0}
+    for badge in badges:
+        rect = badge.boundingRect()
+        assert rect.width() < 120, "编号徽标被富文本页宽撑开了"
+        center = badge.mapToScene(rect.center())
+        assert abs(center.x() - 60.0) <= 3.0, "编号没有落在作业线中点上"
+        nearest = min(line_y, key=lambda y: abs(y - center.y()))
+        assert abs(center.y() - nearest) <= 3.0, "编号偏离了它对应的作业线"
     window.close()
 
 
@@ -821,3 +863,149 @@ def test_centerline_selection_unlocks_service_points_only_after_catalog_choice()
     assert after_choice["entry"].status == "available"
     assert after_choice["unload"].status == "done"
     assert after_choice["plan"].status == "pending"
+
+
+def _masked_state():
+    from state import AppState
+
+    state = AppState()
+    state.tif_path = "dummy.tif"
+    state.field_boundary = [(0, 0), (100, 0), (100, 100)]
+    state.inference_done = True
+    state.mask_raw = np.ones((20, 20), dtype=np.uint8)
+    state.mask_processed = True
+    state.mask_result = {"processed_mask": state.mask_raw}
+    return state
+
+
+def test_default_all_selection_keeps_the_selection_step_open():
+    """生成后的自动全选只是建议：用户没看过就推进到下一步是不合理的。"""
+    from pyside6_app.task_state import derive_task_statuses
+
+    state = _masked_state()
+    state.centerline_catalog = _centerline_catalog_with_three_lines()
+    state.selected_centerline_ids = [
+        "centerline-001", "centerline-002", "centerline-003"
+    ]
+    state.centerline_selection_report = {
+        "selection_origin": "default_all",
+        "selection_confirmed": False,
+        "selected_ids": ["centerline-001", "centerline-002", "centerline-003"],
+    }
+
+    statuses = derive_task_statuses(state, has_image=True)
+    assert statuses["centerline_select"].status == "available"
+    assert statuses["centerline_select"].action == "确认"
+    assert "待确认" in statuses["centerline_select"].text
+
+    state.centerline_selection_report = {
+        "selection_origin": "operator",
+        "selection_confirmed": True,
+        "selected_ids": ["centerline-001", "centerline-002", "centerline-003"],
+    }
+    confirmed = derive_task_statuses(state, has_image=True)
+    assert confirmed["centerline_select"].status == "done"
+    assert confirmed["centerline_select"].action == "调整"
+
+
+def test_confirm_centerline_selection_advances_the_workflow():
+    window = _window()
+    window.state.safe_update(
+        mask_raw=np.ones((80, 120), dtype=np.uint8),
+        inference_done=True,
+        mask_processed=True,
+        mask_result={"processed_mask": np.ones((80, 120), dtype=np.uint8)},
+        field_boundary=[(0.0, 0.0), (119.0, 0.0), (119.0, 79.0), (0.0, 79.0)],
+        centerline_catalog=_centerline_catalog_with_three_lines(),
+        selected_centerline_ids=[
+            "centerline-001", "centerline-002", "centerline-003"
+        ],
+        centerline_selection_report={
+            "selection_origin": "default_all",
+            "selection_confirmed": False,
+            "selected_ids": [
+                "centerline-001", "centerline-002", "centerline-003"
+            ],
+        },
+    )
+    window.task_panel.update_centerline_selection(
+        _centerline_catalog_with_three_lines(),
+        ["centerline-001", "centerline-002", "centerline-003"],
+    )
+    window._sync_task_statuses()
+    assert (
+        window.task_panel._task_widgets["centerline_select"]._status_key
+        == "available"
+    )
+
+    window._confirm_centerline_selection()
+    window._sync_task_statuses()
+
+    assert (
+        window.state.centerline_selection_report["selection_origin"] == "operator"
+    )
+    assert (
+        window.state.centerline_selection_report["selection_confirmed"] is True
+    )
+    assert (
+        window.task_panel._task_widgets["centerline_select"]._status_key == "done"
+    )
+    window.close()
+
+
+def test_checkbox_toggle_reuses_rows_and_keeps_undo_snapshot_light():
+    """勾选/取消：不重建行控件、不抓含大数组的系统快照。"""
+    window = _window()
+    catalog = _centerline_catalog_with_three_lines()
+    window.state.safe_update(
+        centerline_catalog=catalog,
+        selected_centerline_ids=[
+            "centerline-001", "centerline-002", "centerline-003"
+        ],
+    )
+    window.task_panel.update_centerline_selection(
+        catalog, ["centerline-001", "centerline-002", "centerline-003"]
+    )
+    selector = window.task_panel.centerline_selector
+    before = {
+        cid: id(row) for cid, row in selector._centerline_rows.items()
+    }
+
+    window._on_centerline_selection_changed("centerline-002", False)
+
+    after = {
+        cid: id(row) for cid, row in selector._centerline_rows.items()
+    }
+    assert before == after, "勾选复用了行控件，不应整体重建"
+    assert selector._count_label.text() == "已选择 2/3 条"
+
+    snapshot = window.state.undo_stack[-1]
+    assert "mask_raw" not in (snapshot.get("values") or {})
+    assert "selected_centerline_ids" in (snapshot.get("values") or {})
+    window.close()
+
+
+def test_checkbox_toggle_preserves_confirmation_state():
+    """确认之后再改勾选，不能把步骤退回「待确认」。"""
+    window = _window()
+    catalog = _centerline_catalog_with_three_lines()
+    ids = ["centerline-001", "centerline-002", "centerline-003"]
+    window.state.safe_update(
+        centerline_catalog=catalog,
+        selected_centerline_ids=list(ids),
+        centerline_selection_report={
+            "selection_origin": "operator",
+            "selection_confirmed": True,
+            "selected_ids": list(ids),
+        },
+    )
+    window.task_panel.update_centerline_selection(catalog, ids)
+
+    window._on_centerline_selection_changed("centerline-002", False)
+
+    assert (
+        window.state.centerline_selection_report["selection_confirmed"] is True
+    )
+    window.close()
+
+

@@ -198,6 +198,60 @@ class RotationRuler(QWidget):
             super().mouseReleaseEvent(e)
 
 
+class _MapLabelItem(QGraphicsItem):
+    """沿线的编号文字：字形描边（halo），不带底色块。
+
+    制图惯例（Mapbox ``text-halo``、QGIS buffer、工程制图尺寸数字）都是
+    "文字加一圈描边"就够了，实心黑板会把线切断、显得笨重。
+    """
+
+    HALO_WIDTH = 1.5
+
+    def __init__(self, text, fg, halo, font):
+        super().__init__()
+        from PySide6.QtGui import QPainterPath
+
+        self._text = str(text)
+        self._fg = QColor(int(fg[0]), int(fg[1]), int(fg[2]))
+        self._halo = QColor(
+            int(halo[0]), int(halo[1]), int(halo[2]),
+            int(halo[3]) if len(halo) > 3 else 235,
+        )
+        self._font = QFont(font)
+        path = QPainterPath()
+        path.addText(0.0, 0.0, self._font, self._text)
+        bounds = path.boundingRect()
+        self._path = path
+        pad = self.HALO_WIDTH + 1.0
+        self._offset = QPointF(-bounds.left() + pad, -bounds.top() + pad)
+        self._rect = QRectF(
+            0.0, 0.0,
+            bounds.width() + pad * 2.0, bounds.height() + pad * 2.0,
+        )
+        self.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        self.setZValue(32)
+
+    def boundingRect(self):
+        return self._rect.adjusted(-0.5, -0.5, 0.5, 0.5)
+
+    def text(self):
+        return self._text
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.translate(self._offset)
+        painter.setBrush(Qt.NoBrush)
+        halo_pen = QPen(
+            self._halo, self.HALO_WIDTH * 2.0,
+            Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin,
+        )
+        painter.setPen(halo_pen)
+        painter.drawPath(self._path)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(self._fg))
+        painter.drawPath(self._path)
+
+
 class ImageViewer(QGraphicsView):
     mouse_moved = Signal(float, float, int)
     mouse_pressed = Signal(float, float, int)
@@ -656,13 +710,55 @@ class ImageViewer(QGraphicsView):
         self._scene.addItem(e)
         return self._register_overlay_item(e, layer=layer)
 
-    def draw_text(self, x, y, text, color=(255, 255, 255), size=12, layer=None):
-        i = self._scene.addText(text, QFont("", size))
-        i.setPos(x, y)
-        i.setDefaultTextColor(QColor(*reversed(color)))
-        i.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
-        i.setZValue(31)
-        return self._register_overlay_item(i, layer=layer)
+    def draw_text(self, x, y, text, color=(255, 255, 255), size=12, layer=None,
+                  rotation=0.0, center=False):
+        """Draw a screen-fixed label.
+
+        ``center=True`` 把文字中心（而不是左上角）对到 (x, y)。
+        """
+        import math
+
+        item = self._scene.addText(str(text), QFont("", size))
+        item.setDefaultTextColor(QColor(*reversed(color)))
+        if rotation:
+            # 旋转以文字起点为轴：标注沿作业线方向排布，密集时不横着互相压字。
+            item.setTransformOriginPoint(0.0, 0.0)
+            item.setRotation(float(rotation))
+        if center:
+            rect = item.boundingRect()
+            cx, cy = rect.width() / 2.0, rect.height() / 2.0
+            theta = math.radians(float(rotation or 0.0))
+            cos_a, sin_a = math.cos(theta), math.sin(theta)
+            x = float(x) - (cx * cos_a - cy * sin_a)
+            y = float(y) - (cx * sin_a + cy * cos_a)
+        item.setPos(float(x), float(y))
+        item.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        item.setZValue(31)
+        return self._register_overlay_item(item, layer=layer)
+
+    def draw_label(self, x, y, text, fg=(246, 248, 251), halo=(6, 10, 16, 205),
+                   size=9, rotation=0.0, center=True, layer=None):
+        """沿线的编号文字（描边、无底色），可直接压在作业线缺口上。"""
+        import math
+
+        font = QFont("", int(size))
+        font.setBold(True)
+        item = _MapLabelItem(str(text), fg, halo, font)
+        if rotation:
+            item.setTransformOriginPoint(0.0, 0.0)
+            item.setRotation(float(rotation))
+        if center:
+            rect = item.boundingRect()
+            cx, cy = rect.center().x(), rect.center().y()
+            theta = math.radians(float(rotation or 0.0))
+            cos_a, sin_a = math.cos(theta), math.sin(theta)
+            x = float(x) - (cx * cos_a - cy * sin_a)
+            y = float(y) - (cx * sin_a + cy * cos_a)
+        item.setPos(float(x), float(y))
+        # _register_overlay_item 只登记图层，不负责入场景（其它 draw_* 都是
+        # 通过 scene.addText/addItem 先入场景的）。
+        self._scene.addItem(item)
+        return self._register_overlay_item(item, layer=layer)
 
     def draw_mask_overlay(self, mask, x=0, y=0, color=(120, 255, 140), max_dim=1400, layer=None):
         """Draw a downsampled transparent mask overlay in image coordinates."""
