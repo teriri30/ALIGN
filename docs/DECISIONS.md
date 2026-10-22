@@ -731,3 +731,33 @@
   2. `turn_decisions` 必须同时保留 `requested_strategy`、`ordering_strategy`、`effective_strategy` 三个字段，禁止只留 `strategy`。
 - 口径确认（2026-10-21，用户选定）：保留两半交错拓扑。跨度 14–16 m 是"每条作业线跨半田去对面那条"的必然结果，不是普通行距，也不是弓形退化；不做相邻顺序紧凑掉头，不做闭合轮廓螺旋套圈。
 - 代码锚点：`path_planner.TURN_STRATEGY_LABELS`、`path_planner` 转弯日志段、`_contour_order_work_lines`。
+
+## DECISION-043：工作流面板的六处交互缺陷（步骤停留、标注遮挡、勾选卡顿、选填二级折叠）
+
+- 日期：2026-10-21
+- 现象（用户截图）：①掩膜优化运行时进度条压住「处理强度」标签；②生成作业线后「选择作业线」卡片刚展开就被推到下一步，来不及看；③14 条作业线的编号在端头叠成一片、看不出线从哪到哪；④勾选/取消作业线明显卡顿；⑤起点已确认却「路径规划」不可用，且没有任何说明；⑥终点、卸粮点与必选的起点平铺，看着像也必须填。
+- 根因：
+  1. `StepCard` 展开时把内容区 `maximumHeight` 固定成展开瞬间的高度；进度条是运行中才出现、行会变高，但卡片不重算，布局把进度条挤到标签上。
+  2. 生成后的自动全选写的是 `selection_origin="default_all"`，而状态机把「有选中」直接当成完成，`_refresh_cards` 立刻把焦点交给下一步。
+  3. 所有编号都画在 `points[0] + (8, 8)`：14 条平行线的端点在同一排，标签必然互相压字。
+  4. 每次勾选都 `_save_system_undo`（系统快照）+ `update_centerline_selection`（销毁重建 14 行）+ 13 行/10 张卡片重写 `setStyleSheet`；实测单次约 32 ms，连点就成卡顿。
+  5. 状态机把「高级设置（农机参数确认）」当成规划前置门槛；但高级设置按惯例是可动可不动、用默认值即可，用户被逼着先"确认"才能规划。
+  6. 选填行与必选行同层同样式。
+- 修正：
+  1. 进度条位置**常驻**：`ShimmerBar` 始终占 4 px，空闲时 `set_idle(True)` 不绘制（用户要求"预留出进度条的位置"），行高与卡片高度从头到尾不变；`TaskRow._sync_row_height` 仍会在行高变化时回调 `refresh_content_geometry`，供选填分组、路线编辑工具行等其他可见性变化使用。
+  2. `derive_task_statuses`：生成后的报告写 `selection_confirmed=False`，`centerline_select` 保持 `available`、动作为「确认」；勾选/取消不会把已确认改回未确认，确认动作走新信号 `centerline_selection_confirm_requested`（点行仍只展开卡片，只有点按钮才确认）。
+  3. 编号做成**压在作业线上、但绝不断线**的标注（用户要求"一定要在线上，否则分不清对应哪条"，且明确"不要断线，不能影响用户判断"）：**不用实心色块**（用户否掉"大黑块"），也不在编号处切开折线（试过 AutoCAD `DIMGAP` 式"线断、数字嵌缺口"，被用户否掉：线一断就判断不出这条线从哪到哪）；最终做法是**线整条画完（一条线的所有折点一次画完，不做缺口）+ 编号写全称「中心线 N」（用户要求：只写数字信息量不够）+ 白字 1.5 px 深色描边**（Mapbox `text-halo`／QGIS label buffer 的写法，描边代替底色块）。文字中心对到各线中点（投影区间 50%），随线旋转；碰撞判定用分离轴（SAT）判真实矩形，并**先把矩形沿自身两轴外扩 2 px 再判**（只判不重叠会让编号紧贴成一堵字墙）；缩放后防抖重画、放大时逐步补齐（实测 fit 7 → zoom1 13 → zoom2/3 14）；每条线两个端点各画一个圆点。不要用富文本 span 做底色（`QGraphicsTextItem` 会按文档默认页宽排版，实测 boundingRect 宽 1118 px）。
+  4. 勾选走 `save_centerline_selection_undo`（只快照选择相关 6 个字段）、`sync_centerline_selection`（只改勾选状态与计数）、落盘用 400 ms 单次定时器合并；`TaskRow.set_status` 与 `StepCard.refresh_state` 在状态未变时直接返回（换主题时 `force=True`）。
+  5. 取消该门槛：`ready_to_plan` 不再要求 `harvester_params_confirmed`（默认参数由 `_effective_harvester_params` 从配置补齐，参数来源在导出/校验阶段才把关）；「高级设置」标记为 optional、状态显示「默认参数（可修改）」，卡片回到「路径规划」之后；plan 行仍把 blocker 直接写成状态文字（例如「先设置并确认起点」）。
+  6. 新增 `OptionalRowGroup`：终点/卸粮点折进「选填：终点与卸粮点」二级分组，默认收起、表头暗色、右侧摘要「均未设置 / 终点已设」。
+  7. 浮岛式卡片留白（用户要求"预留足够空隙，不然看着累"）：卡片间距 4→10 px、卡片内边距 7/6→12/10、内容行距 2→8、行内边距 8/4→10/6；横向仍不允许出现滚动条（既有测试兜底）。
+- 不变量：
+  1. 卡片内任何子控件高度变化都必须让卡片按 `sizeHint` 重算高度，不得依赖展开瞬间的快照高度。
+  2. 系统默认全选是**建议**不是确认；只有报告里 `selection_confirmed=True`（用户点过确认）才算完成该步骤。
+  3. 「选择作业线」的整行点击只展开卡片，确认只由行内按钮触发（`TaskRow.clicked` 与 `action_clicked` 分流）。
+  4. 可选步骤不得成为必选门禁：`params`（高级设置）只影响参数来源标注，不阻塞规划；卡片顺序体现依赖，锁定原因在目标行就地可见。
+  5. 作业线标注优先保证「不叠字」：同一横截线对齐、旋转、SAT 碰撞过滤、按间距自动降字号；被过滤掉的标签宁可少画（fit 视图 7 条等距），放大后逐步补齐（13 → 14 条），不得叠画。
+  6. 高频交互路径（勾选、切换行状态）禁止抓系统快照、重建行控件、重写未变化的样式表。
+- 代码锚点：`panels.TaskRow._sync_row_height/_notify_card_height_change`、`panels.StepCard._on_expand_finished/refresh_state(force)`、`panels.OptionalRowGroup`、`panels.TaskPanel._on_task_action/_sync_optional_summary`、`task_state.derive_task_statuses`、`state.AppState.save_centerline_selection_undo`、`ui_motion.ShimmerBar.set_idle`、`MainWindow._confirm_centerline_selection/_schedule_centerline_selection_persist/_aligned_label_anchors/_overlay_text_polygon/_polygons_overlap/_on_view_scale_changed`、`ImageViewer.draw_text(rotation=)`。
+- 测试锚点：`tests/test_reui_logic.py::test_mask_progress_bar_does_not_cover_strength_label`、`::test_optional_points_live_in_a_collapsed_secondary_group`、`::test_plan_row_shows_why_it_is_still_pending`、`::test_workflow_separates_centerlines_from_path_planning_and_advanced_settings`；`tests/test_task_row_click.py::test_action_button_click_is_reported_separately_from_row_click`、`::test_centerline_selection_action_requests_confirmation`；`tests/test_work_band_selection.py::test_default_all_selection_keeps_the_selection_step_open`、`::test_confirm_centerline_selection_advances_the_workflow`、`::test_checkbox_toggle_reuses_rows_and_keeps_undo_snapshot_light`、`::test_unchecked_centerline_is_hidden_from_canvas_overlay`（端点契约）、`::test_centerline_label_is_a_halo_badge_centered_on_its_line`（编号压在线上、用描边而非底色块）。
+
