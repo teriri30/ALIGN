@@ -76,6 +76,11 @@ def run_self_test() -> int:
     check("rasterio EPSG:4326", lambda: _check_rasterio())
     check("user data directories", ensure_user_dirs)
 
+    status = describe_device()
+    print(f"[INFO] 运行设备: {status['summary']}")
+    if status["installed"] and not status["cuda_available"]:
+        print("       （已装 GPU 运行时但未生效，可能是显卡驱动过旧）")
+
     if failures:
         print("冻结包自检失败:")
         for failure in failures:
@@ -83,6 +88,40 @@ def run_self_test() -> int:
         return 1
     print(f"ALIGN self-test passed; version={load_build_info().get('version', APP_VERSION)}")
     return 0
+
+
+def describe_device() -> dict:
+    """给自检和「帮助 → 关于」用的运行设备摘要。"""
+    try:
+        import device_runtime
+
+        status = device_runtime.torch_status()
+        gpu = device_runtime.detect_nvidia_gpu()
+        installed = device_runtime.gpu_runtime_installed()
+    except Exception as exc:  # pragma: no cover - 环境损坏
+        return {
+            "summary": f"检测失败：{exc}",
+            "cuda_available": False,
+            "installed": False,
+        }
+    parts = []
+    if status.get("cuda_available"):
+        parts.append(f"GPU（{status.get('device_name') or 'CUDA 设备'}）")
+    else:
+        parts.append("CPU")
+    if status.get("version"):
+        parts.append(f"torch {status['version']}")
+    if gpu:
+        parts.append(f"显卡 {gpu.get('name')}")
+    else:
+        parts.append("未检测到 NVIDIA 显卡")
+    if installed:
+        parts.append("已装 GPU 运行时" + ("（已启用）" if status.get("source") == "gpu-runtime" else "（未启用）"))
+    return {
+        "summary": "；".join(parts),
+        "cuda_available": bool(status.get("cuda_available")),
+        "installed": installed,
+    }
 
 
 def _require_file(relative_path: str) -> None:

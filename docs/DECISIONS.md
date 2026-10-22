@@ -775,3 +775,20 @@
 - 代码锚点：`runtime_paths.APP_DATA_NAME/_migrate_legacy_data_root/user_data_root`。
 - 测试锚点：`tests/test_runtime_packaging.py::test_version_has_one_runtime_source`、`::test_build_spec_keeps_exe_at_release_root`。
 
+
+## DECISION-045：GPU 支持改为「应用内按需下载运行时」（2026-10-22）
+
+- 背景：用户质疑「为什么不能在系统内一键配置 CPU/GPU，不然用户怎么知道怎么配置」。原先只有 CPU 版发布包，GPU 要自己建环境，普通用户无法操作。
+- 约束：
+  1. PyInstaller 冻结后没有 pip/python，应用内不能装包，只能替换或外挂一个运行时目录。
+  2. CUDA 版 torch 解压 4.3 GB、wheel 2.86 GB，超过 GitHub Release 单文件 2 GiB 上限，塞不进安装包；两个安装包（761 MB / 1.7 GB）会让下载页更难选。
+  3. 打包时 torch 是以包目录收集进 `_internal`（不是冻结进 PYZ），因此 `sys.path` 优先级对它有效。
+- 方案：发布包保持单个 CPU 版；「设置 → 运行设备」检测显卡并在用户点击后下载 CUDA 运行时到 `%LOCALAPPDATA%\ALIGN\gpu-runtime`，启动时 `device_runtime.activate()` 把它插到 `sys.path[0]`，`import torch` 即拿到 CUDA 版；移除目录自动退回 CPU。
+- 不变量：
+  1. 挂载必须发生在任何 `torch` 导入之前（`frozen_main.py` 在 `from app_entry import run_app` 之前调用），`torch` 已在 `sys.modules` 时 `activate()` 返回 False，不假装成功。
+  2. GPU 运行时与内置 torch 严格同版本（torch 2.9.1 / torchvision 0.24.1），版本不一致会 `_C.pyd` ABI 崩。
+  3. 安装过程失败/取消/磁盘不足必须清理半成品，避免下次启动挂载残缺 torch（`install_gpu_runtime` 的 `except BaseException` 分支 `rmtree`）。
+  4. 没有 NVIDIA 显卡时不给「启用」按钮，文案明确写「不需要做任何设置」，不制造焦虑。
+  5. 下载走镜像回退（上海交大 → PyTorch 官方），每个 wheel 校验官方 sha256。
+- 代码锚点：`src/device_runtime.py`（`activate/install_gpu_runtime/remove_gpu_runtime/detect_nvidia_gpu/torch_status`）、`src/frozen_main.py`、`src/main.py`、`src/app_entry.py::describe_device`、`src/pyside6_app/dialogs.py::SettingsDialog._device_tab/_apply_device_state/_start_gpu_install`。
+- 测试锚点：`tests/test_device_runtime.py`（19 条：目录/挂载幂等/已导入不挂载/移除/显卡解析/状态降级/安装解包/失败清理/取消/磁盘不足/版本对齐/设置页三个状态分支）。

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 - 2026-10-22
+
+### 新增
+- 「设置 → 运行设备」：自动识别 CPU / GPU，显示显卡型号、驱动版本、当前 torch 与 CUDA 版本。
+- 一键启用 GPU 加速：应用内下载 CUDA 12.8 运行时（torch 2.9.1+cu128、torchvision 0.24.1+cu128，共约 2.7 GB，国内镜像优先、官方源兜底），sha256 校验通过后解包到 `%LOCALAPPDATA%\ALIGN\gpu-runtime`，重启后自动优先加载。
+- 一键移除 GPU 运行时，回收约 4.3 GB 空间并退回 CPU 模式。
+- 冻结包自检新增「运行设备」一行，`align.exe --self-test` 可直接看出 GPU 运行时是否生效。
+
+### 说明
+- 安装包仍是单个 761 MB 的 CPU 版：CUDA 运行时压缩后 2.86 GB，超过 GitHub Release 单文件 2 GiB 上限，没有 N 卡的用户也不需要它。
+- 下载失败、取消或磁盘不足都不会留下半装状态：半成品目录会被清理，下次启动不会挂载残缺 torch。
+- GPU 运行时与发布包内置的 torch 严格同版本（2.9.1 / torchvision 0.24.1），避免 C++ ABI 不匹配。
+
 ## 0.2.0 - 2026-10-22
 
 - **改名：reUI → ALIGN**（Autonomous Line-guided Intelligent Guidance & Navigation，直指“跟着行带走、自主规划路径”）。

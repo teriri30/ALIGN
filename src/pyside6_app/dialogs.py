@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QProgressBar,
     QTextEdit, QListWidget, QListWidgetItem, QFormLayout, QDoubleSpinBox,
@@ -8,7 +8,59 @@ from PySide6.QtWidgets import (
 from pyside6_app.styles import COLORS
 from config import save_json_atomic, DEFAULT_HARVESTER_PARAMS
 from runtime_paths import user_config_path
+import device_runtime
 import os
+
+
+class _DeviceStatusWorker(QThread):
+    """后台探测显卡与 torch 状态：导入 torch 要几秒，不能卡界面。"""
+
+    done = Signal(dict)
+
+    def run(self):  # noqa: D102
+        info = {}
+        try:
+            info = device_runtime.torch_status()
+        except Exception as exc:  # pragma: no cover - 环境损坏
+            info = {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            info["gpu"] = device_runtime.detect_nvidia_gpu()
+            info["installed"] = device_runtime.gpu_runtime_installed()
+            info["size"] = device_runtime.gpu_runtime_size()
+        except Exception:  # pragma: no cover
+            info.setdefault("gpu", None)
+            info.setdefault("installed", False)
+            info.setdefault("size", 0)
+        self.done.emit(info)
+
+
+class _GpuInstallWorker(QThread):
+    """下载 + 解包 CUDA 运行时；下载在子线程，界面不冻结。"""
+
+    progress = Signal(str, int, int, float)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):  # noqa: D102
+        try:
+            path = device_runtime.install_gpu_runtime(
+                progress=lambda stage, done, total, speed: self.progress.emit(
+                    stage, done, total, speed
+                ),
+                is_cancelled=lambda: self._cancel,
+            )
+            self.finished_ok.emit(str(path))
+        except device_runtime.InstallCancelled:
+            self.failed.emit("已取消，未做任何改动")
+        except Exception as exc:
+            self.failed.emit(str(exc) or type(exc).__name__)
 
 
 class LoadingProgress(QDialog):
@@ -440,14 +492,19 @@ class SettingsDialog(QDialog):
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.setWindowTitle("系统设置")
-        self.setFixedSize(460, 390)
+        self.resize(560, 500)
+        self.setMinimumSize(520, 460)
         self._config = config or {}
+        self._status_worker = None
+        self._install_worker = None
+        self._device_info = {}
         self._build_ui()
 
     def _build_ui(self):
         lo = QVBoxLayout(self)
         tabs = QTabWidget()
         tabs.addTab(self._general_tab(), "通用")
+        tabs.addTab(self._device_tab(), "运行设备")
         tabs.addTab(self._path_tab(), "路径规划")
         tabs.addTab(self._mask_tab(), "掩膜处理")
         lo.addWidget(tabs)
@@ -455,6 +512,223 @@ class SettingsDialog(QDialog):
         bb.accepted.connect(self._save)
         bb.rejected.connect(self.reject)
         lo.addWidget(bb)
+
+    # ------------------------------------------------------------------ 运行设备
+    def _device_tab(self):
+        w = QWidget()
+        lo = QVBoxLayout(w)
+        lo.setSpacing(8)
+
+        self.lbl_device_head = QLabel("正在检测…")
+        self.lbl_device_head.setStyleSheet("font-size:15px;font-weight:600;")
+        self.lbl_device_head.setWordWrap(True)
+        lo.addWidget(self.lbl_device_head)
+
+        self.lbl_device_detail = QLabel("")
+        self.lbl_device_detail.setWordWrap(True)
+        self.lbl_device_detail.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
+        lo.addWidget(self.lbl_device_detail)
+
+        row = QHBoxLayout()
+        self.btn_device_enable = QPushButton("启用 GPU 加速")
+        self.btn_device_enable.clicked.connect(self._start_gpu_install)
+        self.btn_device_remove = QPushButton("移除 GPU 运行时")
+        self.btn_device_remove.clicked.connect(self._remove_gpu)
+        self.btn_device_refresh = QPushButton("重新检测")
+        self.btn_device_refresh.clicked.connect(self._refresh_device)
+        row.addWidget(self.btn_device_enable)
+        row.addWidget(self.btn_device_remove)
+        row.addWidget(self.btn_device_refresh)
+        row.addStretch(1)
+        lo.addLayout(row)
+
+        self.bar_device = QProgressBar()
+        self.bar_device.setRange(0, 100)
+        self.bar_device.setVisible(False)
+        lo.addWidget(self.bar_device)
+
+        self.lbl_device_hint = QLabel("")
+        self.lbl_device_hint.setWordWrap(True)
+        self.lbl_device_hint.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
+        lo.addWidget(self.lbl_device_hint)
+        lo.addStretch(1)
+
+        for btn in (self.btn_device_enable, self.btn_device_remove):
+            btn.setVisible(False)
+        self._refresh_device()
+        return w
+
+    def _refresh_device(self):
+        if self._install_worker is not None and self._install_worker.isRunning():
+            return
+        self.lbl_device_head.setText("正在检测…")
+        self.lbl_device_detail.setText("")
+        self.btn_device_enable.setVisible(False)
+        self.btn_device_remove.setVisible(False)
+        self.btn_device_refresh.setEnabled(False)
+        worker = _DeviceStatusWorker(self)
+        worker.done.connect(self._apply_device_state)
+        worker.finished.connect(lambda: self.btn_device_refresh.setEnabled(True))
+        self._status_worker = worker
+        worker.start()
+
+    def _apply_device_state(self, info: dict):
+        self._device_info = info or {}
+        gpu = info.get("gpu")
+        installed = bool(info.get("installed"))
+        size_gb = (info.get("size") or 0) / 1e9
+        cuda_ready = bool(info.get("cuda_available"))
+
+        detail_parts = []
+        if info.get("available"):
+            detail_parts.append(f"torch {info.get('version') or '未知'}")
+            if info.get("cuda_build"):
+                detail_parts.append(f"CUDA {info['cuda_build']}")
+            detail_parts.append("CUDA 版" if info.get("cuda_build") else "CPU 版")
+        elif info.get("error"):
+            detail_parts.append(f"torch 加载失败：{info['error']}")
+        if gpu:
+            memory = gpu.get("memory_mb") or 0
+            detail_parts.append(
+                f"显卡 {gpu.get('name')}（{memory / 1024:.0f} GB，驱动 {gpu.get('driver')}）"
+            )
+        else:
+            detail_parts.append("未检测到 NVIDIA 显卡")
+        if installed:
+            detail_parts.append(f"已安装 GPU 运行时 {size_gb:.1f} GB")
+        self.lbl_device_detail.setText("；".join(detail_parts))
+
+        if cuda_ready:
+            self.lbl_device_head.setText(f"正在使用 GPU：{info.get('device_name') or 'CUDA 设备'}")
+            self.lbl_device_hint.setText(
+                "识别、掩膜和评价都会跑在显卡上，速度比 CPU 快十几倍。"
+                "换回 CPU 可以点「移除 GPU 运行时」，随时能再装回来。"
+            )
+            self.btn_device_remove.setVisible(installed)
+            return
+
+        if gpu and not installed:
+            self.lbl_device_head.setText("正在使用 CPU（检测到 NVIDIA 显卡，可以开 GPU 加速）")
+            self.lbl_device_hint.setText(
+                "点「启用 GPU 加速」后，程序会自己下载约 2.7 GB 的 CUDA 运行库"
+                "（从国内镜像取，装到 ALIGN 自己的数据目录），装完重启就生效。\n"
+                "不装也完全能用，只是识别会慢一些。中途可以取消，取消不会留下垃圾文件。"
+            )
+            self.btn_device_enable.setText("启用 GPU 加速（约 2.7 GB）")
+            self.btn_device_enable.setVisible(True)
+            self.btn_device_remove.setVisible(installed)
+            return
+
+        if gpu and installed:
+            self.lbl_device_head.setText("正在使用 CPU（GPU 运行时已装，但没能启用）")
+            self.lbl_device_hint.setText(
+                "常见原因是显卡驱动太旧，或这张卡不支持 CUDA 12.8。"
+                "可以先更新 NVIDIA 驱动再点「重新检测」；确认用不了就点「移除 GPU 运行时」回收空间。"
+            )
+            self.btn_device_enable.setText("重新下载安装（约 2.7 GB）")
+            self.btn_device_enable.setVisible(True)
+            self.btn_device_remove.setVisible(True)
+            return
+
+        self.lbl_device_head.setText("正在使用 CPU")
+        self.lbl_device_hint.setText(
+            "这台电脑没有检测到 NVIDIA 显卡，CPU 模式就是最合适的选择，不需要做任何设置。"
+            "程序里所有功能都能正常用。"
+        )
+        self.btn_device_remove.setVisible(installed)
+
+    def _start_gpu_install(self):
+        if self._install_worker is not None and self._install_worker.isRunning():
+            self._install_worker.cancel()
+            self.btn_device_enable.setEnabled(False)
+            self.btn_device_enable.setText("正在取消…")
+            return
+        answer = QMessageBox.question(
+            self,
+            "启用 GPU 加速",
+            "将下载约 2.7 GB 的 CUDA 运行库并安装到 ALIGN 的数据目录。\n"
+            "占用磁盘约 4.3 GB，装完需要重启 ALIGN 才生效。\n\n现在开始吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.bar_device.setVisible(True)
+        self.bar_device.setValue(0)
+        self.btn_device_enable.setText("取消")
+        self.btn_device_remove.setVisible(False)
+        self.btn_device_refresh.setEnabled(False)
+
+        worker = _GpuInstallWorker(self)
+        worker.progress.connect(self._on_install_progress)
+        worker.finished_ok.connect(self._on_install_done)
+        worker.failed.connect(self._on_install_failed)
+        self._install_worker = worker
+        worker.start()
+
+    def _on_install_progress(self, stage: str, done: int, total: int, speed: float):
+        total = max(int(total or 0), 1)
+        percent = int(min(100, done * 100 / total))
+        self.bar_device.setValue(percent)
+        if stage == "解包":
+            self.lbl_device_hint.setText(f"正在解包（{percent}%），这一步大约 1-3 分钟，别关窗口…")
+        else:
+            self.lbl_device_hint.setText(
+                f"正在下载 {stage}：{done / 1e6:.0f} / {total / 1e6:.0f} MB"
+                f"（{speed / 1e6:.1f} MB/s）"
+            )
+
+    def _on_install_done(self, path: str):
+        self.bar_device.setValue(100)
+        self.bar_device.setVisible(False)
+        self.btn_device_enable.setEnabled(True)
+        self.btn_device_enable.setText("启用 GPU 加速（约 2.7 GB）")
+        self.btn_device_refresh.setEnabled(True)
+        self._install_worker = None
+        QMessageBox.information(
+            self,
+            "装好了",
+            "GPU 运行库已经装好。\n\n请关闭 ALIGN 再重新打开，"
+            "之后这里会显示「正在使用 GPU」。",
+        )
+        self._refresh_device()
+
+    def _on_install_failed(self, message: str):
+        self.bar_device.setVisible(False)
+        self.btn_device_enable.setEnabled(True)
+        self.btn_device_enable.setText("启用 GPU 加速（约 2.7 GB）")
+        self.btn_device_refresh.setEnabled(True)
+        self._install_worker = None
+        QMessageBox.warning(self, "没能装好", f"{message}\n\nCPU 模式不受影响，可以继续用。")
+        self._refresh_device()
+
+    def _remove_gpu(self):
+        size_gb = (self._device_info.get("size") or device_runtime.gpu_runtime_size()) / 1e9
+        answer = QMessageBox.question(
+            self,
+            "移除 GPU 运行时",
+            f"删除已安装的 CUDA 运行库，释放约 {size_gb:.1f} GB 空间。\n"
+            "ALIGN 会退回 CPU 模式，功能不受影响。继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        ok = device_runtime.remove_gpu_runtime()
+        QMessageBox.information(
+            self,
+            "已移除" if ok else "没有可删的内容",
+            "GPU 运行库已删除，下次启动用 CPU 模式。" if ok else "没找到已安装的 GPU 运行库。",
+        )
+        self._refresh_device()
+
+    def closeEvent(self, event):  # noqa: N802
+        for worker in (self._install_worker, self._status_worker):
+            if worker is not None and worker.isRunning():
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+                worker.wait(3000)
+        super().closeEvent(event)
 
     def _general_tab(self):
         w = QWidget(); f = QFormLayout(w)
