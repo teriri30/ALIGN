@@ -314,3 +314,42 @@ def test_device_tab_reports_gpu_in_use(monkeypatch):
     assert dialog.lbl_device_head.text().startswith("正在使用 GPU")
     assert "RTX 5060 Ti" in dialog.lbl_device_detail.text()
     dialog.close()
+
+
+def test_device_tab_does_not_leave_stale_buttons_after_state_change(monkeypatch):
+    """先显示"可启用"，再切成"没有 N 卡"时，按钮必须收起来（曾出现残留）。"""
+    dialog = _device_dialog(monkeypatch)
+    dialog._apply_device_state(
+        {
+            "available": True,
+            "version": "2.9.1+cpu",
+            "cuda_build": "",
+            "cuda_available": False,
+            "gpu": {"name": "NVIDIA GeForce RTX 3060", "driver": "560.94", "memory_mb": 12288},
+            "installed": False,
+            "size": 0,
+        }
+    )
+    assert dialog.btn_device_enable.isHidden() is False
+    dialog._apply_device_state(
+        {
+            "available": True,
+            "version": "2.9.1+cpu",
+            "cuda_build": "",
+            "cuda_available": False,
+            "gpu": None,
+            "installed": False,
+            "size": 0,
+        }
+    )
+    assert dialog.btn_device_enable.isHidden() is True
+    assert dialog.btn_device_remove.isHidden() is True
+    dialog.close()
+
+
+def test_device_hint_keeps_room_for_three_lines(monkeypatch):
+    """说明文字曾经只给一行高，后半句被裁掉。"""
+    dialog = _device_dialog(monkeypatch)
+    assert dialog.lbl_device_hint.minimumHeight() >= 50
+    assert dialog.lbl_device_detail.minimumHeight() >= 30
+    dialog.close()

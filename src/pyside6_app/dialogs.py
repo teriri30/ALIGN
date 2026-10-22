@@ -492,8 +492,8 @@ class SettingsDialog(QDialog):
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.setWindowTitle("系统设置")
-        self.resize(560, 500)
-        self.setMinimumSize(520, 460)
+        self.resize(560, 420)
+        self.setMinimumSize(520, 400)
         self._config = config or {}
         self._status_worker = None
         self._install_worker = None
@@ -518,6 +518,7 @@ class SettingsDialog(QDialog):
         w = QWidget()
         lo = QVBoxLayout(w)
         lo.setSpacing(8)
+        lo.setContentsMargins(14, 14, 14, 10)
 
         self.lbl_device_head = QLabel("正在检测…")
         self.lbl_device_head.setStyleSheet("font-size:15px;font-weight:600;")
@@ -526,6 +527,7 @@ class SettingsDialog(QDialog):
 
         self.lbl_device_detail = QLabel("")
         self.lbl_device_detail.setWordWrap(True)
+        self.lbl_device_detail.setMinimumHeight(34)  # 两行：torch/显卡信息容易顶到右边缘
         self.lbl_device_detail.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
         lo.addWidget(self.lbl_device_detail)
 
@@ -549,6 +551,11 @@ class SettingsDialog(QDialog):
 
         self.lbl_device_hint = QLabel("")
         self.lbl_device_hint.setWordWrap(True)
+        # 说明文字占满剩余高度：只给一行高会被裁掉后半句
+        self.lbl_device_hint.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # 预留三行高度：最长的提示（有 N 卡待启用）正好三行，给少了会裁掉后半句
+        self.lbl_device_hint.setMinimumHeight(56)
+        self.lbl_device_hint.setMaximumHeight(88)
         self.lbl_device_hint.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
         lo.addWidget(self.lbl_device_hint)
         lo.addStretch(1)
@@ -574,6 +581,9 @@ class SettingsDialog(QDialog):
 
     def _apply_device_state(self, info: dict):
         self._device_info = info or {}
+        # 每次先全部收起，再由下面各个分支显式打开，避免上次状态残留
+        self.btn_device_enable.setVisible(False)
+        self.btn_device_remove.setVisible(False)
         gpu = info.get("gpu")
         installed = bool(info.get("installed"))
         size_gb = (info.get("size") or 0) / 1e9
@@ -610,8 +620,8 @@ class SettingsDialog(QDialog):
         if gpu and not installed:
             self.lbl_device_head.setText("正在使用 CPU（检测到 NVIDIA 显卡，可以开 GPU 加速）")
             self.lbl_device_hint.setText(
-                "点「启用 GPU 加速」后，程序会自己下载约 2.7 GB 的 CUDA 运行库"
-                "（从国内镜像取，装到 ALIGN 自己的数据目录），装完重启就生效。\n"
+                "点「启用 GPU 加速」后，程序会自己下载约 2.7 GB 的 CUDA 版 PyTorch 运行库"
+                "（torch 2.9.1+cu128，从国内镜像取，装到 ALIGN 自己的数据目录），装完重启就生效。\n"
                 "不装也完全能用，只是识别会慢一些。中途可以取消，取消不会留下垃圾文件。"
             )
             self.btn_device_enable.setText("启用 GPU 加速（约 2.7 GB）")
@@ -646,7 +656,7 @@ class SettingsDialog(QDialog):
         answer = QMessageBox.question(
             self,
             "启用 GPU 加速",
-            "将下载约 2.7 GB 的 CUDA 运行库并安装到 ALIGN 的数据目录。\n"
+            "将下载约 2.7 GB 的 CUDA 版 PyTorch 运行库（含 CUDA 12.8 组件），安装到 ALIGN 的数据目录。\n"
             "占用磁盘约 4.3 GB，装完需要重启 ALIGN 才生效。\n\n现在开始吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
