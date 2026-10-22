@@ -89,6 +89,45 @@ jobs:
           "zip=$zip" | Out-File $env:GITHUB_OUTPUT -Append
           "sha=$zip.sha256" | Out-File $env:GITHUB_OUTPUT -Append
           Write-Host "Created $zip ($size bytes)"
+      - name: Build Windows installer
+        id: installer
+        shell: pwsh
+        run: |
+          # Actions 的 pwsh 默认 EAP=stop，原生命令写一行 stderr 就会掐断 step，先放宽。
+          $ErrorActionPreference = "Continue"
+          $version = (Get-Content build_info.json -Raw | ConvertFrom-Json).version
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup 未预装，尝试 choco 安装"
+            choco install innosetup --no-progress -y *> choco-install.log
+            Get-Content choco-install.log -Tail 10 | Write-Host
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) { throw "找不到 ISCC.exe，无法生成安装包" }
+          New-Item -ItemType Directory -Force -Path installer | Out-Null
+          & $iscc "/DMyAppVersion=$version" "packaging\reUI_setup.iss" *> installer-build.log
+          $code = $LASTEXITCODE
+          Get-Content installer-build.log -Tail 40 | Write-Host
+          if ($code -ne 0) { throw "ISCC 失败，退出码 $code（见 installer-build.log）" }
+          $setup = Get-ChildItem installer -Filter "reUI-Setup-*.exe" | Select-Object -First 1
+          if (-not $setup) { throw "安装包未生成" }
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($setup.Name)" | Set-Content "$($setup.FullName).sha256" -Encoding ascii
+          $size = $setup.Length
+          if ($size -ge 2040109465) { throw "安装包 >= 1.9 GiB，超出 Release 单文件上限" }
+          "setup=$($setup.Name)" | Out-File $env:GITHUB_OUTPUT -Append
+          "setup_path=$($setup.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          "setup_sha=$($setup.FullName).sha256" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Created $($setup.Name) ($size bytes)"
+      - name: Publish installer build log
+        if: failure()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path installer-build.log)) { exit 0 }
+          foreach ($line in (Get-Content installer-build.log | Where-Object { $_.Trim().Length -gt 0 } | Select-Object -Last 25)) {
+            $safe = $line.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Host "::error title=ISCC::$safe"
+          }
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
@@ -96,6 +135,8 @@ jobs:
           path: |
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.sha }}
+            installer\reUI-Setup-*.exe
+            installer\reUI-Setup-*.exe.sha256
       - name: Publish tagged GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         env:
@@ -108,4 +149,4 @@ jobs:
           # 发布逻辑放在 py 里：gh CLI 在 pwsh 下的参数/退出码行为难排查，
           # 脚本自己会打印 ::error:: 注解，失败原因直接出现在 check-run。
           $env:GITHUB_REF_NAME = "$env:RELEASE_TAG"
-          python scripts/publish_release.py "${{ steps.package.outputs.zip }}" "${{ steps.package.outputs.sha }}"
+          python scripts/publish_release.py "${{ steps.package.outputs.zip }}" "${{ steps.package.outputs.sha }}" "installer/${{ steps.installer.outputs.setup }}" "installer/${{ steps.installer.outputs.setup }}.sha256"

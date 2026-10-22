@@ -131,6 +131,11 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=(
+        str(ROOT / "packaging" / "reUI.ico")
+        if (ROOT / "packaging" / "reUI.ico").exists()
+        else None
+    ),
 )
 coll = COLLECT(
     exe,

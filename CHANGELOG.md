@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 - 2026-10-22
+
+- 新增 Windows 安装包（Inno Setup）：`reUI-Setup-x.y.z.exe` 双击一路下一步即可安装，装在 `%LOCALAPPDATA%\Programs\reUI`，不需要管理员权限，带桌面/开始菜单快捷方式和标准卸载项。
+- 新增应用图标（`packaging/reUI.ico`，由 `packaging/make_icon.py` 生成），EXE 与安装包共用。
+- 发布流程同时产出安装包与便携 ZIP，Release 说明改为“先讲怎么装”的写法；`.sha256` 两个包都有。
+- README 完全重写：口语气、短句，先讲下载安装再讲怎么用，补充常见问题（杀软拦截、没管理员权限、数据在哪、换电脑迁移、GPU 与速度）。
+- 版本号统一从 `src/version.py` 读取，`build_windows.bat` 不再写死 0.1.0。
+
 ## 0.1.2 - 2026-10-22
 
 - 任务面板：进度条改为常驻 4 px 槽位，空闲不绘制，行高恒定，不再压住「处理强度」标签；卡片与行间距按浮岛式留白加大。

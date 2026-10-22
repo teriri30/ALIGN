@@ -88,12 +88,12 @@ def upload_asset(upload_url: str, token: str, path: str) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        annotate("用法: python scripts/publish_release.py <zip> <sha256>")
+    if not argv:
+        annotate("用法: python scripts/publish_release.py <安装包> <安装包.sha256> <便携zip> <zip.sha256>")
         return 2
-    assets = [path for path in argv[:2] if path and os.path.isfile(path)]
+    assets = [path for path in argv if path and os.path.isfile(path)]
     if not assets:
-        annotate("发布资产不存在：zip 与 sha256 都没找到")
+        annotate(f"发布资产都不存在：{argv}")
         return 2
 
     token = os.environ.get("GH_TOKEN") or ""
@@ -110,12 +110,47 @@ def main(argv: list[str]) -> int:
         annotate(f"读不到 build_info.json 的版本号：{exc}")
         version = tag.lstrip("v")
 
-    zip_name = os.path.basename(assets[0])
-    body = (
-        f"**普通用户请下载 {zip_name}（完整便携版，解压后双击 reUI.exe 即可运行，"
-        "无需安装任何环境）。同名的 .sha256 文件是校验值，可不下。"
-        "下方的“源代码”压缩包仅供开发者，不能直接运行。**"
+    setup_name = next(
+        (
+            os.path.basename(path)
+            for path in assets
+            if path.lower().endswith(".exe") and "setup" in os.path.basename(path).lower()
+        ),
+        "",
     )
+    zip_name = next(
+        (os.path.basename(path) for path in assets if path.lower().endswith(".zip")),
+        "",
+    )
+    lines = []
+    if setup_name:
+        size_mb = next(
+            (os.path.getsize(p) // (1024 * 1024) for p in assets if os.path.basename(p) == setup_name),
+            0,
+        )
+        lines += [
+            "## 推荐：双击安装（Windows 10/11 64 位）",
+            "",
+            f"1. 下载 **{setup_name}**（约 {size_mb} MB）",
+            "2. 双击它，一路「下一步」就行（装在当前用户目录，不会弹管理员权限）",
+            "3. 桌面和开始菜单会出现 reUI 图标，双击打开即可",
+            "",
+            "卸载：Windows 设置 → 应用 → 找到 reUI 卸载，或者开始菜单里点「卸载 reUI」。",
+            "",
+        ]
+    if zip_name:
+        lines += [
+            "## 不想安装：用便携版",
+            "",
+            f"下载 **{zip_name}**，**完整解压**后双击最外层的 `reUI.exe`。"
+            "别把 exe 单独拖出来，它需要旁边的 `_internal` 文件夹。",
+            "",
+        ]
+    lines += [
+        "> 同名的 `.sha256` 是校验值，一般不用管。"
+        "「源代码」压缩包是给开发者的，不能直接运行。",
+    ]
+    body = "\n".join(lines)
 
     try:
         payload = {

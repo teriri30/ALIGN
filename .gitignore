@@ -82,3 +82,4 @@ reUI-Windows-x64-*.sha256
 /_internal/
 /README-Windows.txt
 /version.json
+/installer/
