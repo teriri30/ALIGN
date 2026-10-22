@@ -94,13 +94,40 @@ def _c(n, colors=None):
     c = colors if colors is not None else COLORS
     return c.get(n, "#FFFFFF")
 
+# 全站字体族（按优先级）：数字/英文走 Times New Roman（新罗马），
+# 中文回退到微软雅黑。Qt 是逐字符匹配字体族的，Times New Roman 没有中文字形，
+# 所以中文自然落到下一个族，不需要手工拆分文本。
+FONT_FAMILIES = (
+    "Times New Roman",
+    "Microsoft YaHei",
+    "Microsoft YaHei UI",
+    "SimHei",
+)
+FONT_FAMILY_CSS = ",".join(f'"{name}"' for name in FONT_FAMILIES)
+FONT_POINT_SIZE = 10
+
+
+def ui_font(point_size: int, weight=None):
+    """统一字体：数字/英文 Times New Roman，中文微软雅黑。"""
+    from PySide6.QtGui import QFont
+
+    font = QFont(FONT_FAMILIES[0], point_size)
+    if hasattr(font, "setFamilies"):
+        font.setFamilies(list(FONT_FAMILIES))
+    if weight is not None:
+        font.setWeight(weight)
+    return font
+
+
 def build_stylesheet(colors=None):
     """动态生成全局样式表 — 根据当前主题颜色"""
     c = colors if colors is not None else COLORS
     _ = lambda n: c.get(n, "#FFFFFF")
     return f"""
 QMainWindow {{ background: {_('bg_dark')}; }}
-QWidget {{ color: {_('text')}; font-size: 14px; font-family: "Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif; }}
+# 字体族不写在 QSS 里：QSS 的 font-family 会覆盖 setFont，导致部分控件
+# 回退到 SimHei。统一由 QApplication.setFont(build_app_font()) 提供。
+QWidget {{ color: {_('text')}; font-size: 14px; }}
 QWidget#central {{ background: {_('bg_dark')}; }}
 QMenuBar {{ background: {_('bg_darkest')}; border-bottom: 1px solid {_('border')}; padding: 2px 4px; }}
 QMenuBar::item {{ padding: 4px 14px; border-radius: 4px; }}

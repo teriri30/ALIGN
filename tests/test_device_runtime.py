@@ -353,3 +353,25 @@ def test_device_hint_keeps_room_for_three_lines(monkeypatch):
     assert dialog.lbl_device_hint.minimumHeight() >= 50
     assert dialog.lbl_device_detail.minimumHeight() >= 30
     dialog.close()
+
+
+# ---------------------------------------------------------------- 字体
+
+
+def test_ui_font_is_times_new_roman_with_yahei_fallback():
+    """数字/英文用新罗马，中文回退微软雅黑（Qt 逐字符匹配字体族）。"""
+    from pyside6_app.styles import FONT_FAMILIES, FONT_FAMILY_CSS, build_stylesheet
+
+    assert FONT_FAMILIES[0] == "Times New Roman"
+    assert "Microsoft YaHei" in FONT_FAMILIES
+    assert '"Times New Roman"' in FONT_FAMILY_CSS
+    # 字体族只由 QApplication.setFont 提供：QSS 里再写 font-family 会压过 setFont，
+    # 之前步骤标题就是这样回退成 SimHei 的（DECISION-046）。
+    css = build_stylesheet()
+    assert "Times New Roman" not in css
+
+    from app_entry import build_app_font
+
+    font = build_app_font()
+    assert font.families()[0] == "Times New Roman"
+    assert "Microsoft YaHei" in font.families()

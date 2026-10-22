@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QSlider, QComboBox, QToolButton, QStyle, QTreeWidget, QTreeWidgetItem,
     QAbstractItemView,
 )
-from pyside6_app.styles import COLORS
+from pyside6_app.styles import COLORS, ui_font
 from pyside6_app.ui_icons import (
     point_icon, line_icon, area_icon, chevron_icon, plus_icon, minus_icon,
 )
@@ -47,6 +47,16 @@ DISPLAY_LAYER_KEYS = (
 )
 
 
+def _scale_bar_font(point_size: int, weight=None) -> QFont:
+    """比例尺/坐标这类纯数字文字：数字用 Times New Roman（新罗马）。"""
+    from pyside6_app.styles import FONT_FAMILIES
+
+    font = QFont(FONT_FAMILIES[0], point_size)
+    if weight is not None:
+        font.setWeight(weight)
+    return font
+
+
 class RotationRuler(QWidget):
     """水平刻度尺旋转控件 — 拖拽即旋转视图（对齐原项目 ROTATION_DIAL）
 
@@ -76,7 +86,7 @@ class RotationRuler(QWidget):
         self.setMaximumWidth(280)
         self.setCursor(Qt.SizeHorCursor)
         self.setToolTip("左右拖拽旋转视图")
-        self.setFont(QFont("Consolas", 9))
+        self.setFont(ui_font(9))
 
     @property
     def angle(self):
@@ -858,7 +868,7 @@ class MetricScaleBar(QWidget):
 
         if self._scale_m <= 0:
             p.setPen(QColor(70, 75, 72) if dark else QColor(160, 165, 162))
-            p.setFont(QFont("Consolas", 8))
+            p.setFont(_scale_bar_font(8))
             p.drawText(0, 0, w, h, Qt.AlignCenter, "N/A")
             p.end()
             return
@@ -882,7 +892,7 @@ class MetricScaleBar(QWidget):
         # 距离标签
         label = self._format_distance(self._scale_m)
         p.setPen(QColor(200, 210, 205) if dark else QColor(30, 40, 35))
-        p.setFont(QFont("Consolas", 9, QFont.Bold))
+        p.setFont(_scale_bar_font(9, QFont.Bold))
         fm = p.fontMetrics()
         tw = fm.horizontalAdvance(label)
         p.drawText((w - tw) // 2, bar_y - cap - 3, label)

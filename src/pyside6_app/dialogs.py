@@ -509,6 +509,8 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._mask_tab(), "掩膜处理")
         lo.addWidget(tabs)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("确定")
+        bb.button(QDialogButtonBox.Cancel).setText("取消")
         bb.accepted.connect(self._save)
         bb.rejected.connect(self.reject)
         lo.addWidget(bb)

@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QTextEdit, QToolButton, QMenu,
     QApplication, QCheckBox, QSizePolicy,
 )
-from pyside6_app.styles import COLORS
+from pyside6_app.styles import COLORS, ui_font, FONT_FAMILY_CSS
 from pyside6_app.task_state import TASK_ORDER
 from pyside6_app.ui_icons import chevron_icon, check_icon
 from pyside6_app.ui_motion import (
@@ -18,7 +18,9 @@ from pyside6_app.ui_motion import (
     SpringButton, tween_value,
 )
 
-UI_FONT = '"Microsoft YaHei UI","Microsoft YaHei","SimHei","Segoe UI",sans-serif'
+# 字体统一由 QApplication.setFont(build_app_font()) 提供（数字新罗马 + 中文微软雅黑）。
+# 不要在这里或控件样式表里再写 font-family：QSS 的字体族会压过 setFont，
+# 之前就是因为它，步骤标题回退成了 SimHei。
 
 # 真实窗口 show() 后逐级缩窄测得：高级设置或路径规划卡片展开且出现纵向滚动条时，
 # 328 px 仍会产生 1 px 横向滚动，330 px 起全部控件不再横向挤压。
@@ -121,24 +123,24 @@ class TaskRow(QWidget):
         self._badge.setFixedSize(14, 14)
         self._badge.setVisible(False)   # replaced by the breathing status dot
         self._label = QLabel(task_def["label"])
-        self._label.setFont(QFont("Microsoft YaHei UI", 10))
+        self._label.setFont(ui_font(10))
         self._optional = bool(task_def.get("optional", False))
         # Optional steps carry their marking in the label itself ("（选填）")
         # plus an accent tone: a separate chip overflowed the compact panel.
         self._label.setStyleSheet(
             f"color:{COLORS.get('text_accent', COLORS['text']) if self._optional else COLORS['text']};"
-            f"font-size:14px;font-family:{UI_FONT};"
+            f"font-size:14px;"
         )
         self._label.setMinimumWidth(0)
         self._optional_tip = "选填步骤：可以跳过，但一旦设置会改变生成的路径结果"
         self._label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self._status = QLabel(self._status_text)
-        self._status.setFont(QFont("Microsoft YaHei UI", 9))
+        self._status.setFont(ui_font(9))
         self._status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._status.setMinimumWidth(0)
         self._status.setStyleSheet(
-            f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};"
+            f"color:{COLORS['text_dim']};font-size:12px;"
         )
 
         self._action_btn = SpringButton(task_def["action"])
@@ -146,7 +148,7 @@ class TaskRow(QWidget):
         self._action_btn.setStyleSheet(
             f"QPushButton{{background:{COLORS['accent']};color:{COLORS['on_accent']};"
             f"border:none;border-radius:6px;font-size:13px;font-weight:600;padding:0;"
-            f"font-family:{UI_FONT};}}"
+            f"}}"
             f"QPushButton:hover{{background:{COLORS['accent_hover']};}}"
         )
         self._action_btn.clicked.connect(lambda: self.action_clicked.emit(self.tid))
@@ -245,7 +247,7 @@ class TaskRow(QWidget):
             self._status.setText(self._flash)
             self._status.setStyleSheet(
                 f"color:{COLORS.get('orange', '#E8A33D')};font-size:12px;"
-                f"font-family:{UI_FONT};font-weight:600;"
+                f"font-weight:600;"
             )
         else:
             self._status.setText(self._status_text)
@@ -298,19 +300,19 @@ class TaskRow(QWidget):
         else:
             label_color = COLORS["text"]
         self._label.setStyleSheet(
-            f"color:{label_color};font-size:14px;font-family:{UI_FONT};"
+            f"color:{label_color};font-size:14px;"
         )
         self._status_text = display_text
         if not self._flash:
             self._status.setText(display_text)
             self._status.setStyleSheet(
-                f"color:{color};font-size:12px;font-family:{UI_FONT};"
+                f"color:{color};font-size:12px;"
             )
         opacity = "1.0" if enabled else "0.55"
         self._action_btn.setStyleSheet(
             f"QPushButton{{background:{COLORS['accent']};color:{COLORS['on_accent']};"
             f"border:none;border-radius:6px;font-size:13px;font-weight:600;padding:0;"
-            f"font-family:{UI_FONT};}}"
+            f"}}"
             f"QPushButton:hover{{background:{COLORS['accent_hover']};}}"
             f"QPushButton:disabled{{background:{COLORS.get('bg_light', '#3A3A44')};"
             f"color:{COLORS.get('text_dim', '#8B909A')};}}"
@@ -330,19 +332,19 @@ class TaskRow(QWidget):
         else:
             color = COLORS.get('text_dim', '#8B909A')
         opacity = "1.0" if getattr(self, "_enabled_visual", True) else "0.55"
-        self._status.setStyleSheet(f"color:{color};font-size:12px;font-family:{UI_FONT};")
+        self._status.setStyleSheet(f"color:{color};font-size:12px;")
         label_color = (
             COLORS.get("text_accent", COLORS["text"])
             if getattr(self, "_optional", False)
             else COLORS["text"]
         )
         self._label.setStyleSheet(
-            f"color:{label_color};font-size:14px;font-family:{UI_FONT};"
+            f"color:{label_color};font-size:14px;"
         )
         self._action_btn.setStyleSheet(
             f"QPushButton{{background:{COLORS['accent']};color:{COLORS['on_accent']};"
             f"border:none;border-radius:6px;font-size:13px;font-weight:600;padding:0;"
-            f"font-family:{UI_FONT};}}"
+            f"}}"
             f"QPushButton:hover{{background:{COLORS['accent_hover']};}}"
             f"QPushButton:disabled{{background:{COLORS.get('bg_light', '#3A3A44')};"
             f"color:{COLORS.get('text_dim', '#8B909A')};}}"
@@ -394,7 +396,7 @@ class TaskRow(QWidget):
         return (
             f"QPushButton{{background:transparent;color:{COLORS['text_dim']};"
             f"border:1px solid {COLORS['border_light']};border-radius:6px;"
-            f"font-size:13px;font-weight:600;padding:0;font-family:{UI_FONT};}}"
+            f"font-size:13px;font-weight:600;padding:0;}}"
             f"QPushButton:hover{{background:{COLORS['bg_hover']};color:{COLORS['text']};"
             f"border-color:{COLORS['accent']};}}"
             f"QPushButton:disabled{{color:{COLORS['btn_disabled_text']};"
@@ -430,8 +432,8 @@ class StepCard(QWidget):
         self._toggle = ChevronToggle()
         self._title = QLabel(title)
         self._title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self._title.setFont(QFont("Microsoft YaHei UI", 10))
-        self._title.setStyleSheet(f"color:{COLORS['text']};font-size:14px;font-weight:600;font-family:{UI_FONT};")
+        self._title.setFont(ui_font(10))
+        self._title.setStyleSheet(f"color:{COLORS['text']};font-size:14px;font-weight:600;")
         # Status dot on the header so a collapsed card still reports its state.
         self._status_dot = BreathingDot(8)
         self._status_dot.set_tone("idle", COLORS.get("border_light", "#334155"))
@@ -726,7 +728,7 @@ class StepCard(QWidget):
         self._title.setStyleSheet(
             f"color:{COLORS['text_bright'] if active else COLORS['text']};"
             f"font-size:14px;font-weight:{600 if active else 500};"
-            f"font-family:{UI_FONT};")
+            f"")
         if done:
             border = COLORS.get("green", "#34D399")
             self._mark.setPixmap(check_icon(border).pixmap(QSize(14, 14)))
@@ -744,9 +746,9 @@ class StepCard(QWidget):
         # fill and the rail can share one rounded clip.
         self.setStyleSheet(
             f"#stepCard{{background:transparent;border:none;}}"
-            f"#stepCard QLabel{{font-family:{UI_FONT};}}"
+            f"#stepCard QLabel{{}}"
             f"QToolButton{{background:transparent;color:{COLORS['text_dim']};"
-            f"border:none;font-family:{UI_FONT};}}"
+            f"border:none;}}"
             f"QToolButton:hover{{background:{COLORS['bg_hover']};border-radius:4px;}}"
         )
         self.update()
@@ -891,11 +893,11 @@ class OptionalRowGroup(QWidget):
         )
         self._title.setStyleSheet(
             f"color:{COLORS.get('text_dim', '#8B909A')};font-size:12px;"
-            f"font-family:{UI_FONT};"
+            f""
         )
         self._summary.setStyleSheet(
             f"color:{COLORS.get('text_dim', '#8B909A')};font-size:11px;"
-            f"font-family:{UI_FONT};"
+            f""
         )
         self._toggle.setStyleSheet(
             "QToolButton{background:transparent;border:none;padding:0;margin:0;}"
@@ -948,8 +950,8 @@ class TaskPanel(QWidget):
         self.setStyleSheet(f"background:{COLORS['bg']};")
         lo = QVBoxLayout(self); lo.setContentsMargins(8, 10, 8, 10); lo.setSpacing(6)
         self._title = QLabel("任务清单")
-        self._title.setFont(QFont("Microsoft YaHei UI", 12, QFont.Weight.DemiBold))
-        self._title.setStyleSheet(f"font-size:17px;font-weight:600;color:{COLORS['text_bright']};font-family:{UI_FONT};")
+        self._title.setFont(ui_font(12, QFont.Weight.DemiBold))
+        self._title.setStyleSheet(f"font-size:17px;font-weight:600;color:{COLORS['text_bright']};")
         lo.addWidget(self._title)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
@@ -971,13 +973,13 @@ class TaskPanel(QWidget):
                 rows.append(row)
                 if tid == "process":
                     self._mask_strength_label = QLabel("处理强度")
-                    self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;font-family:{UI_FONT};padding-left:8px;")
+                    self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;padding-left:8px;")
                     self.mask_strength_value_label = QLabel("标准（固定）")
                     self.mask_strength_value_label.setToolTip(
                         "掩膜处理统一使用标准参数，保证不同任务的处理口径一致"
                     )
                     self.mask_strength_value_label.setStyleSheet(
-                        f"color:{COLORS['text']};font-size:13px;font-family:{UI_FONT};"
+                        f"color:{COLORS['text']};font-size:13px;"
                         f"padding:4px 8px;border:1px solid {COLORS['border']};"
                         "border-radius:4px;"
                     )
@@ -997,7 +999,7 @@ class TaskPanel(QWidget):
                     self.model_combo.setToolTip("选择 AI 识别模型，或从文件夹导入其他 .pt 权重")
                     self.model_combo.setStyleSheet(
                         f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                        f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
+                        f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;}}"
                     )
                     rows.append(self.model_combo)
                     self.inference_diagnostic_btn = QPushButton("导出识别诊断")
@@ -1040,7 +1042,7 @@ class TaskPanel(QWidget):
                     forbidden_layout.setSpacing(6)
                     self.forbidden_status_label = QLabel("禁行区：未确认")
                     self.forbidden_status_label.setStyleSheet(
-                        f"color:{COLORS['orange']};font-size:13px;font-family:{UI_FONT};"
+                        f"color:{COLORS['orange']};font-size:13px;"
                     )
                     self.confirm_no_forbidden_btn = QPushButton("确认无")
                     self.draw_forbidden_btn = QPushButton("绘制")
@@ -1048,7 +1050,7 @@ class TaskPanel(QWidget):
                         button.setMinimumSize(52, 26)
                         button.setStyleSheet(
                             f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                            f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;font-family:{UI_FONT};}}"
+                            f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;}}"
                             f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
                         )
                     self.confirm_no_forbidden_btn.setToolTip("确认田块内没有需要避让的沟渠、水坑或障碍")
@@ -1064,7 +1066,7 @@ class TaskPanel(QWidget):
                     turn_layout.setContentsMargins(8, 0, 8, 0)
                     turn_layout.setSpacing(6)
                     turn_label = QLabel("调头方式")
-                    turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;font-family:{UI_FONT};")
+                    turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;")
                     self.turn_combo = ExplicitPopupComboBox()
                     self.turn_combo.setToolTip(
                         "点击展开后选择调头/转弯方式；未展开时滚轮只滚动面板，不会改策略"
@@ -1072,7 +1074,7 @@ class TaskPanel(QWidget):
                     self.turn_combo.setMinimumHeight(28)
                     self.turn_combo.setStyleSheet(
                         f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                        f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
+                        f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;}}"
                     )
                     # DECISION-016: contour is an auditable pass-order strategy.
                     # 套圈收割为默认策略（置于首位）。
@@ -1096,7 +1098,7 @@ class TaskPanel(QWidget):
                     self.route_edit_btn.setMinimumHeight(30)
                     self.route_edit_btn.setStyleSheet(
                         f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                        f"border:1px solid {COLORS['border']};border-radius:5px;padding:4px 8px;font-family:{UI_FONT};}}"
+                        f"border:1px solid {COLORS['border']};border-radius:5px;padding:4px 8px;}}"
                         f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
                         f"QPushButton:disabled{{color:{COLORS.get('text_dim', '#8B909A')};}}"
                     )
@@ -1129,7 +1131,7 @@ class TaskPanel(QWidget):
                         button.setMinimumHeight(28)
                         button.setStyleSheet(
                             f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                            f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;font-family:{UI_FONT};}}"
+                            f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;}}"
                             f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
                             f"QPushButton:checked{{background:{COLORS['accent']};color:white;}}"
                         )
@@ -1411,7 +1413,7 @@ class TaskPanel(QWidget):
             color = COLORS["orange"]
         self.forbidden_status_label.setText(text)
         self.forbidden_status_label.setStyleSheet(
-            f"color:{color};font-size:13px;font-family:{UI_FONT};"
+            f"color:{color};font-size:13px;"
         )
 
     def set_mask_diagnostic_available(self, available):
@@ -1464,13 +1466,13 @@ class TaskPanel(QWidget):
 
     def refresh_theme(self):
         self.setStyleSheet(f"background:{COLORS['bg']};")
-        self._title.setStyleSheet(f"font-size:17px;font-weight:600;color:{COLORS['text_bright']};font-family:{UI_FONT};")
+        self._title.setStyleSheet(f"font-size:17px;font-weight:600;color:{COLORS['text_bright']};")
         combo_style = (
             f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-            f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
+            f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;}}"
         )
         if hasattr(self, "_mask_strength_label"):
-            self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;font-family:{UI_FONT};padding-left:8px;")
+            self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;padding-left:8px;")
         for combo_name in ("model_combo", "turn_combo"):
             combo = getattr(self, combo_name, None)
             if combo:
@@ -1483,7 +1485,7 @@ class TaskPanel(QWidget):
             if button:
                 button.setStyleSheet(
                 f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                f"border:1px solid {COLORS['border']};border-radius:5px;padding:4px 8px;font-family:{UI_FONT};}}"
+                f"border:1px solid {COLORS['border']};border-radius:5px;padding:4px 8px;}}"
                 f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
                 f"QPushButton:disabled{{color:{COLORS.get('text_dim', '#8B909A')};}}"
                 )
@@ -1492,7 +1494,7 @@ class TaskPanel(QWidget):
             if button:
                 button.setStyleSheet(
                     f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                    f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;font-family:{UI_FONT};}}"
+                    f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;}}"
                     f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
                 )
         self.set_forbidden_state(self._forbidden_count, self._forbidden_confirmed)
@@ -1596,7 +1598,8 @@ class RouteSegmentRow(QWidget):
             self._geometry.setStyleSheet(
                 f"color:{COLORS['accent']};font-size:11px;"
             )
-        self._dist.setStyleSheet(f"color:{COLORS['text_dim']};font-family:Consolas;")
+        self._dist.setFont(ui_font(9))
+        self._dist.setStyleSheet(f"color:{COLORS['text_dim']};")
         # Surface is painted (paintEvent) so hover can fade in like the
         # reference rows; QSS only carries the text colours.
         self.setStyleSheet(
@@ -1806,7 +1809,7 @@ class CenterlineSelectionRow(QWidget):
         self._label = QLabel(label)
         self._label.setMinimumWidth(0)
         self._label.setStyleSheet(
-            f"font-size:13px;color:{COLORS['text']};font-family:{UI_FONT};"
+            f"font-size:13px;color:{COLORS['text']};"
         )
         self._source = QLabel(source)
         self._source.setMinimumWidth(0)
@@ -1814,7 +1817,7 @@ class CenterlineSelectionRow(QWidget):
         self._source.setToolTip(raw_source)
         self._source.setVisible(bool(source))
         self._source.setStyleSheet(
-            f"font-size:11px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+            f"font-size:11px;color:{COLORS['text_dim']};"
         )
         lo.addWidget(self.checkbox)
         lo.addWidget(self._label, 1)
@@ -1853,10 +1856,10 @@ class CenterlineSelectionRow(QWidget):
 
     def refresh_theme(self):
         self._label.setStyleSheet(
-            f"font-size:13px;color:{COLORS['text']};font-family:{UI_FONT};"
+            f"font-size:13px;color:{COLORS['text']};"
         )
         self._source.setStyleSheet(
-            f"font-size:11px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+            f"font-size:11px;color:{COLORS['text_dim']};"
         )
 
 
@@ -1877,7 +1880,7 @@ class CenterlineSelectionPanel(QWidget):
         header.setContentsMargins(0, 0, 0, 0)
         self._count_label = QLabel("已选择 0/0 条")
         self._count_label.setStyleSheet(
-            f"font-size:13px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+            f"font-size:13px;color:{COLORS['text_accent']};"
         )
         header.addWidget(self._count_label)
         header.addStretch()
@@ -1888,7 +1891,7 @@ class CenterlineSelectionPanel(QWidget):
         )
         self._hint.setWordWrap(True)
         self._hint.setStyleSheet(
-            f"font-size:11px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+            f"font-size:11px;color:{COLORS['text_accent']};"
         )
         lo.addWidget(self._hint)
 
@@ -1905,7 +1908,7 @@ class CenterlineSelectionPanel(QWidget):
         self._empty_label = QLabel("尚未生成中心线，请先点击上一步“生成中心线”。")
         self._empty_label.setWordWrap(True)
         self._empty_label.setStyleSheet(
-            f"font-size:12px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+            f"font-size:12px;color:{COLORS['text_dim']};"
         )
         lo.addWidget(self._empty_label)
         self.clear_centerline_selection()
@@ -1978,13 +1981,13 @@ class CenterlineSelectionPanel(QWidget):
 
     def refresh_theme(self):
         self._count_label.setStyleSheet(
-            f"font-size:13px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+            f"font-size:13px;color:{COLORS['text_accent']};"
         )
         self._hint.setStyleSheet(
-            f"font-size:11px;color:{COLORS['text_accent']};font-family:{UI_FONT};"
+            f"font-size:11px;color:{COLORS['text_accent']};"
         )
         self._empty_label.setStyleSheet(
-            f"font-size:12px;color:{COLORS['text_dim']};font-family:{UI_FONT};"
+            f"font-size:12px;color:{COLORS['text_dim']};"
         )
         self._container.setStyleSheet(f"background:{COLORS['bg']};")
         self._scroll.setStyleSheet(

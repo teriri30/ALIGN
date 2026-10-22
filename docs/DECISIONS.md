@@ -792,3 +792,13 @@
   5. 下载走镜像回退（上海交大 → PyTorch 官方），每个 wheel 校验官方 sha256。
 - 代码锚点：`src/device_runtime.py`（`activate/install_gpu_runtime/remove_gpu_runtime/detect_nvidia_gpu/torch_status`）、`src/frozen_main.py`、`src/main.py`、`src/app_entry.py::describe_device`、`src/pyside6_app/dialogs.py::SettingsDialog._device_tab/_apply_device_state/_start_gpu_install`。
 - 测试锚点：`tests/test_device_runtime.py`（19 条：目录/挂载幂等/已导入不挂载/移除/显卡解析/状态降级/安装解包/失败清理/取消/磁盘不足/版本对齐/设置页三个状态分支）。
+
+## DECISION-046：全站字体（数字新罗马 + 中文微软雅黑）（2026-10-22）
+
+- 背景：用户反馈"字体太丑"，要求中文用微软雅黑、数字用 Times New Roman（新罗马）。
+- 做法：`styles.FONT_FAMILIES = ("Times New Roman", "Microsoft YaHei", "Microsoft YaHei UI", "SimHei")`，`build_app_font()` 用 `QFont.setFamilies` 整串交给 Qt。Qt 逐字符匹配字体族，新罗马没有中文字形，中文自然回退雅黑，不必手工拆分中英文。
+- 关键教训：**QSS 的 `font-family` 会压过 `setFont`**。改字体前全局 QSS 和 `panels.py` 的 43 处内联样式都写着字体族，导致步骤标题实际渲染成 SimHei（`QFontInfo(...).family()` 可复现）。现在字体族只由 `QApplication.setFont` 提供，QSS 里禁止再写 `font-family`。
+- 例外：日志/代码框保留等宽字体（Cascadia Code / Consolas），等宽是功能需要，不改。
+- 观感说明：14px 下新罗马的衬线只有 1px，缩略看接近无衬线；放大或大字号（比例尺、标题）才明显。这是字号问题，不是字体没生效。
+- 代码锚点：`src/pyside6_app/styles.py::FONT_FAMILIES/FONT_FAMILY_CSS/ui_font/build_stylesheet`、`src/app_entry.py::build_app_font`、`src/pyside6_app/panels.py`（移除全部内联 font-family）、`src/pyside6_app/image_view.py::_scale_bar_font`。
+- 测试锚点：`tests/test_device_runtime.py::test_ui_font_is_times_new_roman_with_yahei_fallback`（断言族列表顺序，并断言 QSS 里不再出现 Times New Roman，防止有人把 font-family 写回样式表）。

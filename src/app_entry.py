@@ -142,6 +142,18 @@ def _check_rasterio() -> None:
         raise RuntimeError("unexpected CRS")
 
 
+def build_app_font():
+    """全站字体：数字/英文 Times New Roman，中文回退微软雅黑。"""
+    from PySide6.QtGui import QFont
+
+    from pyside6_app.styles import FONT_FAMILIES, FONT_POINT_SIZE
+
+    font = QFont(FONT_FAMILIES[0], FONT_POINT_SIZE)
+    if hasattr(font, "setFamilies"):
+        font.setFamilies(list(FONT_FAMILIES))
+    return font
+
+
 def run_app(argv: Sequence[str] | None = None) -> int:
     """Start the Qt GUI, or run the non-GUI self-test."""
     _configure_runtime_environment()
@@ -168,9 +180,7 @@ def run_app(argv: Sequence[str] | None = None) -> int:
     app.setApplicationVersion(str(build_info.get("version") or APP_VERSION))
     app.setOrganizationName("ZHL")
     app.setStyle(QStyleFactory.create("Fusion"))
-    font = QFont("Microsoft YaHei UI", 10)
-    if hasattr(font, "setFamilies"):
-        font.setFamilies(["Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "Segoe UI"])
+    font = build_app_font()
     # 不设 setStyleStrategy(PreferAntialias)：它会让 Windows 退回灰度抗锯齿，
     # 中文小字号笔画发虚。改用 hinting 偏好让笔画对齐像素，渲染交给系统
     # 默认的 DirectWrite / ClearType。
