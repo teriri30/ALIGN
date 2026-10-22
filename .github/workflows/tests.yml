@@ -42,7 +42,32 @@ jobs:
           python -m pytest -q `
             --basetemp "$base_temp" `
             --cov=. --cov-report=term --cov-report=xml:coverage.xml `
-            --junitxml=test-results.xml --cov-fail-under=35
+            --junitxml=test-results.xml --cov-fail-under=35 `
+            -rf 2>&1 | Tee-Object -FilePath pytest-output.txt
+          exit $LASTEXITCODE
+      - name: Publish failure annotations
+        if: always()
+        shell: pwsh
+        run: |
+          # 把失败摘要与日志尾部写成 check-run 注解：匿名调用者也能读到，
+          # 不必登录或下载 artifact 就能知道是哪条测试挂了/进程是否崩溃。
+          if (-not (Test-Path pytest-output.txt)) {
+            Write-Host "::error title=Pytest::pytest-output.txt 不存在，测试进程可能在启动前就退出了"
+            exit 0
+          }
+          $lines = Get-Content pytest-output.txt | Where-Object { $_.Trim().Length -gt 0 }
+          $failed = $lines | Where-Object { $_ -match '^(FAILED|ERROR)\s' }
+          foreach ($line in ($failed | Select-Object -First 40)) {
+            $safe = $line.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Host "::error title=Pytest failure::$safe"
+          }
+          if (-not $failed) {
+            Write-Host "::error title=Pytest::没有 FAILED/ERROR 行，末尾日志如下"
+          }
+          foreach ($line in ($lines | Select-Object -Last 30)) {
+            $safe = $line.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Host "::error title=Pytest tail::$safe"
+          }
       - name: Summarize test failures
         if: always()
         shell: pwsh
