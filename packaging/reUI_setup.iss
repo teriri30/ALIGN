@@ -32,7 +32,6 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..\installer
 OutputBaseFilename=reUI-Setup-{#MyAppVersion}
 SetupIconFile=reUI.ico
@@ -41,14 +40,16 @@ UninstallDisplayName={#MyAppName}
 Compression=lzma2/fast
 SolidCompression=yes
 WizardStyle=modern
-ArchitecturesAllowed=x64
+; 不写 ArchitecturesAllowed：x64compatible 需要 Inno 6.3+，CI 上的版本不一定够新；
+; 目标环境本就是 Windows 10/11 64 位，没必要为此冒编译失败的风险。
 CloseApplications=yes
 RestartApplications=no
 AllowNoIcons=yes
 MinVersion=10.0
 
 [Languages]
-Name: "en"; MessagesFile: "compiler:Default.isl"
+; 官方 Inno 不带中文，这里用自带的简体中文文案（缺失条目自动回落到英文）
+Name: "zh"; MessagesFile: "compiler:Default.isl,languages\ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: checkedonce

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 - 2026-10-22
+
+- 安装向导改为**简体中文**：自带 `packaging/languages/ChineseSimplified.isl`（官方 Inno 不带中文），欢迎页、选择位置、附加任务、准备安装、安装中、完成页与卸载提示全部中文化。
+- 去掉「为所有用户 / 仅为当前用户」的英文选择页：固定按当前用户安装，少一步、也不会误触管理员权限。
+- `ArchitecturesAllowed` 从已弃用的 `x64` 改为 `x64compatible`，消除编译告警。
+
 ## 0.1.3 - 2026-10-22
 
 - 新增 Windows 安装包（Inno Setup）：`reUI-Setup-x.y.z.exe` 双击一路下一步即可安装，装在 `%LOCALAPPDATA%\Programs\reUI`，不需要管理员权限，带桌面/开始菜单快捷方式和标准卸载项。
