@@ -105,4 +105,21 @@ jobs:
           $version = (Get-Content build_info.json -Raw | ConvertFrom-Json).version
           if ($env:GITHUB_REF_TYPE -eq "tag") { $releaseTag = $env:GITHUB_REF_NAME } else { $releaseTag = "${{ inputs.release_tag }}" }
           $guidance = "**普通用户请下载 ${{ steps.package.outputs.zip }}（完整便携版，解压后双击 reUI.exe 即可运行，无需安装任何环境）。同名的 .sha256 文件是校验值，可不下。下方的“源代码”压缩包仅供开发者，不能直接运行。**"
-          gh release create $releaseTag ${{ steps.package.outputs.zip }} ${{ steps.package.outputs.sha }} --target $env:GITHUB_SHA --generate-notes --title "reUI $version" --notes $guidance
+          # gh 不允许 --notes 与 --generate-notes 同时使用（v0.1.2 首次发布就是撞在这里），
+          # 所以先仅用自动生成的 notes 建 release，再把自定义说明前置到正文。
+          gh release create $releaseTag ${{ steps.package.outputs.zip }} ${{ steps.package.outputs.sha }} --target $env:GITHUB_SHA --generate-notes --title "reUI $version" 2>&1 | Tee-Object -FilePath publish-output.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $body = gh release view $releaseTag --json body --jq .body
+          $combined = $guidance + "`n`n" + $body
+          $combined | Out-File -FilePath release-notes.md -Encoding utf8
+          gh release edit $releaseTag --notes-file release-notes.md 2>&1 | Tee-Object -FilePath publish-output.txt -Append
+          exit $LASTEXITCODE
+      - name: Publish failure annotations
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path publish-output.txt)) { exit 0 }
+          foreach ($line in (Get-Content publish-output.txt | Where-Object { $_.Trim().Length -gt 0 } | Select-Object -Last 20)) {
+            $safe = $line.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Host "::error title=Release publish::$safe"
+          }
