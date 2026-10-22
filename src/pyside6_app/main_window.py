@@ -72,7 +72,7 @@ REFERENCE_DOUBLE_CLICK_DISTANCE_PX = 12.0
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("农机作业规划系统")
+        self.setWindowTitle("ALIGN 农机作业规划系统")
         self.resize(1600, 1000); self.setMinimumSize(1024, 680)
         self._theme_mgr = ThemeManager.instance()
         self._theme_mgr.theme_changed.connect(self._on_theme_changed)
@@ -211,7 +211,7 @@ class MainWindow(QMainWindow):
         self._processed_mask_save_threads = []
         self._processed_mask_save_lock = threading.Lock()
         self._log.info("desktop startup complete")
-        if not os.environ.get("REUI_DISABLE_AUTO_START"):
+        if not os.environ.get("ALIGN_DISABLE_AUTO_START"):
             QTimer.singleShot(300, self._auto_start)
 
 
@@ -5480,11 +5480,11 @@ class MainWindow(QMainWindow):
         Research output keeps the computed route metrics and provenance in the
         manifest, but does not turn theoretical footprint thresholds into a
         file-format/export blocker.  ``fail_closed`` remains available for
-        strict CI or controlled-trial runs.  The ``REUI_EXPORT_GATE``
+        strict CI or controlled-trial runs.  The ``ALIGN_EXPORT_GATE``
         environment variable overrides the config so automated test suites can
         select a deterministic gate.
         """
-        env_mode = str(os.environ.get("REUI_EXPORT_GATE", "")).strip().lower()
+        env_mode = str(os.environ.get("ALIGN_EXPORT_GATE", "")).strip().lower()
         if env_mode:
             return env_mode if env_mode in {"fail_closed", "confirm"} else "fail_closed"
         try:
@@ -5976,7 +5976,7 @@ class MainWindow(QMainWindow):
         # readiness assessment; a caller-supplied boolean must never upgrade a
         # route to controlled field-trial status.
         controlled_trial = bool(
-            readiness.get("schema") == "reui.machine-readiness.v1"
+            readiness.get("schema") == "align.machine-readiness.v1"
             and readiness.get("controlled_trial_ready") is True
             and readiness.get("eligible_for_machine_export") is True
             and readiness.get("controlled_trial_blockers") == []
@@ -6772,7 +6772,7 @@ class MainWindow(QMainWindow):
                         if t is not current and t.is_alive()
                     ]
 
-        thread = threading.Thread(target=save_job, name="reui-save-processed-mask", daemon=True)
+        thread = threading.Thread(target=save_job, name="align-save-processed-mask", daemon=True)
         with self._processed_mask_save_lock:
             self._processed_mask_save_threads.append(thread)
         thread.start()
@@ -8561,7 +8561,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _unique_package_path(parent):
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = os.path.join(parent, f"reui_field_trial_{stamp}")
+        base = os.path.join(parent, f"align_field_trial_{stamp}")
         candidate = base
         suffix = 2
         while os.path.exists(candidate):
@@ -8586,7 +8586,7 @@ class MainWindow(QMainWindow):
             raise ValueError("缺少原始或处理后掩膜，不能生成完整资料包")
 
         final_dir = self._unique_package_path(parent)
-        staging_dir = tempfile.mkdtemp(prefix=".reui_package_build_", dir=parent)
+        staging_dir = tempfile.mkdtemp(prefix=".align_package_build_", dir=parent)
         moved = False
         try:
             export_visual_artifacts(
@@ -10260,7 +10260,7 @@ class MainWindow(QMainWindow):
         }
         st.path_artifact = {
             "manual_route": {
-                "schema": "reui.manual-route.v1",
+                "schema": "align.manual-route.v1",
                 "work_line_count": len(self._route_edit_work_records()),
                 "control_point_count": len(getattr(st, "path_points", []) or []),
                 "control_status": list(getattr(st, "path_status", []) or []),

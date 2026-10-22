@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 
 
-INFERENCE_DIAGNOSTIC_SCHEMA = "reui.inference-diagnostic.v1"
+INFERENCE_DIAGNOSTIC_SCHEMA = "align.inference-diagnostic.v1"
 
 
 def _json_default(value: Any):
@@ -381,7 +381,7 @@ def export_inference_diagnostic_bundle(
             "\ufeff" + _records_csv(context_records)
         ).encode("utf-8")
     files["README.txt"] = (
-        "reUI 推理诊断包\n\n"
+        "ALIGN 推理诊断包\n\n"
         "source_preview.png：当前显示坐标下的源影像预览。\n"
         "raw_overlay.png：源影像与原始推理掩膜叠加；黄色边界为田块圈选范围。\n"
         "field_clipped_overlay.png：按田块圈选边界裁剪后的对齐效果图；仅用于显示，不修改原始掩膜。\n"

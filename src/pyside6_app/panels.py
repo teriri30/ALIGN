@@ -1538,7 +1538,7 @@ class RouteSegmentRow(QWidget):
     edit_clicked = Signal(int, int)
     edit_action_requested = Signal(str, int, int)
     reorder_requested = Signal(int, int)
-    _WORK_MIME = "application/x-reui-work-line-index"
+    _WORK_MIME = "application/x-align-work-line-index"
 
     def __init__(self, index, label, distance_m, is_work=True, parent=None,
                  segment_type=None, point_count=None, edit_meta=None,

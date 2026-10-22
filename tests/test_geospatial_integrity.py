@@ -41,7 +41,7 @@ def _window_with_path():
     QApplication.instance() or QApplication([])
     window = MainWindow()
     window.geo, _affine, _transformer = _real_geo()
-    model_path = os.path.join(tempfile.gettempdir(), "reui-integrity-test-model.pt")
+    model_path = os.path.join(tempfile.gettempdir(), "align-integrity-test-model.pt")
     with open(model_path, "wb") as handle:
         handle.write(b"test-model")
     model_sha256 = file_sha256(model_path)

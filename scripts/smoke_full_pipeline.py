@@ -1,6 +1,6 @@
 """全流程冒烟测试：只给正射影像，自动跑完整条链路。
 
-给 AI / 开发者用的**外部测试工具**，不进入 reUI 系统、不注册到界面。
+给 AI / 开发者用的**外部测试工具**，不进入 ALIGN 系统、不注册到界面。
 
     python scripts/smoke_full_pipeline.py --tif data/tif/result.tif
 
@@ -26,7 +26,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 # 脚本模式不能触发桌面自动启动逻辑。
-os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
+os.environ.setdefault("ALIGN_DISABLE_AUTO_START", "1")
 
 
 # ---------------------------------------------------------------- 基础设施
@@ -96,7 +96,7 @@ def resolve_model(explicit: str) -> Path:
 # ---------------------------------------------------------------- 主流程
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="reUI 全流程冒烟测试（外部工具，不属于系统功能）",
+        description="ALIGN 全流程冒烟测试（外部工具，不属于系统功能）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--tif", required=True, help="正射影像 GeoTIFF")
@@ -128,7 +128,7 @@ def main(argv=None) -> int:
         from raster_preprocessing import read_rgb_raster
         from state import AppState
     except Exception as exc:
-        return run.fail("准备", "导入 reUI 模块失败", exc)
+        return run.fail("准备", "导入 ALIGN 模块失败", exc)
 
     # ---- 读栅格 ------------------------------------------------------
     try:

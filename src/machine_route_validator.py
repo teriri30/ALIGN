@@ -12,7 +12,7 @@ from harvester_geometry import FOOTPRINT_MODEL, FOOTPRINT_REFERENCE_POINT
 from footprint_planner import compare_work_line_footprints
 
 
-MACHINE_READINESS_SCHEMA = "reui.machine-readiness.v1"
+MACHINE_READINESS_SCHEMA = "align.machine-readiness.v1"
 
 
 def _verified_report(report: object) -> bool:

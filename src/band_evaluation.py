@@ -55,15 +55,15 @@ NARROW_LABELS = {"窄行带", "窄", "narrow", "narrowband", "narrow_band", "nar
 
 
 # ─────────────────────────────────────────────────────────────
-# 运行环境（定位 reUI 源码目录）
+# 运行环境（定位 ALIGN 源码目录）
 # ─────────────────────────────────────────────────────────────
 
-def _ensure_reui_src() -> str:
-    """把 reUI/src 加入 sys.path（开发副本与工程内副本都可用）。"""
+def _ensure_align_src() -> str:
+    """把 ALIGN/src 加入 sys.path（开发副本与工程内副本都可用）。"""
     candidates = [
-        os.environ.get("REUI_SRC", ""),
+        os.environ.get("ALIGN_SRC", ""),
         os.path.dirname(os.path.abspath(__file__)),
-        "E:/zhlonly/project/reUI/src",
+        "E:/zhlonly/project/ALIGN/src",
     ]
     for path in candidates:
         if path and os.path.isfile(os.path.join(path, "path_planner.py")):
@@ -71,20 +71,20 @@ def _ensure_reui_src() -> str:
                 sys.path.insert(0, path)
             return path
     raise RuntimeError(
-        "找不到 reUI 源码目录（含 path_planner.py）；请设置环境变量 REUI_SRC"
+        "找不到 ALIGN 源码目录（含 path_planner.py）；请设置环境变量 ALIGN_SRC"
     )
 
 
-_SRC_DIR = _ensure_reui_src()
+_SRC_DIR = _ensure_align_src()
 
 
-def _reui_root() -> str:
+def _align_root() -> str:
     return os.path.dirname(_SRC_DIR)
 
 
 def resolve_repo_config(section: str, config_path: Optional[str] = None) -> Dict[str, Any]:
     """读取仓库根 config.json 的指定段（与桌面端源码运行一致）。"""
-    candidate = config_path or os.path.join(_reui_root(), "config.json")
+    candidate = config_path or os.path.join(_align_root(), "config.json")
     with open(candidate, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     block = data.get(section)

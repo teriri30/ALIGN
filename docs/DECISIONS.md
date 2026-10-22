@@ -413,7 +413,7 @@
   3. 外扩量用米（默认 6.0 m），按掩膜/显示 GSD 换算像素；外扩后多边形截断到掩膜/显示图边界。
   4. 推理裁剪窗口的放大不改变缓存键（仍按 tif 路径），旧掩膜缓存由现有模型指纹/失效机制处理。
 - 代码锚点：`inference.InferenceRunner._run_from_tif`（`min_infer_window_display_px`、流式分支 `crop_field_mask`）、`inference.InferenceRunner._run_from_image`（整块分支 `crop_field_mask`）、`row_geometry.expand_polygon_px`、`row_geometry.regularize_crop_mask`（`analysis_polygon` 掩膜裁剪；`clip_band_polygon`/中心线检查仍用 `field_polygon`）。
-- 测试锚点：`tests/test_reui_logic.py::test_source_tif_inference_streams_oversized_crop_at_source_tile_size`（窗口 clamp 行为不回归）、`tests/test_reliability_hardening.py`（inference 指纹/缓存提交门禁不回归）。
+- 测试锚点：`tests/test_align_logic.py::test_source_tif_inference_streams_oversized_crop_at_source_tile_size`（窗口 clamp 行为不回归）、`tests/test_reliability_hardening.py`（inference 指纹/缓存提交门禁不回归）。
 - 允许的变更方式：可调整默认外扩量、最小窗口像素与配置键位置；不得让分析多边形缩回原多边形（紧贴圈选回归失败），也不得让行带/中心线改用外扩多边形（作业范围越界）。
 
 ## DECISION-021: 掩膜显示路径必须复制后裁剪，禁止原地修改 state 数据
@@ -460,7 +460,7 @@
 - 路径缓存：`PATH_PLANNING_VERSION` 升至 `footprint-path-v31`，避免旧画布作业带选择或未经过最终田界过滤的路径 provenance 被误认为新的中心线勾选结果。
 - 不变量：所有可规划作业带必须在中心线目录生成前确定；所有候选中心线必须在任何操作员选择之前生成；最终目录还必须对整条中心线执行已确认田块边界覆盖检查，田外孤立候选不得进入目录；取消勾选的中心线不绘制、不栅格化覆盖目标、不参与转弯连接；区域边界只影响直线生成证据，不产生分区转弯。田界过滤结果写入 `layout.centerline_field_boundary_filter`。
 - 代码锚点：`path_planner.prepare_operator_centerline_plan`、`path_planner._apply_operator_centerline_selection`、`pyside6_app.workers.CenterlineCatalogWorker`、`TaskPanel.update_centerline_selection`、`CenterlineSelectionPanel`、`MainWindow._on_centerline_selection_changed`、`MainWindow._draw_centerline_overlay`。
-- 测试锚点：`tests/test_work_band_selection.py` 和 `tests/test_reui_logic.py`（全量中心线目录、独立生成/选择步骤、左侧逐线复选框、取消后隐藏/失效、状态失效链）以及 `tests/test_mixed_region_strategy.py`。
+- 测试锚点：`tests/test_work_band_selection.py` 和 `tests/test_align_logic.py`（全量中心线目录、独立生成/选择步骤、左侧逐线复选框、取消后隐藏/失效、状态失效链）以及 `tests/test_mixed_region_strategy.py`。
 
 ## DECISION-025：每个逻辑操作独立持久化并可跨重启逐步撤销
 
@@ -595,7 +595,7 @@
   3. 任务主按钮不再使用任务专属色；`TASK_DEFS` 的 `color` 仅保留为历史字段，不再驱动按钮。
   4. 次级按钮（回退）不得用高饱和填充色，避免与主操作争夺注意力。
 - 代码锚点：`pyside6_app.ui_icons`（`undo_icon`/`redo_icon`/`theme_icon`/`settings_icon`/`chevron_icon`/`check_icon`/`point_icon`/`line_icon`/`area_icon`/`plus_icon`/`minus_icon`）、`top_bar.TopToolbar`、`panels.TaskRow._update_badge/_secondary_button_style`、`panels.StepCard`、`image_view.ImageViewerGroup`。
-- 测试锚点：`tests/test_reui_logic.py`（任务面板与视图控件不回归）、`tests/test_system_history.py`（撤回/恢复可用态）。
+- 测试锚点：`tests/test_align_logic.py`（任务面板与视图控件不回归）、`tests/test_system_history.py`（撤回/恢复可用态）。
 
 ## DECISION-033：界面图标采用 Lucide 网格，配色对齐 ZoneDeck / Codex++ 参考（ui-icons-v2）
 
@@ -608,7 +608,7 @@
   3. 每套主题只允许一个强调色；状态色（成功/失败/警告）不得用于装饰。
   4. 强调色底上的文字必须用 `on_accent`，不得用 `btn_default`。
 - 代码锚点：`pyside6_app.ui_icons`、`pyside6_app.styles.THEMES`、`panels.StepCard.refresh_state/set_active`、`panels.TaskRow._update_badge/_secondary_button_style`。
-- 测试锚点：`tests/test_reui_logic.py`、`tests/test_system_history.py`。
+- 测试锚点：`tests/test_align_logic.py`、`tests/test_system_history.py`。
 
 ## DECISION-034：侧栏卡片采用「状态竖条 + 可提亮高亮面」的自绘卡片（step-card-v2）
 
@@ -621,7 +621,7 @@
   3. 悬停时长固定 160 ms，与参考实现的 `opacity 160ms` 对齐。
   4. `paintEvent` 中访问的实例属性必须有默认值（`_done`/`_active`/`_hover`），自绘异常会导致进程级崩溃而非 Python 异常。
 - 代码锚点：`panels.StepCard.paintEvent/_chrome/_set_hover`、`panels.StepCard.set_active`、`ui_motion.tween_value`。
-- 测试锚点：`tests/test_reui_logic.py`（手风琴展开、卡片宽度与不重叠）。
+- 测试锚点：`tests/test_align_logic.py`（手风琴展开、卡片宽度与不重叠）。
 
 ## DECISION-035：动效分三层——短过渡、少量过冲、循环提示（motion-v1）
 
@@ -674,7 +674,7 @@
   3. 失效由**动作**触发：重画/删除田块调用 `_finish_field_polygon → _invalidate_analysis_from("inference")` 清空整条下游；状态机不得从"边界为空"推断掩膜过期。
   4. `plan` 的锁链不再包含田块（识别已产出掩膜即可继续）；其余锁链保持严格：掩膜→参数确认→作业线→选线→起点锁定。
 - 代价与取舍：若真是"边界被外部清空但掩膜仍在"的损坏存档，界面会允许在旧掩膜上继续规划。这是有意的取舍——用可恢复的宽容换掉不可恢复的"整套降级"，且这种存档本身不可能由本程序产生。
-- 测试锚点：`tests/test_task_chain.py::test_mask_derived_steps_survive_a_partially_restored_cache`、`::test_deleting_field_polygon_invalidates_every_downstream_step`、`tests/test_reui_logic.py::test_cache_restore_reenables_confirmed_parameters_after_processed_mask`（断言恢复为 done）。
+- 测试锚点：`tests/test_task_chain.py::test_mask_derived_steps_survive_a_partially_restored_cache`、`::test_deleting_field_polygon_invalidates_every_downstream_step`、`tests/test_align_logic.py::test_cache_restore_reenables_confirmed_parameters_after_processed_mask`（断言恢复为 done）。
 
 ## DECISION-039：进度只由真实任务驱动；卡片展开改为内容区高度动画（motion-v3）
 
@@ -691,7 +691,7 @@
   2. 展开动画期间表头不得移动；任何让表头位移的实现视为缺陷。
   3. 任务行进度只允许由真实运行标志驱动，禁止从百分比区间推断当前步骤。
 - 代码锚点：`panels.StepCard._collapsed_height/_content_height/_apply_expanded_state/_animate_expansion/_on_expand_finished`、`main_window._on_progress`。
-- 测试锚点：`tests/test_reui_logic.py::test_planning_card_fully_expands_in_scroll_area_without_overlap`（等待动画结束后再量几何）。
+- 测试锚点：`tests/test_align_logic.py::test_planning_card_fully_expands_in_scroll_area_without_overlap`（等待动画结束后再量几何）。
 
 ## DECISION-040：行高随内容自适应、步骤推进自动换焦点、字号与 hinting 调整（layout-v1）
 
@@ -759,5 +759,19 @@
   5. 作业线标注优先保证「不叠字」：同一横截线对齐、旋转、SAT 碰撞过滤、按间距自动降字号；被过滤掉的标签宁可少画（fit 视图 7 条等距），放大后逐步补齐（13 → 14 条），不得叠画。
   6. 高频交互路径（勾选、切换行状态）禁止抓系统快照、重建行控件、重写未变化的样式表。
 - 代码锚点：`panels.TaskRow._sync_row_height/_notify_card_height_change`、`panels.StepCard._on_expand_finished/refresh_state(force)`、`panels.OptionalRowGroup`、`panels.TaskPanel._on_task_action/_sync_optional_summary`、`task_state.derive_task_statuses`、`state.AppState.save_centerline_selection_undo`、`ui_motion.ShimmerBar.set_idle`、`MainWindow._confirm_centerline_selection/_schedule_centerline_selection_persist/_aligned_label_anchors/_overlay_text_polygon/_polygons_overlap/_on_view_scale_changed`、`ImageViewer.draw_text(rotation=)`。
-- 测试锚点：`tests/test_reui_logic.py::test_mask_progress_bar_does_not_cover_strength_label`、`::test_optional_points_live_in_a_collapsed_secondary_group`、`::test_plan_row_shows_why_it_is_still_pending`、`::test_workflow_separates_centerlines_from_path_planning_and_advanced_settings`；`tests/test_task_row_click.py::test_action_button_click_is_reported_separately_from_row_click`、`::test_centerline_selection_action_requests_confirmation`；`tests/test_work_band_selection.py::test_default_all_selection_keeps_the_selection_step_open`、`::test_confirm_centerline_selection_advances_the_workflow`、`::test_checkbox_toggle_reuses_rows_and_keeps_undo_snapshot_light`、`::test_unchecked_centerline_is_hidden_from_canvas_overlay`（端点契约）、`::test_centerline_label_is_a_halo_badge_centered_on_its_line`（编号压在线上、用描边而非底色块）。
+- 测试锚点：`tests/test_align_logic.py::test_mask_progress_bar_does_not_cover_strength_label`、`::test_optional_points_live_in_a_collapsed_secondary_group`、`::test_plan_row_shows_why_it_is_still_pending`、`::test_workflow_separates_centerlines_from_path_planning_and_advanced_settings`；`tests/test_task_row_click.py::test_action_button_click_is_reported_separately_from_row_click`、`::test_centerline_selection_action_requests_confirmation`；`tests/test_work_band_selection.py::test_default_all_selection_keeps_the_selection_step_open`、`::test_confirm_centerline_selection_advances_the_workflow`、`::test_checkbox_toggle_reuses_rows_and_keeps_undo_snapshot_light`、`::test_unchecked_centerline_is_hidden_from_canvas_overlay`（端点契约）、`::test_centerline_label_is_a_halo_badge_centered_on_its_line`（编号压在线上、用描边而非底色块）。
+
+## DECISION-044：产品改名 reUI → ALIGN（2026-10-22）
+
+- 背景：用户要求换成"像 TRAE / workbuddy / ChatGPT 那样"的短名，且缩写展开后要能组成一个有正面含义的词（对标 GOAT = Greatest Of All Time）。
+- 选定：**ALIGN = Autonomous Line-guided Intelligent Guidance & Navigation**。`ALIGN` 本身即"对齐"，直指课题核心"对行"；五个字母可连读，像成熟软件名。
+- 落点：程序名与窗口标题（`ALIGN 农机作业规划系统`）、EXE（`align.exe`）、安装包（`align-Setup-*.exe`）、便携包（`align-Windows-x64-*.zip`）、构件脚本（`packaging/align.spec`、`packaging/align_setup.iss`、`packaging/align.ico`）、环境变量前缀（`REUI_*` → `ALIGN_*`）、GitHub 仓库名。
+- 数据迁移：数据目录改为 `%LOCALAPPDATA%\ALIGN`；`runtime_paths.user_data_root()` 在目标目录不存在时把旧的 `%LOCALAPPDATA%\reUI` 整体 `rename`（失败则 `copytree`）过来，只搬一次，用户既有项目与缓存不丢。`REUI_USER_DATA_DIR` 保留为环境变量兼容别名。
+- 历史记录不改写：`CHANGELOG.md` 旧条目与本文 043 之前的条目继续使用旧名，属"当时的事实"。
+- 不变量：
+  1. 迁移只在目标目录不存在时发生，且绝不删除旧目录内容（rename 失败退化为复制）。
+  2. 测试统一通过 `ALIGN_USER_DATA_DIR` 指向临时目录，不触发迁移。
+  3. 安装包 AppId GUID 保持不变，改名后的安装包可以直接覆盖升级旧版本。
+- 代码锚点：`runtime_paths.APP_DATA_NAME/_migrate_legacy_data_root/user_data_root`。
+- 测试锚点：`tests/test_runtime_packaging.py::test_version_has_one_runtime_source`、`::test_build_spec_keeps_exe_at_release_root`。
 

@@ -8,11 +8,38 @@ researcher's state.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
 
-APP_DATA_NAME = "reUI"
+APP_DATA_NAME = "ALIGN"
+
+# 改名（reUI -> ALIGN）前旧版本用的数据目录名。首次以新名字启动时整体搬过来，
+# 免得用户升级后“项目不见了”。测试都通过 ALIGN_USER_DATA_DIR 指定临时目录，
+# 不会走到这段迁移逻辑。
+LEGACY_APP_DATA_NAMES = ("reUI",)
+
+
+def _migrate_legacy_data_root(target: Path) -> None:
+    """把旧数据目录搬到新名字下；目标已存在就什么都不做。"""
+    if target.exists():
+        return
+    base = target.parent
+    for legacy_name in LEGACY_APP_DATA_NAMES:
+        legacy = base / legacy_name
+        if not legacy.is_dir():
+            continue
+        try:
+            legacy.rename(target)
+            return
+        except OSError:
+            pass
+        try:
+            shutil.copytree(legacy, target, dirs_exist_ok=True)
+        except OSError:
+            pass
+        return
 
 
 def is_frozen() -> bool:
@@ -37,7 +64,7 @@ def executable_dir() -> Path:
 
 
 def bundle_root() -> Path:
-    """Return the source root or the directory containing ``reUI.exe``."""
+    """Return the source root or the directory containing ``align.exe``."""
     return executable_dir()
 
 
@@ -89,16 +116,23 @@ def bundled_resource(relative_path: str | os.PathLike) -> Path:
 def user_data_root() -> Path:
     """Return the writable per-user data directory.
 
-    ``REUI_USER_DATA_DIR`` is intentionally supported for tests and portable
+    ``ALIGN_USER_DATA_DIR``（兼容旧的 ``REUI_USER_DATA_DIR``）is intentionally
+    supported for tests and portable
     lab deployments.  Normal Windows installs use ``%LOCALAPPDATA%``.
     """
-    override = str(os.environ.get("REUI_USER_DATA_DIR", "") or "").strip()
+    override = str(
+        os.environ.get("ALIGN_USER_DATA_DIR")
+        or os.environ.get("REUI_USER_DATA_DIR")
+        or ""
+    ).strip()
     if override:
         return Path(override).expanduser().resolve()
     base = str(os.environ.get("LOCALAPPDATA", "") or "").strip()
     if not base:
         base = str(Path.home() / "AppData" / "Local")
-    return (Path(base) / APP_DATA_NAME).resolve()
+    target = (Path(base) / APP_DATA_NAME).resolve()
+    _migrate_legacy_data_root(target)
+    return target
 
 
 def config_dir() -> Path:

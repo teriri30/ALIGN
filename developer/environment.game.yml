@@ -1,4 +1,4 @@
-name: reui-game
+name: align-game
 channels:
   - conda-forge
 dependencies:

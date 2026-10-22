@@ -85,8 +85,8 @@ def test_builtin_assets_report_partial_without_returning_personal_paths(monkeypa
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     (model_dir / "yolo11m_seg_best.pt").write_bytes(b"model")
-    monkeypatch.setenv("REUI_TEST_IMAGE", str(image))
-    monkeypatch.setenv("REUI_TEST_MODEL_DIR", str(model_dir))
+    monkeypatch.setenv("ALIGN_TEST_IMAGE", str(image))
+    monkeypatch.setenv("ALIGN_TEST_MODEL_DIR", str(model_dir))
 
     discovered = assets.discover_builtin_assets()
 
@@ -102,8 +102,8 @@ def test_builtin_assets_report_partial_without_returning_personal_paths(monkeypa
 def test_builtin_assets_report_missing_when_no_env_or_packaged_asset_exists(monkeypatch, tmp_path):
     import builtin_test_assets as assets
 
-    monkeypatch.delenv("REUI_TEST_IMAGE", raising=False)
-    monkeypatch.delenv("REUI_TEST_MODEL_DIR", raising=False)
+    monkeypatch.delenv("ALIGN_TEST_IMAGE", raising=False)
+    monkeypatch.delenv("ALIGN_TEST_MODEL_DIR", raising=False)
     monkeypatch.setattr(assets, "_DEFAULT_TEST_IMAGE", str(tmp_path / "missing.tif"))
     monkeypatch.setattr(assets, "_DEFAULT_MODEL_DIR", str(tmp_path / "missing-models"))
 
@@ -133,8 +133,8 @@ def test_builtin_assets_use_the_model_registry_manifest(monkeypatch, tmp_path):
         }),
         encoding="utf-8",
     )
-    monkeypatch.setenv("REUI_TEST_IMAGE", str(image))
-    monkeypatch.setenv("REUI_TEST_MODEL_DIR", str(model_dir))
+    monkeypatch.setenv("ALIGN_TEST_IMAGE", str(image))
+    monkeypatch.setenv("ALIGN_TEST_MODEL_DIR", str(model_dir))
 
     discovered = assets.discover_builtin_assets()
 

@@ -3,7 +3,7 @@ import sys
 import types
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
+os.environ.setdefault("ALIGN_DISABLE_AUTO_START", "1")
 
 from PySide6.QtWidgets import QApplication
 

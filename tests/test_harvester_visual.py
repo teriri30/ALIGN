@@ -1,11 +1,11 @@
-"""Offscreen checks for the reUI detailed harvester visual item."""
+"""Offscreen checks for the ALIGN detailed harvester visual item."""
 import math
 import os
 import sys
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
+os.environ.setdefault("ALIGN_DISABLE_AUTO_START", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np

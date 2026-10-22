@@ -18,7 +18,7 @@ PROJECT_STATE_SCHEMA = 6
 # repeated route edits do not duplicate the same raw/processed masks.
 PROJECT_HISTORY_SCHEMA = 1
 PROJECT_HISTORY_LIMIT = 50
-_HISTORY_TYPE_KEY = "__reui_history_type__"
+_HISTORY_TYPE_KEY = "__align_history_type__"
 _PROJECT_LOCKS = {}
 _PROJECT_LOCKS_GUARD = threading.Lock()
 _PENDING_STATE_SAVES = {}

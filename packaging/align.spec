@@ -125,15 +125,15 @@ exe = EXE(
     analysis.scripts,
     [],
     exclude_binaries=True,
-    name="reUI",
+    name="align",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     console=False,
     icon=(
-        str(ROOT / "packaging" / "reUI.ico")
-        if (ROOT / "packaging" / "reUI.ico").exists()
+        str(ROOT / "packaging" / "align.ico")
+        if (ROOT / "packaging" / "align.ico").exists()
         else None
     ),
 )
@@ -144,6 +144,6 @@ coll = COLLECT(
     analysis.zipfiles,
     strip=False,
     upx=False,
-    name="reUI",
+    name="align",
     contents_directory="_internal",
 )

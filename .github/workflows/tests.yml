@@ -9,7 +9,7 @@ jobs:
     runs-on: windows-latest
     env:
       QT_QPA_PLATFORM: offscreen
-      REUI_DISABLE_AUTO_START: "1"
+      ALIGN_DISABLE_AUTO_START: "1"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -37,7 +37,7 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          $base_temp = Join-Path $env:RUNNER_TEMP "reui-pytest"
+          $base_temp = Join-Path $env:RUNNER_TEMP "align-pytest"
           New-Item -ItemType Directory -Force -Path $base_temp | Out-Null
           python -m pytest -q `
             --basetemp "$base_temp" `

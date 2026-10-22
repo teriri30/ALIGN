@@ -225,7 +225,7 @@ def test_confirm_gate_exports_metric_failure_with_warning_notice(monkeypatch):
         },
         "is_valid": False,
     }
-    monkeypatch.setenv("REUI_EXPORT_GATE", "confirm")
+    monkeypatch.setenv("ALIGN_EXPORT_GATE", "confirm")
     warnings = []
     monkeypatch.setattr(window.log_panel, "warn", warnings.append)
     monkeypatch.setattr(window, "_path_result_from_state", lambda: path_result)

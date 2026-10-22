@@ -72,7 +72,7 @@ def test_export_experiment_bundle_writes_tables_figures_cases_and_manifest(tmp_p
     assert (root / "README.md").is_file()
 
     manifest = json.loads((root / "experiment_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema"] == "reui.paper-experiment.v1"
+    assert manifest["schema"] == "align.paper-experiment.v1"
     assert manifest["completed_count"] == 1
     assert manifest["failed_count"] == 1
     assert manifest["inputs"]["source_sha256"] == "abc"
@@ -243,7 +243,7 @@ def test_decision_014_experiment_menu_is_removed_from_desktop():
     from pyside6_app.main_window import MainWindow
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    os.environ["REUI_DISABLE_AUTO_START"] = "1"
+    os.environ["ALIGN_DISABLE_AUTO_START"] = "1"
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     menus = [action.text() for action in window.menuBar().actions()]

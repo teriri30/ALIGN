@@ -1,4 +1,4 @@
-"""Realistic top-view harvester item for the reUI simulation view.
+"""Realistic top-view harvester item for the ALIGN simulation view.
 
 Local frame: +x forward, +y machine right, origin at the track-contact centre.
 The item is painted in metres and placed with ``setPos``/``setRotation``/

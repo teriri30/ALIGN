@@ -9,7 +9,7 @@ def test_user_data_paths_are_separate_from_the_bundle(monkeypatch, tmp_path):
     from runtime_paths import ensure_user_dirs, user_config_path
 
     user_root = tmp_path / "user-data"
-    monkeypatch.setenv("REUI_USER_DATA_DIR", str(user_root))
+    monkeypatch.setenv("ALIGN_USER_DATA_DIR", str(user_root))
     paths = ensure_user_dirs()
 
     assert user_config_path() == user_root / "config" / "config.json"
@@ -31,8 +31,8 @@ def test_config_first_run_migrates_legacy_file_to_user_data(monkeypatch, tmp_pat
     legacy.write_text('{"_schema_version":"1.3","model":{}}', encoding="utf-8")
     example.write_text('{"_schema_version":"1.3","model":{}}', encoding="utf-8")
     user_root = tmp_path / "user-data"
-    monkeypatch.setenv("REUI_USER_DATA_DIR", str(user_root))
-    monkeypatch.delenv("REUI_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("ALIGN_USER_DATA_DIR", str(user_root))
+    monkeypatch.delenv("ALIGN_CONFIG_PATH", raising=False)
     monkeypatch.setattr(config_module, "legacy_config_path", lambda: legacy)
     monkeypatch.setattr(config_module, "bundled_resource", lambda name: bundle / name)
 
@@ -52,7 +52,7 @@ def test_resource_resolution_supports_exe_root_and_internal(monkeypatch, tmp_pat
     resource.parent.mkdir(parents=True)
     resource.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", str(exe_root / "reUI.exe"))
+    monkeypatch.setattr(sys, "executable", str(exe_root / "align.exe"))
     monkeypatch.setattr(sys, "_MEIPASS", str(internal), raising=False)
 
     assert runtime_paths.bundled_resource("data/models/model_registry.json") == resource
@@ -101,7 +101,7 @@ def test_windows_build_isolates_pyinstaller_dll_search_path():
 
 
 def test_build_spec_rejects_codex_tool_runtime_dlls():
-    spec = (ROOT / "packaging" / "reUI.spec").read_text(encoding="utf-8")
+    spec = (ROOT / "packaging" / "align.spec").read_text(encoding="utf-8")
 
     assert '"codex-runtimes"' in spec
     assert "analysis.binaries = filter_host_tool_binaries" in spec
@@ -118,8 +118,8 @@ def test_version_has_one_runtime_source():
 
 
 def test_build_spec_keeps_exe_at_release_root():
-    spec = (ROOT / "packaging" / "reUI.spec").read_text(encoding="utf-8")
-    assert 'name="reUI"' in spec
+    spec = (ROOT / "packaging" / "align.spec").read_text(encoding="utf-8")
+    assert 'name="align"' in spec
     assert 'contents_directory="_internal"' in spec
     assert 'SOURCE_ROOT = ROOT / "src"' in spec
     assert 'SOURCE_ROOT / "frozen_main.py"' in spec
@@ -130,5 +130,5 @@ def test_windows_build_verifies_and_cleans_rebuildable_outputs():
     script = (ROOT / "build_windows.bat").read_text(encoding="utf-8")
     assert "Get-FileHash" in script
     assert "[verify]" in script
-    assert "REUI_CLEAN_DIST" in script
+    assert "ALIGN_CLEAN_DIST" in script
     assert "rmdir /S /Q dist" in script

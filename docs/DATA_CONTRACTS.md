@@ -11,11 +11,11 @@
 
 ## 运行时与发布包（DECISION-018）
 
-- 冻结版发布目录的入口固定为根目录 `reUI.exe`；PyInstaller 支持文件可以位于 `_internal`，不能要求用户调用 Python、Conda 或 pip；源码入口只做运行环境初始化，不提供依赖检测或安装界面。
+- 冻结版发布目录的入口固定为根目录 `align.exe`；PyInstaller 支持文件可以位于 `_internal`，不能要求用户调用 Python、Conda 或 pip；源码入口只做运行环境初始化，不提供依赖检测或安装界面。
 - `runtime_paths.bundled_resource()` 只解析随程序发布的只读资源；`config.example.json`、`data/models/model_registry.json` 和内置模型不得在运行时直接改写。
-- 用户配置、缓存、日志、用户模型和更新临时文件分别位于 `%LOCALAPPDATA%/reUI/config`、`cache`、`logs`、`models`、`updates`；首次运行从旧版 `config.json` 或内置示例迁移配置，更新不得覆盖这些目录。
+- 用户配置、缓存、日志、用户模型和更新临时文件分别位于 `%LOCALAPPDATA%/ALIGN/config`、`cache`、`logs`、`models`、`updates`；首次运行从旧版 `config.json` 或内置示例迁移配置，更新不得覆盖这些目录。
 - 冻结包的 `build_info.json` 至少包含版本、提交号、频道、构建时间和科学代码指纹。正式导出 manifest 必须保留这些构建信息；缺失科学代码指纹时不得生成可追溯正式清单。
-- 源码 ZIP 与 Release 二进制 ZIP 是不同交付物。`update.bat` 只同步源代码；Release 工作流负责生成 `reUI-Windows-x64-<version>.zip` 和校验文件。
+- 源码 ZIP 与 Release 二进制 ZIP 是不同交付物。`update.bat` 只同步源代码；Release 工作流负责生成 `align-Windows-x64-<version>.zip` 和校验文件。
 
 ## 阶段证据
 
@@ -158,11 +158,11 @@
 
 ## 自动离线实验包与完整论文证据
 
-`reui.paper-experiment.v1` 是软件中的离线实验 schema，当前默认计划只覆盖掩膜阶段消融。这个实现边界不等于论文研究范围：完整论文证据还包括作业带、中心线、路径、终端导入、无人收获机自主执行和作业后田间调查。统一流程见 [研究、算法、界面与田间验证统一流程](RESEARCH_SYSTEM_WORKFLOW.md)。
+`align.paper-experiment.v1` 是软件中的离线实验 schema，当前默认计划只覆盖掩膜阶段消融。这个实现边界不等于论文研究范围：完整论文证据还包括作业带、中心线、路径、终端导入、无人收获机自主执行和作业后田间调查。统一流程见 [研究、算法、界面与田间验证统一流程](RESEARCH_SYSTEM_WORKFLOW.md)。
 
 ### 离线掩膜消融包
 
-- `experiment_manifest.json` 使用 `reui.paper-experiment.v1`，记录冻结输入摘要、实验矩阵、完成/失败计数和逐组参数。
+- `experiment_manifest.json` 使用 `align.paper-experiment.v1`，记录冻结输入摘要、实验矩阵、完成/失败计数和逐组参数。
 - `results_long.csv` 是指标长表；`results_wide.csv` 和 `tables/*_comparison.csv` 是论文表格底稿。
 - `cases/<case_id>/` 保存逐组 `result.json`、掩膜和路径预览；`figures/` 保存自动指标图。
 - 掩膜消融组来自同一次正式规则化结果的原始掩膜、`regularized_body_mask`、`body_residual_mask` 和最终 `processed_mask`，不得伪造不存在的阶段开关。
@@ -172,7 +172,7 @@
 
 ### 完整软件田间资料包与外场记录
 
-- `reui.field-trial-package.v1` 归档源影像预览、原始/处理后掩膜、路径预览、候选导入路径、同名 manifest、推理/掩膜诊断和软件验证摘要，并由 `package_index.json` 记录文件哈希。
+- `align.field-trial-package.v1` 归档源影像预览、原始/处理后掩膜、路径预览、候选导入路径、同名 manifest、推理/掩膜诊断和软件验证摘要，并由 `package_index.json` 记录文件哈希。
 - 该资料包证明导出对象及其软件证据可追溯，不证明目标终端已接受路径，也不证明无人收获机完成自主作业。
 - 终端导入回读、实际轨迹、执行时长、人工接管或中断、异常位置和作业后碾压调查必须作为外场记录另行保存，并与对应生育期、源影像、模型、中心线选择和路径 manifest 关联。
 - 软件理论足迹与实际碾压调查必须分别保存和统计；没有田间记录时不得把理论几何指标改写为实测结果。
@@ -198,7 +198,7 @@
 - 路线编辑器显示的 `state.path_points/path_status/path_geometry_modes` 是编辑器与兼容导出共享的唯一有序控制折线（DECISION-019）。相邻控制点构成一条可选边：`path_status` 保留终端兼容的 `1=作业/0=非作业` 语义，`path_geometry_modes` 逐边记录物理预览为 `straight` 或 `turn`，二者不能拆成第二套隐藏路线。自动结果进入编辑器时，每条主作业线先压缩为起终点；编辑器把连续状态 `1` 边即时派生为可选作业线对象，可从空路线新增，并支持整线平移、删除、调序、反向、端点移动、航点增删、边语义切换和直线/转弯几何切换。结构修改在相邻作业线之间重建局部状态 `0` 连接，不能维护第二套隐藏路线。编辑器点数、兼容预览文件点数和 manifest 的 `route_source=shared_route_control_polyline` 必须来自同一组控制点。
 - 起点和终点在编辑覆盖层中与首、末控制点共用颜色、尺寸和交互层级；删除首/末控制点后，起终点引用自动切换到新的首/末控制点。未显式设置终点时不写入独立服务点状态，显示和兼容 TXT 仍使用当前控制折线最后一点作为自动终点。
 - 两点状态 `0` 连接可根据当前最小转弯半径生成稠密连续预览；人工插入到三个及以上点的状态 `0` 点列是显式人工转弯，必须原样进入 canonical 显示、模拟与当前几何验证。结构调序/删除会重建相邻局部连接，但普通拖点和转弯插点不得把人工几何重新压成自动弓形。自动规划的稠密 `auto_path` 与人工重建后的连续 `auto_path` 都是各自当前路线的显示/评价几何，控制折线仍是人工编辑和兼容协议投影的权威来源。
-- 每次人工修改都清空旧 `path_provenance/path_artifact` 和验证有效性。点击“验证人工路线”后，`path_artifact.manual_route.schema=reui.manual-route.v1`，验证必须记录 `route_geometry_source=manual_control_edit_validated`、`manual_route_validated=true`、`automatic_planning_provenance_valid=false`、作业线数、控制点数和 0/1 状态；同一 `validate_path` 使用当前 `processed_mask`、`main_angle`、田界、确认禁行区、农机参数和语义掩膜，人工转弯另记录观测最小局部曲率半径。该记录证明当前软件几何检查已执行，不恢复自动规划阶段指纹，也不是田间执行证据。
+- 每次人工修改都清空旧 `path_provenance/path_artifact` 和验证有效性。点击“验证人工路线”后，`path_artifact.manual_route.schema=align.manual-route.v1`，验证必须记录 `route_geometry_source=manual_control_edit_validated`、`manual_route_validated=true`、`automatic_planning_provenance_valid=false`、作业线数、控制点数和 0/1 状态；同一 `validate_path` 使用当前 `processed_mask`、`main_angle`、田界、确认禁行区、农机参数和语义掩膜，人工转弯另记录观测最小局部曲率半径。该记录证明当前软件几何检查已执行，不恢复自动规划阶段指纹，也不是田间执行证据。
 - 路线编辑覆盖层必须叠加在当前 `processed_mask`、`headland_mask`、`uncertain_residual_mask`、田界和禁行区之上；进入编辑以及编辑中重绘不得清空这些前置证据或退回仅显示原始影像。紧凑工具区只常显选择/拖动、新增作业线、添加控制点、切换作业/转弯语义、切换直线/转弯几何和验证人工路线入口；添加控制点必须接受作业或转弯边，在线段上插入时保留原边模式，空白处新增时从当前路线末端追加直线边，低频结构操作由工具区常显的快捷键说明承接。工具区在已展开路径规划卡片中显示/隐藏后必须同步更新卡片最小高度和滚动内容高度，按钮几何不得相交或被卡片边界裁切。
 - 编辑模式下“路径结果”列表由同一 `path_status` 与 `path_geometry_modes` 的连续运行段即时派生：每张卡片只保存 `edge_start/edge_end/node_start/node_end/work_index` 等临时索引，不得序列化为另一份路线。卡片单击与画布点选共享 `state.selected_type/selected_idx`；整段语义切换、直线/转弯几何切换、航点增删、作业线增删和作业线卡片拖拽排序必须调用同一人工编辑函数并刷新 `auto_path`、列表和画布。状态 `0` 转弯卡片不接受独立拖拽；作业线重排后局部转弯按共享端点重建。
 - 兼容投影只在导出副本上清理相邻距离小于 `0.02 m` 的点，并重新计算 `index` 与 `total`；不改变内部路径。

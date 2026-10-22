@@ -87,7 +87,7 @@ def test_research_export_records_parameter_and_recovery_risks_without_blocking(
 ):
     from pyside6_app.main_window import MainWindow
 
-    monkeypatch.setenv("REUI_EXPORT_GATE", "confirm")
+    monkeypatch.setenv("ALIGN_EXPORT_GATE", "confirm")
     QApplication.instance() or QApplication([])
     window = MainWindow()
     window._enforce_formal_parameter_and_recovery_gate(_path_result("default"))

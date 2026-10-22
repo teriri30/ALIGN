@@ -26,7 +26,7 @@ DECISION_ANCHORS = {
         "docs/DECISIONS.md",
         "src/inference.py",
         "src/pyside6_app/image_view.py",
-        "tests/test_reui_logic.py",
+        "tests/test_align_logic.py",
         "tests/test_geospatial_integrity.py",
     ),
     "DECISION-005": (

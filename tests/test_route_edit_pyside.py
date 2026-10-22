@@ -3,7 +3,7 @@
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
+os.environ.setdefault("ALIGN_DISABLE_AUTO_START", "1")
 
 import numpy as np
 import pytest
@@ -1424,7 +1424,7 @@ def test_manual_route_validation_reuses_planner_validator_and_records_source(mon
     assert validation["route_geometry_source"] == "manual_control_edit_validated"
     assert validation["automatic_planning_provenance_valid"] is False
     assert window.state.path_provenance == {}
-    assert window.state.path_artifact["manual_route"]["schema"] == "reui.manual-route.v1"
+    assert window.state.path_artifact["manual_route"]["schema"] == "align.manual-route.v1"
     restored = window._path_result_from_state()
     assert restored["manual_route_edited"] is True
     assert restored["manual_route_validated"] is True

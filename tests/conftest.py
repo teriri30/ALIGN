@@ -15,15 +15,15 @@ from runtime_env import configure_geospatial_environment
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
+os.environ.setdefault("ALIGN_DISABLE_AUTO_START", "1")
 # The managed test runner cannot write to its synthetic LOCALAPPDATA path.
 # Keep test state isolated without changing the production default used by a
 # normal Windows user (DECISION-018).
-if not os.environ.get("REUI_USER_DATA_DIR"):
-    _pytest_user_data = tempfile.mkdtemp(prefix="reui-pytest-")
-    os.environ["REUI_USER_DATA_DIR"] = _pytest_user_data
+if not os.environ.get("ALIGN_USER_DATA_DIR"):
+    _pytest_user_data = tempfile.mkdtemp(prefix="align-pytest-")
+    os.environ["ALIGN_USER_DATA_DIR"] = _pytest_user_data
     atexit.register(shutil.rmtree, _pytest_user_data, ignore_errors=True)
 # Automated suites must always run under the deterministic fail-closed export
 # gate, regardless of the local config.json export.gate_mode setting.
-os.environ.setdefault("REUI_EXPORT_GATE", "fail_closed")
+os.environ.setdefault("ALIGN_EXPORT_GATE", "fail_closed")
 configure_geospatial_environment()

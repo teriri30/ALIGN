@@ -19,7 +19,7 @@ import numpy as np
 from config import save_json_atomic
 
 
-EXPERIMENT_SCHEMA = "reui.paper-experiment.v1"
+EXPERIMENT_SCHEMA = "align.paper-experiment.v1"
 
 
 def default_experiment_plan(model_paths: Optional[Sequence[str]] = None) -> Dict[str, Any]:
@@ -624,7 +624,7 @@ def _export_experiment_bundle_base(
     }
     save_json_atomic(str(root / "experiment_manifest.json"), manifest)
     (root / "README.md").write_text(
-        "# reUI 论文实验结果\n\n"
+        "# ALIGN 论文实验结果\n\n"
         "- `results_long.csv`：长表，适合统计软件和绘图。\n"
         "- `results_wide.csv`：宽表，适合直接整理论文表格。\n"
         "- `path_segments.csv`：按 case 和实际 segment_type 导出的逐段足迹指标。\n"

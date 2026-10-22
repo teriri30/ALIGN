@@ -92,7 +92,7 @@ class TopToolbar(QWidget):
         sep0 = QFrame(); sep0.setFrameShape(QFrame.VLine)
         sep0.setStyleSheet(f"background:{COLORS['border']};max-width:1px;max-height:24px;")
         sep0.setFixedHeight(24); row1.addWidget(sep0); self._seps.append(sep0)
-        self._title_lbl = QLabel("农机作业规划系统")
+        self._title_lbl = QLabel("ALIGN 农机作业规划系统")
         self._title_lbl.setStyleSheet(f"font-size:16px;font-weight:600;color:{COLORS['text_bright']};padding:0 8px;font-family:{UI_FONT};")
         row1.addWidget(self._title_lbl)
         sep = QFrame(); sep.setFrameShape(QFrame.VLine)

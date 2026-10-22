@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 - 2026-10-22
+
+- **改名：reUI → ALIGN**（Autonomous Line-guided Intelligent Guidance & Navigation，直指“跟着行带走、自主规划路径”）。
+  程序名、窗口标题、EXE（`align.exe`）、安装包（`align-Setup-*.exe`）、便携包（`align-Windows-x64-*.zip`）、
+  GitHub 仓库、文档全部同步；数据目录改为 `%LOCALAPPDATA%\ALIGN`，首次以新名字启动时会把旧的
+  `%LOCALAPPDATA%\reUI` 整体搬过来，旧项目与缓存不会丢。环境变量前缀 `REUI_*` → `ALIGN_*`，
+  `REUI_USER_DATA_DIR` 仍作为兼容别名可读。
+- 安装器脚本随之更名（`packaging/align_setup.iss`、`packaging/align.spec`、`packaging/align.ico`）。
+
 ## 0.1.4 - 2026-10-22
 
 - 安装向导改为**简体中文**：自带 `packaging/languages/ChineseSimplified.isl`（官方 Inno 不带中文），欢迎页、选择位置、附加任务、准备安装、安装中、完成页与卸载提示全部中文化。

@@ -1,4 +1,4 @@
-"""Theme-aware outline icon set for reUI.
+"""Theme-aware outline icon set for ALIGN.
 
 All geometry lives on one 24×24 grid with a single 2.0 px round-capped stroke so
 glyphs keep the same optical weight at every size. The set follows the Lucide

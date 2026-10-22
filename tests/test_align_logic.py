@@ -671,7 +671,7 @@ def test_pending_segment_completion_enables_mask_process_action():
     raw = np.ones((20, 20), dtype=np.uint8) * 255
     window._pending_segment_display = True
     window.state.safe_update(
-        tif_path="D:/zhlonly/project/reUI/data/tif/result.tif",
+        tif_path="D:/zhlonly/project/ALIGN/data/tif/result.tif",
         field_boundary=[(1, 1), (10, 1), (10, 10)],
         mask_raw=raw,
         inference_original_mask=raw,
@@ -754,7 +754,7 @@ def test_auto_start_does_not_load_bundled_tif_without_user_choice(monkeypatch):
 
 def test_auto_start_loads_launcher_selected_path(monkeypatch):
     window = _window()
-    selected = r"D:\zhlonly\project\reUI\data\tif\result.tif"
+    selected = r"D:\zhlonly\project\ALIGN\data\tif\result.tif"
     loaded = []
 
     class AcceptingLauncher:
@@ -885,7 +885,7 @@ def test_field_area_uses_display_geotransform_and_is_persisted():
 def test_segment_uses_source_geotiff_instead_of_downsampled_preview(monkeypatch):
     """DECISION-004: formal inference reads source pixels, never preview pixels."""
     window = _window()
-    window._tif_path = "D:/zhlonly/project/reUI/data/tif/result.tif"
+    window._tif_path = "D:/zhlonly/project/ALIGN/data/tif/result.tif"
     window.state.tif_path = window._tif_path
     window._tif_rgb = np.zeros((100, 150, 3), dtype=np.uint8)
     window.state.source_img_h = 400
@@ -2667,7 +2667,7 @@ def test_inference_diagnostic_bundle_records_source_model_and_tile_positions(tmp
             "raw_mask.npz", "tile_trace.csv", "tile_trace.json",
         } <= set(archive.namelist())
         manifest = json.loads(archive.read("manifest.json"))
-        assert manifest["schema"] == "reui.inference-diagnostic.v1"
+        assert manifest["schema"] == "align.inference-diagnostic.v1"
         assert manifest["run_label"] == "识别001"
         assert manifest["source_image"]["path"].endswith("result.tif")
         assert manifest["model"]["name"] == "tiller12.pt"

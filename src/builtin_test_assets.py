@@ -117,8 +117,8 @@ def _packaged_models(model_dir: str) -> List[Dict[str, str]]:
 
 def discover_builtin_assets() -> Dict[str, object]:
     """Discover portable built-in demo assets with explicit availability status."""
-    env_image = str(os.environ.get("REUI_TEST_IMAGE", "") or "").strip()
-    env_model_dir = str(os.environ.get("REUI_TEST_MODEL_DIR", "") or "").strip()
+    env_image = str(os.environ.get("ALIGN_TEST_IMAGE", "") or "").strip()
+    env_model_dir = str(os.environ.get("ALIGN_TEST_MODEL_DIR", "") or "").strip()
     image = _first_existing(
         [
             env_image,

@@ -12,7 +12,7 @@ from pyside6_app.main_window import MainWindow
 
 def _machine_ready():
     return {
-        "schema": "reui.machine-readiness.v1",
+        "schema": "align.machine-readiness.v1",
         "controlled_trial_ready": True,
         "controlled_trial_blockers": [],
         "eligible_for_machine_export": True,

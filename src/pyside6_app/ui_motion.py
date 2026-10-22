@@ -1,4 +1,4 @@
-"""Spring-like motion for reUI, modelled on the two reference apps.
+"""Spring-like motion for ALIGN, modelled on the two reference apps.
 
 Both reference implementations are webview UIs, so their "Q弹" feel comes from
 one CSS recipe rather than a physics engine:

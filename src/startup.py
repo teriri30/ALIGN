@@ -8,7 +8,7 @@
 2. 配置 GDAL/PROJ 地理环境变量（``runtime_env``）。
 
 DECISION-018 v2：依赖检测与一键安装界面已移除；源码入口只做上述初始化，
-发布版（``reUI.exe``）由 ``frozen_main.py`` 进入，不导入本模块。
+发布版（``align.exe``）由 ``frozen_main.py`` 进入，不导入本模块。
 """
 import os
 import site

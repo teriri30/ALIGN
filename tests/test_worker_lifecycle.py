@@ -3,7 +3,7 @@ import hashlib
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
+os.environ.setdefault("ALIGN_DISABLE_AUTO_START", "1")
 
 from PySide6.QtCore import QObject, QEventLoop, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import QApplication, QMessageBox

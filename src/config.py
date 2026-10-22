@@ -492,7 +492,7 @@ class Config:
         else:
             # DECISION-018: user settings are outside the install directory.
             target_path = os.path.abspath(
-                str(os.environ.get("REUI_CONFIG_PATH", "") or user_config_path())
+                str(os.environ.get("ALIGN_CONFIG_PATH", "") or user_config_path())
             )
             example_path = str(bundled_resource("config.example.json"))
             if not os.path.exists(target_path):
@@ -601,7 +601,7 @@ class Config:
     @property
     def INFO_BAR_H(self) -> int: return 120   # 左侧面板底部信息枢纽高度
     @property
-    def TITLE(self) -> str: return self._get("window", "title", default="农机作业规划系统")
+    def TITLE(self) -> str: return self._get("window", "title", default="ALIGN 农机作业规划系统")
 
     @property
     def CV2_WIN_ID(self) -> str:

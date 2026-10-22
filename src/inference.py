@@ -449,7 +449,7 @@ class ModelEngine:
         if not self.is_loaded(): return None
         try:
             # Ultralytics 8.x treats numpy inputs as BGR and reverses the last
-            # channel in BasePredictor.preprocess.  reUI owns an RGB contract,
+            # channel in BasePredictor.preprocess.  ALIGN owns an RGB contract,
             # so adapt once here for both single-image and batched-list calls.
             # Tensor inputs are left untouched because Ultralytics documents
             # them as already preprocessed BCHW RGB tensors.

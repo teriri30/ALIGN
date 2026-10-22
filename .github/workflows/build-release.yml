@@ -23,7 +23,7 @@ jobs:
     runs-on: windows-latest
     env:
       QT_QPA_PLATFORM: offscreen
-      REUI_DISABLE_AUTO_START: "1"
+      ALIGN_DISABLE_AUTO_START: "1"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -69,19 +69,19 @@ jobs:
           python scripts/generate_build_info.py --version $version --channel $channel
       - name: Build PyInstaller bundle
         shell: pwsh
-        run: python -m PyInstaller packaging/reUI.spec --noconfirm --clean
+        run: python -m PyInstaller packaging/align.spec --noconfirm --clean
       - name: Frozen bundle self-test
         shell: pwsh
-        run: dist/reUI/reUI.exe --self-test
+        run: dist/align/align.exe --self-test
       - name: Package and checksum
         id: package
         shell: pwsh
         run: |
           $version = (Get-Content build_info.json -Raw | ConvertFrom-Json).version
-          Copy-Item build_info.json dist/reUI/version.json -Force
-          Copy-Item packaging/README-Windows.txt dist/reUI/README-Windows.txt -Force
-          $zip = "reUI-Windows-x64-v$version.zip"
-          Compress-Archive -Path dist/reUI/* -DestinationPath $zip -Force
+          Copy-Item build_info.json dist/align/version.json -Force
+          Copy-Item packaging/README-Windows.txt dist/align/README-Windows.txt -Force
+          $zip = "align-Windows-x64-v$version.zip"
+          Compress-Archive -Path dist/align/* -DestinationPath $zip -Force
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $zip" | Set-Content "$zip.sha256" -Encoding ascii
           $size = (Get-Item $zip).Length
@@ -105,11 +105,11 @@ jobs:
           }
           if (-not (Test-Path $iscc)) { throw "找不到 ISCC.exe，无法生成安装包" }
           New-Item -ItemType Directory -Force -Path installer | Out-Null
-          & $iscc "/DMyAppVersion=$version" "packaging\reUI_setup.iss" *> installer-build.log
+          & $iscc "/DMyAppVersion=$version" "packaging\align_setup.iss" *> installer-build.log
           $code = $LASTEXITCODE
           Get-Content installer-build.log -Tail 40 | Write-Host
           if ($code -ne 0) { throw "ISCC 失败，退出码 $code（见 installer-build.log）" }
-          $setup = Get-ChildItem installer -Filter "reUI-Setup-*.exe" | Select-Object -First 1
+          $setup = Get-ChildItem installer -Filter "align-Setup-*.exe" | Select-Object -First 1
           if (-not $setup) { throw "安装包未生成" }
           $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $($setup.Name)" | Set-Content "$($setup.FullName).sha256" -Encoding ascii
@@ -131,12 +131,12 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: reUI-windows-portable
+          name: align-windows-portable
           path: |
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.sha }}
-            installer\reUI-Setup-*.exe
-            installer\reUI-Setup-*.exe.sha256
+            installer\align-Setup-*.exe
+            installer\align-Setup-*.exe.sha256
       - name: Publish tagged GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         env:

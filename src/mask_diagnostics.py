@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 
-DIAGNOSTIC_SCHEMA = "reui.mask-diagnostic.v1"
+DIAGNOSTIC_SCHEMA = "align.mask-diagnostic.v1"
 
 
 def _json_default(value: Any):

@@ -6,15 +6,15 @@ rem Usage: build_windows.bat D:\zhl\anaconda\envs\game\python.exe
 
 set "PYTHON=%~1"
 if "%PYTHON%"=="" set "PYTHON=python"
-set "VERSION=%REUI_VERSION%"
+set "VERSION=%ALIGN_VERSION%"
 if "%VERSION%"=="" (
   rem 版本号以 src/version.py 为唯一来源；cmd 的 for /f 处理带引号路径会碎，先落临时文件再读。
-  "%PYTHON%" -c "import sys;sys.path.insert(0,'src');from version import APP_VERSION;print(APP_VERSION)" > "%TEMP%/reui_version.txt" 2>nul
-  set /p VERSION=<"%TEMP%/reui_version.txt"
-  del "%TEMP%/reui_version.txt" >nul 2>nul
+  "%PYTHON%" -c "import sys;sys.path.insert(0,'src');from version import APP_VERSION;print(APP_VERSION)" > "%TEMP%/align_version.txt" 2>nul
+  set /p VERSION=<"%TEMP%/align_version.txt"
+  del "%TEMP%/align_version.txt" >nul 2>nul
 )
 if "%VERSION%"=="" set "VERSION=0.1.0"
-set "CHANNEL=%REUI_CHANNEL%"
+set "CHANNEL=%ALIGN_CHANNEL%"
 if "%CHANNEL%"=="" set "CHANNEL=stable"
 
 echo [1/6] Checking build interpreter: %PYTHON%
@@ -39,12 +39,12 @@ for %%D in (src scripts tests) do (
 )
 rem Do not reuse a fixed temp directory: Windows ACLs or a previous pytest
 rem worker can leave it undeletable, turning every test into a setup error.
-rem An explicit REUI_PYTEST_BASETEMP is supported for CI; otherwise use a
+rem An explicit ALIGN_PYTEST_BASETEMP is supported for CI; otherwise use a
 rem unique directory under the active TEMP and clean only that exact path.
-set "BUILD_PYTEST_BASETEMP=%REUI_PYTEST_BASETEMP%"
+set "BUILD_PYTEST_BASETEMP=%ALIGN_PYTEST_BASETEMP%"
 set "BUILD_PYTEST_BASETEMP_OWNED=0"
 if "%BUILD_PYTEST_BASETEMP%"=="" (
-  set "BUILD_PYTEST_BASETEMP=%TEMP%\reui-pytest-%RANDOM%-%RANDOM%"
+  set "BUILD_PYTEST_BASETEMP=%TEMP%\align-pytest-%RANDOM%-%RANDOM%"
   set "BUILD_PYTEST_BASETEMP_OWNED=1"
 )
 if exist "%BUILD_PYTEST_BASETEMP%" rmdir /S /Q "%BUILD_PYTEST_BASETEMP%"
@@ -65,53 +65,53 @@ for %%I in ("%PYTHON%") do set "BUILD_PYTHON_DIR=%%~dpI"
 set "BUILD_PYINSTALLER_PATH=%BUILD_PYTHON_DIR%;%BUILD_PYTHON_DIR%Scripts;%BUILD_PYTHON_DIR%Library\bin;%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemRoot%\System32\WindowsPowerShell\v1.0"
 set "PATH=%BUILD_PYINSTALLER_PATH%"
 set "YOLO_AUTOINSTALL=false"
-"%PYTHON%" -m PyInstaller packaging\reUI.spec --noconfirm --clean
+"%PYTHON%" -m PyInstaller packaging\align.spec --noconfirm --clean
 set "PYINSTALLER_EXIT=%ERRORLEVEL%"
 set "PATH=%BUILD_ORIGINAL_PATH%"
 set "YOLO_AUTOINSTALL=%BUILD_ORIGINAL_YOLO_AUTOINSTALL%"
 if not "%PYINSTALLER_EXIT%"=="0" exit /b %PYINSTALLER_EXIT%
 
 echo [6/6] Running frozen self-test and preparing portable folder
-set "SELF_TEST_DIR=%TEMP%\reUI-build-self-test-%RANDOM%"
+set "SELF_TEST_DIR=%TEMP%\ALIGN-build-self-test-%RANDOM%"
 if exist "%SELF_TEST_DIR%" rmdir /S /Q "%SELF_TEST_DIR%"
 mkdir "%SELF_TEST_DIR%"
 if errorlevel 1 exit /b 1
-set "REUI_USER_DATA_DIR=%SELF_TEST_DIR%"
-dist\reUI\reUI.exe --self-test
+set "ALIGN_USER_DATA_DIR=%SELF_TEST_DIR%"
+dist\align\align.exe --self-test
 set "SELF_TEST_EXIT=%ERRORLEVEL%"
-set "REUI_USER_DATA_DIR="
+set "ALIGN_USER_DATA_DIR="
 rmdir /S /Q "%SELF_TEST_DIR%"
 if not "%SELF_TEST_EXIT%"=="0" exit /b %SELF_TEST_EXIT%
-copy /Y build_info.json dist\reUI\version.json >nul
-copy /Y packaging\README-Windows.txt dist\reUI\README-Windows.txt >nul
+copy /Y build_info.json dist\align\version.json >nul
+copy /Y packaging\README-Windows.txt dist\align\README-Windows.txt >nul
 echo Publishing portable files to the repository root...
-if exist reUI.exe del /F /Q reUI.exe
+if exist align.exe del /F /Q align.exe
 if exist _internal rmdir /S /Q _internal
 if exist README-Windows.txt del /F /Q README-Windows.txt
 if exist version.json del /F /Q version.json
-robocopy "dist\reUI" "." /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
+robocopy "dist\align" "." /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
 if errorlevel 8 exit /b 1
 rem Verify the published root EXE against the staging copy; the [verify]
 rem lines are part of the build log evidence kept after cleanup.
 rem Hash with the build interpreter, not PowerShell: Get-FileHash needs module
 rem autoloading, and a host with a broken PSModulePath returned two empty
 rem strings for a mismatched pair, so the comparison silently passed.
-"%PYTHON%" -c "import hashlib,sys;a=hashlib.sha256(open('reUI.exe','rb').read()).hexdigest();b=hashlib.sha256(open(r'dist\reUI\reUI.exe','rb').read()).hexdigest();print('[verify] root EXE  sha256: '+a);print('[verify] dist copy sha256: '+b);sys.exit(0 if a==b else 1)"
+"%PYTHON%" -c "import hashlib,sys;a=hashlib.sha256(open('align.exe','rb').read()).hexdigest();b=hashlib.sha256(open(r'dist\align\align.exe','rb').read()).hexdigest();print('[verify] root EXE  sha256: '+a);print('[verify] dist copy sha256: '+b);sys.exit(0 if a==b else 1)"
 if errorlevel 1 (
   echo [ERROR] Published EXE and dist staging copy differ; dist kept for inspection.
   exit /b 1
 )
 echo [verify] root EXE matches dist staging copy.
-if /I not "%REUI_MAKE_ARCHIVE%"=="1" goto cleanup_outputs
-tar.exe -a -c -f "reUI-Windows-x64-v%VERSION%.zip" -C dist\reUI .
+if /I not "%ALIGN_MAKE_ARCHIVE%"=="1" goto cleanup_outputs
+tar.exe -a -c -f "align-Windows-x64-v%VERSION%.zip" -C dist\align .
 if errorlevel 1 exit /b 1
-certutil -hashfile "reUI-Windows-x64-v%VERSION%.zip" SHA256 > "reUI-Windows-x64-v%VERSION%.zip.sha256"
-echo Archive created: reUI-Windows-x64-v%VERSION%.zip
+certutil -hashfile "align-Windows-x64-v%VERSION%.zip" SHA256 > "align-Windows-x64-v%VERSION%.zip.sha256"
+echo Archive created: align-Windows-x64-v%VERSION%.zip
 :cleanup_outputs
 rem Rebuildable outputs (build\, dist\) are regenerated by every build; they
-rem are removed by default.  Set REUI_CLEAN_DIST=0 to keep them.
-if /I "%REUI_CLEAN_DIST%"=="0" (
-  echo [keep] REUI_CLEAN_DIST=0: build\ and dist\ retained.
+rem are removed by default.  Set ALIGN_CLEAN_DIST=0 to keep them.
+if /I "%ALIGN_CLEAN_DIST%"=="0" (
+  echo [keep] ALIGN_CLEAN_DIST=0: build\ and dist\ retained.
   goto folder_ready
 )
 echo Removing rebuildable outputs: build\ dist\ ...
@@ -121,5 +121,5 @@ if exist build echo [WARN] build\ still present; check for locked files.
 if exist dist echo [WARN] dist\ still present; check for locked files.
 echo [clean] build\ and dist\ cleanup finished.
 :folder_ready
-echo Build complete: repository root (reUI.exe is at the folder root)
+echo Build complete: repository root (align.exe is at the folder root)
 endlocal

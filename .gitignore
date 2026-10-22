@@ -76,9 +76,10 @@ coverage.xml
 .coverage*
 .runtime-self-test/
 .portable-build-venv/
-reUI-Windows-x64-*.zip
-reUI-Windows-x64-*.sha256
+align-Windows-x64-*.zip
+align-Windows-x64-*.sha256
 /reUI.exe
+/align.exe
 /_internal/
 /README-Windows.txt
 /version.json

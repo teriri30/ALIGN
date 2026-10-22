@@ -1,35 +1,38 @@
-# reUI 农机作业规划系统
+# ALIGN 农机作业规划系统
+
+> **ALIGN** = **A**utonomous **L**ine-guided **I**ntelligent **G**uidance & **N**avigation
+> 直白点说：让机器跟着行带走、自己规划路径的智能制导与导航。
 
 一句话：把无人机拍的田块正射影像丢进去，自动认出再生稻的种植行带，排出一条**对行、少压苗**的收割路径，最后导出成无人收获机能读的路径文件。
 
 主要给再生稻宽窄行田块用，等距种植的田块也能跑。
 
-[![最新版](https://img.shields.io/github/v/release/teriri30/reUI?label=%E6%9C%80%E6%96%B0%E7%89%88)](https://github.com/teriri30/reUI/releases/latest)
-[![下载量](https://img.shields.io/github/downloads/teriri30/reUI/total)](https://github.com/teriri30/reUI/releases)
+[![最新版](https://img.shields.io/github/v/release/teriri30/ALIGN?label=%E6%9C%80%E6%96%B0%E7%89%88)](https://github.com/teriri30/ALIGN/releases/latest)
+[![下载量](https://img.shields.io/github/downloads/teriri30/ALIGN/total)](https://github.com/teriri30/ALIGN/releases)
 [![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%2010%20%2F%2011%20x64-2ea44f)]()
 
 ---
 
 ## 下载安装（推荐这种方式）
 
-**第一步**：[点这里下载最新版](https://github.com/teriri30/reUI/releases/latest)
+**第一步**：[点这里下载最新版](https://github.com/teriri30/ALIGN/releases/latest)
 
-**第二步**：找到 `reUI-Setup-x.y.z.exe`，双击它。
+**第二步**：找到 `align-Setup-x.y.z.exe`，双击它。
 
 **第三步**：一路点「下一步」，装完桌面和开始菜单就有图标了。
 
 几个说明：
 
-- 装在当前用户目录（`%LOCALAPPDATA%\Programs\reUI`），**不会弹管理员权限**，没管理员账号的电脑也能装。
+- 装在当前用户目录（`%LOCALAPPDATA%\Programs\ALIGN`），**不会弹管理员权限**，没管理员账号的电脑也能装。
 - 换版本直接双击新安装包覆盖即可，配置不会丢。
-- 卸载：「设置 → 应用」里找 reUI，或者开始菜单点「卸载 reUI」。
+- 卸载：「设置 → 应用」里找 ALIGN，或者开始菜单点「卸载 ALIGN」。
 - **不需要**装 Python、Conda、CUDA、显卡驱动——包里都带好了（CPU 推理版）。
 
 ### 不想安装？用便携版
 
-下载 `reUI-Windows-x64-x.y.z.zip`，**完整解压**，双击最外层的 `reUI.exe`。
+下载 `align-Windows-x64-x.y.z.zip`，**完整解压**，双击最外层的 `align.exe`。
 
-⚠️ 别把 `reUI.exe` 单独拖到桌面——它要旁边的 `_internal` 文件夹才能跑。
+⚠️ 别把 `align.exe` 单独拖到桌面——它要旁边的 `_internal` 文件夹才能跑。
 
 系统要求：Windows 10 / 11，64 位。
 
@@ -58,7 +61,7 @@
 看卡片上的提示，一般是还没设起点，或者作业线还没点「确认」。
 
 **数据存在哪？**
-`%LOCALAPPDATA%\reUI`：配置、缓存、日志、自己训的模型都在这里。升级、卸载都不会动它。
+`%LOCALAPPDATA%\ALIGN`：配置、缓存、日志、自己训的模型都在这里。升级、卸载都不会动它。
 
 **换电脑怎么迁？**
 把这个文件夹连同项目目录一起拷过去就行。
@@ -87,16 +90,16 @@ python -m compileall -q .     # 语法检查
 build_windows.bat D:\zhl\anaconda\envs\game\python.exe
 ```
 
-产物在仓库根目录：`reUI.exe` + `_internal\`。
+产物在仓库根目录：`align.exe` + `_internal\`。
 
 发布新版本只要打个 tag，Actions 会自动跑测试、构建、生成安装包和便携包、发 Release：
 
 ```bash
-git tag -a v0.1.3 -m "reUI 0.1.3"
+git tag -a v0.1.3 -m "ALIGN 0.1.3"
 git push origin v0.1.3
 ```
 
-安装包脚本是 `packaging/reUI_setup.iss`（Inno Setup 6，装到当前用户、免管理员），图标由 `packaging/make_icon.py` 生成。
+安装包脚本是 `packaging/align_setup.iss`（Inno Setup 6，装到当前用户、免管理员），图标由 `packaging/make_icon.py` 生成。
 
 导出的路径文件可以独立复核：
 

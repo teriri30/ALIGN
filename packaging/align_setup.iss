@@ -1,23 +1,23 @@
-; reUI Windows 安装包（Inno Setup 6）
+; ALIGN Windows 安装包（Inno Setup 6）
 ; 由 build-release.yml 调用：
-;   ISCC.exe /DMyAppVersion=0.1.3 packaging\reUI_setup.iss
-; 输入：dist\reUI（PyInstaller 产物，含 reUI.exe 与 _internal\）
-; 输出：installer\reUI-Setup-<version>.exe
+;   ISCC.exe /DMyAppVersion=0.1.3 packaging\align_setup.iss
+; 输入：dist\align（PyInstaller 产物，含 align.exe 与 _internal\）
+; 输出：installer\align-Setup-<version>.exe
 ;
 ; 设计取舍：
-; - PrivilegesRequired=lowest：装到 %LOCALAPPDATA%\Programs\reUI，普通用户双击就能装，
+; - PrivilegesRequired=lowest：装到 %LOCALAPPDATA%\Programs\ALIGN，普通用户双击就能装，
 ;   不弹 UAC，也不需要管理员权限（实验室电脑常见无管理员场景）。
-; - 不做开机自启、不改注册表关联，卸载只删程序目录；用户数据在 %LOCALAPPDATA%\reUI，
+; - 不做开机自启、不改注册表关联，卸载只删程序目录；用户数据在 %LOCALAPPDATA%\ALIGN，
 ;   升级和卸载都不动它。
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
 #endif
 
-#define MyAppName "reUI 农机作业规划系统"
-#define MyAppShortName "reUI"
+#define MyAppName "ALIGN 农机作业规划系统"
+#define MyAppShortName "ALIGN"
 #define MyAppPublisher "安徽农业大学 周黄磊"
-#define MyAppExeName "reUI.exe"
+#define MyAppExeName "align.exe"
 #define MyAppId "{{7C1D6A54-9E3B-4C2F-9C77-5A61B0D2E4F1}"
 
 [Setup]
@@ -33,8 +33,8 @@ DisableProgramGroupPage=yes
 DisableWelcomePage=no
 PrivilegesRequired=lowest
 OutputDir=..\installer
-OutputBaseFilename=reUI-Setup-{#MyAppVersion}
-SetupIconFile=reUI.ico
+OutputBaseFilename=align-Setup-{#MyAppVersion}
+SetupIconFile=align.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
 Compression=lzma2/fast
@@ -55,7 +55,7 @@ Name: "zh"; MessagesFile: "compiler:Default.isl,languages\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: checkedonce
 
 [Files]
-Source: "..\dist\reUI\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\align\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -63,7 +63,7 @@ Name: "{group}\卸载 {#MyAppShortName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppShortName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 reUI"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 ALIGN"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"

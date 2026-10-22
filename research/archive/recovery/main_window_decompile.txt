@@ -1,7 +1,7 @@
 ﻿# uncompyle6 version 3.9.3
 # Python bytecode version base 3.10 (3439)
 # Decompiled from: Python 3.10.20 | packaged by conda-forge | (main, Mar  5 2026, 16:36:49) [MSC v.1944 64 bit (AMD64)]
-# Embedded file name: D:\zhlonly\project\reUI\pyside6_app\main_window.py
+# Embedded file name: D:\zhlonly\project\ALIGN\pyside6_app\main_window.py
 # Compiled at: 2026-06-18 15:34:42
 # Size of source mod 2**32: 90784 bytes
 

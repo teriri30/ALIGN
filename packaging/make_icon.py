@@ -1,4 +1,4 @@
-"""生成 packaging/reUI.ico（安装包与 EXE 共用图标）。
+"""生成 packaging/align.ico（安装包与 EXE 共用图标）。
 
 图形语义：深色底 + 三条绿色作业行带 + 一条白色对行路径，16 px 下也能认出是
 “田里有行、机器沿行走”。改了配色或构图后重新运行：
@@ -62,7 +62,7 @@ def build() -> Image.Image:
 
 
 def main() -> int:
-    target = Path(__file__).with_name("reUI.ico")
+    target = Path(__file__).with_name("align.ico")
     image = build()
     image.save(
         target,

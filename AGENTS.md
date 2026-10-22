@@ -1,4 +1,4 @@
-# reUI Agent Entry Point
+# ALIGN Agent Entry Point
 
 本项目是科研可审计原型，不是通用农机自动驾驶产品。任何 AI 或开发者修改代码前必须依次阅读：
 
@@ -16,13 +16,13 @@ D:\zhl\anaconda\envs\game\python.exe -m compileall -q .
 D:\zhl\anaconda\envs\game\python.exe -m pytest -q
 ```
 
-Git Bash / Hermes 环境使用 `bash scripts/test.sh -q`，脚本会清理继承的 `PYTHONPATH` 并支持用 `REUI_PYTHON` 覆盖解释器路径。
+Git Bash / Hermes 环境使用 `bash scripts/test.sh -q`，脚本会清理继承的 `PYTHONPATH` 并支持用 `ALIGN_PYTHON` 覆盖解释器路径。
 
 本文件只负责入口。完整规则以 `AI_RULES.md` 和 `docs/DECISIONS.md` 为准。
 
-# reUI 长期项目事实
+# ALIGN 长期项目事实
 
-- 当前可访问的目标仓库为 `E:\zhlonly\project\reUI`，是 PySide6 农用路径规划系统；用户迁移指令中的 `D:\zhlonly\project\reUI` 当前不存在，若两者同时出现必须先核验是否为同一工作树，不得自动创建或同步替代目录。
+- 当前可访问的目标仓库为 `E:\zhlonly\project\ALIGN`，是 PySide6 农用路径规划系统；用户迁移指令中的 `D:\zhlonly\project\ALIGN` 当前不存在，若两者同时出现必须先核验是否为同一工作树，不得自动创建或同步替代目录。
 - 论文主线为 UAV + YOLO11-seg + 宽窄行中心线对齐；关键组件包括 YOLO11-seg、SAHI 和 TIF 地理参考。
 - `mask_processor.py`：PCA+FFT 两阶段方向检测与掩膜正则化，处理碎片聚合、黏连切割和断裂修复。
 - `row_geometry.py`：`BandInstance`/`Corridor` 及行带排序配对、宽/窄行分类、中心线平滑和通行宽度建模。
@@ -51,8 +51,8 @@ Git Bash / Hermes 环境使用 `bash scripts/test.sh -q`，脚本会清理继承
 
 # 交付验证
 
-- 每次修改影响系统运行行为的源码、配置、模型装载或打包文件后，交付前必须运行 `build_windows.bat D:\zhl\anaconda\envs\game\python.exe`，同步生成仓库根目录的 `reUI.exe`、`_internal`、`version.json`（`dist\reUI` 暂存副本在发布校验后默认清理）；不能只交付源码而声称系统已更新。
-- EXE 同步验证由 `build_windows.bat` 在发布阶段完成并写入构建日志：先比对根目录 `reUI.exe` 与 `dist\reUI\reUI.exe` 的 SHA-256（`[verify]` 行），再对暂存副本运行冻结自检；随后默认删除 `build\`、`dist\`（设 `REUI_CLEAN_DIST=0` 保留供人工回读）。构建、测试或自检失败时，必须明确报告 EXE 未同步。
+- 每次修改影响系统运行行为的源码、配置、模型装载或打包文件后，交付前必须运行 `build_windows.bat D:\zhl\anaconda\envs\game\python.exe`，同步生成仓库根目录的 `align.exe`、`_internal`、`version.json`（`dist\align` 暂存副本在发布校验后默认清理）；不能只交付源码而声称系统已更新。
+- EXE 同步验证由 `build_windows.bat` 在发布阶段完成并写入构建日志：先比对根目录 `align.exe` 与 `dist\align\align.exe` 的 SHA-256（`[verify]` 行），再对暂存副本运行冻结自检；随后默认删除 `build\`、`dist\`（设 `ALIGN_CLEAN_DIST=0` 保留供人工回读）。构建、测试或自检失败时，必须明确报告 EXE 未同步。
 - 交付时报告实际修改文件、决策锚点、聚焦测试与完整测试；明确区分 code-green、目标运行时验证、真实数据验证和田间证据。
 - 代码、文档、缓存和导出产物的状态必须可追溯；不要把通过单元测试写成真实农机执行已经验证。
 - 修改后回读关键配置、参数、测试结果和输出路径；遇到 D/E 路径差异、缺失真实数据、缺失模型或外部环境不可用时，如实报告“待核验/需补充”，不得编造结果。

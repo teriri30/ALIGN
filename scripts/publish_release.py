@@ -25,7 +25,7 @@ import urllib.parse
 import urllib.request
 
 API = "https://api.github.com"
-USER_AGENT = "reui-release"
+USER_AGENT = "align-release"
 
 
 def annotate(message: str) -> None:
@@ -133,16 +133,16 @@ def main(argv: list[str]) -> int:
             "",
             f"1. 下载 **{setup_name}**（约 {size_mb} MB）",
             "2. 双击它，一路「下一步」就行（装在当前用户目录，不会弹管理员权限）",
-            "3. 桌面和开始菜单会出现 reUI 图标，双击打开即可",
+            "3. 桌面和开始菜单会出现 ALIGN 图标，双击打开即可",
             "",
-            "卸载：Windows 设置 → 应用 → 找到 reUI 卸载，或者开始菜单里点「卸载 reUI」。",
+            "卸载：Windows 设置 → 应用 → 找到 ALIGN 卸载，或者开始菜单里点「卸载 ALIGN」。",
             "",
         ]
     if zip_name:
         lines += [
             "## 不想安装：用便携版",
             "",
-            f"下载 **{zip_name}**，**完整解压**后双击最外层的 `reUI.exe`。"
+            f"下载 **{zip_name}**，**完整解压**后双击最外层的 `align.exe`。"
             "别把 exe 单独拖出来，它需要旁边的 `_internal` 文件夹。",
             "",
         ]
@@ -156,7 +156,7 @@ def main(argv: list[str]) -> int:
         payload = {
             "tag_name": tag,
             "target_commitish": sha or "main",
-            "name": f"reUI {version}",
+            "name": f"ALIGN {version}",
             "body": body,
             "generate_release_notes": True,
             "draft": False,
