@@ -7,6 +7,12 @@ rem Usage: build_windows.bat D:\zhl\anaconda\envs\game\python.exe
 set "PYTHON=%~1"
 if "%PYTHON%"=="" set "PYTHON=python"
 set "VERSION=%REUI_VERSION%"
+if "%VERSION%"=="" (
+  rem 版本号以 src/version.py 为唯一来源；cmd 的 for /f 处理带引号路径会碎，先落临时文件再读。
+  "%PYTHON%" -c "import sys;sys.path.insert(0,'src');from version import APP_VERSION;print(APP_VERSION)" > "%TEMP%/reui_version.txt" 2>nul
+  set /p VERSION=<"%TEMP%/reui_version.txt"
+  del "%TEMP%/reui_version.txt" >nul 2>nul
+)
 if "%VERSION%"=="" set "VERSION=0.1.0"
 set "CHANNEL=%REUI_CHANNEL%"
 if "%CHANNEL%"=="" set "CHANNEL=stable"
