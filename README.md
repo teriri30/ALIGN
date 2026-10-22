@@ -4,6 +4,10 @@
 
 主要给再生稻宽窄行田块用，等距种植的田块也能跑。
 
+[![最新版](https://img.shields.io/github/v/release/teriri30/reUI?label=%E6%9C%80%E6%96%B0%E7%89%88)](https://github.com/teriri30/reUI/releases/latest)
+[![下载量](https://img.shields.io/github/downloads/teriri30/reUI/total)](https://github.com/teriri30/reUI/releases)
+[![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%2010%20%2F%2011%20x64-2ea44f)]()
+
 ---
 
 ## 下载安装（推荐这种方式）
