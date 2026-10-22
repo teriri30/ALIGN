@@ -125,7 +125,7 @@ def main(argv: list[str]) -> int:
     lines = []
     if setup_name:
         size_mb = next(
-            (os.path.getsize(p) // (1024 * 1024) for p in assets if os.path.basename(p) == setup_name),
+            (os.path.getsize(p) // 1_000_000 for p in assets if os.path.basename(p) == setup_name),
             0,
         )
         lines += [
