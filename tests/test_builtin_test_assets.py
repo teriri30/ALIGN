@@ -105,6 +105,8 @@ def test_builtin_assets_report_missing_when_no_env_or_packaged_asset_exists(monk
     monkeypatch.delenv("ALIGN_TEST_IMAGE", raising=False)
     monkeypatch.delenv("ALIGN_TEST_MODEL_DIR", raising=False)
     monkeypatch.setattr(assets, "_DEFAULT_TEST_IMAGE", str(tmp_path / "missing.tif"))
+    # 随包样例也存在（DECISION-054），要模拟"什么都没有"必须把它也指空
+    monkeypatch.setattr(assets, "_SAMPLE_TEST_IMAGE", str(tmp_path / "missing-sample.tif"))
     monkeypatch.setattr(assets, "_DEFAULT_MODEL_DIR", str(tmp_path / "missing-models"))
 
     discovered = assets.discover_builtin_assets()
