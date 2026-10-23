@@ -904,7 +904,8 @@
 
 - 现象：用户重新打开工程后，画布上还画着 15 条作业线，左侧任务清单却停在「作物识别」。
 - 根因链：
-  1. 缓存里 `current_model_path` 指向改名前的 `E:\...eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
+  1. 缓存里 `current_model_path` 指向改名前的 `E:\...
+eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
   2. 原逻辑把这个错误当成"推理产物失效"，`inference_done/mask_processed` 一起打成 False；
   3. `derive_task_statuses` 在 `process_done=False` 时把中心线视为不存在，但画布仍按 `centerline_catalog` 渲染 → 左右错位。
 - 规则：
@@ -913,3 +914,21 @@
   3. **兜底一致性**：`_on_cache_restore_done` 结束时若 `mask_processed` 为假，必须清空 `centerline_catalog`、已选集合、路径预览与画布图层。任何"状态说没有、画布却在画"的组合都视为缺陷。
   4. **失效要说明原因**：指纹不一致时列出差异键值（`batch_size`、`precision` 等），不能只抛 fingerprint mismatch。
 - 代码锚点：`workers.CacheRestoreWorker.run`（产物恢复、`_rebind_model_path`、`_describe_config_drift`）、`main_window._on_cache_restore_done`（一致性兜底）、`inference.ModelEngine.last_error`。
+
+## DECISION-056：应用图标采用字母标 A（2026-10-23）
+
+- 背景：原图标 "三条绿色作业带 + 白色对行折线 + 黄色节点" 属于插画式构图，在 256 px 好看，但 16–32 px 下糊成一团，且与"ALIGN"这个名字没有视觉关联。
+- 结论：改为字母标。深色圆角方底（bg_darkest 同色系）+ 细笔画几何 A（圆头收笔）+ 薄荷绿导引横杠（accent #34D399），A 与绿线之间留 2 px 负空间。
+- 分级渲染（同一脚本按 size 分支，不做多套素材）：
+  | 尺寸 | 保留 | 去掉 |
+  |---|---|---|
+  | ≥128 | 径向柔光、白 A 竖向渐变、绿线渐变、端点、细描边 | — |
+  | 48–64 | 端点、细描边、负空间 | 柔光、渐变 |
+  | 32–40 | 白 A + 绿线 + 提亮底色 | 端点、负空间、描边 |
+  | ≤24 | 纯白笔画（笔画占比 9.5%–10.8%）、纯色粗绿线 | 全部半透明装饰 |
+- 硬性要求：
+  1. 16 px 必须能读出 "A + 绿横杠"，因此小尺寸笔画占比不得低于 9.5%；
+  2. 所有尺寸都先 4 倍超采样再降采样，禁止直接按目标像素作画（会出现阶梯与粘连）；
+  3. 不加顶部弧线、背景行带纹理——评审中这两项被判定为"杂线/噪点"；
+  4. 图标脚本仍是唯一来源：`packaging/make_icon.py` → `packaging/align.ico`，spec 与 Inno Setup 共用。
+- 代码锚点：`packaging/make_icon.py`（`_build_refined` 分级、`_shaped_gradient`、`_background(light=True)`）。

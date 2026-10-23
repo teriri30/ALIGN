@@ -1,77 +1,342 @@
-"""生成 packaging/align.ico（安装包与 EXE 共用图标）。
+"""生成 packaging/align.ico（安装包、EXE、窗口图标共用）。
 
-图形语义：深色底 + 三条绿色作业行带 + 一条白色对行路径，16 px 下也能认出是
-“田里有行、机器沿行走”。改了配色或构图后重新运行：
+设计取向：字母标 A + 极简几何，不用插画。
+- 深色圆角方底（与主界面 bg_darkest 同色系），自上而下极轻的明度过渡；
+- 细笔画的几何 A，圆头收笔，留白充足，不显笨重；
+- 横杠换成薄荷绿 accent，作为唯一彩色焦点，呼应"对行 / 中心线"。
+16 px 下仍要能认出 A，所以笔画下限约 7%。
 
-    python packaging/make_icon.py
+用法：
+    python packaging/make_icon.py            # 生成 align.ico
+    python packaging/make_icon.py --preview  # 另存多尺寸预览图到 outputs/icon-preview
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 SIZE = 1024
-BG = (14, 23, 38, 255)
-ROW = (74, 222, 128, 255)
-PATH = (246, 248, 251, 255)
-ACCENT = (255, 226, 77, 255)
+SS = 4  # 超采样倍数：先画 4 倍再缩，边缘更干净
+
+BG_TOP = (14, 22, 34, 255)
+BG_BOTTOM = (8, 13, 21, 255)
+INK = (248, 250, 252, 255)
+ACCENT = (52, 211, 153, 255)
+HAIRLINE = (255, 255, 255, 26)
 
 
-def build() -> Image.Image:
-    image = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
+def _rounded_mask(size: int, radius_ratio: float) -> Image.Image:
+    mask = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle(
+        (0, 0, size - 1, size - 1), radius=int(size * radius_ratio), fill=255
+    )
+    return mask
 
-    radius = int(SIZE * 0.22)
-    draw.rounded_rectangle((0, 0, SIZE - 1, SIZE - 1), radius=radius, fill=BG)
 
-    # 作业行带：上窄下宽，避免看起来像“三条横杠”
-    rows = [
-        (0.30, 0.14, 0.92, 0.055),
-        (0.52, 0.10, 0.86, 0.075),
-        (0.75, 0.16, 0.80, 0.095),
-    ]
-    for center, left, right, width in rows:
-        y = SIZE * center
-        thickness = SIZE * width
+def _background(size: int, light: bool = False) -> Image.Image:
+    """深色圆角底 + 自上而下的轻微渐变（避免大面积死黑，显得有质感）。
+
+    ``light=True`` 用于 ≤32 px：小尺寸下深底在深色任务栏上会"消失"，
+    把底色抬亮一档，方块轮廓才立得住。
+    """
+    bottom_color = (22, 31, 45, 255) if light else BG_BOTTOM
+    top_color = (36, 48, 68, 255) if light else BG_TOP
+    bottom = Image.new("RGBA", (size, size), bottom_color)
+    top = Image.new("RGBA", (size, size), top_color)
+    column = Image.new("L", (1, size))
+    for y in range(size):
+        column.putpixel((0, y), int(255 * (1 - y / max(1, size - 1)) ** 1.15))
+    gradient = Image.composite(top, bottom, column.resize((size, size)))
+    gradient.putalpha(_rounded_mask(size, 0.225))
+    return gradient
+
+
+def _stroke(draw: ImageDraw.ImageDraw, points, width: int, color) -> None:
+    draw.line(points, fill=color, width=width, joint="curve")
+    r = width / 2
+    for x, y in (points[0], points[-1]):
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
+
+
+def _letter_a_geometry(s: int, wide: bool = False):
+    """A 的三段几何：顶点、左右脚、横杠两端。"""
+    # 光学居中：整体比几何中心略高约 1.2%，避免看起来往下坠
+    spread = 0.026 if wide else 0.0  # 小尺寸把两脚再撑开一点，内三角更通透
+    apex = (s * 0.500, s * 0.264)
+    foot_l = (s * (0.302 - spread), s * 0.764)
+    foot_r = (s * (0.698 + spread), s * 0.764)
+    t = 0.578  # 横杠位置：按字形视觉中线再抬 2%，避免看起来偏低
+    bar_y = apex[1] + (foot_l[1] - apex[1]) * t
+    inset = s * 0.010
+
+    def x_on_leg(a, b):
+        return a[0] + (b[0] - a[0]) * t
+
+    return (
+        apex,
+        foot_l,
+        foot_r,
+        (x_on_leg(apex, foot_l) - inset, bar_y),
+        (x_on_leg(apex, foot_r) + inset, bar_y),
+    )
+
+
+def build(variant: str = "crossbar", size: int = SIZE) -> Image.Image:
+    canvas = size * SS if size == SIZE else size
+    base = _background(canvas)
+    draw = ImageDraw.Draw(base)
+    s = canvas
+    apex, foot_l, foot_r, bar_l, bar_r = _letter_a_geometry(s)
+    ratio = 0.066 if size > 48 else 0.082  # 16–48 px 加粗，避免糊成一团
+    w = max(2, int(s * ratio))
+
+    if variant == "refined":
+        return _build_refined(size)
+    if variant == "crossbar":
+        _stroke(draw, [foot_l, apex], w, INK)
+        _stroke(draw, [apex, foot_r], w, INK)
+        _stroke(draw, [bar_l, bar_r], int(w * 0.86), ACCENT)
+    elif variant == "guide":
+        _stroke(draw, [foot_l, apex], w, INK)
+        _stroke(draw, [apex, foot_r], w, INK)
+        # 细一号的导引线，两端略微探出双腿，暗示"对行基准线"
+        ext = s * 0.045
+        _stroke(
+            draw,
+            [(bar_l[0] - ext, bar_l[1]), (bar_r[0] + ext, bar_l[1])],
+            max(2, int(w * 0.52)),
+            ACCENT,
+        )
+    elif variant == "exit":
+        _stroke(draw, [foot_l, apex], w, INK)
+        _stroke(draw, [apex, foot_r], w, INK)
+        # 横杠只向右探出一段，像一条驶出田头的作业路径
+        ext = s * 0.062
+        _stroke(
+            draw,
+            [(bar_l[0], bar_l[1]), (bar_r[0] + ext, bar_l[1])],
+            max(2, int(w * 0.62)),
+            ACCENT,
+        )
+    elif variant == "dual":
+        _stroke(draw, [foot_l, apex], w, INK)
+        _stroke(draw, [apex, foot_r], w, ACCENT)
+        _stroke(draw, [bar_l, bar_r], int(w * 0.86), INK)
+    elif variant == "path":
+        _stroke(draw, [foot_l, apex], w, INK)
+        _stroke(draw, [apex, foot_r], w, INK)
+        count, gap = 3, 0.10
+        span = bar_r[0] - bar_l[0]
+        seg = span / (count + (count - 1) * gap)
+        x = bar_l[0]
+        for _ in range(count):
+            _stroke(draw, [(x, bar_l[1]), (x + seg, bar_l[1])], int(w * 0.8), ACCENT)
+            x += seg * (1 + gap)
+    else:
+        raise SystemExit(f"unknown variant: {variant}")
+
+    # 极细内描边：浅色任务栏上也有边界
+    draw.rounded_rectangle(
+        (1, 1, s - 2, s - 2),
+        radius=int(s * 0.225),
+        outline=HAIRLINE,
+        width=max(1, s // 512),
+    )
+
+    if canvas != size:
+        return base.resize((size, size), Image.LANCZOS)
+    return base
+
+
+def _vertical_gradient(size: int, top, bottom) -> Image.Image:
+    layer = Image.new("RGBA", (size, size), bottom)
+    column = Image.new("L", (1, size))
+    for y in range(size):
+        column.putpixel((0, y), int(255 * (1 - y / max(1, size - 1)) ** 1.05))
+    return Image.composite(Image.new("RGBA", (size, size), top), layer, column.resize((size, size)))
+
+
+def _radial_highlight(size: int, intensity: int = 46) -> Image.Image:
+    """左上偏中的柔光，让深色卡片像被打了一束顶光。"""
+    layer = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(layer)
+    cx, cy, r = size * 0.42, size * 0.24, size * 0.62
+    steps = 26
+    for i in range(steps, 0, -1):
+        k = i / steps
+        alpha = int(intensity * (1 - k) ** 1.8)
+        box = (cx - r * k, cy - r * k * 0.85, cx + r * k, cy + r * k * 0.85)
+        draw.ellipse(box, fill=alpha)
+    glow = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+    glow.putalpha(layer)
+    return glow
+
+
+def _shaped_gradient(size: int, mask: Image.Image, top, bottom) -> Image.Image:
+    shape = _vertical_gradient(size, top, bottom)
+    shape.putalpha(mask)
+    return shape
+
+
+def _build_refined(size: int) -> Image.Image:
+    """精致版，按尺寸分级做减法（optical size）。
+
+    - ≥128：玻璃顶光、极淡行带纹理、渐变白 A、绿色端点
+    - 48–64：去掉纹理与顶光，保留端点与细描边
+    - 32–40：去掉端点，只留白 A + 绿线
+    - ≤24：纯白 A、加粗、单色绿线，不做任何半透明装饰
+    """
+    canvas = size * 4  # 所有尺寸都 4 倍超采样后缩小，小图边缘才不糊
+    s = canvas
+    with_texture = False  # 行带纹理在评审中显得像噪点，去掉
+    with_arc = False      # 顶部弧线像一条杂线，去掉，只留径向柔光
+    with_node = size >= 48
+    with_hairline = size >= 32
+    with_gradient = size >= 64
+
+    tile = _background(canvas, light=size <= 32)
+    if with_arc:
+        tile = Image.alpha_composite(tile, _radial_highlight(canvas, 34))
+    draw = ImageDraw.Draw(tile)
+
+    if with_texture:
+        band_mask = Image.new("L", (s, s), 0)
+        bd = ImageDraw.Draw(band_mask)
+        for i in range(4):
+            y = s * (0.315 + i * 0.132)
+            bd.rounded_rectangle(
+                (s * 0.150, y - s * 0.010, s * 0.850, y + s * 0.010),
+                radius=s * 0.010,
+                fill=255,
+            )
+        bands = Image.new("RGBA", (s, s), (120, 160, 210, 255))
+        bands.putalpha(band_mask.point(lambda v: int(v * 0.042)))
+        tile = Image.alpha_composite(tile, bands)
+        draw = ImageDraw.Draw(tile)
+
+    apex, foot_l, foot_r, bar_l, bar_r = _letter_a_geometry(s, wide=size <= 32)
+    # 笔画占画布的比例：尺寸越小、相对越粗，保证 16 px 也能读出 A
+    if size >= 64:
+        ratio = 0.066
+    elif size >= 48:
+        ratio = 0.072
+    elif size >= 32:
+        ratio = 0.085
+    elif size >= 24:
+        ratio = 0.095
+    else:
+        ratio = 0.108
+    w = max(2, int(s * ratio))
+
+    letter = Image.new("L", (s, s), 0)
+    ld = ImageDraw.Draw(letter)
+    for pts in ([foot_l, apex], [apex, foot_r]):
+        ld.line(pts, fill=255, width=w, joint="curve")
+        for x, y in pts:
+            ld.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=255)
+    # 负空间：沿横杠位置从 A 上挖一条槽（宽度 = 绿线 + 2×间隙），
+    # 绿线落进槽里，交界处不再是"贴纸压在字上"，而是有前后层次。
+    ext = s * (0.052 if size >= 48 else 0.040)
+    line_w0 = max(2, int(w * (0.46 if size >= 48 else 0.64)))
+    gap = max(2, int(s * 0.012)) if size >= 48 else 0
+    cut = Image.new("L", (s, s), 0)
+    cd = ImageDraw.Draw(cut)
+    if gap:
+        cd.rounded_rectangle(
+            (bar_l[0] - ext * 0.7 - gap / 2, bar_l[1] - (line_w0 + gap) / 2,
+             bar_r[0] + ext + gap / 2, bar_l[1] + (line_w0 + gap) / 2),
+            radius=(line_w0 + gap) / 2,
+            fill=255,
+        )
+    letter = ImageChops.subtract(letter, cut)
+
+    if with_gradient:
+        top_ink, bottom_ink = (255, 255, 255, 255), (222, 229, 238, 255)
+    else:
+        top_ink = bottom_ink = (250, 252, 255, 255)
+    tile = Image.alpha_composite(tile, _shaped_gradient(s, letter, top_ink, bottom_ink))
+    draw = ImageDraw.Draw(tile)
+
+    if size >= 48:
+        edge = Image.new("L", (s, s), 0)
+        ed = ImageDraw.Draw(edge)
+        for pts in ([foot_l, apex], [apex, foot_r]):
+            ed.line(pts, fill=64, width=max(1, w // 14), joint="curve")
+        edge_ink = Image.new("RGBA", (s, s), (10, 16, 26, 255))
+        edge_ink.putalpha(edge)
+        tile = Image.alpha_composite(tile, edge_ink)
+        draw = ImageDraw.Draw(tile)
+
+    line_w = line_w0 if size > 32 else max(2, int(w * 0.80))
+    bar_mask = Image.new("L", (s, s), 0)
+    bmd = ImageDraw.Draw(bar_mask)
+    bmd.rounded_rectangle(
+        (bar_l[0] - ext * 0.7, bar_l[1] - line_w / 2, bar_r[0] + ext, bar_l[1] + line_w / 2),
+        radius=line_w / 2,
+        fill=255,
+    )
+    if size > 32:
+        bar_color = _shaped_gradient(s, bar_mask, (74, 222, 160, 255), (44, 190, 138, 255))
+    else:
+        bar_color = Image.new("RGBA", (s, s), ACCENT)
+        bar_color.putalpha(bar_mask)
+    tile = Image.alpha_composite(tile, bar_color)
+    draw = ImageDraw.Draw(tile)
+    if with_node:
+        node_r = max(2, int(s * 0.020))
+        nx = bar_r[0] + ext
+        draw.ellipse((nx - node_r, bar_l[1] - node_r, nx + node_r, bar_l[1] + node_r), fill=(110, 231, 183, 255))
+
+    if with_hairline:
         draw.rounded_rectangle(
-            (SIZE * left, y - thickness / 2, SIZE * right, y + thickness / 2),
-            radius=thickness / 2,
-            fill=ROW,
+            (1, 1, s - 2, s - 2),
+            radius=int(s * 0.225),
+            outline=(255, 255, 255, 44 if size > 48 else (74 if size > 24 else 96)),
+            width=max(1, s // 384),
+        )
+    if with_arc:
+        draw.arc(
+            (int(s * 0.03), int(s * 0.012), int(s * 0.97), int(s * 0.5)),
+            start=200, end=340, fill=(255, 255, 255, 52), width=max(1, s // 320),
         )
 
-    # 对行路径：从右上绕到左下，末端一个黄色节点
-    path_width = int(SIZE * 0.055)
-    points = [
-        (SIZE * 0.80, SIZE * 0.16),
-        (SIZE * 0.52, SIZE * 0.16),
-        (SIZE * 0.30, SIZE * 0.44),
-        (SIZE * 0.30, SIZE * 0.86),
-    ]
-    draw.line(points, fill=PATH, width=path_width, joint="curve")
-    draw.ellipse(
-        (
-            SIZE * 0.30 - path_width * 0.95,
-            SIZE * 0.86 - path_width * 0.95,
-            SIZE * 0.30 + path_width * 0.95,
-            SIZE * 0.86 + path_width * 0.95,
-        ),
-        fill=ACCENT,
-    )
-    return image
+    return tile.resize((size, size), Image.LANCZOS)
+
+def _preview(folder: Path) -> int:
+    folder.mkdir(parents=True, exist_ok=True)
+    for variant in ("refined", "crossbar", "guide", "exit"):
+        big = build(variant, 256)
+        sheet = Image.new("RGBA", (840, 320), (26, 30, 38, 255))
+        sheet.alpha_composite(big, (16, 32))
+        x = 300
+        for px in (128, 64, 48, 32, 24, 16):
+            sheet.alpha_composite(build(variant, px), (x, 40))
+            x += px + 14
+        sheet.save(folder / f"icon_{variant}.png")
+        print(f"preview: {folder / f'icon_{variant}.png'}")
+    return 0
 
 
-def main() -> int:
+def main(argv: list[str]) -> int:
+    if "--preview" in argv:
+        target = Path(__file__).resolve().parent.parent / "outputs" / "icon-preview"
+        return _preview(target)
     target = Path(__file__).with_name("align.ico")
-    image = build()
+    image = build("refined")
     image.save(
         target,
         format="ICO",
-        sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
+        sizes=[
+            (16, 16), (20, 20), (24, 24), (32, 32),
+            (40, 40), (48, 48), (64, 64), (128, 128), (256, 256),
+        ],
     )
     print(f"wrote {target} ({target.stat().st_size} bytes)")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
