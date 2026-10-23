@@ -1,5 +1,10 @@
 @echo off
 setlocal
+rem 清掉外部注入的 PYTHONPATH：Hermes 等工具会把自带 venv 的 site-packages
+rem 塞进 PYTHONPATH，里面若有其它 Python 版本编译的 numpy，会直接让构建/自检崩
+rem （实测：numpy 2.4.3 的 cp314 扩展压过 conda 的 cp310 numpy）。
+set "PYTHONPATH="
+set "PYTHONHOME="
 
 rem Build the portable Windows package from the selected Python environment.
 rem Usage: build_windows.bat D:\zhl\anaconda\envs\game\python.exe
