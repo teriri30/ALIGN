@@ -965,7 +965,7 @@ class TaskPanel(QWidget):
         self._forbidden_confirmed = False
         self._build_ui()
 
-    def set_glass_backdrop(self, pixmap, opacity: float = 0.94):
+    def set_glass_backdrop(self, pixmap, opacity: float = 0.82):
         from pyside6_app.glass import BackdropLayer, blur_pixmap
 
         blurred = blur_pixmap(pixmap)

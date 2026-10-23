@@ -17,10 +17,39 @@ from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QWidget
 
-__all__ = ["BackdropLayer", "blur_pixmap"]
+__all__ = ["BackdropLayer", "blur_pixmap", "cover_source_rect"]
 
 
-def blur_pixmap(source: QPixmap | QImage, dark: bool = True, downscale: int = 8) -> QPixmap | None:
+def cover_source_rect(source_size, target_size):
+    """按"填满并居中裁切"算出源图里该取哪一块（避免拉伸变形）。
+
+    之前直接把整张抓图拉进卡片区域，横竖比例一差，原本的竖条纹与按钮色块
+    就被拉成"奇怪的斜纹/重影"，这是用户看到的那个问题的直接原因。
+    """
+    from PySide6.QtCore import QRect
+
+    sw, sh = int(source_size.width()), int(source_size.height())
+    tw, th = int(target_size.width()), int(target_size.height())
+    if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
+        return QRect(0, 0, max(sw, 0), max(sh, 0))
+    target_ratio = tw / th
+    source_ratio = sw / sh
+    if source_ratio > target_ratio:
+        # 源更宽：裁左右
+        crop_w = int(round(sh * target_ratio))
+        crop_h = sh
+        x = (sw - crop_w) // 2
+        y = 0
+    else:
+        # 源更高：裁上下
+        crop_w = sw
+        crop_h = int(round(sw / target_ratio))
+        x = 0
+        y = (sh - crop_h) // 2
+    return QRect(x, y, max(1, crop_w), max(1, crop_h))
+
+
+def blur_pixmap(source: QPixmap | QImage, dark: bool = True, downscale: int = 14) -> QPixmap | None:
     """把一张图压成「磨砂玻璃」：两次降采样再放大 + 一层暗色叠加。"""
     if source is None:
         return None
@@ -40,7 +69,7 @@ def blur_pixmap(source: QPixmap | QImage, dark: bool = True, downscale: int = 8)
         Qt.SmoothTransformation,
     )
     blurred = tiny.scaled(image.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-    tint = QColor(11, 18, 32, 118) if dark else QColor(248, 250, 252, 150)
+    tint = QColor(11, 18, 32, 152) if dark else QColor(248, 250, 252, 176)
     tinted = QImage(blurred.size(), QImage.Format_ARGB32_Premultiplied)
     tinted.fill(Qt.transparent)
     painter = QPainter(tinted)
@@ -84,5 +113,6 @@ class BackdropLayer(QWidget):
             return
         painter = QPainter(self)
         painter.setOpacity(self._opacity)
-        painter.drawPixmap(self.rect(), self._pixmap)
+        source = cover_source_rect(self._pixmap.size(), self.size())
+        painter.drawPixmap(self.rect(), self._pixmap, source)
         painter.end()

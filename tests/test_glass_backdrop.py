@@ -72,3 +72,43 @@ def test_task_panel_ignores_unusable_backdrop(qapp):
     assert panel.set_glass_backdrop(None) is False
     assert panel._backdrop is None
     panel.deleteLater()
+
+
+# ---------------------------------------------------------------- 背板不拉伸
+
+
+def test_cover_source_rect_crops_wide_source_horizontally(qapp):
+    """源图比目标宽 → 裁左右，保持目标比例（之前直接拉伸导致"奇怪条纹"）。"""
+    from PySide6.QtCore import QSize
+
+    from pyside6_app.glass import cover_source_rect
+
+    rect = cover_source_rect(QSize(1000, 500), QSize(330, 900))
+    assert rect.width() / rect.height() == pytest.approx(330 / 900, rel=1e-2)
+    assert rect.left() > 0 and rect.top() == 0
+
+
+def test_cover_source_rect_crops_tall_source_vertically(qapp):
+    from PySide6.QtCore import QSize
+
+    from pyside6_app.glass import cover_source_rect
+
+    rect = cover_source_rect(QSize(400, 2000), QSize(800, 400))
+    assert rect.width() / rect.height() == pytest.approx(2.0, rel=1e-2)
+    assert rect.top() > 0 and rect.left() == 0
+
+
+def test_cover_source_rect_handles_degenerate_sizes(qapp):
+    from PySide6.QtCore import QSize
+
+    from pyside6_app.glass import cover_source_rect
+
+    assert cover_source_rect(QSize(0, 0), QSize(330, 900)).width() >= 0
+    assert cover_source_rect(QSize(500, 500), QSize(0, 0)).width() == 500
+
+
+def test_blur_is_heavier_than_before_so_rows_are_not_recognisable(qapp):
+    """背板要读成柔和色晕：降采样倍数至少 12（原来 8 还能看出稻行）。"""
+    from pyside6_app.glass import blur_pixmap
+
+    assert blur_pixmap.__defaults__[1] >= 12

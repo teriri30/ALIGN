@@ -7394,8 +7394,14 @@ class MainWindow(QMainWindow):
         panel = getattr(self, "task_panel", None)
         if panel is None or not hasattr(panel, "set_glass_backdrop"):
             return
+        viewer = getattr(self.image_view, "viewer", None)
+        # 只抓画布本身：抓整个 ImageViewerGroup 会把工具栏按钮、比例尺、坐标
+        # 一起模糊进背板，看起来就是卡片后面有"奇怪的一条条东西"。
+        if viewer is None or getattr(viewer, "_pixmap", None) is None:
+            panel.clear_glass_backdrop()
+            return
         try:
-            pixmap = self.image_view.grab()
+            pixmap = viewer.grab()
             panel.set_glass_backdrop(pixmap)
         except Exception:
             # 背板只是装饰，失败不能让影像视图崩掉

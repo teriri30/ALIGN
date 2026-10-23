@@ -845,3 +845,15 @@
   4. 状态条四段缺省自动隐藏，保持一行高度，不得换行撑高。
 - 代码锚点：`src/ui_messages.py`、`panels.LogPanel._append/_render/set_show_details`、`panels.StatusStrip.set_phase/set_step/set_hint/set_metrics`、`main_window.set_status_text/_build_statusbar/_path_quality_summary/_path_quality_details`。
 - 测试锚点：`tests/test_ui_messages.py`（9 条：文案规范化、模板句式、失败文案、去重键、日志合并/级别/上限、状态条四段/规范化）。
+
+## DECISION-050：液态玻璃背板只取画布、按比例裁切（2026-10-23）
+
+- 现象：卡片后面出现明显的竖纹、暗块与"重影"，用户判断为背景脏。
+- 根因两条：①背板抓的是整个 `ImageViewerGroup`（含工具栏、比例尺、坐标），这些 UI 元素被模糊后变成色块；②`drawPixmap(rect, pixmap)` 直接拉伸到 330×900，横竖比例差 3 倍，纹路被拉斜。
+- 改法：只抓 `image_view.viewer`，且要求 `_pixmap` 存在，否则 `clear_glass_backdrop()`；绘制时用 `cover_source_rect()` 做"填满并居中裁切"，不再拉伸；模糊降采样 8 → 14、暗色叠加 118 → 152、层不透明度 0.94 → 0.82，让背板读成柔和色晕。
+- 不变量：
+  1. 背板来源必须是画布像素，不得包含任何工具栏/按钮/文字。
+  2. 绘制必须保持源图比例（cover-crop），禁止 `drawPixmap(rect, pixmap)` 拉伸。
+  3. 没有影像时不得保留旧背板（否则画布空了，背板还留着上一次的残影）。
+- 代码锚点：`glass.cover_source_rect/blur_pixmap/BackdropLayer.paintEvent`、`main_window._apply_glass_backdrop`。
+- 测试锚点：`tests/test_glass_backdrop.py`（cover-crop 横裁/纵裁/退化尺寸、模糊强度下限）。
