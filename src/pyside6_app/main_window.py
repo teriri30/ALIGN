@@ -364,6 +364,9 @@ class MainWindow(QMainWindow):
         self.top_toolbar.update_theme_icon(theme)
         self.route_info.refresh_theme()
         self.log_panel.refresh_theme()
+        strip = getattr(self, "status_strip", None)
+        if strip is not None:
+            strip.refresh_theme()
         for v in (self.image_view,):
             v.refresh_theme()
         # 强制重绘。
@@ -577,7 +580,11 @@ class MainWindow(QMainWindow):
 
     def set_status_text(self, text, tone="idle"):
         """Single entry point for the status bar text + its tone dot."""
-        self.lbl_status.setText(str(text))
+        strip = getattr(self, "status_strip", None)
+        if strip is not None:
+            strip.set_phase(text, tone)
+        else:
+            self.lbl_status.setText(str(text))
         dot = getattr(self, "status_dot", None)
         if dot is not None:
             tone_colors = {
@@ -593,9 +600,15 @@ class MainWindow(QMainWindow):
         # Runtime dot in front of the status text. Reference behaviour: the
         # dot breathes (1.2 s) while a job runs, is solid green when ready and
         # red on failure — the text alone reads as static.
-        self.status_dot = BreathingDot(7)
+        # 状态条按「步骤 / 阶段 / 提示 / 指标」四段排（DECISION-049）。
+        # lbl_status 保留为兼容别名：154 处旧调用 setText() 会走 set_phase()。
+        from pyside6_app.panels import StatusStrip
+
+        self.status_strip = StatusStrip()
+        self.status_dot = self.status_strip.dot
         self.status_dot.set_tone("idle", COLORS.get("text_dim", "#94A3B8"))
-        self.lbl_status = QLabel("就绪")
+        self.lbl_status = self.status_strip
+        self.lbl_status.setText("就绪")
         self.lbl_speed = QLabel("")
         self.progress_bar = QProgressBar(); self.progress_bar.setMaximumWidth(180)
         self.progress_bar.setMaximumHeight(6); self.progress_bar.setTextVisible(False)
@@ -606,8 +619,7 @@ class MainWindow(QMainWindow):
         self.btn_cancel_task.setFixedHeight(22)
         self.btn_cancel_task.hide()
         self.btn_cancel_task.clicked.connect(self._cancel_background_worker)
-        self.status_bar.addWidget(self.status_dot)
-        self.status_bar.addWidget(self.lbl_status, 1)
+        self.status_bar.addWidget(self.status_strip, 1)
         self.status_bar.addPermanentWidget(self.lbl_speed)
         self.status_bar.addPermanentWidget(self.btn_cancel_task)
         self.status_bar.addPermanentWidget(self.progress_bar)
@@ -982,11 +994,15 @@ class MainWindow(QMainWindow):
         self.task_panel.update_centerline_selection(catalog, selected_ids)
         self._restore_visual_from_state()
         self._sync_task_statuses()
-        self.log_panel.success(
-            f"已生成全部中心线（{len(catalog.get('items'))} 条）："
-            "请在’选择作业线’步骤勾选；取消勾选的作业线会隐藏且不进入路径，"
-            "选好后再设置起点并生成作业路线"
-        )
+        from ui_messages import centerlines_done
+
+        self.log_panel.success(centerlines_done(len(catalog.get("items"))))
+        strip = getattr(self, "status_strip", None)
+        if strip is not None:
+            strip.set_step("第 5 步 · 生成作业线")
+            strip.set_phase("已生成", "ready")
+            strip.set_hint("下一步：勾选需要的作业线")
+            strip.set_metrics({"作业线": f"{len(catalog.get('items'))} 条"})
         geometry = dict((result.get("layout") or {}).get("field_boundary_geometry") or {})
         if geometry.get("repaired"):
             self.log_panel.info(
@@ -1061,9 +1077,15 @@ class MainWindow(QMainWindow):
         self.top_toolbar.refresh_actions(self.state)
         self._persist_centerline_selection()
         self._sync_task_statuses()
-        self.log_panel.success(
-            f"已确认采用 {len(selected)}/{len(valid_ids)} 条作业线；接下来设置起点"
-        )
+        from ui_messages import selection_confirmed
+
+        self.log_panel.success(selection_confirmed(len(selected), len(valid_ids)))
+        strip = getattr(self, "status_strip", None)
+        if strip is not None:
+            strip.set_step("第 6 步 · 选择作业线")
+            strip.set_phase("已确认", "ready")
+            strip.set_hint("下一步：设置起点")
+            strip.set_metrics({"已选": f"{len(selected)} 条"})
 
     def _start_centerline_catalog_generation(self):
         """Generate all candidate centerlines once the processed mask is committed."""
@@ -1316,8 +1338,14 @@ class MainWindow(QMainWindow):
         bands_count = len(result.get("bands", []))
         tracks = len(path_result.get("tracks", []))
         turns = len(path_result.get("formal_turns", path_result.get("turns", [])))
-        self.lbl_status.setText("路径规划完成")
         self.log_panel.success(self._path_quality_summary(path_result, bands_count, tracks, turns))
+        self.log_panel.detail(self._path_quality_details(path_result))
+        strip = getattr(self, "status_strip", None)
+        if strip is not None:
+            strip.set_step("第 7 步 · 路径规划")
+            strip.set_phase("已生成", "ready")
+            strip.set_hint("")
+            strip.set_metrics({"作业段": f"{tracks} 段", "转弯": f"{turns} 处"})
         turn_assessment = path_result.get("turn_assessment") or {}
         service_points = turn_assessment.get("service_points") or {}
         if service_points.get("entry_reference_used"):
@@ -2018,7 +2046,7 @@ class MainWindow(QMainWindow):
 
     def _on_load_model(self):
         if getattr(self, "_model_load_in_progress", False) or self._has_background_worker():
-            self.log_panel.warn("当前有任务正在运行，暂不能切换模型")
+            self.log_panel.warn(f"有任务在运行 · 等它结束再切换模型")
             return
         path, _ = QFileDialog.getOpenFileName(self, "加载模型", "", "PyTorch (*.pt);;All files (*)")
         if path:
@@ -2104,7 +2132,7 @@ class MainWindow(QMainWindow):
 
     def _on_import_model_folder(self):
         if getattr(self, "_model_load_in_progress", False) or self._has_background_worker():
-            self.log_panel.warn("当前有任务正在运行，暂不能导入或切换模型")
+            self.log_panel.warn(f"有任务在运行 · 等它结束再导入或切换模型")
             return
         folder = QFileDialog.getExistingDirectory(self, "选择模型文件夹", "")
         if not folder:
@@ -2131,7 +2159,7 @@ class MainWindow(QMainWindow):
 
     def _on_model_manager(self):
         if getattr(self, "_model_load_in_progress", False) or self._has_background_worker():
-            self.log_panel.warn("当前有任务正在运行，暂不能切换模型")
+            self.log_panel.warn(f"有任务在运行 · 等它结束再切换模型")
             return
         models = self._model_list or self._refresh_builtin_models()
         cur = getattr(self.state, 'current_model_path', None)
@@ -2163,10 +2191,10 @@ class MainWindow(QMainWindow):
             # DECISION-006/007: never race model construction with a live
             # predict call.  Cancellation is cooperative and is not an
             # immediate CUDA-safety guarantee.
-            self.log_panel.warn("作物识别正在运行，暂不能切换模型；请等待识别完成")
+            self.log_panel.warn(f"有任务在运行 · 等它结束再切换模型")
             return False
         if self._has_background_worker():
-            self.log_panel.warn("当前有后台任务正在运行，暂不能切换模型")
+            self.log_panel.warn(f"有任务在运行 · 等它结束再切换模型")
             return False
         try:
             builtin_root = os.path.abspath(self._builtin_model_dir())
@@ -4840,7 +4868,7 @@ class MainWindow(QMainWindow):
         self._sync_task_statuses()
         if entry != before:
             self.log_panel.success(
-                "已智能推荐起点；请确认或直接拖动调整。终点会沿最终作业段自动延伸，"
+                "起点已推荐 · 可拖动调整；终点随最后一段自动延伸，"
                 "也可在画布上拖动调整"
             )
         else:
@@ -4894,7 +4922,7 @@ class MainWindow(QMainWindow):
             self._refresh_service_points_panel()
             self._sync_task_statuses()
             self.log_panel.info(
-                "系统智能推荐起点；终点默认沿最终作业段延伸，点击地图可重新设置，"
+                "起点已推荐 · 可拖动调整；终点默认沿最后一段延伸，点地图可重设，"
                 "卸粮点按需添加"
             )
         else:
@@ -6474,40 +6502,43 @@ class MainWindow(QMainWindow):
         return f"{value:.1f}{suffix}"
 
     def _path_quality_summary(self, path_result, bands_count=None, tracks_count=None, turns_count=None):
-        """Build a decision-oriented one-line summary for users after planning."""
+        """一句话结果：作业段 / 转弯 / 总长。其余指标进 _path_quality_details。"""
         path_result = self._normalise_path_result(path_result)
-        validation = path_result.get("validation", {}) or {}
         tracks_count = len(path_result.get("tracks", [])) if tracks_count is None else tracks_count
         turns_count = len(path_result.get("formal_turns", path_result.get("turns", []))) if turns_count is None else turns_count
-        parts = [
-            f"路径规划完成: {tracks_count} 条作业线, {turns_count} 条正式调头段",
-            f"调头方式：{self._turn_strategy_label(path_result)}",
-        ]
+        validation = path_result.get("validation", {}) or {}
         total = validation.get("total_length_m", path_result.get("total_length_m"))
+        if total is None:
+            return f"路径已生成 · 作业段 {tracks_count} 段，转弯 {turns_count} 处。下一步：导出或模拟演示"
+        return (
+            f"路径已生成 · 作业段 {tracks_count} 段，转弯 {turns_count} 处，"
+            f"总长 {self._fmt_metric(total)}。下一步：导出或模拟演示"
+        )
+
+    def _path_quality_details(self, path_result) -> str:
+        """明细：调头方式、分段长度、覆盖率、效率、风险数（只进"详情"）。"""
+        path_result = self._normalise_path_result(path_result)
+        validation = path_result.get("validation", {}) or {}
+        parts = [f"调头方式 {self._turn_strategy_label(path_result)}"]
         work = validation.get("work_length_m", path_result.get("work_length_m"))
         turn = validation.get("turn_length_m", path_result.get("turn_length_m"))
         coverage = validation.get(
             "crop_mask_geometric_coverage_pct",
             validation.get("planned_target_geometric_coverage_pct"),
         )
-        rolling = validation.get("rolling_canopy_pct")
         efficiency = validation.get("field_efficiency_pct", validation.get("field_efficiency"))
-        if total is not None:
-            parts.append(f"总长 {self._fmt_metric(total)}")
         if work is not None:
-            parts.append(f"作业 {self._fmt_metric(work)}")
+            parts.append(f"作业长度 {self._fmt_metric(work)}")
         if turn is not None:
-            parts.append(f"转弯 {self._fmt_metric(turn)}")
+            parts.append(f"转弯长度 {self._fmt_metric(turn)}")
         if coverage is not None:
-            parts.append(f"作物掩膜覆盖 {self._fmt_metric(coverage, '%')}")
-        if rolling is not None:
-            parts.append(f"碾压率 {self._fmt_metric(rolling, '%')}")
+            parts.append(f"掩膜覆盖 {self._fmt_metric(coverage, '%')}")
         if efficiency is not None:
-            parts.append(f"效率 {self._fmt_metric(efficiency, '%')}")
+            parts.append(f"田间效率 {self._fmt_metric(efficiency, '%')}")
         issues = validation.get("issues") or []
         if issues:
             parts.append(f"风险 {len(issues)} 处")
-        return " | ".join(parts)
+        return " · ".join(parts)
 
     @Slot(str, object)
     def _on_step_result(self, step, data):
@@ -6657,26 +6688,26 @@ class MainWindow(QMainWindow):
         narrow_count = len([b for b in all_bands if b.get("band_type") == "narrow"])
 
         # 详细友好提示
-        message = f"掩膜优化完成\n"
-        message += f"   识别结果：{len(wide_bands)} 条4行主体区"
-        if narrow_count > 0:
-            message += f" + {narrow_count} 条2行边缘区"
+        from ui_messages import bands_summary, mask_done
 
-        message += (
-            f"\n   说明：4行主体区用于生成作业线，2行边缘区会被相邻两趟自然收完"
-            f"\n   （收割机幅宽1.8m = 左1行+宽行+4行+宽行+右1行）"
-            f"\n   接下来点击“生成作业线”"
+        # 一句话讲结果，换算说明进"详情"（原来四行碎句全堆在交互栏）
+        self.log_panel.success(mask_done(len(wide_bands), narrow_count))
+        self.log_panel.detail(
+            "幅宽 1.8 m = 左 1 行 + 宽行 + 4 行 + 宽行 + 右 1 行；"
+            f"本块田 {bands_summary(len(wide_bands), narrow_count)}"
         )
-
-        self.log_panel.success(message)
         self.task_panel.set_task_status("process", "done")
         self.task_panel.set_task_action("process", "\u91cd\u505a")
 
         self._sync_task_statuses()
         WorkflowUpdater.advance(self.state, "MASK_PROCESSED")
-        self.lbl_status.setText(f"掩膜优化完成（{len(wide_bands)}条主体区），正在刷新预览...")
+        strip = getattr(self, "status_strip", None)
+        if strip is not None:
+            strip.set_step("第 4 步 · 掩膜优化")
+            strip.set_phase("已完成", "ready")
+            strip.set_hint("下一步：生成作业线")
+            strip.set_metrics({"主体区": f"{len(wide_bands)} 条", "边缘区": f"{narrow_count} 条"})
         QTimer.singleShot(50, lambda: self._show_mask_overlay(processed_mask))
-        self.lbl_status.setText("掩膜优化完成，请点击’生成作业线’")
 
     def _compact_mask_result_for_ui(self, processed):
         """Remove dense per-band arrays before UI state/cache metadata saves."""

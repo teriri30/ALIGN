@@ -830,3 +830,18 @@
   4. 卡片文字对比度优先：填充不透明度不得低于 0.6。
 - 代码锚点：`src/pyside6_app/glass.py`（`blur_pixmap`/`BackdropLayer`）、`panels.StepCard.paintEvent`（`_glass_enabled` 分支）、`panels.TaskPanel.set_glass_backdrop/clear_glass_backdrop`、`main_window._schedule_glass_backdrop/_apply_glass_backdrop`。
 - 测试锚点：`tests/test_glass_backdrop.py`（5 条：模糊产出、小图拒绝、层开关、面板接线与卡片标记、无效背板忽略）。
+
+## DECISION-049：交互栏文案与状态条结构（2026-10-23）
+
+- 背景：用户反馈底部提示"很乱很散，有的根本没必要列出，提示语句不统一"。
+- 盘点：`main_window.py` 里 184 条日志调用，warn 55 条里大量本是信息；同一件事有 2–4 种说法（"当前有任务正在运行，暂不能切换模型"4 个变体）；营销词（"已智能推荐起点"）、哈希/EPSG/缓存指纹与"该做什么"混在一起。
+- 归类：①阶段（正在做什么）②结果（得到什么，带数字）③提示（下一步）④异常（什么事 + 怎么办）⑤明细（参数/路径/指纹，只进"详情"）⑥删除（重复与无信息量）。
+- 句式：阶段 `正在<动词><对象>`；结果 `<对象> <数量><单位>`；完成 `<对象>已<动作>`；提示 `<前置>后才能<动作>`；异常 `<对象><动作>失败：<原因> · <怎么办>`。禁用：智能／一键／自动优化／已成功／请稍候／抱歉／感叹号。
+- 落地：`src/ui_messages.py`（normalize / detail_key / 模板）、`panels.LogPanel`（五级着色、`×N` 合并、detail 折叠、清空确认）、`panels.StatusStrip`（步骤│状态│提示│指标 四段）、`main_window` 的掩膜完成 / 作业线生成 / 选择确认 / 路径完成四个关键节点接到四段状态条。
+- 不变量：
+  1. 交互栏不出现文件路径、哈希、EPSG、缓存版本——这些一律 detail 级。
+  2. 结果型文案数字变化即为新事件，不合并；只有"正在…"+百分比型按数字归一后合并。
+  3. `lbl_status` 保留为 StatusStrip 的兼容别名，`setText()/text()` 均可用，避免 150+ 旧调用失效。
+  4. 状态条四段缺省自动隐藏，保持一行高度，不得换行撑高。
+- 代码锚点：`src/ui_messages.py`、`panels.LogPanel._append/_render/set_show_details`、`panels.StatusStrip.set_phase/set_step/set_hint/set_metrics`、`main_window.set_status_text/_build_statusbar/_path_quality_summary/_path_quality_details`。
+- 测试锚点：`tests/test_ui_messages.py`（9 条：文案规范化、模板句式、失败文案、去重键、日志合并/级别/上限、状态条四段/规范化）。

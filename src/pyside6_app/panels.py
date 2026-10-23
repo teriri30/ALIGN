@@ -2056,7 +2056,7 @@ class RouteInfoPanel(QWidget):
     def _build_ui(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(0,0,0,0); lo.setSpacing(0)
         self._title_hdr = QLabel("路径结果"); self._title_hdr.setStyleSheet(f"font-size:14px;font-weight:600;color:{COLORS['text']};padding:8px 14px 2px;")
-        self._summary = QLabel("作业线 0 / 转弯段 0")
+        self._summary = QLabel("作业段 0 / 转弯段 0")
         self._summary.setWordWrap(True)
         self._summary.setMinimumWidth(0)
         self._summary.setStyleSheet(f"font-size:12px;color:{COLORS['text_dim']};padding:2px 14px 4px;")
@@ -2203,7 +2203,7 @@ class RouteInfoPanel(QWidget):
             row.reorder_requested.connect(self.work_reorder_requested.emit)
             self._add_row(row)
         self._summary.setText(
-            f"作业线 {work_count} / 转弯段 {turn_count} / 总长 {total_length:.1f}m"
+            f"作业段 {work_count} / 转弯段 {turn_count} / 总长 {total_length:.1f} m"
         )
         self._summary.setToolTip("人工控制路线；卡片和画布共享同一几何与顺序")
         self._safety.setText("路径状态：手动编辑后需重新验证")
@@ -2264,7 +2264,7 @@ class RouteInfoPanel(QWidget):
         self._safety.setToolTip("")
     def clear_info(self):
         self._set_editable(False)
-        self._clear_list(); self._empty_label.setVisible(True); self._summary.setText("作业线 0 / 转弯段 0")
+        self._clear_list(); self._empty_label.setVisible(True); self._summary.setText("作业段 0 / 转弯段 0")
         self._safety.setText("路径状态：未评估"); self._safety.setToolTip("")
     def refresh_theme(self):
         self.setStyleSheet(f"background:{COLORS['bg']};")
@@ -2288,23 +2288,268 @@ class RouteInfoPanel(QWidget):
         return sum(math.hypot(pts[i][0]-pts[i-1][0], pts[i][1]-pts[i-1][1]) for i in range(1,len(pts)))
 
 
-class LogPanel(QTextEdit):
+class LogPanel(QWidget):
+    """运行记录：分类、去重、可折叠明细（DECISION-049）。
+
+    改之前是一个裸 QTextEdit，184 条调用各写各的，同一件事有 2–4 种说法，
+    哈希/EPSG 这类明细和"该做什么"的提示混在一起。现在按级别着色 + 同文案
+    合并 ×N + 明细默认收起。
+    """
+
+    MAX_ENTRIES = 400
+    MERGE_WINDOW_S = 6.0
+
     def __init__(self, parent=None):
-        super().__init__(parent); self.setReadOnly(True); self.setMinimumHeight(120)
+        super().__init__(parent)
+        self.setMinimumHeight(120)
+        self.setObjectName("logPanel")
+        self._entries = []          # [(ts_float, level, text, key, repeat)]
+        self._show_details = False
+        self._view = QTextEdit()
+        self._view.setReadOnly(True)
+        self._view.setObjectName("logView")
+        self._hint = QLabel("运行记录")
+        self._chk_detail = QCheckBox("详情")
+        self._chk_detail.setToolTip("显示参数、路径、缓存指纹等技术明细")
+        self._chk_detail.toggled.connect(self.set_show_details)
+        self._btn_clear = QPushButton("清空")
+        self._btn_clear.setFixedHeight(22)
+        self._btn_clear.clicked.connect(self._confirm_clear)
+        head = QHBoxLayout()
+        head.setContentsMargins(2, 0, 2, 0)
+        head.setSpacing(6)
+        head.addWidget(self._hint)
+        head.addSpacing(8)
+        head.addWidget(self._chk_detail)
+        head.addSpacing(8)
+        head.addWidget(self._btn_clear)
+        head.addStretch(1)
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.setSpacing(4)
+        lo.addLayout(head)
+        lo.addWidget(self._view, 1)
         self.refresh_theme()
+
+    # ------------------------------------------------------------------ 主题
     def refresh_theme(self):
+        self._hint.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
+        self._chk_detail.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
+        self._btn_clear.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{COLORS['text_dim']};"
+            f"border:1px solid {COLORS['border']};border-radius:5px;padding:0 8px;font-size:12px;}}"
+            f"QPushButton:hover{{background:{COLORS['bg_hover']};color:{COLORS['text']};}}"
+        )
         self.setStyleSheet(
-            f"QTextEdit{{background:{COLORS['bg_darkest']};color:{COLORS['text']};"
+            f"QWidget#logPanel{{background:{COLORS['bg_darkest']};color:{COLORS['text']};}}"
+        )
+        self._view.setStyleSheet(
+            f"QTextEdit#logView{{background:{COLORS['bg_darkest']};color:{COLORS['text']};"
             f"border:1px solid {COLORS['border']};border-radius:6px;"
             "font-family:'Cascadia Code','Consolas',monospace;font-size:13px;padding:6px;}"
         )
+
+    # ------------------------------------------------------------------ 状态
+    def set_show_details(self, show: bool):
+        self._show_details = bool(show)
+        self._render()
+
+    def _confirm_clear(self):
+        from PySide6.QtWidgets import QMessageBox
+
+        if not self._entries:
+            return
+        answer = QMessageBox.question(
+            self, "清空运行记录", "清空后无法恢复，确定吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            self.clear()
+
+    def clear(self):
+        self._entries.clear()
+        self._view.clear()
+
+    def entry_count(self) -> int:
+        return len(self._entries)
+
+    # ------------------------------------------------------------------ 记录
     def _append(self, level, msg):
-        ts = time.strftime("%H:%M:%S")
-        self.append(f"[{ts}] {msg}")
-    def info(self, m): self._append("INFO", m)
-    def success(self, m): self._append("SUCCESS", m)
-    def warn(self, m): self._append("WARN", m)
-    def error(self, m): self._append("ERROR", m)
+        from ui_messages import detail_key, normalize
+
+        text = normalize(msg)
+        if not text:
+            return
+        if level == "detail" and not self._show_details:
+            # 明细照常入队（打开开关即可回看），只是不渲染
+            pass
+        now = time.time()
+        key = detail_key(text)
+        last = self._entries[-1] if self._entries else None
+        if last and last[3] == key and now - last[0] <= self.MERGE_WINDOW_S:
+            self._entries[-1] = (last[0], last[1], text, key, last[4] + 1)
+        else:
+            self._entries.append((now, level, text, key, 1))
+            if len(self._entries) > self.MAX_ENTRIES:
+                self._entries = self._entries[-self.MAX_ENTRIES:]
+        self._render()
+
+    def info(self, m): self._append("info", m)
+    def success(self, m): self._append("ok", m)
+    def warn(self, m): self._append("warn", m)
+    def error(self, m): self._append("error", m)
+    def detail(self, m): self._append("detail", m)
+
+    # ------------------------------------------------------------------ 渲染
+    def _colors(self):
+        return {
+            "info": COLORS["text"],
+            "ok": COLORS.get("green", "#34D399"),
+            "warn": COLORS.get("orange", "#F5A524"),
+            "error": COLORS.get("red", "#E85D63"),
+            "detail": COLORS["text_dim"],
+        }
+
+    def _render(self):
+        from ui_messages import GLYPHS
+
+        colors = self._colors()
+        rows = []
+        for ts, level, text, _key, repeat in self._entries:
+            if level == "detail" and not self._show_details:
+                continue
+            stamp = time.strftime("%H:%M:%S", time.localtime(ts))
+            glyph = GLYPHS.get(level, "·")
+            color = colors.get(level, COLORS["text"])
+            suffix = f"  ×{repeat}" if repeat > 1 else ""
+            rows.append(
+                f'<div style="margin:1px 0;">'
+                f'<span style="color:{COLORS["text_dim"]};">{stamp}</span> '
+                f'<span style="color:{color};">{glyph}</span> '
+                f'<span style="color:{color if level != "info" else COLORS["text"]};">'
+                f'{self._escape(text)}</span>'
+                f'<span style="color:{COLORS["text_dim"]};">{suffix}</span></div>'
+            )
+        self._view.setHtml("".join(rows))
+        bar = self._view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        return (
+            str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+
+class StatusStrip(QWidget):
+    """底部状态条：步骤 / 阶段 / 提示 / 指标 四段各就各位（DECISION-049）。
+
+    改之前只有一句自由文本，步骤、进度、提示、"该做什么"全挤在同一个 QLabel 里，
+    读起来散。现在固定四段，缺省段自动隐藏，保持一行高度。
+    """
+
+    TONES = {
+        "busy": "accent",
+        "ready": "green",
+        "error": "red",
+        "warn": "orange",
+        "idle": "text_dim",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tone = "idle"
+        self.dot = BreathingDot(7)
+        self.lbl_step = QLabel("")
+        self.lbl_phase = QLabel("")
+        self.lbl_hint = QLabel("")
+        self.lbl_metrics = QLabel("")
+        self.lbl_metrics_divider = QLabel("│")
+        self._sep_step = QLabel("│")
+        self._sep_hint = QLabel("│")
+        self._separators = (self._sep_step, self._sep_hint, self.lbl_metrics_divider)
+        for lbl in (self.lbl_step, self.lbl_hint, self.lbl_metrics, *self._separators):
+            lbl.setVisible(False)
+        lo = QHBoxLayout(self)
+        lo.setContentsMargins(2, 0, 4, 0)
+        lo.setSpacing(8)
+        lo.addWidget(self.dot)
+        lo.addWidget(self.lbl_step)
+        lo.addWidget(self._sep_step)
+        lo.addWidget(self.lbl_phase)
+        lo.addWidget(self._sep_hint)
+        lo.addWidget(self.lbl_hint)
+        lo.addStretch(1)
+        lo.addWidget(self.lbl_metrics_divider)
+        lo.addWidget(self.lbl_metrics)
+        self.refresh_theme()
+
+    def refresh_theme(self):
+        self.lbl_step.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
+        self.lbl_phase.setStyleSheet(f"color:{COLORS['text']};")
+        self.lbl_hint.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
+        self.lbl_metrics.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;")
+        for sep in self._separators:
+            sep.setStyleSheet(f"color:{COLORS['text_dim']};opacity:0.45;")
+        self.set_tone(self._tone)
+
+    # ------------------------------------------------------------------ 写入
+    def setText(self, text):  # noqa: N802 - 兼容旧调用 lbl_status.setText(...)
+        self.set_phase(text)
+
+    def set_phase(self, text, tone=None):
+        from ui_messages import normalize
+
+        self.lbl_phase.setText(normalize(text))
+        if tone:
+            self.set_tone(tone)
+
+    def set_step(self, text):
+        from ui_messages import normalize
+
+        value = normalize(text)
+        self.lbl_step.setText(value)
+        self.lbl_step.setVisible(bool(value))
+        self._sep_step.setVisible(bool(value))
+
+    def set_hint(self, text, tone="idle"):
+        from ui_messages import normalize
+
+        value = normalize(text)
+        self.lbl_hint.setText(value)
+        self.lbl_hint.setVisible(bool(value))
+        self._sep_hint.setVisible(bool(value))
+        if value:
+            color = COLORS.get(
+                {"warn": "orange", "error": "red", "ready": "green"}.get(tone, "text_dim"),
+                COLORS["text_dim"],
+            )
+            self.lbl_hint.setStyleSheet(f"color:{color};font-size:12px;")
+
+    def set_metrics(self, items):
+        """items: dict 或 [(label, value)]；空值自动省略。"""
+        from ui_messages import normalize
+
+        pairs = items.items() if isinstance(items, dict) else (items or [])
+        parts = [f"{normalize(k)} {normalize(v)}" for k, v in pairs if str(v).strip()]
+        text = " · ".join(parts)
+        self.lbl_metrics.setText(text)
+        self.lbl_metrics.setVisible(bool(text))
+        self.lbl_metrics_divider.setVisible(bool(text) and self.lbl_hint.isVisible())
+
+    def set_tone(self, tone):
+        self._tone = tone or "idle"
+        color = COLORS.get(self.TONES.get(self._tone, "text_dim"), COLORS["text_dim"])
+        self.dot.set_tone(self._tone, color)
+
+    def text(self):  # 兼容旧代码 lbl_status.text()
+        return self.lbl_phase.text()
+
+    def phase_text(self):
+        return self.lbl_phase.text()
 
 
 class ParamPanel(QWidget):

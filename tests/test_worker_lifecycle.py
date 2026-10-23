@@ -333,7 +333,7 @@ def test_model_switch_is_rejected_while_inference_is_really_running(tmp_path):
     window.log_panel.warn = messages.append
 
     assert window._on_load_model_at(str(model_path)) is False
-    assert any("暂不能切换模型" in message for message in messages)
+    assert any("等它结束再切换模型" in message for message in messages)
     window.close()
 
 
