@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 SIZE = 1024
 SS = 4  # 超采样倍数：先画 4 倍再缩，边缘更干净
@@ -95,6 +95,8 @@ def build(variant: str = "crossbar", size: int = SIZE) -> Image.Image:
 
     if variant == "refined":
         return _build_refined(size)
+    if variant.startswith("solid"):
+        return _build_solid(variant, size)
     if variant == "crossbar":
         _stroke(draw, [foot_l, apex], w, INK)
         _stroke(draw, [apex, foot_r], w, INK)
@@ -305,9 +307,128 @@ def _build_refined(size: int) -> Image.Image:
 
     return tile.resize((size, size), Image.LANCZOS)
 
+# --------------------------------------------------------------------------
+# 实心字母标：参照成熟桌面图标的规律——品牌色块 + 实心符号 + 高对比，
+# 不靠 1px 细线（细线在 16 px 会糊掉）。
+# --------------------------------------------------------------------------
+
+def _solid_legs(s: int, thick: float):
+    """A 的两条实心腿（厚度按画布比例），返回左右腿多边形与横杠端点。"""
+    apex_y = s * 0.205
+    base_y = s * 0.795
+    foot_l = s * 0.245
+    foot_r = s * 0.755
+    half = s * thick / 2
+    apex = (s * 0.5, apex_y)
+
+    def leg_points(foot_x, sign):
+        # sign=-1 左腿，+1 右腿：沿腿方向偏移半个厚度
+        dx = foot_x - apex[0]
+        dy = base_y - apex[1]
+        length = (dx * dx + dy * dy) ** 0.5
+        nx, ny = dy / length, -dx / length  # 法向
+        pts = [
+            (apex[0] + nx * half * sign, apex[1] + ny * half * sign),
+            (foot_x + nx * half * sign, base_y + ny * half * sign),
+            (foot_x - nx * half * sign, base_y - ny * half * sign),
+            (apex[0] - nx * half * sign, apex[1] - ny * half * sign),
+        ]
+        return pts
+
+    bar_y = s * 0.628
+    def x_on_leg(foot_x):
+        k = (bar_y - apex[1]) / (base_y - apex[1])
+        return apex[0] + (foot_x - apex[0]) * k
+
+    return leg_points(foot_l, -1), leg_points(foot_r, 1), bar_y, x_on_leg(foot_l), x_on_leg(foot_r)
+
+
+def _build_solid(variant: str, size: int) -> Image.Image:
+    """参照成熟桌面图标：色块底 + 一个实心符号 + 高对比，不用细线。
+
+    符号用"粗折线 + 圆头圆角"画成实心 A（不是平行四边形拼接，避免顶点缺口），
+    横杠位置抠出背景色的槽，再把薄荷绿横杠放进去。
+    """
+    canvas = size * 4
+    s = canvas
+    light = size <= 32
+    if variant == "solid_green":
+        top_color, bottom_color = (26, 148, 114, 255), (9, 92, 71, 255)
+    elif variant == "solid_invert":
+        top_color, bottom_color = (86, 232, 178, 255), (36, 186, 137, 255)
+    else:
+        top_color = (30, 43, 62, 255) if light else BG_TOP
+        bottom_color = (18, 27, 41, 255) if light else BG_BOTTOM
+
+    tile = _vertical_gradient(s, top_color, bottom_color)
+    tile.putalpha(_rounded_mask(s, 0.225))
+    if variant == "solid_dark" and not light:
+        tile = Image.alpha_composite(tile, _radial_highlight(s, 30))
+    draw = ImageDraw.Draw(tile)
+
+    apex = (s * 0.500, s * 0.212)
+    foot_l = (s * 0.262, s * 0.788)
+    foot_r = (s * 0.738, s * 0.788)
+    thick = 0.180 if size >= 48 else 0.200
+    w = int(s * thick)
+    bar_y = s * 0.602
+    bar_h = int(s * (0.096 if size >= 48 else (0.120 if size > 24 else 0.155)))
+
+    if variant == "solid_invert":
+        ink_top = ink_bottom = (8, 22, 16, 255)
+    else:
+        ink_top, ink_bottom = (255, 255, 255, 255), (228, 236, 245, 255)
+
+    # 1) 实心 A
+    letter = Image.new("L", (s, s), 0)
+    ld = ImageDraw.Draw(letter)
+    for pts in ([foot_l, apex], [apex, foot_r]):
+        ld.line(pts, fill=255, width=w, joint="curve")
+        for x, y in pts:
+            ld.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=255)
+
+    # 2) 抠出横杠槽（左右各留一点腿，形成负空间）
+    def x_at(y):
+        k = (y - apex[1]) / (foot_l[1] - apex[1])
+        return apex[0] + (foot_l[0] - apex[0]) * k, apex[0] + (foot_r[0] - apex[0]) * k
+
+    left_leg_x, right_leg_x = x_at(bar_y)
+    gap = s * (0.016 if size >= 48 else (0.012 if size > 24 else 0.0))
+    cut = Image.new("L", (s, s), 0)
+    cd = ImageDraw.Draw(cut)
+    cd.rounded_rectangle(
+        (left_leg_x + gap, bar_y - bar_h / 2, right_leg_x - gap, bar_y + bar_h / 2),
+        radius=bar_h / 2,
+        fill=255,
+    )
+    letter = ImageChops.subtract(letter, cut)
+    tile = Image.alpha_composite(tile, _shaped_gradient(s, letter, ink_top, ink_bottom))
+    draw = ImageDraw.Draw(tile)
+
+    # 3) 薄荷绿横杠落进槽里
+    if variant == "solid_invert":
+        bar_fill = (10, 22, 18, 255)
+    else:
+        bar_fill = ACCENT if size > 24 else (74, 222, 160, 255)  # 16/20/24 提亮，小图不发灰
+    draw.rounded_rectangle(
+        (left_leg_x + gap, bar_y - bar_h / 2, right_leg_x - gap, bar_y + bar_h / 2),
+        radius=bar_h / 2,
+        fill=bar_fill,
+    )
+
+    # 4) 内描边：浅色任务栏上不丢边界
+    outline_alpha = 58 if (variant == "solid_dark" and light) else (30 if variant == "solid_invert" else 44)
+    draw.rounded_rectangle(
+        (1, 1, s - 2, s - 2),
+        radius=int(s * 0.225),
+        outline=(255, 255, 255, outline_alpha),
+        width=max(1, s // 400),
+    )
+    return tile.resize((size, size), Image.LANCZOS)
+
 def _preview(folder: Path) -> int:
     folder.mkdir(parents=True, exist_ok=True)
-    for variant in ("refined", "crossbar", "guide", "exit"):
+    for variant in ("solid_dark", "solid_green", "solid_invert", "refined"):
         big = build(variant, 256)
         sheet = Image.new("RGBA", (840, 320), (26, 30, 38, 255))
         sheet.alpha_composite(big, (16, 32))
@@ -325,7 +446,7 @@ def main(argv: list[str]) -> int:
         target = Path(__file__).resolve().parent.parent / "outputs" / "icon-preview"
         return _preview(target)
     target = Path(__file__).with_name("align.ico")
-    image = build("refined")
+    image = build("solid_dark")
     image.save(
         target,
         format="ICO",
