@@ -2042,7 +2042,6 @@ class MainWindow(QMainWindow):
             self, "打开影像", "", "GeoTIFF (*.tif *.tiff);;TIFF (*.tif);;All files (*)")
         if path:
             self._load_tif_path(path)
-            self._schedule_glass_backdrop(400)  # 影像载入后补一张背板
 
     def _on_load_model(self):
         if getattr(self, "_model_load_in_progress", False) or self._has_background_worker():
@@ -7370,42 +7369,6 @@ class MainWindow(QMainWindow):
             timer.timeout.connect(self._redraw_centerline_labels)
             self._centerline_label_timer = timer
         timer.start(220)
-        self._schedule_glass_backdrop()
-
-    # ------------------------------------------------------------------ 液态玻璃
-    def _schedule_glass_backdrop(self, delay_ms: int = 240):
-        """影像缩放/平移/载入后，防抖抓一张画面做卡片的模糊背板。
-
-        真模糊必须来自影像本身：Qt 没有 CSS 的 backdrop-filter，只能在交互
-        结束后抓图模糊一次（DECISION-048）。连续缩放时由单次定时器合并。
-        """
-        viewer = getattr(self.image_view, "viewer", None)
-        if viewer is None or getattr(viewer, "_pixmap", None) is None:
-            return
-        timer = getattr(self, "_glass_timer", None)
-        if timer is None:
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(self._apply_glass_backdrop)
-            self._glass_timer = timer
-        timer.start(delay_ms)
-
-    def _apply_glass_backdrop(self):
-        panel = getattr(self, "task_panel", None)
-        if panel is None or not hasattr(panel, "set_glass_backdrop"):
-            return
-        viewer = getattr(self.image_view, "viewer", None)
-        # 只抓画布本身：抓整个 ImageViewerGroup 会把工具栏按钮、比例尺、坐标
-        # 一起模糊进背板，看起来就是卡片后面有"奇怪的一条条东西"。
-        if viewer is None or getattr(viewer, "_pixmap", None) is None:
-            panel.clear_glass_backdrop()
-            return
-        try:
-            pixmap = viewer.grab()
-            panel.set_glass_backdrop(pixmap)
-        except Exception:
-            # 背板只是装饰，失败不能让影像视图崩掉
-            panel.clear_glass_backdrop()
 
     def _redraw_centerline_labels(self):
         catalog = getattr(self.state, "centerline_catalog", None) or getattr(

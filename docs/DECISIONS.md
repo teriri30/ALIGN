@@ -857,3 +857,12 @@
   3. 没有影像时不得保留旧背板（否则画布空了，背板还留着上一次的残影）。
 - 代码锚点：`glass.cover_source_rect/blur_pixmap/BackdropLayer.paintEvent`、`main_window._apply_glass_backdrop`。
 - 测试锚点：`tests/test_glass_backdrop.py`（cover-crop 横裁/纵裁/退化尺寸、模糊强度下限）。
+
+## DECISION-051：卡片改为纯色底，撤掉影像背板（2026-10-23）
+
+- 结论：DECISION-048 的「模糊快照背板」在真实使用中被否掉，改为纯色底。
+- 原因（用户判断，实测支持）：背板本质是把画面缩小后塞进侧栏，隔着半透明卡片透出来，无论模糊多重都会形成干扰纹理；而且每次缩放/平移都要抓图 + 模糊，属于纯装饰性开销。
+- 改法：删除 `src/pyside6_app/glass.py` 与 `tests/test_glass_backdrop.py`；`TaskPanel`/`StepCard` 去掉 `_glass_enabled` 分支与背板层；`main_window` 去掉 `_schedule_glass_backdrop/_apply_glass_backdrop`。卡片回到不透明填充，静息描边 alpha 90 → 130，当前步骤 205。
+- 保留：DECISION-048 作为历史记录不删除，说明"试过、为什么撤"，避免以后有人再实现一遍。
+- 不变量：卡片区分度靠「底色 + 描边 + 间距 + 左侧状态条」，不得再引入背景图/视频/模糊层。
+- 代码锚点：`panels.StepCard.paintEvent`（fill 恒 alpha 255、edge alpha 130/205）、`panels.TaskPanel`（无 `_backdrop`）。
