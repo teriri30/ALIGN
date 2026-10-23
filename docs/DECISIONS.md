@@ -895,7 +895,7 @@
 ## DECISION-054：内置测试影像随包发布（2026-10-23）
 
 - 背景：原「内置测试影像」指向 `data/tif/result.tif`（246 MB），该文件不进安装包，装好的机器上这一项形同虚设；调试时要靠用户自己找图。
-- 方案：从 result.tif 中央偏左取 6606 px 见方（有效像素 100%）、平均降采样到 2000×2000，保存为 `assets/builtin/field_sample.tif`（LZW，6.5 MB，0.0116 m/px，覆盖 23.1 m，EPSG:32650），由 `packaging/align.spec` 打进 `data/builtin`。
+- 方案：从 result.tif 中央偏左取 6606 px 见方（有效像素 100%）、平均降采样到 2000×2000，保存为 `data/builtin/field_sample.tif`（LZW，6.5 MB，0.0116 m/px，覆盖 23.1 m，EPSG:32650），由 `packaging/align.spec` 打进 `data/builtin`。
 - 查找顺序：`ALIGN_TEST_IMAGE` 环境变量 → `data/tif/result.tif`（开发环境完整影像）→ `data/builtin/field_sample.tif`（随包样例）。
 - 不变量：安装包内的「打开内置测试影像」必须永远可点开；样例必须保留 CRS 与仿射变换，否则后续导出无法验证。
 - 代码锚点：`builtin_test_assets._SAMPLE_TEST_IMAGE`、`packaging/align.spec`；测试 `tests/test_builtin_test_image.py`。

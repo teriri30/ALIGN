@@ -18,7 +18,7 @@ datas = [
     (str(ROOT / "data" / "models"), "data/models"),
     # 内置测试影像样例（6.5 MB）：让"打开内置测试影像"在装好的机器上也点得开。
     # 完整 result.tif 有 246 MB，不随包发布。
-    (str(ROOT / "assets" / "builtin"), "data/builtin"),
+    (str(ROOT / "data" / "builtin"), "data/builtin"),
     (str(ROOT / "docs" / "USER_MANUAL.md"), "docs"),
     (str(ROOT / "README.md"), "."),
     (str(ROOT / "packaging" / "README-Windows.txt"), "."),

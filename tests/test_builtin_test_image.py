@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SAMPLE = ROOT / "assets" / "builtin" / "field_sample.tif"
+SAMPLE = ROOT / "data" / "builtin" / "field_sample.tif"
 
 
 def test_sample_exists_and_is_small_enough_to_ship():
@@ -34,4 +34,4 @@ def test_builtin_test_image_resolves_to_existing_file():
 
 def test_packaging_ships_the_sample():
     spec = (ROOT / "packaging" / "align.spec").read_text(encoding="utf-8")
-    assert "assets" in spec and "builtin" in spec, "spec 必须把样例打进 data/builtin"
+    assert "builtin" in spec, "spec 必须把样例打进 data/builtin"
