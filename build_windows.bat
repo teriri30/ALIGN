@@ -89,6 +89,12 @@ if exist align.exe del /F /Q align.exe
 if exist _internal rmdir /S /Q _internal
 if exist README-Windows.txt del /F /Q README-Windows.txt
 if exist version.json del /F /Q version.json
+rem 改名老账：reUI 时期的产物不在上面的删除范围内，留着就会有人双击到旧版本
+rem （2026-10-23 实际发生过：设置/主题按钮还是小尺寸）。
+if exist reUI.exe del /F /Q reUI.exe
+if exist reUI-Windows-x64.zip del /F /Q reUI-Windows-x64.zip
+if exist disteUI rmdir /S /Q disteUI
+if exist buildeUI rmdir /S /Q buildeUI
 robocopy "dist\align" "." /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
 if errorlevel 8 exit /b 1
 rem Verify the published root EXE against the staging copy; the [verify]

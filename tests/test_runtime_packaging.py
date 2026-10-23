@@ -132,3 +132,15 @@ def test_windows_build_verifies_and_cleans_rebuildable_outputs():
     assert "[verify]" in script
     assert "ALIGN_CLEAN_DIST" in script
     assert "rmdir /S /Q dist" in script
+
+
+def test_build_script_purges_pre_rename_artifacts():
+    """改名前的 reUI.exe 不能被留在仓库根目录：双击它跑的是旧代码。
+
+    2026-10-23 实际发生过：用户双击 E:\zhlonly\project\ALIGN\reUI.exe，
+    看到的是旧版界面（设置/主题按钮还是小尺寸），误以为新版本没构建。
+    """
+    root = Path(__file__).resolve().parents[1]
+    assert not (root / "reUI.exe").exists(), "仓库根目录不该再有改名前的启动器"
+    script = (root / "build_windows.bat").read_text(encoding="utf-8", errors="ignore")
+    assert "reUI.exe" in script and "del /F /Q reUI.exe" in script
