@@ -14,7 +14,9 @@ def test_builtin_test_image_resolves_to_existing_geotiff():
     if not path:
         pytest.skip("data/tif/result.tif is an optional local demo asset")
     assert os.path.isfile(path)
-    assert os.path.basename(path) == "result.tif"
+    # 开发机上是完整 result.tif；安装包/CI 上是随包样例 field_sample.tif
+    # （DECISION-054）。两者都算合格的内置测试影像。
+    assert os.path.basename(path) in {"result.tif", "field_sample.tif"}
     assert builtin_assets_status() == "available"
 
 
@@ -55,7 +57,7 @@ def test_launcher_exposes_builtin_image_independently_of_stale_recent_files(monk
     entries = launcher.project_entries()
     if launcher.builtin_test_image():
         assert entries[0]["kind"] == "builtin_test"
-        assert entries[0]["path"].endswith("result.tif")
+        assert os.path.splitext(entries[0]["path"])[1].lower() in {".tif", ".tiff"}
         assert os.path.isfile(entries[0]["path"])
     else:
         assert all(entry["kind"] != "builtin_test" for entry in entries)
