@@ -8,6 +8,9 @@ from runtime_paths import builtin_model_dir, bundled_resource
 
 
 _DEFAULT_TEST_IMAGE = str(bundled_resource(os.path.join("data", "tif", "result.tif")))
+# 随包发布的小样例（2000×2000、0.014 m/px、约 6.5 MB）：完整 result.tif 有 246 MB，
+# 不能塞进安装包，但"内置测试影像"必须在任何机器上都点得开，否则调试没法复现。
+_SAMPLE_TEST_IMAGE = str(bundled_resource(os.path.join("data", "builtin", "field_sample.tif")))
 _DEFAULT_MODEL_DIR = str(builtin_model_dir())
 
 _PACKAGED_MODEL_SPECS = (
@@ -123,6 +126,7 @@ def discover_builtin_assets() -> Dict[str, object]:
         [
             env_image,
             _DEFAULT_TEST_IMAGE,
+            _SAMPLE_TEST_IMAGE,
         ]
     )
     model_dir = ""

@@ -374,93 +374,142 @@ class MainWindow(QMainWindow):
         self._log.info(f"主题切换: {theme}")
 
     def _build_menu(self):
-        """Register menus and shortcuts."""
-        mb = self.menuBar()
-        sm = mb.addMenu("系统设置")
-        self._add_action(sm, "系统设置...", "Ctrl+Shift+S", self._on_settings_dialog)
-        self._add_action(sm, "农机参数...", "Ctrl+P", self._on_params_dialog)
-        self._model_actions.append(
-            self._add_action(sm, "模型管理...", "Ctrl+Shift+M", self._on_model_manager)
-        )
-        sm.addSeparator()
-        self._add_action(sm, "项目日志...", None, self._on_project_log)
-        self._add_action(sm, "系统诊断...", None, self._on_diagnose)
+        """菜单栏：每个功能只出现一次，按"文件 / 视图 / 工具 / 设置 / 帮助"归位。
 
+        旧版把"系统设置/农机参数/模型管理/项目日志/诊断"同时挂在「系统设置」和
+        「工具」下，同一个动作注册两遍、快捷键也重名（Qt 会报 ambiguous shortcut），
+        而且文件菜单平铺了 8 个导出项。这里统一收进子菜单，删掉重复项。
+        """
+        mb = self.menuBar()
+        # Windows 上 QMenuBar 默认是原生菜单条：它吃不到 QSS，永远是系统浅色，
+        # 还会把窗口顶部挤成"双层"。关掉原生，菜单才会跟深色主题一致。
+        mb.setNativeMenuBar(False)
+
+        # ---------------------------------------------------------------- 文件
         fm = mb.addMenu("文件")
-        self._add_action(fm, "打开影像...", QKeySequence.Open, self._on_open_tif)
+        self._add_action(fm, "打开影像…", QKeySequence.Open, self._on_open_tif)
+        self._add_action(fm, "打开内置测试影像", "Ctrl+Shift+O", self._on_open_builtin_test)
         self._add_action(fm, "保存项目", QKeySequence.Save, self._on_save_project)
-        self._model_actions.append(
-            self._add_action(fm, "加载模型...", "Ctrl+M", self._on_load_model)
-        )
+        self._add_action(fm, "加载模型…", "Ctrl+M", self._on_load_model)
         fm.addSeparator()
+
+        export_menu = fm.addMenu("导出")
         self._add_action(
-            fm,
-            "导出编号 TXT 路径（001.txt、002.txt）...",
-            None,
+            export_menu, "TXT 作业路径（$PATH）…", None, self._on_export_path_format
+        )
+        self._add_action(
+            export_menu, "TXT 编号路径（001.txt、002.txt）…", None,
             self._on_export_machine_compatibility_path,
         )
+        export_menu.addSeparator()
+        self._add_action(export_menu, "GeoJSON…", "Ctrl+E", self._on_export_geojson)
+        self._add_action(export_menu, "CSV（经纬度）…", "Ctrl+Shift+E", self._on_export_csv_geo)
+        self._add_action(export_menu, "KML…", None, self._on_export_kml)
+        self._add_action(export_menu, "JSON…", None, self._on_export_json)
+        export_menu.addSeparator()
+        self._add_action(export_menu, "快照 PNG…", None, self._on_export_img)
+        self._add_action(export_menu, "试验资料包…", None, self._on_export_trial_package)
+        export_menu.addSeparator()
         self._add_action(
-            fm,
-            "导出科研单文件 TXT（$PATH）...",
-            None,
-            self._on_export_path_format,
+            export_menu, "识别诊断…", None, self._on_export_inference_diagnostics
         )
-        self._add_action(fm, "导出完整试验资料包...", None, self._on_export_trial_package)
-        self._add_action(
-            fm,
-            "导出识别诊断（识别001、识别002）...",
-            None,
-            self._on_export_inference_diagnostics,
-        )
-        self._add_action(
-            fm,
-            "导出掩膜优化诊断（掩膜优化001、掩膜优化002）...",
-            None,
-            self._on_export_mask_diagnostics,
-        )
-        record_menu = fm.addMenu("查看与记录导出")
-        self._add_action(record_menu, "导出 GeoJSON...", "Ctrl+E", self._on_export_geojson)
-        self._add_action(record_menu, "导出 CSV (经纬度)...", "Ctrl+Shift+E", self._on_export_csv_geo)
-        self._add_action(record_menu, "导出 KML...", None, self._on_export_kml)
-        self._add_action(record_menu, "导出 JSON...", None, self._on_export_json)
-        self._add_action(fm, "导出快照 PNG...", None, self._on_export_img)
-        fm.addSeparator()
-        self._add_action(fm, "退出", QKeySequence.Quit, self.close)
+        self._add_action(export_menu, "掩膜优化诊断…", None, self._on_export_mask_diagnostics)
 
+        fm.addSeparator()
+        self._add_action(fm, "退出", "Ctrl+Q", self.close)
+
+        # ---------------------------------------------------------------- 视图
         vm = mb.addMenu("视图")
         self._add_action(vm, "适应窗口", "Ctrl+0", lambda: self.image_view.viewer.fit_to_view())
         self._add_action(vm, "放大", "Ctrl++", lambda: self.image_view.viewer.zoom_in())
         self._add_action(vm, "缩小", "Ctrl+-", lambda: self.image_view.viewer.zoom_out())
         self._add_action(vm, "重置视图", None, lambda: self.image_view.viewer.reset_view())
-        self._add_action(vm, "旋转 90°", "R", lambda: self.image_view.viewer.set_rotation(
-            self.image_view.viewer._rotation_deg + 90))
+        # 不给单键快捷键：焦点在文本框时按 R 也会转图（旧版就是 "R"）
+        self._add_action(
+            vm, "旋转 90°", None,
+            lambda: self.image_view.viewer.set_rotation(self.image_view.viewer._rotation_deg + 90),
+        )
         vm.addSeparator()
-        style_menu = vm.addMenu("系统样式")
-        self._add_action(style_menu, "深色", None, lambda: self._set_theme_mode(ThemeMode.DARK))
-        self._add_action(style_menu, "浅色", None, lambda: self._set_theme_mode(ThemeMode.LIGHT))
-        self._add_action(style_menu, "跟随系统", None, lambda: self._set_theme_mode(ThemeMode.SYSTEM))
-        vm.addSeparator()
+        theme_menu = vm.addMenu("主题")
+        self._add_action(theme_menu, "深色", None, lambda: self._set_theme_mode(ThemeMode.DARK))
+        self._add_action(theme_menu, "浅色", None, lambda: self._set_theme_mode(ThemeMode.LIGHT))
+        self._add_action(theme_menu, "跟随系统", None, lambda: self._set_theme_mode(ThemeMode.SYSTEM))
 
+        # ---------------------------------------------------------------- 工具
         tm = mb.addMenu("工具")
+        self._add_action(tm, "运行识别", "Ctrl+R", self._on_run)
+        self._add_action(tm, "掩膜优化", None, self._on_mask_process)
+        tm.addSeparator()
         self._add_action(tm, "田块圈选", "Ctrl+B", self._on_toggle_field_drawing)
         self._add_action(tm, "绘制禁行区", "Ctrl+Shift+B", self._on_toggle_forbidden_drawing)
         self._add_action(tm, "清除全部禁行区", None, self._on_clear_forbidden_regions)
         self._add_action(tm, "布设起终点与卸粮点", None, self._on_toggle_entry_exit)
-        # DECISION-028: 参考线标注（中心线评价基准，研究工具；默认低调）
-        self._add_action(tm, "参考线标注（第 1 遍）", None, lambda: self._set_reference_mode(1))
-        self._add_action(tm, "参考线标注（第 2 遍·重复性）", None, lambda: self._set_reference_mode(2))
-        self._add_action(tm, "导出参考线 JSON...", None, self._on_export_reference_lines)
         tm.addSeparator()
-        self._add_action(tm, "运行", "Ctrl+R", self._on_run)
-        self._add_action(tm, "掩膜优化", None, self._on_mask_process)
-        self._add_action(tm, "农机参数...", "Ctrl+P", self._on_params_dialog)
+        ref_menu = tm.addMenu("参考线标注（研究工具）")
+        self._add_action(ref_menu, "第 1 遍", None, lambda: self._set_reference_mode(1))
+        self._add_action(ref_menu, "第 2 遍（重复性）", None, lambda: self._set_reference_mode(2))
+        self._add_action(ref_menu, "导出参考线 JSON…", None, self._on_export_reference_lines)
+
+        # ---------------------------------------------------------------- 设置
+        sm = mb.addMenu("设置")
+        self._add_action(sm, "系统设置…", "Ctrl+,", self._on_settings_dialog)
+        self._add_action(sm, "农机参数…", "Ctrl+P", self._on_params_dialog)
         self._model_actions.append(
-            self._add_action(tm, "模型管理...", "Ctrl+Shift+M", self._on_model_manager)
+            self._add_action(sm, "模型管理…", "Ctrl+Shift+M", self._on_model_manager)
         )
-        tm.addSeparator()
-        self._add_action(tm, "设置...", "Ctrl+Shift+S", self._on_settings_dialog)
-        self._add_action(tm, "项目日志...", None, self._on_project_log)
-        self._add_action(tm, "系统诊断...", None, self._on_diagnose)
+        sm.addSeparator()
+        self._add_action(sm, "项目日志…", None, self._on_project_log)
+        self._add_action(sm, "系统诊断…", None, self._on_diagnose)
+        self._add_action(sm, "打开数据目录", None, self._on_open_data_dir)
+
+        # ---------------------------------------------------------------- 帮助
+        hm = mb.addMenu("帮助")
+        self._add_action(hm, "使用说明", "F1", self._on_open_manual)
+        self._add_action(hm, "关于 ALIGN", None, self._on_about)
+
+    # ------------------------------------------------------------ 菜单配套动作
+    def _on_open_builtin_test(self):
+        """直接载入随包发布的内置测试影像，省掉找文件的步骤（调试常用）。"""
+        from builtin_test_assets import builtin_test_image
+
+        path = builtin_test_image()
+        if not path:
+            self.log_panel.warn("内置测试影像缺失 · 安装包不完整")
+            return
+        self._load_tif_path(path)
+
+    def _on_open_data_dir(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from runtime_paths import user_data_root
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(user_data_root())))
+
+    def _on_open_manual(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from runtime_paths import bundled_resource
+
+        for name in ("docs/USER_MANUAL.md", "README.md"):
+            path = bundled_resource(name)
+            if os.path.isfile(path):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                return
+        self.log_panel.warn("没找到使用说明 · 安装包不完整")
+
+    def _on_about(self):
+        from PySide6.QtWidgets import QMessageBox
+        from version import APP_VERSION
+        from app_entry import describe_device
+
+        QMessageBox.about(
+            self,
+            "关于 ALIGN",
+            f"<b>ALIGN</b> {APP_VERSION}<br>"
+            "Autonomous Line-guided Intelligent Guidance &amp; Navigation<br><br>"
+            f"运行设备：{describe_device()}<br>"
+            "安徽农业大学 · 农业工程",
+        )
 
     def _add_action(self, menu, text, shortcut, slot):
         act = QAction(text, self)

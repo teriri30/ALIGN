@@ -866,3 +866,36 @@
 - 保留：DECISION-048 作为历史记录不删除，说明"试过、为什么撤"，避免以后有人再实现一遍。
 - 不变量：卡片区分度靠「底色 + 描边 + 间距 + 左侧状态条」，不得再引入背景图/视频/模糊层。
 - 代码锚点：`panels.StepCard.paintEvent`（fill 恒 alpha 255、edge alpha 130/205）、`panels.TaskPanel`（无 `_backdrop`）。
+
+## DECISION-052：菜单栏五栏化 + 每个动作只注册一次（2026-10-23）
+
+- 旧结构：`系统设置 / 文件 / 视图 / 工具` 四栏，其中 5 个动作（系统设置、农机参数、模型管理、项目日志、诊断）在「系统设置」和「工具」各挂一遍，快捷键重复注册（Qt 会报 ambiguous shortcut）；「文件」平铺 8 个导出项。
+- 新结构：`文件 / 视图 / 工具 / 设置 / 帮助`。
+  - 文件：打开影像 / 打开内置测试影像 / 保存项目 / 加载模型 / 导出▸ / 退出（Ctrl+Q）
+  - 视图：适应窗口 / 放大 / 缩小 / 重置 / 旋转 90° / 主题▸
+  - 工具：运行识别 / 掩膜优化 / 圈选与禁行区 / 起终点 / 参考线标注▸
+  - 设置：系统设置 / 农机参数 / 模型管理 / 项目日志 / 系统诊断 / 打开数据目录
+  - 帮助：使用说明（F1）/ 关于 ALIGN
+- 不变量：
+  1. 任何动作在菜单树里只能出现一次；快捷键不得重复。
+  2. 不给单字母快捷键（旧版旋转是 `R`，焦点在输入框时按 R 会转图）。
+  3. 导出类动作一律进「文件 → 导出」，不再平铺在文件菜单。
+- 代码锚点：`main_window._build_menu`；测试 `tests/test_menu_structure.py`。
+
+## DECISION-053：QSS 注释只能用 C 风格，且不能嵌套（2026-10-23）
+
+- 现象：菜单栏始终是系统浅色 `#efefef`，`QMenuBar { background: ... }` 明明写在样式表里。
+- 根因：`build_stylesheet()` 返回的 QSS 里写了 `# 字体族不写在 QSS 里……` 两行注释。QSS 不认 `#` 注释，它被当成 ID 选择器，把紧随其后的 `QWidget`、`QWidget#central`、`QMenuBar` 等规则一并吞掉；排查时把注释改成块注释，又因为在注释正文里写了块注释的结束符导致注释提前闭合，症状依旧。
+- 规则：
+  1. QSS 里禁止出现以 `#` 开头的注释行。
+  2. 块注释正文不得包含 `/*` 或 `*/` 字面量。
+  3. 用「渲染后取像素」的方式验证样式是否真的生效，不要只看样式表字符串。
+- 代码锚点：`styles.build_stylesheet`；测试 `tests/test_theme.py::test_stylesheet_has_no_hash_comments`、`test_stylesheet_block_comments_are_not_nested`、`test_menu_bar_actually_gets_the_dark_background`。
+
+## DECISION-054：内置测试影像随包发布（2026-10-23）
+
+- 背景：原「内置测试影像」指向 `data/tif/result.tif`（246 MB），该文件不进安装包，装好的机器上这一项形同虚设；调试时要靠用户自己找图。
+- 方案：从 result.tif 中央偏左取 6606 px 见方（有效像素 100%）、平均降采样到 2000×2000，保存为 `assets/builtin/field_sample.tif`（LZW，6.5 MB，0.0116 m/px，覆盖 23.1 m，EPSG:32650），由 `packaging/align.spec` 打进 `data/builtin`。
+- 查找顺序：`ALIGN_TEST_IMAGE` 环境变量 → `data/tif/result.tif`（开发环境完整影像）→ `data/builtin/field_sample.tif`（随包样例）。
+- 不变量：安装包内的「打开内置测试影像」必须永远可点开；样例必须保留 CRS 与仿射变换，否则后续导出无法验证。
+- 代码锚点：`builtin_test_assets._SAMPLE_TEST_IMAGE`、`packaging/align.spec`；测试 `tests/test_builtin_test_image.py`。

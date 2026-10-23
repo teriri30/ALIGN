@@ -46,6 +46,8 @@ data/models/*.onnx
 data/tif/
 *.tif
 *.tiff
+# 例外：内置测试影像样例要随仓库/安装包发布（DECISION-054）
+!assets/builtin/*.tif
 
 # Local assistant/runtime workspace
 .hermes/
