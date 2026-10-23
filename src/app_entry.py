@@ -180,6 +180,14 @@ def run_app(argv: Sequence[str] | None = None) -> int:
     app.setApplicationVersion(str(build_info.get("version") or APP_VERSION))
     app.setOrganizationName("ZHL")
     app.setStyle(QStyleFactory.create("Fusion"))
+    # 对话框（项目选择器等）是独立顶层窗口，只给 MainWindow 设样式表它们拿不到，
+    # 会出现"浅色 + 系统默认字体"的割裂感，所以在应用级也铺一份。
+    try:
+        from pyside6_app.styles import build_stylesheet
+
+        app.setStyleSheet(build_stylesheet())
+    except Exception:
+        pass
     font = build_app_font()
     # 不设 setStyleStrategy(PreferAntialias)：它会让 Windows 退回灰度抗锯齿，
     # 中文小字号笔画发虚。改用 hinting 偏好让笔画对齐像素，渲染交给系统

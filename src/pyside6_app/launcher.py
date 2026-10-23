@@ -43,21 +43,36 @@ class LauncherDialog(QDialog):
     file_selected = Signal(str)
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("\u667a\u80fd\u519c\u673a\u89c4\u5212\u7cfb\u7edf")
+        self.setWindowTitle("ALIGN 农机作业规划系统")
         self.setFixedSize(600,480); self.setAcceptDrops(True)
+        # 对话框是独立顶层窗口：只靠 MainWindow 的样式表继承并不可靠（实测
+        # 会退回系统浅色底 + 默认字体），这里显式给一份与主界面同源的样式。
+        self.setStyleSheet(
+            f"QDialog{{background:{COLORS['bg']};}}"
+            f"QPushButton{{background:{COLORS.get('btn_default', COLORS['bg_card'])};"
+            f"color:{COLORS['text']};border:1px solid {COLORS['border']};"
+            f"border-radius:6px;padding:6px 16px;min-height:28px;}}"
+            f"QPushButton:hover{{background:{COLORS.get('btn_default_hover', COLORS['bg_hover'])};}}"
+            f"QPushButton#primary{{background:{COLORS['accent']};color:{COLORS['on_accent']};border:none;}}"
+            f"QPushButton#primary:hover{{background:{COLORS['accent_hover']};}}"
+        )
         self.selected_path = ""
         self._recent = load_recent(); self._build_ui()
     def _build_ui(self):
         lo = QVBoxLayout(self); lo.setSpacing(12); lo.setContentsMargins(24,24,24,20)
-        t = QLabel("\u667a\u80fd\u519c\u673a\u89c4\u5212\u7cfb\u7edf")
-        t.setStyleSheet(f"font-size:22px;font-weight:600;color:{COLORS['text_bright']};")
-        t.setAlignment(Qt.AlignCenter); lo.addWidget(t)
+        t = QLabel("ALIGN 农机作业规划系统")
+        t.setStyleSheet(f"font-size:19px;font-weight:600;color:{COLORS['text_bright']};")
+        t.setAlignment(Qt.AlignLeft); lo.addWidget(t)
         st = QLabel("\u9009\u62e9\u6216\u5bfc\u5165\u6b63\u5c04\u5f71\u50cf (TIF/TIFF) \u5f00\u59cb\u5904\u7406")
         st.setStyleSheet(f"font-size:12px;color:{COLORS['text_dim']};")
-        st.setAlignment(Qt.AlignCenter); lo.addWidget(st)
+        st.setAlignment(Qt.AlignLeft); lo.addWidget(st)
         dp = QLabel("\u5c06 TIF \u6587\u4ef6\u62d6\u653e\u5230\u8fd9\u91cc\n\u6216\u70b9\u51fb\u4e0b\u65b9\u6309\u94ae\u5bfc\u5165")
-        dp.setAlignment(Qt.AlignCenter); dp.setMinimumHeight(80)
-        dp.setStyleSheet(f"QLabel{{background:{COLORS['bg_darkest']};border:2px dashed {COLORS['border_light']};border-radius:10px;color:{COLORS['text_dim']};font-size:13px;padding:20px;}}QLabel:hover{{border-color:{COLORS['accent']};background:{COLORS['bg_accent']};}}")
+        dp.setAlignment(Qt.AlignCenter); dp.setMinimumHeight(96)
+        dp.setStyleSheet(
+            f"QLabel{{background:{COLORS['bg_card']};border:1px dashed {COLORS['border_light']};"
+            f"border-radius:12px;color:{COLORS['text_dim']};font-size:13px;padding:22px;}}"
+            f"QLabel:hover{{border-color:{COLORS['accent']};color:{COLORS['text']};}}"
+        )
         lo.addWidget(dp)
         bl = QHBoxLayout()
         bi = QPushButton("  \u5bfc\u5165 TIF \u6587\u4ef6  ")
@@ -67,7 +82,15 @@ class LauncherDialog(QDialog):
         lr = QLabel("内置测试影像与最近项目")
         lr.setStyleSheet(f"font-size:12px;color:{COLORS['text_dim']};font-weight:500;")
         lo.addWidget(lr)
-        self.list_widget = QListWidget(); self._refresh_list()
+        self.list_widget = QListWidget()
+        self.list_widget.setStyleSheet(
+            f"QListWidget{{background:{COLORS['bg_card']};border:1px solid {COLORS['border']};"
+            f"border-radius:10px;padding:4px;}}"
+            f"QListWidget::item{{padding:8px 10px;border-radius:6px;color:{COLORS['text']};}}"
+            f"QListWidget::item:selected{{background:{COLORS['bg_accent']};color:{COLORS['text_accent']};}}"
+            f"QListWidget::item:hover{{background:{COLORS['bg_hover']};}}"
+        )
+        self._refresh_list()
         self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
         lo.addWidget(self.list_widget)
         bt = QHBoxLayout()

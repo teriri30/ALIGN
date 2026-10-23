@@ -813,3 +813,20 @@
   3. 顶栏不得写 `font-family`（与 DECISION-046 一致）。
 - 代码锚点：`src/pyside6_app/top_bar.py::TopToolbar._build_ui`（右侧按钮样式、`setFixedHeight(46)`）、`ui_icons.theme_icon/settings_icon`（颜色参数）。
 - 测试锚点：`tests/test_top_bar_affordance.py`（3 条：可点面积与手型光标、可见底色与亮色图标、顶栏高度）。
+
+## DECISION-048：卡片液态玻璃（模糊快照背板）（2026-10-23）
+
+- 背景：用户觉得步骤卡片边缘不清、区分不出来，希望做成"液态玻璃/高斯模糊"。
+- 约束：Qt Style Sheet **没有** `backdrop-filter`；`QGraphicsBlurEffect` 只能模糊控件自身内容，模糊不到它背后的东西。左侧面板又是 `QSplitter` 里的独立一列，背后没有可模糊的图层。
+- 做法：
+  1. 影像视图结束一次交互（载入/缩放/平移）后 `grab()` 一张画面；
+  2. `glass.blur_pixmap`：缩到 1/8 → 再缩一半 → 放大回原尺寸（两次平滑缩放 ≈ 大半径高斯），再叠一层暗色保证文字对比度；
+  3. `BackdropLayer` 作为面板的**子控件**铺满、`lower()` 到卡片之下；
+  4. 卡片 paintEvent 在 `_glass_enabled` 时用约 67% 不透明填充 + 顶部 1px 内高光 + 白色细边。
+- 不变量：
+  1. 不要 override 容器的 `paintEvent` 去画背板：在 `QScrollArea` + 样式表背景下会与 Qt 自身绘制冲突，实测直接段错误。背板必须是独立子控件。
+  2. 背板跟随父控件改尺寸用事件过滤器（`BackdropLayer.eventFilter`），不要 override 面板的 `resizeEvent`。
+  3. 背板只是装饰：抓图/模糊失败必须静默退回不透明卡片，不能影响影像视图。
+  4. 卡片文字对比度优先：填充不透明度不得低于 0.6。
+- 代码锚点：`src/pyside6_app/glass.py`（`blur_pixmap`/`BackdropLayer`）、`panels.StepCard.paintEvent`（`_glass_enabled` 分支）、`panels.TaskPanel.set_glass_backdrop/clear_glass_backdrop`、`main_window._schedule_glass_backdrop/_apply_glass_backdrop`。
+- 测试锚点：`tests/test_glass_backdrop.py`（5 条：模糊产出、小图拒绝、层开关、面板接线与卡片标记、无效背板忽略）。

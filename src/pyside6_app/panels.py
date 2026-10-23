@@ -652,14 +652,23 @@ class StepCard(QWidget):
                 int(fill.green() + (lift.green() - fill.green()) * hover),
                 int(fill.blue() + (lift.blue() - fill.blue()) * hover),
             )
-        # Always opaque: a translucent card let the scroll canvas bleed through
-        # and read as a skewed shadow behind the rounded rect.
-        fill.setAlpha(255)
-        painter.fillPath(clip, QBrush(fill))
+        if getattr(self, "_glass_enabled", False):
+            # 液态玻璃：卡面半透明，底下磨砂背板透出来
+            fill.setAlpha(170)
+            painter.fillPath(clip, QBrush(fill))
+        else:
+            # Always opaque: a translucent card let the scroll canvas bleed through
+            # and read as a skewed shadow behind the rounded rect.
+            fill.setAlpha(255)
+            painter.fillPath(clip, QBrush(fill))
 
         painter.setClipping(False)
         edge = QColor(border)
-        edge.setAlpha(int(90 + 120 * hover) if not active else 190)
+        if getattr(self, "_glass_enabled", False):
+            edge = QColor(255, 255, 255)
+            edge.setAlpha(int(46 + 40 * hover) if not active else 76)
+        else:
+            edge.setAlpha(int(90 + 120 * hover) if not active else 190)
         painter.setPen(QPen(edge, 1.0))
         painter.setBrush(Qt.NoBrush)
         painter.drawRoundedRect(rect, radius, radius)
@@ -673,6 +682,15 @@ class StepCard(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(rail_color)
         painter.drawRoundedRect(rail_rect, 1.5, 1.5)
+
+        if getattr(self, "_glass_enabled", False):
+            # 玻璃的内高光：紧贴顶部的一条亮线，模拟光线掠射
+            painter.setBrush(QColor(255, 255, 255, 40 if not active else 58))
+            painter.drawRoundedRect(
+                QRectF(rect.left() + radius, rect.top() + 0.6,
+                       max(0.0, rect.width() - 2 * radius), 1.0),
+                0.5, 0.5,
+            )
         painter.end()
 
     def enterEvent(self, event):
@@ -936,6 +954,7 @@ class TaskPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._backdrop = None
         self.setMinimumWidth(TASK_PANEL_COMPACT_MIN_WIDTH)
         self._task_widgets = {}
         self._step_cards = []
@@ -945,6 +964,33 @@ class TaskPanel(QWidget):
         self._forbidden_count = 0
         self._forbidden_confirmed = False
         self._build_ui()
+
+    def set_glass_backdrop(self, pixmap, opacity: float = 0.94):
+        from pyside6_app.glass import BackdropLayer, blur_pixmap
+
+        blurred = blur_pixmap(pixmap)
+        if blurred is None:
+            return False
+        if self._backdrop is None:
+            self._backdrop = BackdropLayer(self)
+        self._backdrop.set_pixmap(blurred, opacity)
+        self._backdrop.setGeometry(self.rect())
+        self._backdrop.lower()
+        self._backdrop.show()
+        for card in getattr(self, "_step_cards", []):
+            card._glass_enabled = True
+            card.update()
+        return True
+
+    def clear_glass_backdrop(self):
+        """撤掉模糊背板，卡片回到不透明样式。"""
+        if self._backdrop is not None:
+            self._backdrop.hide()
+            self._backdrop.set_pixmap(None)
+        for card in getattr(self, "_step_cards", []):
+            card._glass_enabled = False
+            card.update()
+        self.update()
 
     def _build_ui(self):
         self.setStyleSheet(f"background:{COLORS['bg']};")
