@@ -55,3 +55,54 @@ def test_initial_theme_surfaces_match_current_manager_theme():
         assert colors["bg_darkest"] in window.log_panel.styleSheet()
     finally:
         window.close()
+
+
+# ------------------------------------------------------- QSS 语法：注释别吞规则
+
+
+def test_stylesheet_has_no_hash_comments():
+    """QSS 只认 C 风格块注释；用 # 起的"注释"会被当成 ID 选择器，把下一条规则吞掉。"""
+    from pyside6_app.styles import build_stylesheet
+
+    css = build_stylesheet()
+    offenders = [line for line in css.splitlines() if line.strip().startswith("#")]
+    assert offenders == [], f"QSS 里出现 # 注释: {offenders[:3]}"
+
+
+def test_stylesheet_block_comments_are_not_nested():
+    """注释正文里不能再写块注释结束符，否则注释提前闭合，后面全成非法 CSS。"""
+    from pyside6_app.styles import build_stylesheet
+
+    css = build_stylesheet()
+    depth = 0
+    i = 0
+    while i < len(css):
+        if css.startswith("/*", i):
+            depth += 1
+            assert depth == 1, "出现嵌套块注释"
+            i += 2
+        elif css.startswith("*/", i):
+            depth -= 1
+            assert depth == 0
+            i += 2
+        else:
+            i += 1
+    assert depth == 0
+
+
+def test_menu_bar_actually_gets_the_dark_background():
+    """回归：菜单栏曾因 QSS 被吞而一直是系统浅色 #efefef。"""
+    from PySide6.QtWidgets import QApplication, QMainWindow
+
+    from pyside6_app.styles import build_stylesheet
+
+    app = QApplication.instance() or QApplication([])
+    win = QMainWindow()
+    win.setStyleSheet(build_stylesheet())
+    win.menuBar().addMenu("文件")
+    win.resize(320, 120)
+    win.show()
+    QApplication.processEvents()
+    text = win.grab().toImage().pixelColor(160, 3)
+    win.close()
+    assert text.lightness() < 80, f"菜单栏底色仍是浅色 {text.name()}"

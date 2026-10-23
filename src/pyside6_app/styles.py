@@ -125,8 +125,10 @@ def build_stylesheet(colors=None):
     _ = lambda n: c.get(n, "#FFFFFF")
     return f"""
 QMainWindow {{ background: {_('bg_dark')}; }}
-# 字体族不写在 QSS 里：QSS 的 font-family 会覆盖 setFont，导致部分控件
-# 回退到 SimHei。统一由 QApplication.setFont(build_app_font()) 提供。
+/* 字体族不写在 QSS 里：QSS 的 font-family 会覆盖 setFont，导致部分控件回退到 SimHei。
+   统一由 QApplication.setFont(build_app_font()) 提供。
+   注意：QSS 只认 C 风格块注释，用井号写注释会把紧随其后的规则整条吞掉；
+   注释里也不能再出现块注释的结束符，否则注释会提前闭合。 */
 QWidget {{ color: {_('text')}; font-size: 14px; }}
 QWidget#central {{ background: {_('bg_dark')}; }}
 QMenuBar {{ background: {_('bg_darkest')}; border-bottom: 1px solid {_('border')}; padding: 2px 4px; }}
@@ -136,6 +138,10 @@ QMenu {{ background: {_('bg_dark')}; border: 1px solid {_('border')}; border-rad
 QMenu::item {{ padding: 6px 28px 6px 16px; border-radius: 4px; margin: 1px 2px; }}
 QMenu::item:selected {{ background: {_('accent_bg')}; color: {_('text_accent')}; }}
 QMenu::separator {{ height: 1px; background: {_('border')}; margin: 4px 12px; }}
+QCheckBox {{ color: {_('text_dim')}; spacing: 6px; }}
+QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid {_('border')}; border-radius: 3px; background: {_('bg_darkest')}; }}
+QCheckBox::indicator:hover {{ border-color: {_('accent')}; }}
+QCheckBox::indicator:checked {{ background: {_('accent')}; border-color: {_('accent')}; }}
 QPushButton {{ background: {_('btn_default')}; color: {_('text')}; border: 1px solid {_('border')}; border-radius: 6px; padding: 6px 18px; min-height: 28px; }}
 QPushButton:hover {{ background: {_('btn_default_hover')}; }}
 QPushButton:disabled {{ background: {_('btn_disabled')}; color: {_('btn_disabled_text')}; }}
