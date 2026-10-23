@@ -231,11 +231,15 @@ class ModelLoadWorker(QObject):
                 factory = ModelEngine
             engine = factory()
             if not bool(engine.load(self.model_path)):
+                detail = str(getattr(engine, "last_error", "") or "").strip()
                 try:
                     engine.unload()
                 except Exception:
                     pass
-                self._finish("failed", error="模型加载失败")
+                self._finish(
+                    "failed",
+                    error=f"模型加载失败：{detail}" if detail else "模型加载失败",
+                )
                 return
             if self._is_cancelled():
                 try:
@@ -591,6 +595,45 @@ class TifLoadWorker(QObject):
             self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
+def _describe_config_drift(recorded: dict, current: dict, label: str) -> str:
+    """把"哪些配置项变了"说清楚，别只丢一句 fingerprint does not match。"""
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return ""
+    diffs = []
+    for key in sorted(set(recorded) | set(current)):
+        old, new = recorded.get(key), current.get(key)
+        if old != new:
+            diffs.append(f"{key} {old}→{new}")
+    return f"（{label}：{'、'.join(diffs[:4])}）" if diffs else ""
+
+
+def _rebind_model_path(old_path: str, recorded_sha256: str) -> str:
+    """在随包模型目录里按文件名+哈希找回模型，返回新路径（找不到返回空串）。"""
+    base = os.path.basename(str(old_path or ""))
+    if not base or not recorded_sha256:
+        return ""
+    try:
+        from runtime_paths import builtin_model_dir
+
+        model_dir = str(builtin_model_dir())
+    except Exception:
+        return ""
+    if not os.path.isdir(model_dir):
+        return ""
+    from provenance import file_sha256
+
+    for root, _dirs, files in os.walk(model_dir):
+        if base not in files:
+            continue
+        candidate = os.path.join(root, base)
+        try:
+            if file_sha256(candidate) == recorded_sha256:
+                return candidate
+        except Exception:
+            continue
+    return ""
+
+
 class CacheRestoreWorker(QObject):
     """DECISION-002: restore only artifacts with a complete valid evidence chain.
 
@@ -649,8 +692,24 @@ class CacheRestoreWorker(QObject):
             from provenance import ProvenanceError, file_sha256, verify_stage_record
             cfg = Config()
             self.progress.emit(35, "正在读取 AI 掩膜缓存...")
-            raw_mask, raw_ox, raw_oy = load_mask(self.path, "") if saved.get('inference_done') else (None, 0, 0)
             reasons = []
+            # 产物优先于标记：上一次失效可能只把 inference_done/mask_processed 打成了
+            # False，而 mask.npz、mask_processed.npz 与 provenance 都还在。这时若直接
+            # 相信标记，就会出现"画布上还画着作业线，任务清单却退回作物识别"的错位
+            # （用户 2026-10-23 反馈）。有产物就先把标记扶回来，交给下面的 provenance
+            # 逐级校验决定是否真的可用。
+            probe_mask, probe_ox, probe_oy = (
+                load_mask(self.path, "") if saved.get("inference_provenance") else (None, 0, 0)
+            )
+            if probe_mask is not None and not saved.get("inference_done"):
+                saved["inference_done"] = True
+                reasons.append("检测到 AI 掩膜产物，已按产物恢复识别状态")
+            if saved.get("mask_provenance") and not saved.get("mask_processed"):
+                saved["mask_processed"] = True
+                reasons.append("检测到掩膜优化产物，已按产物恢复掩膜状态")
+            raw_mask, raw_ox, raw_oy = (
+                (probe_mask, probe_ox, probe_oy) if saved.get("inference_done") else (None, 0, 0)
+            )
             inference_valid = False
             inference_record = saved.get("inference_provenance") or {}
             try:
@@ -659,9 +718,28 @@ class CacheRestoreWorker(QObject):
                 current_inputs = dict(inference_record.get("inputs") or {})
                 current_inputs["source_sha256"] = self.expected_source_sha256 or saved.get("source_sha256", "")
                 model_path = str(saved.get("current_model_path", "") or "")
-                if not model_path or not os.path.isfile(model_path):
+                recorded_model_sha = str(
+                    (inference_record.get("inputs") or {}).get("model_sha256", "") or ""
+                )
+                if model_path and os.path.isfile(model_path):
+                    current_inputs["model_sha256"] = file_sha256(model_path)
+                elif recorded_model_sha:
+                    # 模型文件找不到（换目录、reUI→ALIGN 改名、只装了仓库没带权重）时，
+                    # 不能顺着把整条缓存链推翻：掩膜自身的 artifact 哈希仍然会校验，
+                    # 这里沿用记录里的模型哈希，只在日志里说明"无法重新识别"。
+                    current_inputs["model_sha256"] = recorded_model_sha
+                    rebound = _rebind_model_path(model_path, recorded_model_sha)
+                    if rebound:
+                        saved["current_model_path"] = rebound
+                        reasons.append(
+                            f"模型路径已修正为 {os.path.basename(rebound)}"
+                        )
+                    else:
+                        reasons.append(
+                            "原模型文件缺失，无法重新执行识别；已有掩膜与作业线沿用缓存"
+                        )
+                else:
                     raise ProvenanceError("inference model file is missing")
-                current_inputs["model_sha256"] = file_sha256(model_path)
                 current_inputs["inference_config"] = build_inference_config(cfg)
                 current_inputs["preprocessing_config"] = cfg.section("raster_preprocessing")
                 if str(inference_record.get("algorithm_version", "")) != INFERENCE_PIPELINE_VERSION:
@@ -669,7 +747,14 @@ class CacheRestoreWorker(QObject):
                 verify_stage_record(inference_record, "inference", current_inputs, raw_mask)
                 inference_valid = True
             except Exception as exc:
-                reasons.append(f"AI 掩膜缓存失效: {exc}")
+                detail = ""
+                if "fingerprint" in str(exc):
+                    detail = _describe_config_drift(
+                        (inference_record.get("inputs") or {}).get("inference_config") or {},
+                        current_inputs.get("inference_config") or {},
+                        "识别参数",
+                    )
+                reasons.append(f"AI 掩膜缓存失效: {exc}{detail}")
                 saved["inference_done"] = False
                 saved["mask_processed"] = False
                 saved["auto_path_planned"] = False

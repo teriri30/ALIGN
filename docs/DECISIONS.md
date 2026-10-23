@@ -899,3 +899,17 @@
 - 查找顺序：`ALIGN_TEST_IMAGE` 环境变量 → `data/tif/result.tif`（开发环境完整影像）→ `data/builtin/field_sample.tif`（随包样例）。
 - 不变量：安装包内的「打开内置测试影像」必须永远可点开；样例必须保留 CRS 与仿射变换，否则后续导出无法验证。
 - 代码锚点：`builtin_test_assets._SAMPLE_TEST_IMAGE`、`packaging/align.spec`；测试 `tests/test_builtin_test_image.py`。
+
+## DECISION-055：缓存恢复的一致性兜底与模型路径重绑（2026-10-23）
+
+- 现象：用户重新打开工程后，画布上还画着 15 条作业线，左侧任务清单却停在「作物识别」。
+- 根因链：
+  1. 缓存里 `current_model_path` 指向改名前的 `E:\...eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
+  2. 原逻辑把这个错误当成"推理产物失效"，`inference_done/mask_processed` 一起打成 False；
+  3. `derive_task_statuses` 在 `process_done=False` 时把中心线视为不存在，但画布仍按 `centerline_catalog` 渲染 → 左右错位。
+- 规则：
+  1. **产物优先于标记**：`mask.npz` / `mask_processed.npz` + provenance 齐全时，先把 `inference_done` / `mask_processed` 扶正，再交给 provenance 逐级校验。
+  2. **模型缺失不等于掩膜失效**：按文件名 + 记录中的 `model_sha256` 在随包模型目录里重绑；找不到只提示"无法重新识别"，掩膜仍按 artifact 哈希校验复用。
+  3. **兜底一致性**：`_on_cache_restore_done` 结束时若 `mask_processed` 为假，必须清空 `centerline_catalog`、已选集合、路径预览与画布图层。任何"状态说没有、画布却在画"的组合都视为缺陷。
+  4. **失效要说明原因**：指纹不一致时列出差异键值（`batch_size`、`precision` 等），不能只抛 fingerprint mismatch。
+- 代码锚点：`workers.CacheRestoreWorker.run`（产物恢复、`_rebind_model_path`、`_describe_config_drift`）、`main_window._on_cache_restore_done`（一致性兜底）、`inference.ModelEngine.last_error`。

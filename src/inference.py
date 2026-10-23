@@ -386,11 +386,13 @@ class ModelEngine:
         self._loaded = False
         self._runtime_config = resolve_inference_runtime()
         self.log = AppLogger()
+        self.last_error = ""
 
     def load(self, model_path: str) -> bool:
         if model_path and not os.path.isabs(model_path):
             model_path = str(resolve_model_path(model_path))
         if not os.path.exists(model_path):
+            self.last_error = f"模型文件不存在: {model_path}"
             self.log.error(f"模型文件不存在: {model_path}")
             return False
         try:
@@ -408,6 +410,9 @@ class ModelEngine:
             self.log.info("模型加载成功")
             return True
         except Exception as e:
+            # 把原因留给调用方（worker 要把它显示到交互栏），否则界面只有
+            # 一句"模型加载失败"，用户无法判断是缺文件、缺依赖还是显存不够。
+            self.last_error = f"{type(e).__name__}: {e}"
             self.log.error(f"模型加载失败: {e}")
             self._loaded = False
             return False

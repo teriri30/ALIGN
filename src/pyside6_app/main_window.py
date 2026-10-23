@@ -1993,11 +1993,17 @@ class MainWindow(QMainWindow):
                     self.state.work_band_selection_report = {}
                     self.task_panel.clear_centerline_selection()
                     self._sync_task_statuses()
+                    # 左右必须一致：状态已经回退到"未生成作业线"，画布上就不能再留着
+                    # 上一条作业线 / 路径（用户反馈"明明画出中线，清单还停在识别"）。
+                    self._stale_path_preview = None
+                    self._clear_display_overlay_layers()
                     self._show_mask_overlay(raw_mask)
                     if saved.get('mask_processed'):
                         self.log_panel.info("掩膜优化缓存版本已过期，请重新执行掩膜优化")
             elif saved.get('inference_done'):
                 self.state.inference_done = False
+                self._stale_path_preview = None
+                self._clear_display_overlay_layers()
                 self._sync_task_statuses()
                 self.log_panel.error("未找到缓存的 AI 掩膜，请重新运行 作物识别")
 
@@ -2052,6 +2058,28 @@ class MainWindow(QMainWindow):
                 and not self._centerline_state_view()[0].get("items")
             ):
                 self.log_panel.info("缓存已恢复；请在任务清单中点击’生成作业线’。")
+            # 一致性兜底：掩膜没恢复成功时，缓存里残留的作业线/路径必须一起丢掉。
+            # 否则会出现"画布上还画着作业线，任务清单却退回作物识别"的左右错位
+            # （用户 2026-10-23 反馈；derive_task_statuses 在 process_done=False 时
+            # 本来就把中心线当不存在，只是画布还在画）。
+            if not getattr(self.state, "mask_processed", False):
+                cleared_centerlines = bool(
+                    ((getattr(self.state, "centerline_catalog", {}) or {}).get("items"))
+                    or getattr(self.state, "selected_centerline_ids", None)
+                )
+                self.state.centerline_catalog = {}
+                self.state.work_band_catalog = {}
+                self.state.selected_centerline_ids = []
+                self.state.selected_work_band_ids = []
+                self.state.centerline_selection_report = {}
+                self.state.work_band_selection_report = {}
+                if cleared_centerlines:
+                    self.log_panel.warn(
+                        "掩膜缓存未通过校验，已一并清除缓存中的作业线与路径，请重新执行作物识别"
+                    )
+                self.task_panel.clear_centerline_selection()
+                self._stale_path_preview = None
+                self._clear_display_overlay_layers()
             # DECISION-002/013: the task panel is derived from the completely
             # restored domain state.  The individual green checks above are
             # only progressive feedback while large cache arrays are applied;
