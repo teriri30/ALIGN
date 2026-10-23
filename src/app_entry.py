@@ -194,6 +194,19 @@ def run_app(argv: Sequence[str] | None = None) -> int:
     # 默认的 DirectWrite / ClearType。
     font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
     app.setFont(font)
+    # 窗口/任务栏图标：不设 setWindowIcon 时 Windows 会退回 Qt 默认图标，
+    # 任务栏上就看不到我们的 A 标（只改 exe 资源还不够）。
+    try:
+        from PySide6.QtGui import QIcon
+        from runtime_paths import bundled_resource
+
+        icon_path = bundled_resource("align.ico")
+        if not icon_path.is_file():
+            icon_path = bundled_resource("packaging/align.ico")
+        if icon_path.is_file():
+            app.setWindowIcon(QIcon(str(icon_path)))
+    except Exception:
+        pass
     try:
         window = MainWindow()
     except ConfigValidationError as exc:

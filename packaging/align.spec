@@ -21,6 +21,8 @@ datas = [
     (str(ROOT / "data" / "builtin"), "data/builtin"),
     (str(ROOT / "docs" / "USER_MANUAL.md"), "docs"),
     (str(ROOT / "README.md"), "."),
+    # 窗口/任务栏图标要在运行时读取（app_entry 里 setWindowIcon）
+    (str(ROOT / "packaging" / "align.ico"), "."),
     (str(ROOT / "packaging" / "README-Windows.txt"), "."),
 ]
 binaries = []

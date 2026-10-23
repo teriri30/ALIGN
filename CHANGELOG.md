@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.11 - 2026-10-23
+
+### 修复
+- **任务栏/标题栏图标**：程序此前从未调用 `setWindowIcon`，Windows 只能退回 Qt 默认图标，即使 exe 资源里已经是新图标。现在启动时从随包的 `align.ico` 设置窗口图标，`align.spec` 同步把 ico 打进安装包。
+- 图标缓存说明：`align.exe` 里的 32×32 资源已与 `packaging/align.ico` 逐像素一致（sha256 相同），Explorer 里若仍显示旧图，是 Windows 图标缓存，需刷新一次。
+
 ## 0.3.10 - 2026-10-23
 
 ### 变更

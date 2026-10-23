@@ -106,3 +106,13 @@ def test_menu_bar_actually_gets_the_dark_background():
     text = win.grab().toImage().pixelColor(160, 3)
     win.close()
     assert text.lightness() < 80, f"菜单栏底色仍是浅色 {text.name()}"
+
+
+def test_packaged_icon_is_shipped_for_window_icon():
+    """任务栏图标靠运行时读 align.ico；spec 不打包就会退回 Qt 默认图标。"""
+    from pathlib import Path
+
+    spec = Path(__file__).resolve().parents[1] / "packaging" / "align.spec"
+    text = spec.read_text(encoding="utf-8")
+    assert "align.ico" in text
+    assert (Path(__file__).resolve().parents[1] / "packaging" / "align.ico").is_file()
