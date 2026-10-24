@@ -42,7 +42,7 @@ from headland_turn_validation import (
 )
 
 
-PATH_PLANNING_VERSION = "footprint-path-v33"
+PATH_PLANNING_VERSION = "footprint-path-v34"
 
 
 def _adjacent_snake_order_work_lines(
@@ -9441,6 +9441,19 @@ def _apply_operator_centerline_selection(
         main_angle,
         selected_ids=requested if explicit else None,
     )
+    # 人工标定线优先：把 operator_paths.json 里的线替换进作业区与目录，
+    # 后续转弯、栅格化、导出都跟着走（编号保持不变，来源写 line_source）。
+    operator_report: Dict[str, Any] = {}
+    operator_overrides = cfg.get("operator_centerlines")
+    if isinstance(operator_overrides, dict) and operator_overrides:
+        from work_band_selection import apply_operator_centerlines
+
+        selected_regions, catalog, operator_report = apply_operator_centerlines(
+            selected_regions,
+            catalog,
+            operator_overrides,
+            main_angle,
+        )
     selected_lines = [
         list(line)
         for region in selected_regions
@@ -9462,6 +9475,8 @@ def _apply_operator_centerline_selection(
     updated_layout = dict(layout or {})
     updated_layout["centerline_catalog"] = catalog
     updated_layout["centerline_selection"] = report
+    if operator_report:
+        updated_layout["operator_centerline_application"] = operator_report
     # Keep old cache/layout readers able to inspect the same selection without
     # reintroducing the old canvas-selection UI.
     updated_layout["work_band_catalog"] = catalog

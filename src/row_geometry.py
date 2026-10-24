@@ -2784,6 +2784,12 @@ def _recenter_band_centerlines(bands, mpp: float, config: Optional[Dict] = None)
         width_m = float(band.get("width_m") or 0.0)
         if contour.shape[0] < 3 or points.shape[0] < 2 or width_m <= 0:
             continue
+        # 诊断用：保留重压前的线，离线标定评价要拿它当候选之一
+        # （"占用率中位数"与"轮廓弦中点"是两代算法，谁能对上人线要有据可查）。
+        if "centerline_pre_recenter" not in band:
+            band["centerline_pre_recenter"] = [
+                (float(x), float(y)) for x, y in points
+            ]
         axis = points[-1] - points[0]
         length = float(np.linalg.norm(axis))
         if length < 20:

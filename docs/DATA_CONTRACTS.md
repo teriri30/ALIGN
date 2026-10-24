@@ -229,10 +229,35 @@
 
 ### 中心线输出简化（DECISION-017/024）
 
-`centerline-adaptive-polyline-v3` 把 `centerline_simplify_max_points`（默认 8）作为软预算、`centerline_simplify_hard_max_points`（默认 64）作为硬上限：达到软预算后只对仍不满足横向偏差或局部方向条件的区间继续加点，直到满足或到硬上限；硬上限仍不满足时才保留简化前完整的平滑点列。软预算点列作为端点修复锚点，额外加点不移动端点；一条带仍只生成一个候选目录项。`layout.centerline_simplification.point_budget_policy=soft_budget_then_hard_cap_then_smoothed_trace` 记录该规则，逐带记录输入/输出点数及 `budget_exceeded`、`hard_cap_reached`、`dense_fallback`。该变化只控制简化的附加误差，不证明相对人工真值的误差改善。路径算法版本为 `footprint-path-v33`，旧路径缓存重新规划；掩膜处理版本仍为 20。
+`centerline-adaptive-polyline-v3` 把 `centerline_simplify_max_points`（默认 8）作为软预算、`centerline_simplify_hard_max_points`（默认 64）作为硬上限：达到软预算后只对仍不满足横向偏差或局部方向条件的区间继续加点，直到满足或到硬上限；硬上限仍不满足时才保留简化前完整的平滑点列。软预算点列作为端点修复锚点，额外加点不移动端点；一条带仍只生成一个候选目录项。`layout.centerline_simplification.point_budget_policy=soft_budget_then_hard_cap_then_smoothed_trace` 记录该规则，逐带记录输入/输出点数及 `budget_exceeded`、`hard_cap_reached`、`dense_fallback`。该变化只控制简化的附加误差，不证明相对人工真值的误差改善。路径算法版本为 `footprint-path-v34`，旧路径缓存重新规划；掩膜处理版本仍为 21。
 
 
 - 参考线 sidecar 固定在 `<cache>/<project>/reference_lines.json`，schema `centerline-reference-lines-v1`：`{schema, tif_path, station_spacing_hint_m, updated_at, lines:[{id, band_id, band_label, pass, operator, created_at, points:[[x,y]...], fit:{p1,p2,angle_rad}}]}`。`fit` 一律由 `points` 重算，`points` 为全幅显示坐标。
 - 参考线是人工研究证据，不是作业输入：不得进入 `project_state.json`、撤销历史、路径 provenance、导出闸门或缓存恢复校验；桌面端只以独立"参考线（人工）"图层显示，可在图层面板显隐。
 - 离线评价包（`centerline-evaluation` v1，用 `--cache-dir/--tif` 复现）固定包含：`per_line.csv`（逐线 Eθ、平均/最大横向偏差、重叠率、匹配距离与未匹配说明）、`noise_floor.csv`（两遍人工参考线间偏差 = 判读噪声底）、`summary.json`（含 `mask_regularization_version` 与 mpp 溯源）、`reference_lines.json` 副本、`overlay.png`、`boxplot.png`、`README.md`，并打包同名 zip。
 - 横向偏差口径：沿参考线 1 m 等间隔采样到提取中心线（折线）的最短距离；方向角取两线最小二乘方向差（180° 取小）。报告平均与最大，不得只报其一，也不得替换为文献未背书的指标。
+
+## 人工标定作业线与操作日志（DECISION-060）
+
+### 人工标定线 sidecar
+
+- 固定路径 `<cache>/operator_paths.json`，schema `operator-centerlines-v1`：
+  `{schema, tif_path, artifact:{mask_version, tif_mtime, tif_size}, updated_at, lines:[record]}`。
+- `record` 字段：`{id:"op-NNNN", centerline_id, legacy_id, source_band_ids, band_label, band_type, width_m, mode:"drag"|"trace", pass, points:[[x,y]...], base_points:[[x,y]...], edits:[{kind:"uniform"|"local", arc_m, offset_m, sigma_m}], profile_m:[[arc_m, offset_m]...], artifact, created_at, updated_at}`。
+- 坐标口径：`points`/`base_points` 为**掩膜局部像素**（与 `centerline_catalog` 一致）。界面画线用全幅显示坐标 = 局部 + `mask_offset_x/y`，转换只在界面层做。
+- `profile_m` 是"基准线 → 人线"的有符号横向偏移（米），正方向为基准线前进方向的左侧；它只作证据，不参与重新生成人线（人线以 `points` 为准）。
+- 身份绑定：规划替换按 `centerline_id` 精确匹配（兼容 `legacy_id`）；`source_band_ids` 只在没有精确身份时兜底，且同一来源带最多替换一条作业线，防止等距区"标一条改一片"。
+- 版本闸门：`artifact.mask_version` 必须等于当前 `MASK_REGULARIZATION_VERSION`、`tif_path` 必须一致，否则整批标定不参与规划并在报告中写 `mask_version_mismatch` / `tif_mismatch`。
+- 人线优先的落点：`layout.centerline_catalog.items[].line_source == "operator"`，`layout.operator_centerline_application` 记录 `available/applied/missing_points/unmatched`。清除标定后必须恢复算法中心线。
+- 该文件不进 `project_state.json`、撤销历史、路径 provenance 或导出闸门；删除它等价于放弃人工纠偏，不改动算法结果。
+
+### 离线标定案例与报告
+
+- 案例包 schema `align-calibration-case-v1`：`{schema, case_id, tif_path, mpp, mask_path, artifact, bands:[{band_id, band_type, width_m, profile_width_m, centerline, centerline_pre_recenter?, contour?}], operator_lines:[{band_id, points, centerline_id?, edits?}]}`；桌面端 `工具 → 作业线标定 → 导出标定案例` 生成到 `<cache>/calibration/`。
+- 报告 schema `align-calibration-report-v1`：候选（`current/pre_recenter/mask_run_mid/distance_ridge/contour_chord_mid`）逐带 Eθ/Elat，分桶选择规则（含留一命中率）与纠偏类型统计。样本 <3 条带的桶不得写成结论。
+
+### 操作日志
+
+- 路径 `%LOCALAPPDATA%/ALIGN/logs/actions/actions-<会话>.jsonl`（`ALIGN_ACTION_LOG_DIR` 可覆盖，`ALIGN_DISABLE_ACTION_LOG=1` 停用），一行一条：`{schema, ts, session, seq, level, action, target, context, payload}`。
+- 记录范围：`app.start`、`project.open_tif`、`menu.action`、`inference.request`、`mask.request`、`plan.request`、`calibration.*`。写盘失败不得影响任何主流程；按 5 MB 轮转保留 3 份。
+- 该日志是取证与标定审计数据，不参与科学指纹，也不作为作业输入。

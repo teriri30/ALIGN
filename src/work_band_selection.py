@@ -6,7 +6,7 @@ first, then the operator checks which lines may enter turn planning.
 """
 
 import math
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import cv2
@@ -427,3 +427,105 @@ def rasterize_centerline_coverage(
             (np.asarray(support_mask) > 0).astype(np.uint8) * 255,
         )
     return coverage
+
+
+def apply_operator_centerlines(
+    work_regions: Iterable[Dict],
+    catalog: Dict,
+    overrides: Optional[Dict[str, Any]],
+    main_angle: float,
+) -> Tuple[List[Dict], Dict, Dict]:
+    """把人工标定线替换进作业区与候选目录（只换几何，不改编号）。
+
+    ``overrides`` 由 ``operator_paths.planner_overrides`` 生成，键可以是
+    ``centerline-003`` / ``work-band-003`` / ``band:29``。替换后：
+
+    - 作业区 ``work_lines`` 用人线，后续规划、转弯、栅格化都用它；
+    - 候选目录同一条目的 ``work_line`` / ``centerline`` 同步替换，并把
+      ``line_source`` 标成 ``operator``，界面与导出因此看到的是同一条线；
+    - 编号（id / sequence / label）保持不动——换线不能让人认不出这是哪一条。
+
+    没有人工线的带原样保留，不会被"顺手"改掉。
+    """
+    items = list((catalog or {}).get("items") or [])
+    regions = [dict(region) for region in (work_regions or [])]
+    report: Dict[str, Any] = {
+        "algorithm_version": "operator-centerline-apply-v1",
+        "available": len(overrides or {}),
+        "applied": [],
+        "missing_points": [],
+        "unmatched": [],
+    }
+    if not overrides:
+        return regions, dict(catalog or {}), report
+
+    replacement: Dict[str, List[Tuple[float, float]]] = {}
+    used_band_keys: set = set()
+    consumed_keys: set = set()
+    consumed_records: set = set()
+    for region in regions:
+        ids = [str(value) for value in (region.get("selected_centerline_ids") or [])]
+        source_ids = list(region.get("work_line_source_ids") or [])
+        lines = list(region.get("work_lines") or [])
+        updated_lines = []
+        for index, line in enumerate(lines):
+            keys: List[str] = []
+            if index < len(ids):
+                keys.append(ids[index])
+            if index < len(source_ids):
+                value = source_ids[index]
+                if isinstance(value, (list, tuple, set)):
+                    keys.extend("band:" + str(entry) for entry in value)
+                else:
+                    keys.append("band:" + str(value))
+            # 精确身份（centerline id）优先；来源带是兜底，且一条带只允许
+            # 覆盖一条线——等距区把一条带拆成多股时，否则会"标一条改一片"。
+            exact_keys = [key for key in keys if not key.startswith("band:")]
+            band_keys = [key for key in keys if key.startswith("band:")]
+            override = next((overrides[key] for key in exact_keys if key in overrides), None)
+            if override is None:
+                for key in band_keys:
+                    candidate = overrides.get(key)
+                    if candidate is not None and key not in used_band_keys:
+                        override = candidate
+                        used_band_keys.add(key)
+                        break
+            points = _clean_line((override or {}).get("points") or [])
+            if not points:
+                updated_lines.append(line)
+                if override is not None:
+                    report["missing_points"].append(keys[0] if keys else "")
+                continue
+            updated_lines.append(points)
+            identifier = keys[0] if keys else ""
+            if identifier:
+                replacement[identifier] = points
+            consumed_keys.update(keys)
+            record_id = str((override or {}).get("record_id") or "")
+            if record_id:
+                consumed_records.add(record_id)
+            report["applied"].append({
+                "id": identifier,
+                "record_id": (override or {}).get("record_id", ""),
+                "point_count": len(points),
+            })
+        region["work_lines"] = updated_lines
+
+    for item in items:
+        points = replacement.get(str(item.get("id")))
+        if not points:
+            continue
+        item["work_line"] = points
+        item["centerline"] = points
+        item["line_source"] = "operator"
+        item["normal_position"] = _line_normal_position(points, main_angle)
+
+    applied_ids = {entry["id"] for entry in report["applied"]}
+    for key, entry in (overrides or {}).items():
+        if key in consumed_keys:
+            continue
+        if str((entry or {}).get("record_id") or "") in consumed_records:
+            continue
+        if key not in applied_ids and key not in replacement:
+            report["unmatched"].append(key)
+    return regions, dict(catalog or {}), report

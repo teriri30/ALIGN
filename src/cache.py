@@ -164,6 +164,36 @@ def save_reference_lines(tif_path: str, payload: Dict[str, Any]) -> str:
     return path
 
 
+def operator_paths_path(tif_path: str) -> str:
+    """人工标定作业线（operator centerline）sidecar 路径。
+
+    与参考线同级：人工标定线是"人认可的作业线"，不属于作业状态、不进撤销
+    历史与 project_state.json；规划时由 operator_paths.planner_overrides 读取
+    并替换算法中心线。
+    """
+    return os.path.join(_cache_dir(tif_path), "operator_paths.json")
+
+
+def load_operator_paths(tif_path: str) -> Dict[str, Any]:
+    path = operator_paths_path(tif_path)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_operator_paths(tif_path: str, payload: Dict[str, Any]) -> str:
+    path = operator_paths_path(tif_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with _project_lock(tif_path):
+        _atomic_write_json(path, payload)
+    return path
+
+
 def _history_dir(tif_path: str) -> str:
     return os.path.join(_cache_dir(tif_path), "history")
 

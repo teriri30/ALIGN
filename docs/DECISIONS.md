@@ -976,3 +976,20 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
   1. 重压中线**只允许改善，不允许把任何一条带改差**；无法确认改善就跳过并记录原因。
   2. 粘连带（宽度异常）必须交给分割阶段处理，不得在中心线阶段"猜中心"。
 - 代码锚点：`row_geometry._recenter_band_centerlines`（width_outlier 分支）；测试 `tests/test_centerline_recenter.py::test_width_outlier_band_is_skipped_instead_of_pulled_sideways`。
+
+## DECISION-060：以人工标定线为真值，算法线与标定线二选一（2026-10-24）
+
+- 现象：DECISION-057（简化容差 0.20 → 0.03 m）、058（按轮廓重压中线）、059（粘连带跳过）连续三轮都在改"线放哪里"，用户仍判断部分线压在行上。根因不是参数没调对，而是**没有人工真值**：谁也不能证明新算法比旧算法更接近人认可的中心。
+- 决策：建立"人工标定 → 数据留存 → 人线优先 → 离线对比"闭环，不再靠看图调参。
+  1. **操作日志**：`interaction_log` 按会话追加记录每一次菜单/识别/掩膜/规划/标定动作（`%LOCALAPPDATA%/ALIGN/logs/actions/actions-<会话>.jsonl`），与是否保存项目无关；
+  2. **人工标定**：`工具 → 作业线标定`，拖动整条平移、Shift+拖动只纠局部弯曲，松手立即写 sidecar；
+  3. **人线优先**：规划时用 `operator_paths.planner_overrides()` 把标定线替换进候选目录与作业区，转弯、栅格化、导出跟着同一条线走，目录项 `line_source=operator`；
+  4. **离线评价**：`centerline_calibration.py` 用人工线比较 `current / pre_recenter / mask_run_mid / distance_ridge / contour_chord_mid` 五种候选，并把纠偏量归类。
+- 身份绑定规则：
+  1. 有 `centerline_id` 就只认它（可兼容 `legacy_id`）；`source_band_ids` 只在没有精确身份时兜底，且一条带只允许覆盖一条线——等距区一条带拆成多股时，否则会"标一条改一片"；
+  2. 标定记录绑定 `mask_version` 与影像 mtime/size；掩膜算法版本变化后旧标定不得套用（fail-safe，报告 `mask_version_mismatch`）；
+  3. 清除标定必须恢复算法中心线，不能留下"人线已删、画布还是人线"的状态。
+- 纠偏分类（`operator_paths.classify_offset_profile`）：`centered` / `uniform`（平移可解）/ `bow`（多项式可解）/ `step`（带被切断）/ `off_band`（整体偏到另一条带）。**`step` 与 `off_band` 属分割问题，换任何"取中心"算法都无效**，必须回到掩膜/带宽分割处理。
+- 验收（真实案例 `1271b2abf0d7`，5.27 田 5 三模式 12 m，mpp 0.017）：把一条带的人线设成算法线 +0.12 m，重规划后 9 条作业段中**只有 1 条移动，位移 0.120 m**，其余 8 条逐点一致；目录项 `line_source=operator`、`unmatched` 为空。
+- 口径：人线优先是"采用操作员认可的几何"，**不等于算法精度提高**；没有人工线时不得产生任何精度结论。分桶选择规则的样本 <3 条带时只作下一轮采样方向。
+- 版本：`footprint-path-v34`（旧路径缓存重规划）；掩膜处理版本仍为 21。代码锚点：`interaction_log`、`operator_paths`、`work_band_selection.apply_operator_centerlines`、`path_planner._apply_operator_centerline_selection`、`pyside6_app.main_window._set_calibration_mode`、`centerline_calibration`。

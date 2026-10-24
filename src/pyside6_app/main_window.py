@@ -56,6 +56,8 @@ from project_log import ProjectJournal
 from task_lifecycle import admit_task_result, make_task_token
 from pyside6_app.project_session import cached_path_restore_plan, reset_project_state
 from runtime_paths import builtin_model_dir
+import interaction_log
+import operator_paths
 
 
 # ``ImageViewerGroup`` accepts BGR tuples and reverses them before creating a
@@ -67,6 +69,12 @@ REFERENCE_LINE_COLOR_BGR = (0, 160, 255)
 REFERENCE_STATION_COLOR_BGR = (70, 70, 235)
 REFERENCE_DOUBLE_CLICK_SECONDS = 0.45
 REFERENCE_DOUBLE_CLICK_DISTANCE_PX = 12.0
+# DECISION-060: 作业线标定（人工纠偏）。人拖出来的线就是本次规划采用的线，
+# 颜色与算法中心线（绿）区分开，避免"改了看不出改没改"。
+OPERATOR_LINE_COLOR_BGR = (235, 200, 60)
+OPERATOR_EDIT_COLOR_BGR = (60, 255, 255)
+CALIBRATION_PICK_TOLERANCE_M = 1.0
+CALIBRATION_PREVIEW_POINT_LIMIT = 400
 
 
 class MainWindow(QMainWindow):
@@ -107,6 +115,15 @@ class MainWindow(QMainWindow):
         self._route_display_mode = "continuous"
         self._log = AppLogger()
         self._journal = ProjectJournal()
+        # 交互日志：记的是"用户做了什么"，与项目日志（错误/配置变更）分工不同。
+        # 版本与影像上下文随每条记录落盘，日志可以脱离本次会话单独阅读。
+        try:
+            from version import APP_VERSION
+
+            interaction_log.configure(app="ALIGN", version=APP_VERSION)
+            interaction_log.record("app.start", APP_VERSION)
+        except Exception:
+            pass
         self.event_bridge = EventBridge(self.state, self.geo)
         # 动画引擎
         self._anim_engine: Optional[AnimationEngine] = None
@@ -128,6 +145,18 @@ class MainWindow(QMainWindow):
         self._reference_last_click = None
         self._reference_payload = {}
         self._reference_payload_tif = ""
+        # DECISION-060: 作业线标定（人工纠偏）。_calibration_edits 按中心线 id
+        # 存拖动记录（米制弧长 + 横向偏移），人线 = 算法线 + 这些偏移；每条
+        # 拖动立即写 sidecar，不依赖"保存项目"。
+        self._calibration_drawing = False
+        self._calibration_item_id = ""
+        self._calibration_press = None
+        self._calibration_preview = None
+        self._calibration_payload = {}
+        self._calibration_payload_tif = ""
+        self._calibration_edits: dict = {}
+        self._calibration_history: List[Tuple[str, list]] = []
+        self._calibration_originals: dict = {}
         self._measure_tool = ""
         self._measure_points: List[Tuple[int, int]] = []
         self._measure_overlay_items = []
@@ -282,6 +311,14 @@ class MainWindow(QMainWindow):
         )
         if selected_ids and selection_report.get("selection_origin") == "operator":
             runtime["selected_centerline_ids"] = selected_ids
+        # 人工标定线优先：只要本项目存在与当前掩膜版本匹配的标定线，规划就用它
+        # 替换算法中心线（导出、转弯、栅格化随同一条线走）。
+        try:
+            operator_overrides = self._operator_overrides()
+        except Exception:
+            operator_overrides = {}
+        if operator_overrides:
+            runtime["operator_centerlines"] = operator_overrides
         try:
             from path_planner import normalize_turn_strategy
 
@@ -449,6 +486,12 @@ class MainWindow(QMainWindow):
         self._add_action(ref_menu, "第 1 遍", None, lambda: self._set_reference_mode(1))
         self._add_action(ref_menu, "第 2 遍（重复性）", None, lambda: self._set_reference_mode(2))
         self._add_action(ref_menu, "导出参考线 JSON…", None, self._on_export_reference_lines)
+        tm.addSeparator()
+        cal_menu = tm.addMenu("作业线标定（人工纠偏）")
+        self._add_action(cal_menu, "开始 / 结束标定", None, self._on_toggle_calibration)
+        self._add_action(cal_menu, "清除当前线标定", None, self._on_clear_calibration)
+        self._add_action(cal_menu, "导入参考线为标定线", None, self._on_import_reference_as_operator)
+        self._add_action(cal_menu, "导出标定案例…", None, self._on_export_calibration_case)
 
         # ---------------------------------------------------------------- 设置
         sm = mb.addMenu("设置")
@@ -459,6 +502,7 @@ class MainWindow(QMainWindow):
         )
         sm.addSeparator()
         self._add_action(sm, "项目日志…", None, self._on_project_log)
+        self._add_action(sm, "操作记录…", None, self._on_export_action_log)
         self._add_action(sm, "系统诊断…", None, self._on_diagnose)
         self._add_action(sm, "打开数据目录", None, self._on_open_data_dir)
 
@@ -514,7 +558,22 @@ class MainWindow(QMainWindow):
     def _add_action(self, menu, text, shortcut, slot):
         act = QAction(text, self)
         if shortcut: act.setShortcut(QKeySequence(shortcut))
-        act.triggered.connect(slot); menu.addAction(act); return act
+        act.triggered.connect(slot)
+        # 交互日志：菜单/快捷键触发的动作全部留痕（含没保存项目的那部分）。
+        act.triggered.connect(
+            lambda _checked=False, _text=text, _menu=menu.title(): self._log_action(
+                "menu.action", "%s / %s" % (_menu, _text), menu=_menu, label=_text
+            )
+        )
+        menu.addAction(act); return act
+
+    # ------------------------------------------------------------ 交互日志
+    def _log_action(self, action, target="", **payload):
+        """统一入口：任何用户动作都走这里，写盘失败也不影响界面。"""
+        try:
+            interaction_log.record(action, target, tif=str(getattr(self.state, "tif_path", "") or ""), **payload)
+        except Exception:
+            pass
 
     def _build_central(self):
         c = QWidget(); c.setObjectName("central"); self.setCentralWidget(c)
@@ -1552,6 +1611,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(100, lambda: self._load_tif_path(path))
     def _load_tif_path(self, path):
         """Load a GeoTIFF image and initialise display/georeference state."""
+        self._log_action("project.open_tif", os.path.basename(os.fspath(path)))
         if self._has_background_worker():
             self.log_panel.warn("任务正在运行：当前已有耗时任务正在执行，请等待完成后再打开影像。")
             return
@@ -3586,6 +3646,9 @@ class MainWindow(QMainWindow):
         if self._reference_drawing:
             self._handle_reference_click(x, y, button)
             return
+        if self._calibration_drawing:
+            self._handle_calibration_press(x, y, button)
+            return
         if button == 1 and self._begin_service_point_drag(x, y):
             return
         if getattr(self.state, 'entry_exit_mode', False):
@@ -3595,6 +3658,9 @@ class MainWindow(QMainWindow):
         self.event_bridge.on_mouse_pressed(x, y, button)
 
     def _on_viewer_mouse_released(self, x, y, button):
+        if self._calibration_drawing and self._calibration_press is not None:
+            self._handle_calibration_release(x, y)
+            return
         if self._route_edit_active and self._route_drag_work_index >= 0:
             self._route_drag_work_index = -1
             self._route_drag_work_origin = None
@@ -3658,6 +3724,9 @@ class MainWindow(QMainWindow):
         if getattr(self.state, "_drag_entry_exit", None) is not None and (buttons & 1):
             self._move_service_point_drag(x, y)
             return
+        if self._calibration_drawing and self._calibration_press is not None:
+            if self._handle_calibration_move(x, y, buttons):
+                return
         if self._field_drawing and self._field_pts:
             self._redraw_field_overlay(mouse_pos=(x, y))
         elif self._forbidden_drawing and self._forbidden_pts:
@@ -4279,6 +4348,753 @@ class MainWindow(QMainWindow):
             self.log_panel.error("导出失败：%s" % exc)
             return
         self.log_panel.success("参考线已导出：%s" % path)
+
+    # ── 作业线标定（人工纠偏，DECISION-060） ──────────────────────────
+    #
+    # 算法线的"中心"是否等于人认可的中心，只能由人来回答。这一节把人的回答
+    # 变成可以复用的数据：拖一下就改一条线，改完立即落盘，规划时人线优先。
+    # 没有单独的新图层：改完的线直接替换候选目录里那条线的几何，界面看到的
+    # 就是本次规划会走的线。
+
+    def _operator_artifact(self):
+        """标定线绑定的产物指纹；掩膜版本变了就不再套用旧标定。"""
+        from row_geometry import MASK_REGULARIZATION_VERSION
+
+        artifact = {"mask_version": int(MASK_REGULARIZATION_VERSION)}
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        try:
+            if tif and os.path.isfile(tif):
+                stat = os.stat(tif)
+                artifact["tif_mtime"] = round(float(stat.st_mtime), 3)
+                artifact["tif_size"] = int(stat.st_size)
+        except OSError:
+            pass
+        return artifact
+
+    def _operator_paths_payload(self):
+        """读取 operator_paths.json（按影像路径记忆，避免频繁读盘）。"""
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            return {}
+        if getattr(self, "_calibration_payload_tif", "") != tif:
+            import cache
+
+            loaded = cache.load_operator_paths(tif)
+            if loaded:
+                try:
+                    loaded = operator_paths.normalize_payload(loaded)
+                except ValueError:
+                    loaded = {}
+            self._calibration_payload = loaded if isinstance(loaded, dict) else {}
+            self._calibration_payload_tif = tif
+        return self._calibration_payload or {}
+
+    def _operator_paths_save(self, payload):
+        import cache
+
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            raise OSError("当前没有打开的项目")
+        payload["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        cache.save_operator_paths(tif, payload)
+        self._calibration_payload = payload
+        self._calibration_payload_tif = tif
+
+    def _operator_overrides(self):
+        """规划用的替换表；版本/影像对不上的旧标定一律不用。"""
+        payload = self._operator_paths_payload()
+        if not payload.get("lines"):
+            return {}
+        from row_geometry import MASK_REGULARIZATION_VERSION
+
+        overrides, _report = operator_paths.planner_overrides(
+            payload,
+            mask_version=int(MASK_REGULARIZATION_VERSION),
+            tif_path=str(getattr(self.state, "tif_path", "") or ""),
+        )
+        return overrides
+
+    def _calibration_items(self):
+        catalog = getattr(self.state, "centerline_catalog", None) or {}
+        return [item for item in (catalog.get("items") or []) if isinstance(item, dict)]
+
+    def _calibration_item(self, item_id):
+        for item in self._calibration_items():
+            if str(item.get("id")) == str(item_id):
+                return item
+        return None
+
+    def _band_by_id(self, band_id):
+        result = getattr(self.state, "mask_result", None) or {}
+        for key in ("all_bands", "wide_bands", "narrow_bands"):
+            for band in result.get(key) or []:
+                if str(band.get("id")) == str(band_id):
+                    return band
+        return None
+
+    def _calibration_width_m(self, item):
+        for value in item.get("source_band_ids") or []:
+            band = self._band_by_id(value)
+            if band:
+                width = float(band.get("width_m") or 0.0)
+                if width > 0:
+                    return width
+        try:
+            return max(float(item.get("width_m") or 0.0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _calibration_scale(self, x=None, y=None):
+        try:
+            if self.geo.is_ready():
+                return float(self.geo.meters_per_pixel(x or 0.0, y or 0.0))
+        except Exception:
+            pass
+        return None
+
+    def _calibration_local_to_display(self, points):
+        ox = float(getattr(self.state, "mask_offset_x", 0) or 0)
+        oy = float(getattr(self.state, "mask_offset_y", 0) or 0)
+        return [(float(x) + ox, float(y) + oy) for x, y in points]
+
+    def _calibration_state_for(self, item):
+        item_id = str(item.get("id") or "")
+        state = self._calibration_edits.get(item_id)
+        if state:
+            return state
+        base = operator_paths.as_points(
+            item.get("centerline") or item.get("work_line") or []
+        )
+        if base.size == 0:
+            return None
+        state = {
+            "base": [(float(x), float(y)) for x, y in base],
+            "edits": [],
+            "record_id": "",
+        }
+        record = operator_paths.find_record(
+            self._operator_paths_payload(),
+            centerline_id=item_id,
+            legacy_id=str(item.get("legacy_id") or ""),
+            source_band_ids=item.get("source_band_ids") or [],
+        )
+        if record:
+            state["record_id"] = str(record.get("id") or "")
+            saved_base = operator_paths.as_points(record.get("base_points") or [])
+            state["base"] = (
+                [(float(x), float(y)) for x, y in saved_base]
+                if saved_base.size
+                else state["base"]
+            )
+            state["edits"] = [dict(edit) for edit in record.get("edits") or []]
+            if not state["edits"]:
+                saved = operator_paths.as_points(record.get("points") or [])
+                if saved.size:
+                    # 描点导入的线没有拖动记录：把它当作新基准，后续拖动在其上叠加
+                    state["base"] = [(float(x), float(y)) for x, y in saved]
+        self._calibration_edits[item_id] = state
+        return state
+
+    def _on_toggle_calibration(self):
+        self._set_calibration_mode(not self._calibration_drawing)
+
+    def _set_calibration_mode(self, active):
+        if not active:
+            self._calibration_drawing = False
+            self._calibration_press = None
+            self._calibration_preview = None
+            self._calibration_item_id = ""
+            self.image_view.viewer.clear_overlay_layer("interaction_calibration")
+            self._sync_drawing_mode()
+            self.log_panel.info("已退出作业线标定")
+            return
+        if not str(getattr(self.state, "tif_path", "") or ""):
+            self.log_panel.warn("请先导入影像，再进行作业线标定。")
+            return
+        if not self._calibration_items():
+            self.log_panel.warn("请先生成作业线，再标定。")
+            return
+        if self._route_edit_active or self._measure_tool:
+            self.log_panel.warn("请先退出路线编辑或测量工具，再进入作业线标定。")
+            return
+        if self._field_drawing or self._forbidden_drawing or self._reference_drawing:
+            self._field_drawing = False
+            self._forbidden_drawing = False
+            self._reference_drawing = False
+            self._reference_pts = []
+            self._field_pts = []
+            self._forbidden_pts = []
+            for layer in ("interaction_field", "interaction_forbidden", "interaction_reference"):
+                self.image_view.viewer.clear_overlay_layer(layer)
+        self._calibration_drawing = True
+        self._calibration_press = None
+        self._calibration_preview = None
+        self._calibration_item_id = ""
+        self._sync_drawing_mode()
+        self._draw_operator_paths_overlay()
+        self.log_panel.info(
+            "作业线标定：左键点住要微调的作业线拖动（不按 Shift = 整条平移，"
+            "按住 Shift = 只纠局部弯曲），松手即保存；右键撤销上一步；"
+            "再次点击同一菜单退出。"
+        )
+        self._log_action("calibration.mode", "enter", items=len(self._calibration_items()))
+
+    def _calibration_pick(self, x, y):
+        """找离点击位置最近、且在容差内的已勾选作业线（只标会进规划的那几条）。"""
+        scale = self._calibration_scale(x, y) or 0.0
+        tolerance_px = max(12.0, CALIBRATION_PICK_TOLERANCE_M / scale) if scale > 0 else 40.0
+        selected = {
+            str(value)
+            for value in (
+                getattr(self.state, "selected_centerline_ids", None)
+                or getattr(self.state, "selected_work_band_ids", [])
+                or []
+            )
+        }
+        best = None
+        for item in self._calibration_items():
+            if selected and str(item.get("id")) not in selected:
+                continue
+            points = self._calibration_local_to_display(
+                operator_paths.as_points(item.get("centerline") or item.get("work_line") or [])
+            )
+            if len(points) < 2:
+                continue
+            arc, distance = operator_paths.nearest_arc(points, (x, y))
+            if best is None or distance < best[0]:
+                best = (distance, item, arc)
+        if best is None or best[0] > tolerance_px:
+            return None, 0.0
+        return best[1], float(best[2])
+
+    def _handle_calibration_press(self, x, y, button):
+        if button == 2:
+            self._undo_calibration_edit()
+            return True
+        if button != 1:
+            return True
+        item, _arc = self._calibration_pick(x, y)
+        if item is None:
+            self.log_panel.warn("请点在要标定的作业线上（容差约 1 m）。")
+            return True
+        self._calibration_item_id = str(item.get("id") or "")
+        self._calibration_press = (float(x), float(y))
+        self._calibration_preview = None
+        self._draw_operator_paths_overlay()
+        label = str(item.get("label") or item.get("id") or "")
+        self.log_panel.info("已选中 %s：拖动调整，松手保存" % label)
+        return True
+
+    def _calibration_offset_for(self, x, y):
+        """把鼠标位移投影到作业线法向，返回 (偏移米, 站点帧, 是否局部纠弯)。"""
+        if not self._calibration_press or not self._calibration_item_id:
+            return None, None, None
+        item = self._calibration_item(self._calibration_item_id)
+        if item is None:
+            return None, None, None
+        state = self._calibration_state_for(item)
+        if state is None:
+            return None, None, None
+        scale = self._calibration_scale(x, y)
+        if not scale:
+            return None, None, None
+        anchor = state["base"]
+        arc, _distance = operator_paths.nearest_arc(anchor, self._calibration_press)
+        position, tangent = operator_paths.point_at_arc(anchor, arc)
+        normal = np.array([-tangent[1], tangent[0]])
+        delta = np.array([x - self._calibration_press[0], y - self._calibration_press[1]])
+        offset_m = float(np.dot(delta, normal) * scale)
+        local = bool(QGuiApplication.keyboardModifiers() & Qt.ShiftModifier)
+        return offset_m, (position, normal, arc * scale), local
+
+    def _calibration_preview_points(self, x, y):
+        offset_m, frame, local = self._calibration_offset_for(x, y)
+        if offset_m is None:
+            return None
+        item = self._calibration_item(self._calibration_item_id)
+        state = self._calibration_state_for(item)
+        scale = self._calibration_scale(x, y)
+        preview_edit = {
+            "kind": "local" if local else "uniform",
+            "offset_m": offset_m,
+            "arc_m": (frame[2] if frame else 0.0),
+            "sigma_m": operator_paths.DEFAULT_SIGMA_M,
+        }
+        points = operator_paths.path_from_edits(
+            state["base"],
+            list(state["edits"]) + [preview_edit],
+            scale,
+            width_m=self._calibration_width_m(item) or 1.0,
+        )
+        return points, preview_edit, offset_m
+
+    def _handle_calibration_move(self, x, y, buttons):
+        if not (buttons & 1) or not self._calibration_press:
+            return False
+        preview = self._calibration_preview_points(x, y)
+        if preview is None:
+            return True
+        points, edit, offset_m = preview
+        self._calibration_preview = (points, edit)
+        self._draw_operator_paths_overlay(cursor=(x, y), offset_m=offset_m)
+        return True
+
+    def _handle_calibration_release(self, x, y):
+        if not self._calibration_press:
+            return False
+        preview = self._calibration_preview_points(x, y)
+        self._calibration_press = None
+        self._calibration_preview = None
+        if preview is None:
+            self._draw_operator_paths_overlay()
+            return True
+        points, edit, offset_m = preview
+        if abs(offset_m) < 0.005:
+            self._draw_operator_paths_overlay()
+            self.log_panel.info("位移不足 5 mm，未记录标定")
+            return True
+        self._commit_calibration_edit(self._calibration_item_id, edit)
+        return True
+
+    def _write_calibration_record(self, item, state, points, width_m):
+        """把当前人线写进 sidecar（新增/替换），返回 (action, record, profile)。"""
+        scale = self._calibration_scale() or 0.0
+        profile = operator_paths.build_profile(state["base"], points, scale)
+        record = operator_paths.new_record(
+            points,
+            centerline_id=str(item.get("id") or ""),
+            legacy_id=str(item.get("legacy_id") or ""),
+            source_band_ids=item.get("source_band_ids") or [],
+            band_label=str(item.get("label") or ""),
+            band_type=str(item.get("kind") or ""),
+            width_m=width_m,
+            mode="drag",
+            edits=state["edits"],
+            profile_m=profile,
+            artifact=self._operator_artifact(),
+            record_id=state.get("record_id") or "",
+        )
+        # 基准线是人线可复现的前提：没有它，后续拖动无法叠加到同一条线上。
+        record["base_points"] = [list(point) for point in state["base"]]
+        payload = deepcopy(self._operator_paths_payload() or {})
+        if not payload or payload.get("schema") != operator_paths.SCHEMA:
+            payload = operator_paths.empty_payload(
+                str(getattr(self.state, "tif_path", "") or ""), self._operator_artifact()
+            )
+        payload.setdefault("artifact", self._operator_artifact())
+        action = operator_paths.upsert_record(payload, record)
+        self._operator_paths_save(payload)
+        state["record_id"] = record.get("id") or state.get("record_id", "")
+        return action, record, profile
+
+    def _delete_calibration_record(self, item_id):
+        """删除该作业线的标定记录；没有记录时返回 False。"""
+        item = self._calibration_item(item_id)
+        payload = deepcopy(self._operator_paths_payload() or {})
+        record = self._operator_record_for_item(item, payload) if item else None
+        if not record:
+            return False
+        payload["lines"] = [
+            entry for entry in (payload.get("lines") or [])
+            if not (isinstance(entry, dict) and str(entry.get("id") or "") == str(record.get("id") or ""))
+        ]
+        self._operator_paths_save(payload)
+        return True
+
+    def _commit_calibration_edit(self, item_id, edit):
+        item = self._calibration_item(item_id)
+        if item is None:
+            return False
+        state = self._calibration_state_for(item)
+        if state is None:
+            return False
+        scale = self._calibration_scale()
+        if not scale:
+            self.log_panel.warn("缺少米制比例，无法保存标定。")
+            return False
+        self._calibration_history.append((item_id, list(state["edits"])))
+        state["edits"] = list(state["edits"]) + [dict(edit)]
+        width_m = self._calibration_width_m(item) or 1.0
+        points = operator_paths.path_from_edits(
+            state["base"], state["edits"], scale, width_m=width_m
+        )
+        if len(points) < 2:
+            self.log_panel.warn("标定后的线无效，已忽略本次拖动。")
+            return False
+        try:
+            action, record, profile = self._write_calibration_record(
+                item, state, points, width_m
+            )
+        except OSError as exc:
+            self.log_panel.error("标定保存失败：%s" % exc)
+            return False
+        self._calibration_originals.setdefault(
+            str(item.get("id")),
+            [tuple(point) for point in operator_paths.as_points(
+                item.get("centerline") or item.get("work_line") or []
+            )],
+        )
+        item["centerline"] = [tuple(point) for point in points]
+        item["work_line"] = [tuple(point) for point in points]
+        item["line_source"] = "operator"
+        self._invalidate_analysis_from(
+            "path", "作业线已人工标定，旧路径作废，重新生成路径后生效"
+        )
+        self._draw_centerline_overlay(self.image_view.viewer)
+        self._draw_operator_paths_overlay()
+        classification = operator_paths.classify_offset_profile(
+            [value for _arc, value in profile], width_m
+        )
+        try:
+            self.log_panel.success(
+                "已更新 %s（%s）：本次偏移 %+.2f m，%s；规划将采用这条线"
+                % (
+                    item.get("label") or item.get("id"),
+                    action,
+                    float(edit.get("offset_m", 0.0)),
+                    classification.get("reason", ""),
+                )
+            )
+        except Exception:
+            pass
+        self._log_action(
+            "calibration.edit",
+            str(item.get("id") or ""),
+            record_id=record.get("id"),
+            kind=edit.get("kind"),
+            offset_m=round(float(edit.get("offset_m", 0.0)), 4),
+            arc_m=round(float(edit.get("arc_m", 0.0)), 3),
+            edit_count=len(state["edits"]),
+            width_m=round(width_m, 3),
+            classification=classification.get("kind"),
+        )
+        return True
+
+    def _undo_calibration_edit(self):
+        if not self._calibration_history:
+            self.log_panel.info("没有可撤销的标定操作")
+            return
+        item_id, previous = self._calibration_history.pop()
+        item = self._calibration_item(item_id)
+        state = self._calibration_edits.get(str(item_id))
+        if item is None or state is None:
+            return
+        state["edits"] = list(previous)
+        if not state["edits"]:
+            try:
+                self._delete_calibration_record(item_id)
+            except OSError as exc:
+                self.log_panel.error("撤销标定失败：%s" % exc)
+                return
+            self._restore_calibration_item(item_id)
+            self._draw_centerline_overlay(self.image_view.viewer)
+            self._draw_operator_paths_overlay()
+            self._invalidate_analysis_from("path", "已撤销作业线标定")
+            self.log_panel.info("已撤销 %s 的全部标定" % (item.get("label") or item_id))
+            self._log_action("calibration.undo", str(item_id), remaining_edits=0)
+            return
+        scale = self._calibration_scale() or 0.0
+        width_m = self._calibration_width_m(item) or 1.0
+        points = operator_paths.path_from_edits(
+            state["base"], state["edits"], scale, width_m=width_m
+        )
+        try:
+            self._write_calibration_record(item, state, points, width_m)
+        except OSError as exc:
+            self.log_panel.error("撤销标定失败：%s" % exc)
+            return
+        item["centerline"] = [tuple(point) for point in points]
+        item["work_line"] = [tuple(point) for point in points]
+        self._draw_centerline_overlay(self.image_view.viewer)
+        self._draw_operator_paths_overlay()
+        self._invalidate_analysis_from("path", "已撤销上一次作业线标定")
+        self.log_panel.info("已撤销上一次标定：%s" % (item.get("label") or item_id))
+
+    def _restore_calibration_item(self, item_id):
+        original = self._calibration_originals.pop(str(item_id), None)
+        item = self._calibration_item(item_id)
+        if item is not None and original:
+            item["centerline"] = list(original)
+            item["work_line"] = list(original)
+            item.pop("line_source", None)
+        self._calibration_edits.pop(str(item_id), None)
+
+    def _on_clear_calibration(self):
+        payload = self._operator_paths_payload()
+        if not payload.get("lines"):
+            self.log_panel.info("当前项目没有作业线标定")
+            return
+        item_id = self._calibration_item_id
+        if not item_id:
+            self.log_panel.warn("请先在图上点选一条要清除标定的作业线。")
+            return
+        try:
+            removed = self._delete_calibration_record(item_id)
+        except OSError as exc:
+            self.log_panel.error("清除标定失败：%s" % exc)
+            return
+        if not removed:
+            self.log_panel.info("该作业线没有标定记录")
+            return
+        self._restore_calibration_item(item_id)
+        self._draw_centerline_overlay(self.image_view.viewer)
+        self._draw_operator_paths_overlay()
+        self._invalidate_analysis_from("path", "已清除作业线标定")
+        self.log_panel.success("已清除该线的标定，恢复算法中心线")
+        self._log_action("calibration.clear", str(item_id))
+
+    def _on_import_reference_as_operator(self):
+        """把已有参考线（人工描点）转成标定线：同一批桩点既当基准也当作业线。"""
+        reference_payload = self._reference_lines_payload()
+        if not reference_payload.get("lines"):
+            self.log_panel.warn("当前项目还没有参考线，先标注再导入。")
+            return
+        lookup = {}
+        band_counts: dict = {}
+        for item in self._calibration_items():
+            for band_id in item.get("source_band_ids") or []:
+                band_counts[str(band_id)] = band_counts.get(str(band_id), 0) + 1
+        for item in self._calibration_items():
+            for band_id in item.get("source_band_ids") or []:
+                # 一条带拆成多股作业线时无法自动判断桩点属于哪一股，
+                # 宁可不绑定，也不要把一条参考线套到整片作业线上。
+                if band_counts.get(str(band_id), 0) > 1:
+                    continue
+                lookup[str(band_id)] = {
+                    "centerline_id": str(item.get("id") or ""),
+                    "legacy_id": str(item.get("legacy_id") or ""),
+                    "source_band_ids": item.get("source_band_ids") or [],
+                    "label": str(item.get("label") or ""),
+                    "band_type": str(item.get("kind") or ""),
+                    "width_m": self._calibration_width_m(item),
+                }
+        records, report = operator_paths.from_reference_lines(
+            reference_payload,
+            offset_x=float(getattr(self.state, "mask_offset_x", 0) or 0),
+            offset_y=float(getattr(self.state, "mask_offset_y", 0) or 0),
+            artifact=self._operator_artifact(),
+            band_lookup=lookup,
+        )
+        if not records:
+            self.log_panel.warn("参考线里没有可转换的桩点（%d 条被跳过）" % report.get("skipped", 0))
+            return
+        payload = deepcopy(self._operator_paths_payload() or {})
+        if not payload or payload.get("schema") != operator_paths.SCHEMA:
+            payload = operator_paths.empty_payload(
+                str(getattr(self.state, "tif_path", "") or ""), self._operator_artifact()
+            )
+        applied = 0
+        for record in records:
+            if not record.get("centerline_id") and not record.get("source_band_ids"):
+                continue
+            operator_paths.upsert_record(payload, record)
+            applied += 1
+        if not applied:
+            self.log_panel.warn("参考线没有匹配到当前作业线，未导入。")
+            return
+        try:
+            self._operator_paths_save(payload)
+        except OSError as exc:
+            self.log_panel.error("导入标定线失败：%s" % exc)
+            return
+        self._calibration_edits.clear()
+        for record in payload.get("lines") or []:
+            item_id = str(record.get("centerline_id") or "")
+            item = self._calibration_item(item_id) if item_id else None
+            if item is None:
+                continue
+            points = operator_paths.as_points(record.get("points") or [])
+            if points.size == 0:
+                continue
+            self._calibration_originals.setdefault(
+                item_id,
+                [tuple(point) for point in operator_paths.as_points(
+                    item.get("centerline") or item.get("work_line") or []
+                )],
+            )
+            item["centerline"] = [tuple(point) for point in points]
+            item["work_line"] = [tuple(point) for point in points]
+            item["line_source"] = "operator"
+        self._draw_centerline_overlay(self.image_view.viewer)
+        self._draw_operator_paths_overlay()
+        self._invalidate_analysis_from("path", "已导入人工标定线")
+        self.log_panel.success("已把 %d 条人工参考线转为标定线，规划将采用这些线" % applied)
+        self._log_action("calibration.import_reference", "reference", applied=applied)
+
+    def _on_export_calibration_case(self):
+        """导出离线评价用的案例包（人工线 + 带几何 + 掩膜路径）。"""
+        import centerline_calibration
+
+        payload = self._operator_paths_payload()
+        if not payload.get("lines"):
+            self.log_panel.warn("当前项目还没有标定线，先标定再导出。")
+            return
+        scale = self._calibration_scale()
+        if not scale:
+            self.log_panel.warn("缺少米制比例，无法导出标定案例。")
+            return
+        import cache
+
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        try:
+            mask_path = os.path.join(
+                os.path.dirname(cache.operator_paths_path(tif)), "mask.npz"
+            )
+        except Exception:
+            mask_path = ""
+        if not mask_path or not os.path.isfile(mask_path):
+            self.log_panel.warn("项目缓存缺少 mask.npz，无法导出标定案例。")
+            return
+        bands = []
+        mapping = {}
+        result = getattr(self.state, "mask_result", None) or {}
+        for key in ("all_bands", "wide_bands", "narrow_bands"):
+            for band in result.get(key) or []:
+                band_id = band.get("id")
+                if band_id is None:
+                    continue
+                points = operator_paths.as_points(band.get("centerline") or [])
+                if points.size == 0:
+                    continue
+                mapping[str(band_id)] = band
+                if any(item.get("band_id") is not None and str(item.get("band_id")) == str(band_id) for item in bands):
+                    continue
+                record = {
+                    "band_id": band_id,
+                    "band_type": band.get("band_type"),
+                    "width_m": band.get("width_m"),
+                    "profile_width_m": band.get("profile_width_m"),
+                    "centerline": [[float(x), float(y)] for x, y in points],
+                }
+                pre = operator_paths.as_points(band.get("centerline_pre_recenter") or [])
+                if pre.size:
+                    record["centerline_pre_recenter"] = [[float(x), float(y)] for x, y in pre]
+                contour = np.asarray(band.get("contour"), dtype=np.float64).reshape(-1, 2)
+                if contour.shape[0] >= 3:
+                    step = max(1, contour.shape[0] // 400)
+                    record["contour"] = [[float(x), float(y)] for x, y in contour[::step]]
+                bands.append(record)
+        operator_lines = []
+        for record in payload.get("lines") or []:
+            points = operator_paths.as_points(record.get("points") or [])
+            if points.size == 0:
+                continue
+            band_id = None
+            for value in record.get("source_band_ids") or []:
+                if str(value) in mapping:
+                    band_id = value
+                    break
+            if band_id is None:
+                continue
+            operator_lines.append({
+                "band_id": band_id,
+                "points": [[float(x), float(y)] for x, y in points],
+                "centerline_id": record.get("centerline_id"),
+                "edits": record.get("edits") or [],
+            })
+        if not operator_lines:
+            self.log_panel.warn("标定线没有匹配到带几何，无法导出案例。")
+            return
+        case = {
+            "schema": centerline_calibration.SCHEMA,
+            "case_id": "%s_%s" % (
+                os.path.splitext(os.path.basename(tif))[0] or "case",
+                datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
+            ),
+            "tif_path": tif,
+            "mpp": float(scale),
+            "mask_path": mask_path,
+            "artifact": payload.get("artifact") or self._operator_artifact(),
+            "bands": bands,
+            "operator_lines": operator_lines,
+        }
+        out_dir = os.path.join(os.path.dirname(mask_path), "calibration")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, case["case_id"] + ".json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(case, handle, ensure_ascii=False, indent=2, default=str)
+        except OSError as exc:
+            self.log_panel.error("导出标定案例失败：%s" % exc)
+            return
+        self.log_panel.success(
+            "标定案例已导出：%s（%d 条带 / %d 条人线）"
+            % (path, len(bands), len(operator_lines))
+        )
+        self._log_action("calibration.export_case", path, bands=len(bands), lines=len(operator_lines))
+
+    def _on_export_action_log(self):
+        """把本次会话的操作记录复制到用户指定目录（取证/复现用）。"""
+        try:
+            paths = interaction_log.action_log().export_to(
+                os.path.join(os.path.expanduser("~"), "ALIGN_操作记录")
+            )
+        except Exception as exc:
+            self.log_panel.error("导出操作记录失败：%s" % exc)
+            return
+        if not paths:
+            self.log_panel.info("本次会话还没有可导出的操作记录。")
+            return
+        self.log_panel.success("操作记录已导出：%s" % os.path.dirname(paths[0]))
+
+    def _draw_operator_paths_overlay(self, viewer=None, cursor=None, offset_m=None):
+        """标定模式下的叠加层：已保存人线 + 正在拖动的预览。"""
+        viewer = viewer if viewer is not None else self.image_view.viewer
+        if not hasattr(viewer, "clear_overlay_layer"):
+            return
+        viewer.clear_overlay_layer("interaction_calibration")
+        if not self._calibration_drawing:
+            return
+        payload = self._operator_paths_payload()
+        viewer.begin_overlay_layer("interaction_calibration")
+        try:
+            for record in payload.get("lines") or []:
+                points = self._calibration_local_to_display(
+                    operator_paths.as_points(record.get("points") or [])
+                )
+                if len(points) < 2:
+                    continue
+                selected = str(record.get("centerline_id") or "") == self._calibration_item_id
+                viewer.draw_polyline(
+                    points,
+                    color=OPERATOR_EDIT_COLOR_BGR if selected else OPERATOR_LINE_COLOR_BGR,
+                    width=6 if selected else 4,
+                )
+                scale = self._calibration_scale() or 0.0
+                for edit in record.get("edits") or []:
+                    try:
+                        arc_m = float(edit.get("arc_m", 0.0))
+                    except (TypeError, ValueError):
+                        continue
+                    if scale <= 0:
+                        continue
+                    position, _tangent = operator_paths.point_at_arc(points, arc_m / scale)
+                    viewer.draw_circle(position[0], position[1], radius=4, color=OPERATOR_EDIT_COLOR_BGR)
+            if self._calibration_preview:
+                points = self._calibration_local_to_display(self._calibration_preview[0])
+                if len(points) > 1:
+                    step = max(1, len(points) // CALIBRATION_PREVIEW_POINT_LIMIT)
+                    viewer.draw_polyline(
+                        points[::step] + [points[-1]], color=OPERATOR_EDIT_COLOR_BGR, width=5
+                    )
+                if cursor and self._calibration_press:
+                    viewer.draw_line(
+                        self._calibration_press[0], self._calibration_press[1],
+                        cursor[0], cursor[1],
+                        color=OPERATOR_EDIT_COLOR_BGR, width=2, style=Qt.DashLine,
+                    )
+            if self._calibration_item_id:
+                item = self._calibration_item(self._calibration_item_id)
+                if item is not None:
+                    points = self._calibration_local_to_display(
+                        operator_paths.as_points(
+                            item.get("centerline") or item.get("work_line") or []
+                        )
+                    )
+                    if len(points) > 1:
+                        viewer.draw_polyline(points, color=OPERATOR_EDIT_COLOR_BGR, width=7)
+        finally:
+            viewer.end_overlay_layer()
 
 
     def _route_service_anchor(self, kind):
@@ -5151,6 +5967,31 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_plan(self):
+        self._log_action(
+            "plan.request",
+            "path",
+            selected=len(
+                getattr(self.state, "selected_centerline_ids", None)
+                or getattr(self.state, "selected_work_band_ids", [])
+                or []
+            ),
+            operator_lines=len(self._operator_paths_payload().get("lines") or []),
+        )
+        payload = self._operator_paths_payload()
+        if payload.get("lines"):
+            from row_geometry import MASK_REGULARIZATION_VERSION
+
+            _overrides, report = operator_paths.planner_overrides(
+                payload,
+                mask_version=int(MASK_REGULARIZATION_VERSION),
+                tif_path=str(getattr(self.state, "tif_path", "") or ""),
+            )
+            reason = str(report.get("reason") or "")
+            if reason in {"mask_version_mismatch", "tif_mismatch"}:
+                self.log_panel.warn(
+                    "人工标定线已失效（%s），本次规划使用算法中心线；请在标定工具里重新标定。"
+                    % ("掩膜算法版本已变化" if reason == "mask_version_mismatch" else "影像不一致")
+                )
         mask_result = getattr(self.state, 'mask_result', None)
         if mask_result is None:
             self.log_panel.warn("请先完成掩膜优化")
@@ -5243,6 +6084,7 @@ class MainWindow(QMainWindow):
             self._sync_task_statuses()
 
     def _on_run(self):
+        self._log_action("inference.request", "segment")
         if self._tif_rgb is None:
             self.log_panel.warn("请先加载影像")
             return
@@ -6899,6 +7741,7 @@ class MainWindow(QMainWindow):
             threads[0].join(min(0.2, remaining))
 
     def _on_mask_process(self):
+        self._log_action("mask.request", "process")
         mask = getattr(self.state, 'mask_raw', None)
         # DECISION-020 diagnostics: log the exact array that reaches mask
         # processing so a mismatch with the inference artifact can be seen
@@ -7698,6 +8541,26 @@ class MainWindow(QMainWindow):
             return 8
         return 7
 
+    def _operator_record_for_item(self, item, payload=None):
+        """按精确身份找该作业线的人工标定记录（只认 centerline/legacy id）。
+
+        不允许按 source_band_ids 兜底：等距区一条带可能拆成多股，按带匹配会
+        把同一段标定画到邻居线上。
+        """
+        data = payload if isinstance(payload, dict) else self._operator_paths_payload()
+        item_id = str(item.get("id") or "")
+        legacy_id = str(item.get("legacy_id") or "")
+        for record in data.get("lines") or []:
+            if not isinstance(record, dict):
+                continue
+            if item_id and str(record.get("centerline_id") or "") == item_id:
+                return record
+        if legacy_id:
+            for record in data.get("lines") or []:
+                if isinstance(record, dict) and str(record.get("legacy_id") or "") == legacy_id:
+                    return record
+        return None
+
     def _draw_centerline_overlay(self, viewer):
         if hasattr(viewer, "clear_overlay_layer"):
             viewer.clear_overlay_layer("centerlines")
@@ -7717,9 +8580,19 @@ class MainWindow(QMainWindow):
         label_rects = []
         anchors = self._aligned_label_anchors(items, selected)
         label_size = self._centerline_label_size(viewer, anchors)
+        operator_payload = self._operator_paths_payload()
         try:
             for item in items:
                 points = self._centerline_display_points(item)
+                # 标定过的线在画布上直接画人线（与规划同源），否则"重启后画布
+                # 还是算法线、导出的却是人线"，状态与画布对不上。
+                operator_points = None
+                record = self._operator_record_for_item(item, operator_payload)
+                if record is not None:
+                    local = operator_paths.as_points(record.get("points") or [])
+                    if local.size >= 2:
+                        operator_points = self._calibration_local_to_display(local)
+                        points = operator_points
                 if len(points) < 2:
                     continue
                 is_selected = str(item.get("id")) in selected
@@ -7781,7 +8654,11 @@ class MainWindow(QMainWindow):
                     if hasattr(viewer, "remove_overlays"):
                         viewer.remove_overlays([text_item])
                     text_item, polygon = None, None
-                viewer.draw_polyline(points, color=(40, 220, 80), width=5)
+                viewer.draw_polyline(
+                    points,
+                    color=OPERATOR_LINE_COLOR_BGR if operator_points else (40, 220, 80),
+                    width=5,
+                )
                 if polygon is not None:
                     label_rects.append(polygon)
         finally:
@@ -11213,6 +12090,7 @@ class MainWindow(QMainWindow):
             self._field_drawing
             or self._forbidden_drawing
             or self._reference_drawing
+            or self._calibration_drawing
             or bool(self._measure_tool)
             or getattr(self.state, 'entry_exit_mode', False)
             or self._route_edit_active
@@ -11238,6 +12116,10 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(
                 "参考线标注（第 %d 遍）：左键加桩点，双击完成，右键取消"
                 % self._reference_pass
+            )
+        elif self._calibration_drawing:
+            self.lbl_status.setText(
+                "作业线标定：拖动整条平移，Shift+拖动只纠局部弯曲，右键撤销上一步"
             )
         elif self._measure_tool == "point":
             self.lbl_status.setText("点选测量：左键选择点，下一次左键替换")
