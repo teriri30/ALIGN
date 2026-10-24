@@ -512,3 +512,28 @@ def test_hard_cap_never_sits_below_the_soft_budget():
 
     assert settings["max_points"] == 16
     assert settings["hard_max_points"] == 16
+
+
+def test_centerline_simplification_defaults_keep_a_curved_band_curved():
+    """默认容差必须小到能跟住真实弯曲：0.20 m 会让 1 m 宽的带被拉成直线。"""
+    from path_planner import _centerline_simplification_settings, _simplify_centerline_polyline
+
+    settings = _centerline_simplification_settings({})
+    assert settings["max_deviation_m"] <= 0.05
+    assert settings["max_points"] >= 16
+
+    # 40 m 长、中部弓 0.25 m 的带（像素坐标：1 px = 0.014 m）。
+    # 旧默认 0.20 m 容差会把这条带压成 2 点直线。
+    mpp = 0.014
+    length_px = 40.0 / mpp
+    sagitta_px = 0.25 / mpp
+    dense = []
+    for i in range(0, 41):
+        u = i / 40.0
+        dense.append((u * length_px, sagitta_px * 4.0 * u * (1.0 - u)))
+    line = _simplify_centerline_polyline(dense, mpp, {})
+    # 不能退化成两端点的直线；同时保留的折线要贴住原轨迹
+    assert len(line) >= 4, f"弯曲带被压成 {len(line)} 个点"
+    xs = [p[0] for p in line]; ys = [p[1] for p in line]
+    mid_x, mid_y = xs[len(xs) // 2], ys[len(ys) // 2]
+    assert mid_y > 0.5 * sagitta_px, "折线把弯曲抹平了"

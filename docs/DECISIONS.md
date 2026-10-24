@@ -937,3 +937,15 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
   3. 不加顶部弧线、背景行带纹理——评审中这两项被判为"杂线/噪点"；
   4. 图标唯一来源是 `packaging/make_icon.py` → `packaging/align.ico`，spec 与 Inno Setup 共用。
 - 代码锚点：`packaging/make_icon.py`（`_build_solid` 分级、`_shaped_gradient`、`_background(light=True)`、`_radial_highlight`）。
+
+## DECISION-057：作业线折线简化的容差必须小到能跟住弯曲（2026-10-23）
+
+- 现象：右侧某条作业线明显不在行带中间，且整条是直的（用户 2026-10-23 反馈）。
+- 根因：`path_planner._centerline_simplification_settings` 默认 `max_deviation_m=0.20`、`max_points=8`。1 m 宽的带允许 20 cm 横向误差才会加顶点，于是轻微弯曲被压成 2 点直线；实测该带最大偏差 0.153 m（≈15% 带宽），落在行上。
+- 改法：`max_deviation_m` 0.20 → **0.03**，`max_points` 8 → **32**，`hard_max_points` 64 → 96，`max_heading_change_deg` 8° → 4°。同一批 15 条带点数 2–18，最大偏差 0.050 m。
+- 不变量：
+  1. 简化后的折线相对原始逐站轨迹的最大法向偏差必须 ≤ 0.03 m（约 2 px @ 0.014 m/px）；
+  2. 弯曲带不得退化为两端点直线；
+  3. 点数上限只作为抖动保护，不得用来"压平"真实弯曲。
+- 影响：`centerline_catalog` 里的折线点数变多（显示与规划都按折线走），路径规划的分段数随之增加，属于预期变化。
+- 代码锚点：`path_planner._centerline_simplification_settings`、`_simplify_centerline_polyline`；测试 `tests/test_path_boundary.py::test_centerline_simplification_defaults_keep_a_curved_band_curved`。

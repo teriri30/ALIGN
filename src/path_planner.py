@@ -760,34 +760,34 @@ def _centerline_simplification_settings(config: Dict) -> Dict[str, float | int]:
     cfg = config or {}
     try:
         max_deviation_m = float(
-            cfg.get("centerline_simplify_max_deviation_m", 0.20)
+            cfg.get("centerline_simplify_max_deviation_m", 0.03)
         )
     except (TypeError, ValueError):
-        max_deviation_m = 0.20
+        max_deviation_m = 0.03
     if not math.isfinite(max_deviation_m) or max_deviation_m < 0.0:
-        max_deviation_m = 0.20
+        max_deviation_m = 0.03
 
     try:
         max_heading_change_deg = float(
-            cfg.get("centerline_simplify_max_heading_change_deg", 8.0)
+            cfg.get("centerline_simplify_max_heading_change_deg", 4.0)
         )
     except (TypeError, ValueError):
-        max_heading_change_deg = 8.0
+        max_heading_change_deg = 4.0
     if not math.isfinite(max_heading_change_deg) or max_heading_change_deg < 0.0:
-        max_heading_change_deg = 8.0
+        max_heading_change_deg = 4.0
 
     try:
-        max_points = int(cfg.get("centerline_simplify_max_points", 8))
+        max_points = int(cfg.get("centerline_simplify_max_points", 32))
     except (TypeError, ValueError):
-        max_points = 8
+        max_points = 32
     max_points = max(2, min(max_points, 64))
 
     try:
         hard_max_points = int(
-            cfg.get("centerline_simplify_hard_max_points", 64)
+            cfg.get("centerline_simplify_hard_max_points", 96)
         )
     except (TypeError, ValueError):
-        hard_max_points = 64
+        hard_max_points = 96
     # The hard ceiling is what accuracy may spend; it can never sit below the
     # soft budget, otherwise the budget would silently win over the tolerance.
     hard_max_points = max(max_points, min(hard_max_points, 256))
