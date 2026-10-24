@@ -2745,11 +2745,30 @@ def _recenter_band_centerlines(bands, mpp: float, config: Optional[Dict] = None)
         return
     import cv2
 
+    # 宽度异常带（明显宽于同类中位数）多半是"粘连带"：轮廓把邻带/宽行空间
+    # 并进来了，按它的轮廓取中点会把线拉偏。这类带直接跳过，交给分割阶段处理。
+    widths_by_type: Dict[str, list] = {}
+    for band in bands:
+        band_type = str(band.get("band_type") or "wide")
+        width_value = float(band.get("width_m") or 0.0)
+        if width_value > 0:
+            widths_by_type.setdefault(band_type, []).append(width_value)
+    median_width_by_type = {
+        band_type: float(np.median(values)) for band_type, values in widths_by_type.items()
+    }
+
     station_m = max(0.05, float(cfg.get("centerline_recenter_station_m", 0.10)))
     sample_m = max(0.015, float(cfg.get("centerline_recenter_sample_m", 0.02)))
     max_shift_ratio = max(0.05, min(float(cfg.get("centerline_recenter_max_shift_ratio", 0.22)), 0.45))
 
     for band in bands:
+        band_type = str(band.get("band_type") or "wide")
+        median_width = median_width_by_type.get(band_type, 0.0)
+        width_value = float(band.get("width_m") or 0.0)
+        if median_width > 0 and abs(width_value - median_width) > 0.18 * median_width:
+            band["recenter_m"] = 0.0
+            band["recenter_skipped"] = "width_outlier"
+            continue
         contour = np.asarray(band.get("contour"), dtype=np.float64).reshape(-1, 2)
         points = np.asarray(band.get("centerline") or [], dtype=np.float64)
         width_m = float(band.get("width_m") or 0.0)

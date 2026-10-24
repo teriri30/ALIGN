@@ -45,3 +45,22 @@ def test_recenter_can_be_disabled_and_keeps_points_untouched():
     before = np.asarray(band["centerline"], float).copy()
     _recenter_band_centerlines([band], 0.014, {"centerline_recenter": False})
     assert np.allclose(np.asarray(band["centerline"], float), before)
+
+
+def test_width_outlier_band_is_skipped_instead_of_pulled_sideways():
+    """宽度明显偏大 = 粘连带：轮廓把邻带并进来了，按它取中点会把线拉偏。"""
+    narrow = _slanted_band(offset_px=10)
+    narrow["id"] = 1
+    narrow["band_type"] = "wide"
+    narrow["width_m"] = 1.0
+
+    merged = _slanted_band(offset_px=10, width_px=110)
+    merged["id"] = 2
+    merged["band_type"] = "wide"
+    merged["width_m"] = 1.54  # 比同类中位数宽 54%
+
+    before = np.asarray(merged["centerline"], float).copy()
+    _recenter_band_centerlines([narrow, merged], 0.014, {"centerline_recenter": True})
+
+    assert np.allclose(np.asarray(merged["centerline"], float), before)
+    assert merged.get("recenter_skipped") == "width_outlier"

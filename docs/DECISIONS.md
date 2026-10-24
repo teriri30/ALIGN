@@ -965,3 +965,14 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
   2. 平移只改变横向位置，不得改变端点弧长范围；
   3. 单位必须一致：`contour/centerline` 是像素，采样步长与阈值要先除以 mpp。
 - 代码锚点：`row_geometry._recenter_band_centerlines`；测试 `tests/test_centerline_recenter.py`。
+
+## DECISION-059：粘连带不得参与"重压中线"（2026-10-24）
+
+- 现象：用户看 673% 放大图发现某条带的绿线比红线更靠左，而行带中心明明在右侧（0.3.13 回归）。
+- 诊断：该带报告宽度 1.39 m，同类中位 1.00 m；其轮廓实际把邻带/宽行空间并了进来，弦宽只有 1.02 m。按这种轮廓取中点，得到的是"混合区域的中点"，与用户看到的行带中心不一致 → 线被拉偏。
+- 规则：`_recenter_band_centerlines` 先按 `band_type` 求宽度中位数；`|width_m - median| > 0.18 × median` 的带判定为粘连带，**跳过重压**并写 `recenter_skipped = width_outlier`。
+- 效果：中位偏心 20 → 10 mm、P90 40 → 25 mm，且没有任何一条带变差（band 29 维持 115 mm，不再恶化到 125 mm）。
+- 不变量：
+  1. 重压中线**只允许改善，不允许把任何一条带改差**；无法确认改善就跳过并记录原因。
+  2. 粘连带（宽度异常）必须交给分割阶段处理，不得在中心线阶段"猜中心"。
+- 代码锚点：`row_geometry._recenter_band_centerlines`（width_outlier 分支）；测试 `tests/test_centerline_recenter.py::test_width_outlier_band_is_skipped_instead_of_pulled_sideways`。
