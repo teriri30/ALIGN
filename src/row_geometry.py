@@ -12,7 +12,7 @@ try:  # shapely >= 2.0
 except ImportError:  # pragma: no cover - shapely 1.8 fallback
     from shapely.validation import make_valid as shapely_make_valid
 
-MASK_REGULARIZATION_VERSION = 20
+MASK_REGULARIZATION_VERSION = 21
 
 FIELD_BOUNDARY_GEOMETRY_VERSION = "field-boundary-geometry-v1"
 # A self-intersecting field outline is repaired only when the discarded parts
@@ -320,6 +320,16 @@ def smooth_1d(values: np.ndarray, window: float) -> np.ndarray:
     kernel = cv2.getGaussianKernel(size, max(size / 5.0, 0.8)).reshape(-1)
     padded = np.pad(values, (size // 2, size // 2), mode="edge")
     return np.convolve(padded, kernel, mode="valid")
+
+
+def _cross_section_center_and_width(occupied_rows: np.ndarray) -> Tuple[float, float]:
+    """Return the midpoint and width of a row band's outer occupied extent."""
+    rows = np.asarray(occupied_rows, dtype=np.float64).reshape(-1)
+    rows = rows[np.isfinite(rows)]
+    if rows.size < 2:
+        raise ValueError("a row-band cross-section needs at least two occupied rows")
+    low, high = np.quantile(rows, (0.04, 0.96))
+    return float((low + high) * 0.5), float(max(2.0, high - low + 1.0))
 
 
 def fill_nan(values: np.ndarray) -> np.ndarray:
@@ -3159,10 +3169,9 @@ def regularize_crop_mask(
             )
             if local_y.size < 2:
                 continue
-            center_observed[index] = gate_start + float(np.median(local_y))
-            low = float(np.quantile(local_y, 0.04))
-            high = float(np.quantile(local_y, 0.96))
-            width_observed[index] = max(2.0, high - low + 1.0)
+            center_offset, observed_width = _cross_section_center_and_width(local_y)
+            center_observed[index] = gate_start + center_offset
+            width_observed[index] = observed_width
             observed[index] = True
 
         observed_count = int(np.count_nonzero(observed))
@@ -3215,37 +3224,6 @@ def regularize_crop_mask(
             cfg,
         )
         widths_i = fill_nan(np.where(center_trusted, width_observed, np.nan))
-        center_detail = float(cfg.get("center_detail_blend", 0.65))
-        trusted_indices = np.flatnonzero(
-            center_trusted & np.isfinite(center_observed)
-        )
-        if trusted_indices.size >= 2:
-            fit_x = xs[trusted_indices].astype(np.float64)
-            fit_y = center_observed[trusted_indices].astype(np.float64)
-            fit_x_mean = float(np.mean(fit_x))
-            fit_y_mean = float(np.mean(fit_y))
-            centered_x = fit_x - fit_x_mean
-            denominator = float(np.sum(centered_x * centered_x, dtype=np.float64))
-            if denominator > 1e-12:
-                slope = float(
-                    np.sum(
-                        centered_x * (fit_y - fit_y_mean),
-                        dtype=np.float64,
-                    )
-                    / denominator
-                )
-                intercept = fit_y_mean - slope * fit_x_mean
-                row_trend = slope * xs.astype(np.float64) + intercept
-            else:
-                row_trend = np.full_like(
-                    xs,
-                    fit_y_mean,
-                    dtype=np.float64,
-                )
-            centers_i = row_trend + center_detail * (
-                centers_i - row_trend
-            )
-
         width_detail = float(cfg.get("width_detail_blend", 0.20))
         widths_i = target_width + width_detail * (
             widths_i - float(np.nanmedian(widths_i))

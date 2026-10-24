@@ -564,7 +564,7 @@
   2. 未触发 run 与正常案例必须逐位零改动（六案例安全对照逐位一致；合成粘连桥 19→20 带恢复）。
   3. 本切割只改剖面 run 区间，不得改掩膜数组本体；候选与切割明细必须随掩膜诊断持久化（论文复现与审计）。
   4. 全填充通道（无几何腰）的切口位置天然欠定、子带宽度为近似值；不得据其对外声明精确带宽恢复。
-- 缓存：`MASK_REGULARIZATION_VERSION` 升至 `20`，版本 19 及更早处理产物必须重跑。
+- 缓存：`MASK_REGULARIZATION_VERSION` 当前为 `21`；本版本将四行作业带中心线改为逐站外包络中点，并取消全局直线趋势混合。版本 20 及更早处理产物必须重跑。
 - 代码锚点：`row_geometry._adhesion_width_profile`、`row_geometry._split_adhesion_runs`、`row_geometry.regularize_crop_mask`。
 - 测试锚点：`tests/test_mask_strategy.py`（合成瓶颈分割、保护条件拦截、禁用开关）、`tests/test_research_integrity.py`（版本断言）。
 

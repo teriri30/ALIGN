@@ -2,6 +2,7 @@
 import numpy as np
 
 from row_geometry import _recenter_band_centerlines
+from row_geometry import _cross_section_center_and_width
 
 
 def _slanted_band(offset_px: float, width_px: int = 70, length_px: int = 1200):
@@ -64,3 +65,17 @@ def test_width_outlier_band_is_skipped_instead_of_pulled_sideways():
 
     assert np.allclose(np.asarray(merged["centerline"], float), before)
     assert merged.get("recenter_skipped") == "width_outlier"
+
+
+def test_four_row_center_uses_outer_extent_midpoint_not_occupancy_median():
+    """Uneven row density must not pull the machine center toward one side."""
+    occupied_rows = np.asarray(
+        [0] * 10 + [20] * 2 + [40] * 8 + [60] * 2 + [80] * 2,
+        dtype=np.float64,
+    )
+
+    center, width = _cross_section_center_and_width(occupied_rows)
+
+    assert np.median(occupied_rows) == 30.0
+    assert center == 40.0
+    assert width == 81.0
