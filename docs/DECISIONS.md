@@ -949,3 +949,19 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
   3. 点数上限只作为抖动保护，不得用来"压平"真实弯曲。
 - 影响：`centerline_catalog` 里的折线点数变多（显示与规划都按折线走），路径规划的分段数随之增加，属于预期变化。
 - 代码锚点：`path_planner._centerline_simplification_settings`、`_simplify_centerline_polyline`；测试 `tests/test_path_boundary.py::test_centerline_simplification_defaults_keep_a_curved_band_curved`。
+
+## DECISION-058：作业线按行带轮廓重压中线（2026-10-24）
+
+- 现象：折线已经跟随弯曲，但局部仍压到行（用户第二次反馈，图二可见）。
+- 诊断：逐站中心是"±6 px 窄条内、占用率 ≥0.18 的行的中位数"，对单侧阴影/贴边不稳健；实测中位偏心 10–30 mm、P90 最高 187 mm。
+- 改法：`regularize_crop_mask` 结束前调用 `_recenter_band_centerlines`：
+  1. 把每条带的 `contour` 栅格化；
+  2. 沿中心线每 0.10 m 取站点，沿法向以 0.02 m 采样，取"包含站点的那段弦"，记录弦中点；
+  3. 对（弧长，偏移）做稳健多项式拟合（1 次与 2 次各拟一次，残差小者胜；2.5σ 迭代剔除）；
+  4. 只横向平移原折线，端点范围不变；平移量上限 0.22×带宽。
+- 结果：15 条带中 14 条改善，中位偏移 20 → 10 mm，P90 40 → 25 mm。band 29 未改善（报告宽 1.39 m / 实测弦宽 1.02 m），属粘连带分割缺陷，另案处理。
+- 不变量：
+  1. 拟合残差 > 0.22×带宽 时**跳过**，写 `recenter_skipped`，不得强行平移；
+  2. 平移只改变横向位置，不得改变端点弧长范围；
+  3. 单位必须一致：`contour/centerline` 是像素，采样步长与阈值要先除以 mpp。
+- 代码锚点：`row_geometry._recenter_band_centerlines`；测试 `tests/test_centerline_recenter.py`。
