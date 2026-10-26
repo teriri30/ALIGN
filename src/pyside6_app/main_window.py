@@ -2123,17 +2123,15 @@ class MainWindow(QMainWindow):
                 self.task_panel.set_task_status("plan", "done")
             if self._pipeline_result is None and path_restore["historical_path_present"]:
                 self._log.info("cached path state restored without full path geometry")
-            self._restore_visual_from_state()
-            if (
-                getattr(self.state, "mask_processed", False)
-                and isinstance(getattr(self.state, "mask_result", None), dict)
-                and not self._centerline_state_view()[0].get("items")
-            ):
-                self.log_panel.info("缓存已恢复；请在任务清单中点击’生成作业线’。")
             # 一致性兜底：掩膜没恢复成功时，缓存里残留的作业线/路径必须一起丢掉。
             # 否则会出现"画布上还画着作业线，任务清单却退回作物识别"的左右错位
             # （用户 2026-10-23 反馈；derive_task_statuses 在 process_done=False 时
             # 本来就把中心线当不存在，只是画布还在画）。
+            #
+            # 顺序铁律：先清状态、再按状态重画画布。反过来（先画再清）会把刚按
+            # 状态画好的识别掩膜与田块边界一起擦掉，用户看到的就是"左边已经到第 4 步、
+            # 右边一片空白"（2026-10-26 反馈；缓存 inference_done=True 且
+            # mask_processed=False 时必现）。清理也只能清派生层，不能清底图证据层。
             if not getattr(self.state, "mask_processed", False):
                 cleared_centerlines = bool(
                     ((getattr(self.state, "centerline_catalog", {}) or {}).get("items"))
@@ -2151,7 +2149,16 @@ class MainWindow(QMainWindow):
                     )
                 self.task_panel.clear_centerline_selection()
                 self._stale_path_preview = None
-                self._clear_display_overlay_layers()
+                self._clear_derived_path_layers()
+            # 画布永远是状态的函数：所有会改变状态的分支收敛之后，再统一重绘一次。
+            self._restore_visual_from_state()
+            if (
+                getattr(self.state, "mask_processed", False)
+                and isinstance(getattr(self.state, "mask_result", None), dict)
+                and not self._centerline_state_view()[0].get("items")
+            ):
+                self.log_panel.info("缓存已恢复；请在任务清单中点击’生成作业线’。")
+            self._repair_canvas_if_state_disagrees(where="cache_restore")
             # DECISION-002/013: the task panel is derived from the completely
             # restored domain state.  The individual green checks above are
             # only progressive feedback while large cache arrays are applied;
@@ -3526,6 +3533,15 @@ class MainWindow(QMainWindow):
         self._pipeline_result = None
         self.route_info.clear_info()
         self._sync_task_statuses()
+        # 状态变了就必须同步画布。这里不指望 25 个调用点都记得重绘：漏一个就是
+        # "左边清单说没有了、右边画布还画着"（用户反复反馈的左右不同步）。
+        # 交互式绘制/拖拽期间不动画布，避免和正在进行的绘制抢图层。
+        if not (
+            getattr(self, "_field_drawing", False)
+            or getattr(self, "_forbidden_drawing", False)
+            or int(getattr(self, "_route_drag_idx", -1) or -1) >= 0
+        ):
+            self._repair_canvas_if_state_disagrees(where=f"invalidate:{stage}")
         if reason:
             self.log_panel.info(f"已使下游结果失效：{reason}")
 
@@ -8302,6 +8318,107 @@ class MainWindow(QMainWindow):
             g[nz] = (g[nz].astype(np.float32) * 0.6 + m[nz].astype(np.float32) * 0.4).clip(0, 255).astype(np.uint8)
             rr[nz] = (rr[nz].astype(np.float32) * 0.6).astype(np.uint8)
         return ov
+
+    #: 只有这些图层是"路径/作业线的派生物"：掩膜失效时必须一起消失，
+    #: 而田块边界、识别掩膜、参考线属于证据层，只要各自的状态还在就必须留着。
+    DERIVED_PATH_LAYERS = ("centerlines", "route", "route_edit")
+
+    def _clear_derived_path_layers(self):
+        """Drop only path-derived overlays and keep the evidence layers."""
+        viewer = self.image_view.viewer
+        for name in self.DERIVED_PATH_LAYERS:
+            viewer.clear_overlay_layer(name)
+
+    def canvas_state_mismatches(self):
+        """Return human-readable disagreements between domain state and canvas.
+
+        左清单与右画布必须由同一份状态驱动（用户要求"左右一起同步"）。这个
+        检查把"状态里有什么、画布上就该有什么"（Rule A）与"状态里没有的，
+        画布上也不许有"（Rule B）写成可断言的清单，既是回归测试的判据，
+        也是状态改动后的自检依据。
+        """
+        problems = []
+        if self._tif_rgb is None:
+            return problems
+        viewer = self.image_view.viewer
+        state = self.state
+        if getattr(viewer, "_pixmap", None) is None:
+            problems.append("影像已导入但画布没有底图")
+
+        raw = getattr(state, "mask_raw", None)
+        has_raw = isinstance(raw, np.ndarray) and raw.size > 0
+        inference_done = bool(getattr(state, "inference_done", False)) and has_raw
+        mask_processed = bool(getattr(state, "mask_processed", False))
+        mask_result = getattr(state, "mask_result", None)
+        has_processed = mask_processed and isinstance(mask_result, dict)
+
+        # Rule A：状态里有，画布上就必须有。
+        if len(getattr(state, "field_boundary", []) or []) >= 3:
+            if not viewer.has_overlay_layer("field_boundary"):
+                problems.append("田块边界已存在但画布没有边界图层")
+        if has_raw and np.count_nonzero(np.asarray(raw) > 2):
+            # draw_mask_overlay 把像素值当强度（alpha = v*115/255），0/1 二值掩膜
+            # 渲染出来是全透明，那是另一条问题，不算"应该有图层"。
+            if not (
+                viewer.has_overlay_layer("raw_mask")
+                or viewer.has_overlay_layer("processed_mask")
+            ):
+                problems.append("作物识别结果已存在但画布没有掩膜图层")
+
+        # Rule B：状态里没有，画布上就不许留。
+        if not inference_done:
+            for name in (
+                "raw_mask",
+                "processed_mask",
+                "headland_mask",
+                "uncertain_residual",
+                "centerlines",
+            ):
+                if viewer.has_overlay_layer(name):
+                    problems.append(f"作物识别结果已失效，画布仍有 {name} 图层")
+        elif not has_processed:
+            for name in ("processed_mask", "headland_mask", "uncertain_residual"):
+                if viewer.has_overlay_layer(name):
+                    problems.append(f"掩膜尚未优化，画布却有 {name} 图层")
+        if not mask_processed and viewer.has_overlay_layer("centerlines"):
+            problems.append("掩膜尚未优化，画布却有 centerlines 图层")
+        if not getattr(state, "auto_path_planned", False):
+            stale_preview = getattr(self, "_stale_path_preview", None)
+            stale_ok = bool(
+                isinstance(stale_preview, dict) and stale_preview.get("full_path")
+            )
+            if not stale_ok and viewer.has_overlay_layer("route"):
+                problems.append("路径已失效但画布仍画着路线")
+        return problems
+
+    def _repair_canvas_if_state_disagrees(self, *, where=""):
+        """画布与状态打架时，以状态为准重绘一次（视图缩放/平移不动）。
+
+        「左边清单和右边画布必须一起同步」是用户的硬要求。任何改动状态的
+        流程只要留下"状态说没有、画布还在画"或"状态说有、画布空着"，都会被
+        这里发现并按状态重绘；重绘不改变用户当前看的位置。
+        """
+        problems = self.canvas_state_mismatches()
+        if not problems:
+            return False
+        viewer = self.image_view.viewer
+        view_state = (
+            viewer.capture_view_state()
+            if getattr(viewer, "_pixmap", None) is not None
+            else None
+        )
+        self._restore_visual_from_state()
+        if view_state is not None and getattr(viewer, "_pixmap", None) is not None:
+            try:
+                viewer.restore_view_state(view_state)
+            except Exception:
+                pass
+        remaining = self.canvas_state_mismatches()
+        self._log.info(
+            "画布按状态重绘（%s）：修复 %s；剩余 %s"
+            % (where or "state change", "、".join(problems), "、".join(remaining) or "无")
+        )
+        return True
 
     def _clear_display_overlay_layers(self, *, include_route=True):
         viewer = self.image_view.viewer
