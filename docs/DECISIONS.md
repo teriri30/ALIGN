@@ -1006,3 +1006,19 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
   5. “设置 / 操作记录”打开可读的操作记录窗口（此前只能导出文件），支持导出副本。
 - 代码锚点：`cache.save_reference_draft/load_reference_draft/clear_reference_draft`、`main_window._finalize_pending_reference/_persist_reference_draft/_exit_reference_mode`、`interaction_log.format_records`、`dialogs.ActionLogDialog`。
 - 测试：`tests/test_reference_lines_ui.py` 的退出自动保存、重启恢复、右键清草稿、切遍/切标定保存；`tests/test_interaction_log.py` 的可读格式。
+
+## DECISION-061：画布只能是状态的函数，左右必须同步（2026-10-26）
+
+- 现象（用户反复反馈）：缓存恢复后左侧任务清单已经走到「4. 掩膜优化 可操作」，右侧画布却**什么都没有**——既没有田块边界，也没有作物识别掩膜。
+- 复现（真实工程 `ba570cbf2799` / `data/tif/result.tif`，`inference_done=True`、`mask_processed=False`）：`_restore_cache_payload` 先调 `_restore_visual_from_state()` 按状态画好识别掩膜与田块边界，随后「一致性兜底」分支在 `mask_processed` 为假时调用 `_clear_display_overlay_layers()`。该函数清的是**全部**持久层（含 `raw_mask`、`field_boundary`），于是刚画好的证据层被自己擦掉，任务清单却仍按状态显示 1–3 步已完成。
+- 根因（两层）：
+  1. **顺序错**：先按状态重绘、再清图层，等于把正确结果扔掉；
+  2. **清理粒度错**：`_clear_display_overlay_layers()` 是"清空画布"，而当时真正失效的只有路径派生物（作业线/路线）。掩膜与田块边界属于上游证据层，只要各自状态还在就必须留着。
+- 规则（不变量）：
+  1. **画布是状态的函数**：任何改动状态的流程收敛后，都必须以状态为准重绘一次；先清状态、后重绘，不得先画后清。
+  2. **清理只清派生物**：失效清理用 `_clear_derived_path_layers()`（`centerlines`/`route`/`route_edit`）；`raw_mask`、`processed_mask`、`field_boundary`、`reference_lines` 由状态决定去留。
+  3. **自检**：`canvas_state_mismatches()` 双向校验——状态里有必须有图层（Rule A），状态里没有不许留图层（Rule B）；`_repair_canvas_if_state_disagrees()` 在恢复与失效流程末尾按状态重绘，**保持当前缩放/平移**，修复明细写入内部日志。
+  4. `_invalidate_analysis_from()` 末尾自带该自检，25 个调用点不再需要各自记得重绘；绘制/拖拽交互进行中跳过重绘，避免抢图层。
+- 代码锚点：`pyside6_app.main_window._restore_cache_payload`（顺序）、`_clear_derived_path_layers`、`canvas_state_mismatches`、`_repair_canvas_if_state_disagrees`、`_invalidate_analysis_from`。
+- 测试：`tests/test_canvas_state_consistency.py`（5 条：恢复后证据层必须存在 / 任务行与画布同步 / 失效后识别层必须消失而田块保留 / 检测器非空转 / 修复不改变视图）。全量 825 passed / 1 skipped。
+- 验收（真实数据，offscreen 全链路）：修复前 `canvas_layers == {}`（用户截图现象）；修复后 `raw_mask: 1`、`field_boundary: 14`、`canvas_state_mismatches() == []`。
