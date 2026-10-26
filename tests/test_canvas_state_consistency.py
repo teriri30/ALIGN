@@ -125,3 +125,17 @@ def test_repair_redraws_canvas_from_state_and_keeps_the_view(monkeypatch):
     assert abs(after["center"].x() - before["center"].x()) < 1.0
     assert abs(after["center"].y() - before["center"].y()) < 1.0
     window.close()
+
+def test_restore_replaces_progress_text_with_a_conclusion(monkeypatch):
+    """恢复结束状态条要给结论，不能停在「正在读取逐步操作历史…」。"""
+    window = _window()
+    monkeypatch.setattr(window, "_sync_cache_model_identity", lambda: True)
+    window.progress_bar.show()
+
+    window._restore_cache_payload(_payload(processed_valid=False, mask_processed=False))
+
+    text = window.status_strip.lbl_phase.text()
+    assert "已恢复最近项目" in text
+    assert "掩膜优化" in text
+    assert window.progress_bar.isHidden() is True
+    window.close()

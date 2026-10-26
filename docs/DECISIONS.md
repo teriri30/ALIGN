@@ -1020,5 +1020,6 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
   3. **自检**：`canvas_state_mismatches()` 双向校验——状态里有必须有图层（Rule A），状态里没有不许留图层（Rule B）；`_repair_canvas_if_state_disagrees()` 在恢复与失效流程末尾按状态重绘，**保持当前缩放/平移**，修复明细写入内部日志。
   4. `_invalidate_analysis_from()` 末尾自带该自检，25 个调用点不再需要各自记得重绘；绘制/拖拽交互进行中跳过重绘，避免抢图层。
 - 代码锚点：`pyside6_app.main_window._restore_cache_payload`（顺序）、`_clear_derived_path_layers`、`canvas_state_mismatches`、`_repair_canvas_if_state_disagrees`、`_invalidate_analysis_from`。
-- 测试：`tests/test_canvas_state_consistency.py`（5 条：恢复后证据层必须存在 / 任务行与画布同步 / 失效后识别层必须消失而田块保留 / 检测器非空转 / 修复不改变视图）。全量 825 passed / 1 skipped。
+- 恢复结束必须给结论：状态条与进度条要由 `ui_messages.project_restored()` 收口（「已恢复最近项目 · 识别结果可用，可执行掩膜优化」），否则界面一直停在「正在读取逐步操作历史…」+90% 进度条，看起来像卡死。
+- 测试：`tests/test_canvas_state_consistency.py`（6 条：恢复后证据层必须存在 / 任务行与画布同步 / 失效后识别层必须消失而田块保留 / 检测器非空转 / 修复不改变视图）。全量 825 passed / 1 skipped。
 - 验收（真实数据，offscreen 全链路）：修复前 `canvas_layers == {}`（用户截图现象）；修复后 `raw_mask: 1`、`field_boundary: 14`、`canvas_state_mismatches() == []`。

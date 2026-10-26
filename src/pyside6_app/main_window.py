@@ -2176,6 +2176,26 @@ class MainWindow(QMainWindow):
                     f"可撤回 {len(self.state.undo_stack)} 步，"
                     f"可重做 {len(self.state.redo_stack)} 步"
                 )
+            # 恢复结束必须给结论并收起进度条：否则状态条一直停在
+            # 「正在读取逐步操作历史…」、进度条停在 90%，看起来像程序卡死
+            # （用户在 2026-10-26 截图里就是这个状态）。
+            self.progress_bar.hide()
+            self.top_toolbar.set_progress(0)
+            from ui_messages import project_restored
+
+            inference_ready = bool(
+                getattr(self.state, "inference_done", False)
+                and isinstance(getattr(self.state, "mask_raw", None), np.ndarray)
+            )
+            if getattr(self.state, "mask_processed", False):
+                next_step = "掩膜优化结果可用，可生成作业线"
+            elif inference_ready:
+                next_step = "识别结果可用，可执行掩膜优化"
+            elif len(getattr(self.state, "field_boundary", []) or []) >= 3:
+                next_step = "田块已圈选，可运行作物识别"
+            else:
+                next_step = ""
+            self.set_status_text(project_restored(next_step), "ready")
         except Exception as e:
             self._log.info(f"cache restore failed: {e}")
 

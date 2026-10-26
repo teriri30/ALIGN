@@ -103,6 +103,16 @@ def origin_suggested(mode: str = "reference") -> str:
     return "起点已推荐 · 可拖动调整；终点按需在画布上设置"
 
 
+def project_restored(next_step: str = "") -> str:
+    """项目缓存恢复后的状态条结论：现在的状态 + 下一步。
+
+    「正在读取逐步操作历史…」这类进度文案必须被结论替换掉，否则恢复完成后
+    状态条一直停在过程中间，用户会以为程序卡住了（2026-10-26）。
+    """
+    step = normalize(next_step or "")
+    return f"已恢复最近项目 · {step}" if step else "已恢复最近项目"
+
+
 def path_done(work_lines: int, turns: int, length_m: float) -> str:
     return (
         f"路径已生成 · 作业段 {int(work_lines)} 段，转弯 {int(turns)} 处，"
