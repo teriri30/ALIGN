@@ -67,6 +67,9 @@ FIELD_BOUNDARY_COLOR_BGR = (255, 140, 50)
 # 参考线橙色（RGB 橙 = BGR (0,160,255)），桩点红橙色。
 REFERENCE_LINE_COLOR_BGR = (0, 160, 255)
 REFERENCE_STATION_COLOR_BGR = (70, 70, 235)
+#: 拟合基准线（评价用的直线口径）。必须比桩点连线暗、细，否则用户分不清
+#: "我画的线"和"评价用的线"，也就会把拟合偏差看成界面错位。
+REFERENCE_FIT_COLOR_BGR = (120, 120, 120)
 REFERENCE_DOUBLE_CLICK_SECONDS = 0.45
 REFERENCE_DOUBLE_CLICK_DISTANCE_PX = 12.0
 # DECISION-060: 作业线标定（人工纠偏）。人拖出来的线就是本次规划采用的线，
@@ -4126,7 +4129,8 @@ class MainWindow(QMainWindow):
             "参考线标注（第 %d 遍）：左键沿宽行带中心逐点添加桩点（建议每 5 m 一点，"
             "一条带 10-16 个点），最后一个桩点上双击完成并自动保存；也可以点菜单"
             "“完成当前参考线”保存；右键取消当前线；再次点击同一条菜单退出"
-            "（退出前会自动保存已画好的线）。当前已有 %d 条参考线。"
+            "（退出前会自动保存已画好的线）。保存后橙色实线按桩点连、暗色细虚线是"
+            "拟合基准线（评价用），两者分开说明桩点不在一条直线上。当前已有 %d 条参考线。"
             % (self._reference_pass, existing)
         )
         self._log_action(
@@ -4299,18 +4303,35 @@ class MainWindow(QMainWindow):
         payload = deepcopy(self._reference_lines_payload() or {})
         if not payload or payload.get("schema") != reference_lines.SCHEMA:
             payload = reference_lines.empty_payload(tif)
-        band_id, band_label, band_note = self._nearest_reference_band(pts)
-        record = reference_lines.new_line_record(
-            pts,
-            band_id=band_id,
-            band_label=band_label,
-            pass_index=self._reference_pass,
-        )
-        replaced = False
-        if band_id in (None, ""):
-            replaced = self._reference_replace_nearest(payload, record)
-        if not replaced:
-            reference_lines.upsert_line(payload, record)
+        # 一条参考线对应一条行带。用户常把两条带连着画（中间直角过渡），
+        # 那样一条记录里就混了两条直线的点，拟合直线必然与点整体错位
+        # （实测 58 点里后 4 点偏 114 px ≈ 6.4 m）。这里按转折自动拆开。
+        segments = reference_lines.split_points_at_turns(pts)
+        if len(segments) > 1:
+            self.log_panel.warn(
+                "检测到 %d 处转折（≥%d°），已按转折拆成 %d 条参考线（一条行带一条线）。"
+                "画下一条行带前先双击收线，再继续点。"
+                % (
+                    len(segments) - 1,
+                    int(reference_lines.TURN_SPLIT_ANGLE_DEG),
+                    len(segments),
+                )
+            )
+        saved = []
+        for segment in segments:
+            band_id, band_label, band_note = self._nearest_reference_band(segment)
+            record = reference_lines.new_line_record(
+                segment,
+                band_id=band_id,
+                band_label=band_label,
+                pass_index=self._reference_pass,
+            )
+            replaced = False
+            if band_id in (None, ""):
+                replaced = self._reference_replace_nearest(payload, record)
+            if not replaced:
+                reference_lines.upsert_line(payload, record)
+            saved.append((record, replaced, band_id, band_label, band_note, segment))
         payload["tif_path"] = str(payload.get("tif_path") or tif)
         payload["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
         try:
@@ -4328,36 +4349,59 @@ class MainWindow(QMainWindow):
         self.image_view.viewer.clear_overlay_layer("interaction_reference")
         self._draw_reference_lines_overlay()
         self._sync_display_layer_availability()
-        band_part = ""
-        if band_id not in (None, ""):
-            band_part = "，匹配 %s" % (band_label or band_id)
-        elif band_note:
-            band_part = "，%s" % band_note
-        self.log_panel.success(
-            "参考线已保存（%s%s）：第 %d 遍，%d 个桩点%s"
-            % (
-                "替换 " if replaced else "",
-                record.get("id", ""),
-                self._reference_pass,
-                len(pts),
-                band_part,
+        for record, replaced, band_id, band_label, band_note, segment in saved:
+            band_part = ""
+            if band_id not in (None, ""):
+                band_part = "，匹配 %s" % (band_label or band_id)
+            elif band_note:
+                band_part = "，%s" % band_note
+            self.log_panel.success(
+                "参考线已保存（%s%s）：第 %d 遍，%d 个桩点%s"
+                % (
+                    "替换 " if replaced else "",
+                    record.get("id", ""),
+                    self._reference_pass,
+                    len(segment),
+                    band_part,
+                )
             )
-        )
-        coverage = self._reference_coverage_hint(pts)
-        if coverage is not None and coverage < 0.6:
-            self.log_panel.warn(
-                "参考线落膜覆盖率约 %.0f%%，疑似偏离行带主体，建议放大复核。"
-                % (coverage * 100.0)
+            coverage = self._reference_coverage_hint(segment)
+            if coverage is not None and coverage < 0.6:
+                self.log_panel.warn(
+                    "参考线落膜覆盖率约 %.0f%%，疑似偏离行带主体，建议放大复核。"
+                    % (coverage * 100.0)
+                )
+            # 桩点质量提示（不拦截保存）：只看 RMS 会把"个别点跨行"平均掉，
+            # 必须同时报最大垂距与它是第几个点。
+            fit_info = record.get("fit") or {}
+            rms_m = self._reference_px_to_m(
+                float(fit_info.get("residual_rms_px") or 0.0),
+                segment[0][0], segment[0][1],
             )
-        self._log_action(
-            "reference.finish", str(record.get("id") or ""),
-            pass_index=self._reference_pass,
-            points=len(pts),
-            band_id=band_id,
-            band_label=band_label,
-            replaced=bool(replaced),
-            coverage=None if coverage is None else round(float(coverage), 3),
-        )
+            dev_px = float(fit_info.get("max_deviation_px") or 0.0)
+            worst = int(fit_info.get("max_deviation_station") or 0)
+            anchor = segment[min(max(worst - 1, 0), len(segment) - 1)]
+            dev_m = self._reference_px_to_m(dev_px, anchor[0], anchor[1])
+            if dev_m is not None and dev_m > 0.5:
+                self.log_panel.warn(
+                    "参考线拟合偏差偏大：第 %d 个桩点偏离基准线 %.2f m（均方根 %.2f m）。"
+                    "橙色实线是按桩点连的线，暗色细虚线是拟合基准——两者分开说明"
+                    "桩点不在一条直线上，若有点跨到别的行，右键取消后重画。"
+                    % (worst, dev_m, rms_m if rms_m is not None else 0.0)
+                )
+            self._log_action(
+                "reference.finish", str(record.get("id") or ""),
+                pass_index=self._reference_pass,
+                points=len(segment),
+                band_id=band_id,
+                band_label=band_label,
+                replaced=bool(replaced),
+                coverage=None if coverage is None else round(float(coverage), 3),
+                rms_m=None if rms_m is None else round(float(rms_m), 3),
+                max_dev_m=None if dev_m is None else round(float(dev_m), 3),
+                max_dev_station=worst,
+                segments=len(segments),
+            )
         self._sync_drawing_mode()
         return True
 
@@ -4482,7 +4526,15 @@ class MainWindow(QMainWindow):
             return None
 
     def _draw_reference_lines_overlay(self, viewer=None):
-        """绘制已保存的参考线到 reference_lines 图层（可在图层面板显隐）。"""
+        """绘制已保存的参考线到 reference_lines 图层（可在图层面板显隐）。
+
+        三层画法，缺一层用户就看不懂：
+        1. 暗色细虚线 = 桩点拟合出的**基准直线**（评价口径用它算 Eθ / 沿线采样）；
+        2. 橙色实线 = **按桩点连起来的线**（用户画的那条，点和线必须重合）；
+        3. 红橙圆点 = 桩点本身。
+        之前只画了 1 + 3，58 个桩点里只要有 4 个跨到别的行（实测偏 114 px），
+        拟合直线就与点整体错位约 6 m，用户看到的就是"点和线错位"。
+        """
         import reference_lines
 
         viewer = viewer if viewer is not None else self.image_view.viewer
@@ -4495,13 +4547,28 @@ class MainWindow(QMainWindow):
         viewer.begin_overlay_layer("reference_lines")
         try:
             for line in lines:
-                fit = reference_lines.reference_fit(line)
-                p1, p2 = fit["p1"], fit["p2"]
-                viewer.draw_line(
-                    p1[0], p1[1], p2[0], p2[1],
-                    color=REFERENCE_LINE_COLOR_BGR, width=3, style=Qt.DashLine,
+                points = [
+                    (float(point[0]), float(point[1]))
+                    for point in (line.get("points") or [])
+                    if len(point) >= 2
+                ]
+                if len(points) < 2:
+                    continue
+                try:
+                    fit = reference_lines.reference_fit(line)
+                    p1, p2 = fit["p1"], fit["p2"]
+                except ValueError:
+                    p1 = p2 = None
+                if p1 is not None:
+                    viewer.draw_line(
+                        p1[0], p1[1], p2[0], p2[1],
+                        color=REFERENCE_FIT_COLOR_BGR, width=1,
+                        style=Qt.DashLine,
+                    )
+                viewer.draw_polyline(
+                    points, color=REFERENCE_LINE_COLOR_BGR, width=2,
                 )
-                for point in line.get("points") or []:
+                for point in points:
                     viewer.draw_circle(
                         point[0], point[1], radius=5,
                         color=REFERENCE_STATION_COLOR_BGR,

@@ -77,11 +77,16 @@ def fit_line(points: Sequence[Sequence[float]]) -> Dict[str, Any]:
     p2 = (center[0] + ux * t1, center[1] + uy * t1)
     perp = np.abs(ux * dy - uy * dx)  # 各桩点到拟合线的垂距
     residual = float(np.sqrt(np.mean(perp * perp))) if len(pts) else 0.0
+    worst = int(np.argmax(perp)) if len(pts) else 0
     return {
         "p1": [float(p1[0]), float(p1[1])],
         "p2": [float(p2[0]), float(p2[1])],
         "angle_rad": float(angle),
         "residual_rms_px": residual,
+        # 最大垂距与它来自第几个桩点（1 起）。只看 RMS 会把"只有一个点跨到
+        # 别的行"平均掉：58 个点里 4 个偏 114 px，RMS 只有 34 px。
+        "max_deviation_px": float(perp[worst]) if len(pts) else 0.0,
+        "max_deviation_station": worst + 1,
         "point_count": int(len(pts)),
     }
 
@@ -270,6 +275,96 @@ def new_line_record(
         "points": pts,
         "fit": fit_line(pts),
     }
+
+
+#: 相邻两段桩点的转折角阈值（180°=继续直行，0°=原路折返）。
+#: 一条行带上的桩点不会在一站之内拐 40°（5 m 桩距要拐 40° 相当于转弯半径 7 m），
+#: 所以超过它基本就是"换了一条行带往下画"，必须拆成两条参考线。
+TURN_SPLIT_ANGLE_DEG = 40.0
+#: 判断转折时，两侧线段都不得短于「中位桩距 × 该比例」，避免双击抖动被误判。
+TURN_SPLIT_MIN_STEP_RATIO = 0.5
+TURN_SPLIT_MIN_STEP_PX = 20.0
+
+
+def turn_angles_deg(points: Sequence[Sequence[float]]) -> List[float]:
+    """返回每个中间桩点处的转折角（180° 直行，0° 原路折返）。"""
+    pts = np.asarray([(float(x), float(y)) for x, y in points], dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 3:
+        return []
+    vectors = np.diff(pts, axis=0)
+    angles: List[float] = []
+    for index in range(1, len(vectors)):
+        a, b = vectors[index - 1], vectors[index]
+        na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+        if na <= 1e-9 or nb <= 1e-9:
+            angles.append(180.0)
+            continue
+        cos_value = float(np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0))
+        angles.append(math.degrees(math.acos(cos_value)))
+    return angles
+
+
+def split_points_at_turns(
+    points: Sequence[Sequence[float]],
+    *,
+    angle_deg: float = TURN_SPLIT_ANGLE_DEG,
+    min_step_ratio: float = TURN_SPLIT_MIN_STEP_RATIO,
+    min_step_px: float = TURN_SPLIT_MIN_STEP_PX,
+) -> List[List[List[float]]]:
+    """把一条桩点序列按明显转折拆成若干段（每段 ≥2 点，拐点由相邻两段共用）。
+
+    一条参考线必须只对应一条行带：把两条行带连着画（中间直角过渡）会让
+    "拟合直线 vs 桩点"整体错位，用户看到的就是"点和线错位"。
+
+    拐点处的相邻两段共用该桩点（几何上它就是两段的公共端点）。连续几个
+    桩点都超阈值时（折返式急转会同时抬升两个转折角）只取转折角最大的那个，
+    否则中间那 1 个点会变成一个"单点段"被丢掉。
+    """
+    pts = [[float(x), float(y)] for x, y in points]
+    if len(pts) < 3:
+        return [pts] if len(pts) >= MIN_STATION_POINTS else []
+    turns = turn_angles_deg(pts)
+    if not turns:
+        return [pts]
+    steps = [
+        math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        for i in range(len(pts) - 1)
+    ]
+    median_step = float(np.median(steps)) if steps else 0.0
+    limit = max(float(min_step_px), float(min_step_ratio) * median_step)
+    candidates = [
+        index
+        for index, turn in enumerate(turns)
+        if turn >= float(angle_deg)
+        and steps[index] >= limit
+        and steps[index + 1] >= limit
+    ]
+    if not candidates:
+        return [pts]
+    apex_runs: List[List[int]] = []
+    for index in candidates:
+        if apex_runs and index == apex_runs[-1][-1] + 1:
+            apex_runs[-1].append(index)
+        else:
+            apex_runs.append([index])
+    # turns[index] 是第 (index+1) 个桩点处的转折角 → 该桩点的 0 基索引
+    corners = [max(run, key=lambda k: turns[k]) + 1 for run in apex_runs]
+    # 拐点归到**后一段**：它已经是新那条线带的起点，若同时算进前一段，
+    # 前一段的拟合会被拐点带偏（实测 RMS 3.5 px → 19.2 px）。
+    corners = [c for c in corners if 2 <= c <= len(pts) - 2]
+    if not corners:
+        return [pts]
+    segments: List[List[List[float]]] = []
+    start = 0
+    for corner in corners:
+        chunk = pts[start:corner]
+        if len(chunk) >= MIN_STATION_POINTS:
+            segments.append(chunk)
+        start = corner
+    tail = pts[start:]
+    if len(tail) >= MIN_STATION_POINTS:
+        segments.append(tail)
+    return segments or [pts]
 
 
 def next_line_id(payload: Dict[str, Any]) -> str:

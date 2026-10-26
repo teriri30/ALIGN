@@ -232,3 +232,111 @@ def test_entering_calibration_saves_pending_reference(tmp_path, monkeypatch):
     payload = cache.load_reference_lines(window.state.tif_path)
     assert len(payload["lines"]) == 1
     window.close()
+
+
+def test_fit_records_the_worst_station_not_just_the_rms():
+    """一个点跨到别的行时 RMS 会被平均掉，必须能报出"第几个点偏了多少"。"""
+    import reference_lines
+
+    points = [[0.0, 0.0], [100.0, 2.0], [200.0, 4.0], [300.0, 120.0], [400.0, 6.0]]
+    fit = reference_lines.fit_line(points)
+
+    assert fit["point_count"] == 5
+    assert fit["max_deviation_station"] == 4
+    assert fit["max_deviation_px"] > 50.0
+    # 最小二乘会把线往离群点方向拉，所以最大垂距一定明显大于 RMS
+    assert fit["residual_rms_px"] < fit["max_deviation_px"] * 0.7
+
+
+def test_saved_reference_line_connects_the_stations_it_was_drawn_through(tmp_path, monkeypatch):
+    """保存后必须按桩点连成折线：只画拟合直线就是用户看到的"点和线错位"。"""
+    window = _window(tmp_path, monkeypatch)
+    points = [[100.0, 100.0], [110.0, 200.0], [122.0, 300.0], [134.0, 400.0]]
+    monkeypatch.setattr(
+        window,
+        "_reference_lines_payload",
+        lambda: {
+            "schema": "centerline-reference-lines-v1",
+            "lines": [
+                {
+                    "id": "ref-0001",
+                    "pass": 1,
+                    "points": points,
+                    "fit": {
+                        "p1": [100.0, 100.0],
+                        "p2": [120.0, 400.0],
+                        "angle_rad": 1.5,
+                    },
+                }
+            ],
+        },
+    )
+
+    window._draw_reference_lines_overlay()
+
+    viewer = window.image_view.viewer
+    items = viewer._overlay_layers.get("reference_lines") or []
+    # 3 段折线 + 4 个桩点 + 1 条拟合基准虚线
+    assert len(items) == (len(points) - 1) + len(points) + 1
+    window.close()
+
+
+def test_finish_warns_when_one_station_sits_off_the_line(tmp_path, monkeypatch):
+    """桩点跨行时保存后要提示，而不是默默画一条歪线。"""
+    window = _window(tmp_path, monkeypatch)
+    # 0.05 m/px 的显示分辨率（接近真实工程的降采样口径）
+    monkeypatch.setattr(window, "_reference_px_to_m", lambda px, x, y: float(px) * 0.05)
+    messages = []
+    monkeypatch.setattr(
+        window.log_panel, "warn", lambda text, *a, **k: messages.append(str(text)), raising=False
+    )
+    window._set_reference_mode(1)
+    # 一条带里有一个桩点点偏了（转折 <40°，不会被拆段），但仍应提示偏差
+    for x, y in ((0.0, 0.0), (100.0, 5.0), (200.0, 35.0), (300.0, 5.0), (400.0, 0.0)):
+        window._on_viewer_mouse_pressed(x, y, 1)
+
+    assert window._finish_reference_line() is True
+
+    assert any("偏离基准线" in text for text in messages)
+    window.close()
+
+
+def test_split_points_at_turns_separates_two_rows_drawn_in_one_go():
+    """两条行带连着画（中间直角过渡）必须拆成两段，否则拟合线整体歪掉。"""
+    import reference_lines
+
+    points = [[0.0, 0.0], [0.0, 100.0], [0.0, 200.0], [100.0, 200.0], [200.0, 200.0]]
+    segments = reference_lines.split_points_at_turns(points)
+
+    assert [len(segment) for segment in segments] == [2, 3]
+    # 拐点归到后一段，点数不丢不重
+    assert sum(len(segment) for segment in segments) == len(points)
+
+
+def test_split_keeps_a_single_curved_row_as_one_line():
+    import reference_lines
+
+    curved = [[0.0, 0.0], [50.0, 2.0], [100.0, 5.0], [150.0, 9.0], [200.0, 14.0], [250.0, 20.0]]
+
+    assert len(reference_lines.split_points_at_turns(curved)) == 1
+
+
+def test_finishing_two_rows_in_one_go_saves_two_reference_lines(tmp_path, monkeypatch):
+    window = _window(tmp_path, monkeypatch)
+    messages = []
+    monkeypatch.setattr(
+        window.log_panel, "warn", lambda text, *a, **k: messages.append(str(text)), raising=False
+    )
+    window._set_reference_mode(1)
+    for x, y in ((100.0, 100.0), (100.0, 200.0), (100.0, 300.0), (200.0, 300.0), (300.0, 300.0)):
+        window._on_viewer_mouse_pressed(x, y, 1)
+
+    assert window._finish_reference_line() is True
+
+    import cache
+
+    payload = cache.load_reference_lines(window.state.tif_path)
+    assert len(payload["lines"]) == 2
+    assert sorted(len(line["points"]) for line in payload["lines"]) == [2, 3]
+    assert any("转折" in text for text in messages)
+    window.close()
