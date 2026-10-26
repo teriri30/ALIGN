@@ -310,6 +310,7 @@ def split_points_at_turns(
     angle_deg: float = TURN_SPLIT_ANGLE_DEG,
     min_step_ratio: float = TURN_SPLIT_MIN_STEP_RATIO,
     min_step_px: float = TURN_SPLIT_MIN_STEP_PX,
+    min_segment_points: int = 2,
 ) -> List[List[List[float]]]:
     """把一条桩点序列按明显转折拆成若干段（每段 ≥2 点，拐点由相邻两段共用）。
 
@@ -319,6 +320,10 @@ def split_points_at_turns(
     拐点处的相邻两段共用该桩点（几何上它就是两段的公共端点）。连续几个
     桩点都超阈值时（折返式急转会同时抬升两个转折角）只取转折角最大的那个，
     否则中间那 1 个点会变成一个"单点段"被丢掉。
+
+    ``min_segment_points`` 用于丢弃转折处的过渡桩点（默认 2 表示一段都不丢）：
+    用户在田头换行带时会顺手点 1-2 个过渡点，它们既不属于上一条行带也不属于
+    下一条，留着会把两侧的拟合线拉歪。
     """
     pts = [[float(x), float(y)] for x, y in points]
     if len(pts) < 3:
@@ -330,8 +335,10 @@ def split_points_at_turns(
         math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
         for i in range(len(pts) - 1)
     ]
-    median_step = float(np.median(steps)) if steps else 0.0
-    limit = max(float(min_step_px), float(min_step_ratio) * median_step)
+    # 只用绝对下限判定"够长的桩距"，不按中位桩距按比例抬高下限：用户实际
+    # 桩距常常很不均匀（实测中位 352 px、最大 911 px），按 0.5×中位设限会把
+    # 真实转折全部滤掉（ref-0004 154 点、27 处 ≥40° 转折被判成 1 段）。
+    limit = float(min_step_px)
     candidates = [
         index
         for index, turn in enumerate(turns)
@@ -354,17 +361,93 @@ def split_points_at_turns(
     corners = [c for c in corners if 2 <= c <= len(pts) - 2]
     if not corners:
         return [pts]
+    minimum = max(MIN_STATION_POINTS, int(min_segment_points))
     segments: List[List[List[float]]] = []
     start = 0
     for corner in corners:
         chunk = pts[start:corner]
-        if len(chunk) >= MIN_STATION_POINTS:
+        if len(chunk) >= minimum:
             segments.append(chunk)
         start = corner
     tail = pts[start:]
-    if len(tail) >= MIN_STATION_POINTS:
+    if len(tail) >= minimum:
         segments.append(tail)
     return segments or [pts]
+
+
+def _split_by_deviation(
+    segment: Sequence[Sequence[float]],
+    max_deviation: float,
+    min_points: int,
+    max_iterations: int,
+    depth: int = 0,
+) -> List[List[List[float]]]:
+    """递归按"本段自己的拟合线下最大垂距"切开，直到每段都够直或点数不足。"""
+    pts = [[float(x), float(y)] for x, y in segment]
+    if len(pts) < min_points or depth >= max_iterations:
+        return [pts]
+    fit = fit_line(pts)
+    p1 = np.asarray(fit["p1"], dtype=np.float64)
+    vector = np.asarray(fit["p2"], dtype=np.float64) - p1
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-9:
+        return [pts]
+    unit = vector / norm
+    normal = np.asarray([-unit[1], unit[0]], dtype=np.float64)
+    deviations = np.abs((np.asarray(pts, dtype=np.float64) - p1) @ normal)
+    worst = int(np.argmax(deviations))
+    if float(deviations[worst]) <= float(max_deviation):
+        return [pts]
+    if worst <= 0 or worst >= len(pts) - 1:
+        # 最差点在端点上：它本身就是过渡点，丢掉端点后重试（每次少一个点，必然收敛）
+        trimmed = pts[1:] if worst <= 0 else pts[:-1]
+        return _split_by_deviation(
+            trimmed, max_deviation, min_points, max_iterations, depth + 1
+        )
+    # 最差点通常是两条行带之间的过渡点：它不进任何一段
+    parts: List[List[List[float]]] = []
+    for chunk in (pts[:worst], pts[worst + 1:]):
+        if len(chunk) >= min_points:
+            parts.extend(_split_by_deviation(chunk, max_deviation, min_points, max_iterations, depth + 1))
+        elif len(chunk) >= MIN_STATION_POINTS:
+            parts.append(chunk)
+    return parts or [pts]
+
+
+def split_reference_lines(
+    points: Sequence[Sequence[float]],
+    *,
+    angle_deg: float = TURN_SPLIT_ANGLE_DEG,
+    min_step_px: float = TURN_SPLIT_MIN_STEP_PX,
+    min_segment_points: int = 3,
+    max_deviation_px: float = 0.0,
+) -> List[List[List[float]]]:
+    """一条参考线一条行带：先按转折粗分，再按"最大垂距"细分。
+
+    用户实际画法往往是"顺着一条行带点几个桩点 → 在田头拐到下一行 → 继续点"，
+    转折角不一定都超过 40°（实测 ref-0004：154 点、桩距中位 352 px，27 处转折
+    里不少是渐进的），因此粗分之后还要把"一段里横跨两条行带"的部分按最大垂距
+    切开。``max_deviation_px`` 为 0 时只做转折粗分。
+    """
+    base = split_points_at_turns(
+        points,
+        angle_deg=angle_deg,
+        min_step_px=min_step_px,
+        min_segment_points=min_segment_points,
+    )
+    if not max_deviation_px or float(max_deviation_px) <= 0.0:
+        return base
+    segments: List[List[List[float]]] = []
+    for segment in base:
+        segments.extend(
+            _split_by_deviation(
+                segment,
+                float(max_deviation_px),
+                max(3, int(min_segment_points)),
+                16,
+            )
+        )
+    return segments or base
 
 
 def next_line_id(payload: Dict[str, Any]) -> str:

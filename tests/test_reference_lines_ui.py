@@ -87,13 +87,47 @@ def test_reference_double_click_finishes_without_extra_point(tmp_path, monkeypat
     window.close()
 
 
-def test_reference_right_click_cancels_current_line(tmp_path, monkeypatch):
+def test_reference_right_click_undoes_only_the_last_point(tmp_path, monkeypatch):
+    """右键只撤一个桩点（用户误触右键丢过 34 个点）。"""
     window = _window(tmp_path, monkeypatch)
     window._set_reference_mode(1)
-    window._on_viewer_mouse_pressed(5.0, 5.0, 1)
+    for x, y in ((10.0, 10.0), (40.0, 12.0), (80.0, 14.0)):
+        window._on_viewer_mouse_pressed(x, y, 1)
     window._on_viewer_mouse_pressed(0.0, 0.0, 2)
+
+    assert len(window._reference_pts) == 2
+    assert window._reference_pts[-1] == (40.0, 12.0)
+    import cache
+
+    draft = cache.load_reference_draft(window.state.tif_path, 1)
+    assert [list(map(float, p)) for p in draft["points"]] == [[10.0, 10.0], [40.0, 12.0]]
+    window.close()
+
+
+def test_right_click_undo_works_point_by_point_and_keeps_the_line(tmp_path, monkeypatch):
+    window = _window(tmp_path, monkeypatch)
+    window._set_reference_mode(1)
+    for x, y in ((10.0, 10.0), (40.0, 12.0), (80.0, 14.0), (120.0, 16.0)):
+        window._on_viewer_mouse_pressed(x, y, 1)
+    for _ in range(2):
+        window._on_viewer_mouse_pressed(0.0, 0.0, 2)
+
+    assert [p[0] for p in window._reference_pts] == [10.0, 40.0]
+    window.close()
+
+
+def test_ctrl_right_click_discards_the_whole_pending_line(tmp_path, monkeypatch):
+    window = _window(tmp_path, monkeypatch)
+    monkeypatch.setattr(window, "_reference_cancel_modifier_active", staticmethod(lambda: True))
+    window._set_reference_mode(1)
+    for x, y in ((10.0, 10.0), (40.0, 12.0), (80.0, 14.0)):
+        window._on_viewer_mouse_pressed(x, y, 1)
+    window._on_viewer_mouse_pressed(0.0, 0.0, 2)
+
     assert window._reference_pts == []
-    assert window.image_view.viewer.has_overlay_layer("interaction_reference") is False
+    import cache
+
+    assert cache.load_reference_draft(window.state.tif_path, 1) == {}
     window.close()
 
 
@@ -170,15 +204,16 @@ def test_single_point_is_not_saved_and_draft_is_cleared(tmp_path, monkeypatch):
     window.close()
 
 
-def test_right_click_cancel_clears_the_draft(tmp_path, monkeypatch):
+def test_right_click_on_an_empty_line_exits_the_mode(tmp_path, monkeypatch):
+    """空线状态下右键＝退出标注，不再需要另一条入口。"""
     window = _window(tmp_path, monkeypatch)
     window._set_reference_mode(1)
-    window._on_viewer_mouse_pressed(10.0, 10.0, 1)
-    window._on_viewer_mouse_pressed(40.0, 12.0, 1)
-    window._on_viewer_mouse_pressed(0.0, 0.0, 2)
-    import cache
+    assert window._reference_drawing is True
 
-    assert cache.load_reference_draft(window.state.tif_path, 1) == {}
+    window._on_viewer_mouse_pressed(0.0, 0.0, 2)
+
+    assert window._reference_drawing is False
+    assert window.image_view.viewer.has_overlay_layer("interaction_reference") is False
     window.close()
 
 
@@ -338,5 +373,5 @@ def test_finishing_two_rows_in_one_go_saves_two_reference_lines(tmp_path, monkey
     payload = cache.load_reference_lines(window.state.tif_path)
     assert len(payload["lines"]) == 2
     assert sorted(len(line["points"]) for line in payload["lines"]) == [2, 3]
-    assert any("转折" in text for text in messages)
+    assert any("拆成" in text for text in messages)
     window.close()

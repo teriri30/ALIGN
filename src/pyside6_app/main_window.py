@@ -4128,7 +4128,7 @@ class MainWindow(QMainWindow):
         self.log_panel.info(
             "参考线标注（第 %d 遍）：左键沿宽行带中心逐点添加桩点（建议每 5 m 一点，"
             "一条带 10-16 个点），最后一个桩点上双击完成并自动保存；也可以点菜单"
-            "“完成当前参考线”保存；右键取消当前线；再次点击同一条菜单退出"
+            "“完成当前参考线”保存；右键撤销上一个桩点（Ctrl+右键丢弃整条）；再次点击同一条菜单退出"
             "（退出前会自动保存已画好的线）。保存后橙色实线按桩点连、暗色细虚线是"
             "拟合基准线（评价用），两者分开说明桩点不在一条直线上。当前已有 %d 条参考线。"
             % (self._reference_pass, existing)
@@ -4215,18 +4215,58 @@ class MainWindow(QMainWindow):
             )
         return True
 
+    @staticmethod
+    def _reference_cancel_modifier_active():
+        """Ctrl+右键＝丢弃整条未保存的参考线（普通右键只撤一个桩点）。"""
+        try:
+            return bool(QApplication.keyboardModifiers() & Qt.ControlModifier)
+        except Exception:
+            return False
+
     def _handle_reference_click(self, x, y, button):
-        """参考线标注模式下的一次点击：左键加桩点，双击收线，右键取消。"""
+        """参考线标注模式下的一次点击：左键加桩点，双击收线，右键撤销一个桩点。"""
         if button == 2:
-            discarded = len(self._reference_pts)
-            self._reference_pts = []
+            # 右键 ＝ **撤销最后 1 个桩点**。旧行为是一键丢弃整条未保存的线，
+            # 用户 2026-10-26 实测误触一次就丢了 34 个桩点。整条丢弃改为
+            # Ctrl+右键（明确意图），空线状态下右键＝退出标注。
+            if self._reference_cancel_modifier_active():
+                discarded = len(self._reference_pts)
+                self._reference_pts = []
+                self._reference_last_click = None
+                self._clear_reference_draft()
+                self.image_view.viewer.clear_overlay_layer("interaction_reference")
+                self._sync_drawing_mode()
+                self.log_panel.info(
+                    "已丢弃当前参考线（未保存，丢弃 %d 个桩点）" % discarded
+                )
+                self._log_action(
+                    "reference.cancel", "", pass_index=self._reference_pass, points=discarded
+                )
+                return
+            if not self._reference_pts:
+                self._exit_reference_mode()
+                return
+            removed = self._reference_pts.pop()
             self._reference_last_click = None
-            self._clear_reference_draft()
-            self.image_view.viewer.clear_overlay_layer("interaction_reference")
-            self._sync_drawing_mode()
-            self.log_panel.info("已取消当前参考线（未保存，丢弃 %d 个桩点）" % discarded)
+            self._persist_reference_draft()
+            self._redraw_reference_interaction()
             self._log_action(
-                "reference.cancel", "", pass_index=self._reference_pass, points=discarded
+                "reference.undo_point", "",
+                pass_index=self._reference_pass,
+                remaining=len(self._reference_pts),
+                x=round(float(removed[0]), 1),
+                y=round(float(removed[1]), 1),
+            )
+            if self._reference_pts:
+                self.log_panel.info(
+                    "已撤销最后 1 个桩点，剩 %d 个" % len(self._reference_pts)
+                )
+            else:
+                self.log_panel.info("已撤销最后 1 个桩点，当前没有桩点")
+            self.lbl_status.setText(
+                "参考线标注（第 %d 遍）：已加 %d 点，双击或菜单“完成当前参考线”保存，"
+                "右键撤销上一个点"
+                % (self._reference_pass, len(self._reference_pts))
             )
             return
         if button != 1:
@@ -4306,16 +4346,20 @@ class MainWindow(QMainWindow):
         # 一条参考线对应一条行带。用户常把两条带连着画（中间直角过渡），
         # 那样一条记录里就混了两条直线的点，拟合直线必然与点整体错位
         # （实测 58 点里后 4 点偏 114 px ≈ 6.4 m）。这里按转折自动拆开。
-        segments = reference_lines.split_points_at_turns(pts)
+        mpp = self._reference_px_to_m(1.0, pts[0][0], pts[0][1])
+        # 1.5 m 是"参考线该有多直"的工程口径：行带本身约 1 m 宽，桩点偏离基准线
+        # 超过一个半行距就说明这段横跨了两条行带；拿不到米制比例时退回 30 px。
+        max_deviation_px = (1.5 / mpp) if mpp else 30.0
+        segments = reference_lines.split_reference_lines(
+            pts, min_segment_points=2, max_deviation_px=max_deviation_px,
+        )
+        dropped = len(pts) - sum(len(segment) for segment in segments)
         if len(segments) > 1:
+            detail = "，丢弃 %d 个转折过渡点" % dropped if dropped > 0 else ""
             self.log_panel.warn(
-                "检测到 %d 处转折（≥%d°），已按转折拆成 %d 条参考线（一条行带一条线）。"
-                "画下一条行带前先双击收线，再继续点。"
-                % (
-                    len(segments) - 1,
-                    int(reference_lines.TURN_SPLIT_ANGLE_DEG),
-                    len(segments),
-                )
+                "这条桩点跨了 %d 条行带，已自动拆成 %d 条参考线（一条行带一条线%s）。"
+                "下次换行带前先双击收线。"
+                % (len(segments), len(segments), detail)
             )
         saved = []
         for segment in segments:
@@ -4401,6 +4445,7 @@ class MainWindow(QMainWindow):
                 max_dev_m=None if dev_m is None else round(float(dev_m), 3),
                 max_dev_station=worst,
                 segments=len(segments),
+                dropped_stations=dropped,
             )
         self._sync_drawing_mode()
         return True
@@ -12495,7 +12540,7 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("禁行区绘制：点击首点闭合，右键取消")
         elif self._reference_drawing:
             self.lbl_status.setText(
-                "参考线标注（第 %d 遍）：已加 %d 点，双击或菜单“完成当前参考线”保存，右键取消"
+                "参考线标注（第 %d 遍）：已加 %d 点，双击或菜单“完成当前参考线”保存，右键撤销上一个点"
                 % (self._reference_pass, len(self._reference_pts))
             )
         elif self._calibration_drawing:

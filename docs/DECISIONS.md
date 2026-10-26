@@ -1038,3 +1038,14 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - 代码锚点：`reference_lines.turn_angles_deg/split_points_at_turns/fit_line`、`pyside6_app.main_window._finish_reference_line`、`_draw_reference_lines_overlay`。
 - 测试：`tests/test_reference_lines_ui.py`（拆段/单条弯曲不拆/一条记录存成两条/最差点不是 RMS/保存后按桩点连成折线/偏差提示）。
 - 真实数据验收：58 点 → 拆成 54 + 4 两条，各自 RMS 3.47 px 与 0.27 px，点数不丢不重。
+
+## DECISION-062 修订：拆段判据改为"绝对桩距下限 + 最大垂距递归细分"；右键逐步撤销（2026-10-26）
+
+- 事故一（拆段失效）：用户把 14 条行带连着画成一条参考线（`ref-0004`，154 个桩点、桩距中位 352 px、27 处 ≥40° 转折），但**一条都没拆出来**。根因：判据把桩距下限写成"中位桩距 × 0.5"（=176 px），真实转折处的相邻桩距常常小于它 → 候选转折被全部滤掉。
+  - 改法：桩距下限只保留**绝对值** `TURN_SPLIT_MIN_STEP_PX = 20 px`（≈1.1 m，用来滤双击抖动），不再按中位桩距抬高；
+  - 粗分之后增加**按最大垂距递归细分**（`split_reference_lines` + `_split_by_deviation`）：一段内某桩点相对本段拟合线的垂距 > 1.5 m（工程口径：行带约 1 m 宽）就切开、最差点作过渡点丢弃，直到每段都够直或点数不足；最差点落在端点时丢端点重试（保证收敛）。
+  - 实测：`ref-0004` 154 点 → 14 段，各段 RMS ≤ 6.64 px（0.37 m）、中位 3.01 px，丢弃 5 个转折过渡点；`ref-0001` 54 点保持 1 段不变。阈值 1.0–2.0 m 结果完全一致（不敏感）。
+- 事故二（右键丢数据）：标注模式下右键＝**丢弃整条未保存的线**，用户误触一次丢了 34 个桩点。
+  - 改法：右键＝**撤销最后 1 个桩点**（逐点可撤，草稿同步落盘）；`Ctrl+右键`＝丢弃整条（明确意图）；空线状态下右键＝退出标注模式。状态条与模式提示同步改成"右键撤销上一个点"。
+- 代码锚点：`reference_lines.split_reference_lines/_split_by_deviation/turn_angles_deg`、`main_window._finish_reference_line`、`_handle_reference_click`、`_reference_cancel_modifier_active`。
+- 测试：`tests/test_reference_lines_ui.py`（右键单点撤销 / 连续撤销 / Ctrl+右键丢弃整条 / 空线右键退出 / 拆段两条记录 / 弯曲单条不拆 / 最大垂距报告 / 偏差提示）。
