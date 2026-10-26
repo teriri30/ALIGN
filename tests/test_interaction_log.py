@@ -74,3 +74,16 @@ def test_export_copies_the_current_log(tmp_path, monkeypatch):
     written = log.export_to(str(tmp_path / "out"))
     assert written
     assert (tmp_path / "out" / "f.jsonl").is_file()
+
+
+def test_format_records_is_readable_and_keeps_parameters(tmp_path, monkeypatch):
+    monkeypatch.delenv("ALIGN_DISABLE_ACTION_LOG", raising=False)
+    log = _fresh(tmp_path / "g.jsonl")
+    log.record("reference.point", "", pass_index=1, index=3, x=10.5, y=20.5)
+    log.record("reference.finish", "ref-0001", points=3, band_id="centerline-003")
+    text = interaction_log.format_records(log.recent(10))
+    assert "reference.point" in text
+    assert "index=3" in text
+    assert "ref-0001" in text
+    assert "band_id=centerline-003" in text
+    assert text.count("\n") >= 1

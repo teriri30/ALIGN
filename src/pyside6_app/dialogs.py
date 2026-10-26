@@ -811,6 +811,50 @@ class ProjectLogDialog(QDialog):
         lo.addWidget(edit)
 
 
+class ActionLogDialog(QDialog):
+    """操作记录查看器：按时间列出用户做过什么，并可导出副本。
+
+    与“项目日志”分工不同：项目日志回答“为什么失败”，操作记录回答
+    “用户到底点了什么、改了什么”，是复现问题与追踪标定过程的依据。
+    """
+
+    def __init__(self, text="", log_path="", export_callback=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("操作记录")
+        self.resize(900, 620)
+        layout = QVBoxLayout(self)
+        path_label = QLabel("日志文件：%s" % (log_path or "（尚未写入）"))
+        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        path_label.setWordWrap(True)
+        layout.addWidget(path_label)
+        edit = QTextEdit()
+        edit.setReadOnly(True)
+        edit.setLineWrapMode(QTextEdit.NoWrap)
+        edit.setPlainText(str(text or ""))
+        layout.addWidget(edit, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        export_button = QPushButton("导出副本…")
+        close_button = QPushButton("关闭")
+        row.addWidget(export_button)
+        row.addWidget(close_button)
+        layout.addLayout(row)
+
+        def _export():
+            if not callable(export_callback):
+                return
+            try:
+                destination = export_callback()
+            except Exception as exc:  # 导出失败要说清楚，不能静默
+                QMessageBox.warning(self, "导出失败", str(exc))
+                return
+            if destination:
+                QMessageBox.information(self, "已导出", "操作记录已导出到：\n%s" % destination)
+
+        export_button.clicked.connect(_export)
+        close_button.clicked.connect(self.accept)
+
+
 class ReportDialog(QDialog):
     def __init__(self, data=None, parent=None):
         super().__init__(parent)

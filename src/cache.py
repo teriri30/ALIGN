@@ -194,6 +194,41 @@ def save_operator_paths(tif_path: str, payload: Dict[str, Any]) -> str:
     return path
 
 
+def reference_draft_path(tif_path: str, pass_index: int = 1) -> str:
+    """未完成参考线的草稿（每加一个桩点就落盘，退出/崩溃都不丢）。"""
+    return os.path.join(_cache_dir(tif_path), "reference_draft_p%d.json" % int(pass_index))
+
+
+def load_reference_draft(tif_path: str, pass_index: int = 1) -> Dict[str, Any]:
+    path = reference_draft_path(tif_path, pass_index)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_reference_draft(tif_path: str, payload: Dict[str, Any]) -> str:
+    pass_index = int((payload or {}).get("pass", 1) or 1)
+    path = reference_draft_path(tif_path, pass_index)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with _project_lock(tif_path):
+        _atomic_write_json(path, payload)
+    return path
+
+
+def clear_reference_draft(tif_path: str, pass_index: int = 1) -> None:
+    path = reference_draft_path(tif_path, pass_index)
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
 def _history_dir(tif_path: str) -> str:
     return os.path.join(_cache_dir(tif_path), "history")
 

@@ -223,6 +223,34 @@ class ActionLog:
         return written
 
 
+def format_records(records: Iterable[Dict[str, Any]], *, max_payload_chars: int = 200) -> str:
+    """把操作记录排成可读文本：一行一个动作，参数压成 key=value。
+
+    给“操作记录”窗口和导出的 txt 用；不改变 JSONL 原文，日志仍是逐行 JSON。
+    """
+    lines: List[str] = []
+    for item in records or []:
+        if not isinstance(item, dict):
+            continue
+        timestamp = str(item.get("ts") or "")
+        action = str(item.get("action") or "")
+        target = str(item.get("target") or "")
+        payload = item.get("payload") or {}
+        detail = ""
+        if isinstance(payload, dict) and payload:
+            detail = "  " + "  ".join(
+                "%s=%s" % (key, value) for key, value in payload.items()
+                if value not in (None, "", [], {})
+            )
+            if len(detail) > max_payload_chars:
+                detail = detail[:max_payload_chars].rstrip() + " ..."
+        line = "%s  [%s]" % (timestamp, action)
+        if target:
+            line += "  " + target
+        lines.append(line + detail)
+    return "\n".join(lines)
+
+
 def action_log() -> ActionLog:
     return ActionLog()
 

@@ -993,3 +993,16 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - 验收（真实案例 `1271b2abf0d7`，5.27 田 5 三模式 12 m，mpp 0.017）：把一条带的人线设成算法线 +0.12 m，重规划后 9 条作业段中**只有 1 条移动，位移 0.120 m**，其余 8 条逐点一致；目录项 `line_source=operator`、`unmatched` 为空。
 - 口径：人线优先是"采用操作员认可的几何"，**不等于算法精度提高**；没有人工线时不得产生任何精度结论。分桶选择规则的样本 <3 条带时只作下一轮采样方向。
 - 版本：`footprint-path-v34`（旧路径缓存重规划）；掩膜处理版本仍为 21。代码锚点：`interaction_log`、`operator_paths`、`work_band_selection.apply_operator_centerlines`、`path_planner._apply_operator_centerline_selection`、`pyside6_app.main_window._set_calibration_mode`、`centerline_calibration`。
+
+## DECISION-060 修订：未完成的标注必须逐点落盘，退出即保存（2026-10-25）
+
+- 事故：用户在“参考线标注（第 1 遍）”里画完桩点，按提示“再次点击同一条菜单退出”，代码把 `_reference_pts` 直接清空，一条线都没保存（日志只有“已退出参考线标注模式”）。
+- 根因：退出分支只清内存与图层，没有调用 `_finish_reference_line`；“退出”被当成“取消”。
+- 规则：
+  1. 每加一个桩点立即写草稿 `<cache>/reference_draft_p<遍数>.json`，与最终 `reference_lines.json` 分离；
+  2. 离开标注（再次点同一遍、切到另一遍、进入标定、关闭窗口后重开）时，≥2 点自动保存，1 点提示“未保存”并留痕，保存失败则留在模式里不丢点；
+  3. 进入模式时自动恢复同遍草稿；右键取消才清草稿，并写 `reference.cancel`；
+  4. 操作日志记录 `reference.point`（逐点坐标）、`reference.finish`、`reference.exit`、`reference.discard`、`reference.restore_draft`；
+  5. “设置 / 操作记录”打开可读的操作记录窗口（此前只能导出文件），支持导出副本。
+- 代码锚点：`cache.save_reference_draft/load_reference_draft/clear_reference_draft`、`main_window._finalize_pending_reference/_persist_reference_draft/_exit_reference_mode`、`interaction_log.format_records`、`dialogs.ActionLogDialog`。
+- 测试：`tests/test_reference_lines_ui.py` 的退出自动保存、重启恢复、右键清草稿、切遍/切标定保存；`tests/test_interaction_log.py` 的可读格式。

@@ -45,7 +45,7 @@ from pyside6_app.workers import (
 from pyside6_app.event_handler import EventBridge
 from pyside6_app.dialogs import (
     HarvesterParamsDialog, ModelManagerDialog, SettingsDialog,
-    ProjectLogDialog, ReportDialog, DiagnosisDialog, LoadingProgress,
+    ProjectLogDialog, ActionLogDialog, ReportDialog, DiagnosisDialog, LoadingProgress,
     MachineRecommendationDialog,
 )
 from pyside6_app.launcher import LauncherDialog
@@ -485,6 +485,7 @@ class MainWindow(QMainWindow):
         ref_menu = tm.addMenu("参考线标注（研究工具）")
         self._add_action(ref_menu, "第 1 遍", None, lambda: self._set_reference_mode(1))
         self._add_action(ref_menu, "第 2 遍（重复性）", None, lambda: self._set_reference_mode(2))
+        self._add_action(ref_menu, "完成当前参考线（保存）", None, self._on_finish_reference_line)
         self._add_action(ref_menu, "导出参考线 JSON…", None, self._on_export_reference_lines)
         tm.addSeparator()
         cal_menu = tm.addMenu("作业线标定（人工纠偏）")
@@ -502,7 +503,7 @@ class MainWindow(QMainWindow):
         )
         sm.addSeparator()
         self._add_action(sm, "项目日志…", None, self._on_project_log)
-        self._add_action(sm, "操作记录…", None, self._on_export_action_log)
+        self._add_action(sm, "操作记录…", None, self._on_action_log_dialog)
         self._add_action(sm, "系统诊断…", None, self._on_diagnose)
         self._add_action(sm, "打开数据目录", None, self._on_open_data_dir)
 
@@ -1417,6 +1418,17 @@ class MainWindow(QMainWindow):
             return
         self.state.plan_running = False
         self.state.plan_progress = 1.0
+        path_payload = result.get("path") or {}
+        layout_payload = path_payload.get("layout") or {}
+        self._log_action(
+            "plan.done", "path",
+            segments=len(path_payload.get("full_path") or []),
+            valid=bool(path_payload.get("is_valid")),
+            operator_applied=len(
+                (layout_payload.get("operator_centerline_application") or {}).get("applied") or []
+            ),
+            strategy=str(path_payload.get("requested_strategy") or ""),
+        )
         self.progress_bar.hide()
         if hasattr(self, 'btn_cancel_task'):
             self.btn_cancel_task.hide()
@@ -3811,6 +3823,14 @@ class MainWindow(QMainWindow):
             )
         self.log_panel.success(f"田块已设置: {len(points)} 个顶点 | 面积 = {area_info}")
         self._journal.info(f"田块已设置: {len(points)} 个顶点, 面积={area_info}")
+        self._log_action(
+            "field.finish", "",
+            vertices=len(points),
+            area_m2=round(float(area_m2), 3),
+            dropped_area_ratio=round(
+                float(geometry_report.get("dropped_area_ratio", 0.0) or 0.0), 6
+            ),
+        )
         self.task_panel.set_task_status("draw_field", "done")
         self._sync_task_statuses()
         WorkflowUpdater.advance(self.state, "BOUNDARY_SET")
@@ -4019,12 +4039,7 @@ class MainWindow(QMainWindow):
         """进入/退出参考线标注模式；与田块/禁行区绘制模式互斥。"""
         pass_index = int(pass_index)
         if self._reference_drawing and self._reference_pass == pass_index:
-            self._reference_drawing = False
-            self._reference_pts = []
-            self._reference_last_click = None
-            self.image_view.viewer.clear_overlay_layer("interaction_reference")
-            self._sync_drawing_mode()
-            self.log_panel.info("已退出参考线标注模式")
+            self._exit_reference_mode()
             return
         if not str(getattr(self.state, "tif_path", "") or ""):
             self.log_panel.warn("请先导入影像，再标注参考线。")
@@ -4039,6 +4054,10 @@ class MainWindow(QMainWindow):
             self.image_view.viewer.clear_overlay_layer("interaction_forbidden")
         if self._reference_drawing:
             self.image_view.viewer.clear_overlay_layer("interaction_reference")
+        if self._reference_drawing and self._reference_pass != pass_index:
+            # 切到另一遍之前先把手上的线存好，不能因为换遍数丢掉。
+            if not self._finalize_pending_reference("切换标注遍数"):
+                return
         self._reference_drawing = True
         self._reference_pass = pass_index
         self._reference_pts = []
@@ -4046,24 +4065,129 @@ class MainWindow(QMainWindow):
         # 进入模式时重读 sidecar，保证与磁盘一致（离线工具可能已更新）
         self._reference_payload = {}
         self._reference_payload_tif = ""
+        draft = self._load_reference_draft(pass_index)
+        draft_points = [
+            (float(point[0]), float(point[1]))
+            for point in (draft.get("points") or [])
+            if len(point) >= 2
+        ]
+        if draft_points:
+            self._reference_pts = draft_points
+            self.log_panel.info(
+                "已恢复上次未完成的参考线：第 %d 遍，%d 个桩点。继续加点，双击或点"
+                "“完成当前参考线”保存。"
+                % (pass_index, len(draft_points))
+            )
+            self._log_action(
+                "reference.restore_draft", "", pass_index=pass_index, points=len(draft_points)
+            )
         self._sync_drawing_mode()
         self._draw_reference_lines_overlay()
+        self._redraw_reference_interaction()
         self._sync_display_layer_availability()
         existing = len(self._reference_lines_payload().get("lines") or [])
         self.log_panel.info(
             "参考线标注（第 %d 遍）：左键沿宽行带中心逐点添加桩点（建议每 5 m 一点，"
-            "一条带 10-16 个点），最后一个桩点上双击完成并自动保存；右键取消当前线；"
-            "再次点击同一条菜单退出。当前已有 %d 条参考线。"
+            "一条带 10-16 个点），最后一个桩点上双击完成并自动保存；也可以点菜单"
+            "“完成当前参考线”保存；右键取消当前线；再次点击同一条菜单退出"
+            "（退出前会自动保存已画好的线）。当前已有 %d 条参考线。"
             % (self._reference_pass, existing)
         )
+        self._log_action(
+            "reference.mode", "enter", pass_index=pass_index, existing=existing
+        )
+
+    def _load_reference_draft(self, pass_index):
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            return {}
+        import cache
+
+        draft = cache.load_reference_draft(tif, int(pass_index))
+        if not isinstance(draft, dict) or not draft.get("points"):
+            return {}
+        if int(draft.get("pass", pass_index) or pass_index) != int(pass_index):
+            return {}
+        return draft
+
+    def _persist_reference_draft(self):
+        """每加一个桩点就落盘：退出、切菜单、崩溃都不会丢正在画的线。"""
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            return
+        import cache
+
+        cache.save_reference_draft(
+            tif,
+            {
+                "schema": "reference-draft-v1",
+                "tif_path": tif,
+                "pass": int(self._reference_pass),
+                "points": [[float(x), float(y)] for x, y in self._reference_pts],
+                "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+
+    def _clear_reference_draft(self, pass_index=None):
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            return
+        import cache
+
+        cache.clear_reference_draft(
+            tif, int(self._reference_pass if pass_index is None else pass_index)
+        )
+
+    def _exit_reference_mode(self):
+        """退出标注：有待完成桩点先自动保存，绝不静默丢弃。"""
+        pending = len(self._reference_pts)
+        if not self._finalize_pending_reference("退出"):
+            return
+        self._reference_drawing = False
+        self._reference_pts = []
+        self._reference_last_click = None
+        self.image_view.viewer.clear_overlay_layer("interaction_reference")
+        self._sync_drawing_mode()
+        self._log_action(
+            "reference.exit", "", pass_index=self._reference_pass, pending=pending
+        )
+
+    def _finalize_pending_reference(self, reason=""):
+        """离开参考线模式前的收口：2 点以上自动保存，1 点丢弃并留痕。"""
+        pending = len(self._reference_pts)
+        if pending >= 2:
+            if not self._finish_reference_line():
+                self.log_panel.error(
+                    "参考线保存失败，已保留当前 %d 个桩点；请重试或检查缓存目录权限。"
+                    % pending
+                )
+                return False
+            self.log_panel.info(
+                "%s前已自动保存当前参考线（%d 个桩点）" % (reason or "离开", pending)
+            )
+            return True
+        if pending == 1:
+            self.log_panel.warn("只有 1 个桩点，至少需要 2 个，未保存。")
+            self._clear_reference_draft()
+            self._log_action(
+                "reference.discard", "single_point",
+                pass_index=self._reference_pass, points=1,
+            )
+        return True
 
     def _handle_reference_click(self, x, y, button):
         """参考线标注模式下的一次点击：左键加桩点，双击收线，右键取消。"""
         if button == 2:
+            discarded = len(self._reference_pts)
             self._reference_pts = []
             self._reference_last_click = None
+            self._clear_reference_draft()
             self.image_view.viewer.clear_overlay_layer("interaction_reference")
-            self.log_panel.info("已取消当前参考线（未保存）")
+            self._sync_drawing_mode()
+            self.log_panel.info("已取消当前参考线（未保存，丢弃 %d 个桩点）" % discarded)
+            self._log_action(
+                "reference.cancel", "", pass_index=self._reference_pass, points=discarded
+            )
             return
         if button != 1:
             return
@@ -4084,7 +4208,20 @@ class MainWindow(QMainWindow):
             return
         self._reference_last_click = (now, point)
         self._reference_pts.append(point)
+        # 每加一点立即落盘：切菜单、退出、崩溃都不会丢正在画的线。
+        self._persist_reference_draft()
+        self._log_action(
+            "reference.point", "",
+            pass_index=self._reference_pass,
+            index=len(self._reference_pts),
+            x=round(point[0], 1),
+            y=round(point[1], 1),
+        )
         self._redraw_reference_interaction(mouse_pos=point)
+        self.lbl_status.setText(
+            "参考线标注（第 %d 遍）：已加 %d 点，双击或菜单“完成当前参考线”保存"
+            % (self._reference_pass, len(self._reference_pts))
+        )
 
     def _redraw_reference_interaction(self, mouse_pos=None):
         """绘制进行中的参考线（interaction 层，不触碰已保存图层）。"""
@@ -4149,6 +4286,7 @@ class MainWindow(QMainWindow):
             return False
         self._reference_payload = payload
         self._reference_payload_tif = tif
+        self._clear_reference_draft()
         self._reference_pts = []
         self._reference_last_click = None
         self.image_view.viewer.clear_overlay_layer("interaction_reference")
@@ -4175,6 +4313,16 @@ class MainWindow(QMainWindow):
                 "参考线落膜覆盖率约 %.0f%%，疑似偏离行带主体，建议放大复核。"
                 % (coverage * 100.0)
             )
+        self._log_action(
+            "reference.finish", str(record.get("id") or ""),
+            pass_index=self._reference_pass,
+            points=len(pts),
+            band_id=band_id,
+            band_label=band_label,
+            replaced=bool(replaced),
+            coverage=None if coverage is None else round(float(coverage), 3),
+        )
+        self._sync_drawing_mode()
         return True
 
     def _reference_lines_payload(self):
@@ -4324,6 +4472,16 @@ class MainWindow(QMainWindow):
                     )
         finally:
             viewer.end_overlay_layer()
+
+    def _on_finish_reference_line(self):
+        """菜单里的“完成当前参考线”：与双击等价，避免用户找不到收线手势。"""
+        if not self._reference_drawing:
+            self.log_panel.warn("请先进入参考线标注（第 1 遍或第 2 遍）。")
+            return
+        if len(self._reference_pts) < 2:
+            self.log_panel.warn("至少需要 2 个桩点，当前 %d 个。" % len(self._reference_pts))
+            return
+        self._finish_reference_line()
 
     def _on_export_reference_lines(self):
         """导出当前项目的参考线 JSON 副本（用于归档/离线评价）。"""
@@ -4517,10 +4675,14 @@ class MainWindow(QMainWindow):
         if self._route_edit_active or self._measure_tool:
             self.log_panel.warn("请先退出路线编辑或测量工具，再进入作业线标定。")
             return
+        if self._reference_drawing:
+            # 进标定前先保存手上未完成的参考线，不能一换工具就丢。
+            if not self._finalize_pending_reference("进入标定"):
+                return
+            self._reference_drawing = False
         if self._field_drawing or self._forbidden_drawing or self._reference_drawing:
             self._field_drawing = False
             self._forbidden_drawing = False
-            self._reference_drawing = False
             self._reference_pts = []
             self._field_pts = []
             self._forbidden_pts = []
@@ -5023,19 +5185,34 @@ class MainWindow(QMainWindow):
         )
         self._log_action("calibration.export_case", path, bands=len(bands), lines=len(operator_lines))
 
+    def _on_action_log_dialog(self):
+        """查看本次会话的操作记录（按时间列出动作与参数），可导出副本。"""
+        log = interaction_log.action_log()
+        text = interaction_log.format_records(log.recent(500))
+        if not text:
+            text = "本次会话还没有操作记录。"
+        ActionLogDialog(
+            text,
+            str(log.log_path()),
+            export_callback=self._on_export_action_log,
+            parent=self,
+        ).exec()
+
     def _on_export_action_log(self):
-        """把本次会话的操作记录复制到用户指定目录（取证/复现用）。"""
+        """把本次会话的操作记录复制到用户目录，返回落盘目录（供对话框提示）。"""
         try:
             paths = interaction_log.action_log().export_to(
                 os.path.join(os.path.expanduser("~"), "ALIGN_操作记录")
             )
         except Exception as exc:
             self.log_panel.error("导出操作记录失败：%s" % exc)
-            return
+            raise
         if not paths:
             self.log_panel.info("本次会话还没有可导出的操作记录。")
-            return
-        self.log_panel.success("操作记录已导出：%s" % os.path.dirname(paths[0]))
+            return ""
+        destination = os.path.dirname(paths[0])
+        self.log_panel.success("操作记录已导出：%s" % destination)
+        return destination
 
     def _draw_operator_paths_overlay(self, viewer=None, cursor=None, offset_m=None):
         """标定模式下的叠加层：已保存人线 + 正在拖动的预览。"""
@@ -12114,8 +12291,8 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("禁行区绘制：点击首点闭合，右键取消")
         elif self._reference_drawing:
             self.lbl_status.setText(
-                "参考线标注（第 %d 遍）：左键加桩点，双击完成，右键取消"
-                % self._reference_pass
+                "参考线标注（第 %d 遍）：已加 %d 点，双击或菜单“完成当前参考线”保存，右键取消"
+                % (self._reference_pass, len(self._reference_pts))
             )
         elif self._calibration_drawing:
             self.lbl_status.setText(
