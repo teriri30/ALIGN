@@ -1049,3 +1049,18 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
   - 改法：右键＝**撤销最后 1 个桩点**（逐点可撤，草稿同步落盘）；`Ctrl+右键`＝丢弃整条（明确意图）；空线状态下右键＝退出标注模式。状态条与模式提示同步改成"右键撤销上一个点"。
 - 代码锚点：`reference_lines.split_reference_lines/_split_by_deviation/turn_angles_deg`、`main_window._finish_reference_line`、`_handle_reference_click`、`_reference_cancel_modifier_active`。
 - 测试：`tests/test_reference_lines_ui.py`（右键单点撤销 / 连续撤销 / Ctrl+右键丢弃整条 / 空线右键退出 / 拆段两条记录 / 弯曲单条不拆 / 最大垂距报告 / 偏差提示）。
+
+## DECISION-063：参考线图层默认收起，且必须可清除（2026-10-28）
+
+- 现象（用户 2026-10-28）：上次标注的人工打点线，这次打开项目还整幅挂在画布上；菜单里只有「第 1 遍 / 第 2 遍 / 完成 / 导出」，**没有删除入口**，用户的原话是「还清除不了」。
+- 真实数据：`%LOCALAPPDATA%\ALIGN\cache\ba570cbf2799\reference_lines.json`（2026-10-26 16:32，17 条、259 个桩点）。这个 sidecar 一旦存在，`_sync_display_layer_availability` 就以 `default_visible=True` 把它画上画布，每次恢复项目都重画一次。
+- 两层原因：
+  1. **可见性默认值错**：`reference_lines` 的默认可见性等于「有没有数据」，参考线属于研究工具证据，不该在用户没要求时就占着画布；
+  2. **缺删除入口**：sidecar 只能手工删文件，界面里没有「删除最后一条 / 清除全部」。
+- 规则：
+  1. **默认收起**：`reference_lines` 的 availability 为 `(has_reference, False)`——有数据就把图层面板那一行亮起来可勾选，但默认不画。
+  2. **按需出现**：进入参考线标注模式自动显示（在 `_sync_display_layer_availability` 之后调用，否则被默认值覆盖），退出标注自动收起；图层面板的「参考线（人工）」行与菜单「显示 / 隐藏参考线图层」都可随时开关，只动显示、不动数据。
+  3. **必须能删**：菜单新增「删除最后一条参考线」与「清除本项目参考线…」（带确认，删的是落盘数据，不可撤销；同时清 `reference_draft_p1/p2.json` 草稿）。删除走 `cache.delete_reference_lines()`，「去掉最后一条」在仍有剩余时重写 sidecar，否则删文件。
+  4. **界面与磁盘同源**：删除后必须清掉按 tif 记忆的 sidecar 缓存（`_reference_payload`）、清 `reference_lines` 图层、重新同步可用性，否则界面按旧内容重画——收敛点统一在 `_after_reference_edit()`。
+- 代码锚点：`pyside6_app.main_window._sync_display_layer_availability`、`_set_reference_mode`、`_exit_reference_mode`、`_set_reference_layer_visible`、`_on_toggle_reference_layer`、`_on_delete_last_reference_line`、`_on_clear_reference_lines`、`_after_reference_edit`；`cache.delete_reference_lines`。
+- 测试：`tests/test_reference_layer_visibility.py`（6 条：恢复后默认不可见但图层仍在 / 进模式显示退出收起 / 菜单开关不动数据 / 清除删文件并清图层 / 取消确认不动数据 / 逐条删除保留其余）、`tests/test_centerline_evaluation.py::test_cache_delete_reference_lines_removes_the_sidecar`。
