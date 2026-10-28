@@ -84,16 +84,25 @@ class HoverTip(QObject):
             if obj.toolTip():
                 self._target = obj
                 self._timer.start(self._delay_ms)
-        elif kind in (
-            QEvent.Type.Leave,
-            QEvent.Type.Hide,
-            QEvent.Type.MouseButtonPress,
-            QEvent.Type.Wheel,
-        ):
-            self._timer.stop()
-            if self._target is obj:
+        elif kind in (QEvent.Type.Leave, QEvent.Type.Hide):
+            # 只有"当前目标自己"离开才算走开。父控件在子控件接管之后仍会收到
+            # Leave（父 Enter → 子 Enter → 父 Leave 是真实顺序），旧写法在这里
+            # 把子控件的计时器一起停掉，于是从数字框边缘移进输入区就不弹提示。
+            leaves_target = self._target is obj
+            if not leaves_target and kind == QEvent.Type.Hide and self._target is not None:
+                try:
+                    leaves_target = obj.isAncestorOf(self._target)
+                except (RuntimeError, AttributeError):
+                    leaves_target = True
+            if leaves_target:
+                self._timer.stop()
                 QToolTip.hideText()
                 self._target = None
+        elif kind in (QEvent.Type.MouseButtonPress, QEvent.Type.Wheel):
+            # 点击/滚轮＝用户已经动手，不管落在哪个控件都收起当前提示。
+            self._timer.stop()
+            QToolTip.hideText()
+            self._target = None
         return False
 
     # ------------------------------------------------------------------ 显示

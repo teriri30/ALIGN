@@ -1152,3 +1152,21 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - 落点：`SettingsDialog._build_ui` 与 `HarvesterParamsDialog._build_ui` 结尾各 `self._hover_tips = install_hover_tips(self)`。`FastTooltipStyle` 保留作为未接管控件的兜底（150 ms）。
 - 实测（离屏探针）：控制器类型 `HoverTip`；控件与 lineEdit 的 `QEvent.ToolTip` 均返回 True（被吞）；`Enter` 后约 90–100 ms 出现提示；同一时刻可见的顶层提示窗口数 = **1**；`Leave` 后收起。
 - 契约：`tests/test_settings_tooltips.py::test_only_one_tooltip_is_shown_per_hover`（原生事件必须被吞、弹出 ≤400 ms、同一时刻只有 1 个提示框、移开必须收起）。全量 861 passed / 1 skipped。
+
+
+## DECISION-067 二次修订：父控件 Leave 误停子控件的计时器（2026-10-28）
+
+外部复查（P2）指出 `ui_tooltips.HoverTip.eventFilter` 对**任何**控件的 `Leave` 都执行 `self._timer.stop()`，即使当前目标已经切到它的子控件。核实结论：**属实**。
+
+- 复现（离屏探针，`QDoubleSpinBox` 与其内部 `QLineEdit`）：按真实顺序发 `Enter(spin) → Enter(lineEdit) → Leave(spin)`，得到 `_target=QLineEdit`、`_timer.isActive()=False`、`QToolTip.isVisible()=False`；对照只发 `Enter(lineEdit)` 则正常弹出。即：从数字框边缘移进数字区时提示会不弹。
+- 改法：`Leave`/`Hide` 只有在 `obj is self._target` 时才算走开；`Hide` 额外接受"目标的祖先被隐藏"。`MouseButtonPress`/`Wheel` 仍然无条件收起（用户已经动手）。
+- 契约：`tests/test_settings_tooltips.py::test_child_tooltip_survives_the_parent_leave`（钉住父 Leave 之后目标仍是子控件、且提示必须出现）。全量 863 passed / 1 skipped。
+
+## DECISION-068：未完成草稿的丢弃入口（2026-10-28）
+
+外部复查（P3）指出 `reference_draft_p1/p2.json` 的丢弃入口偏深：只能在标注模式里 `Ctrl+右键`，或"清除本项目参考线"连草稿一起清。核实结论：**属实**，DECISION-064 当时也把它列进"入口偏深、保留现状"的清单，现在补上。
+
+- 新增菜单：工具 → 参考线标注（研究工具）→ **丢弃未完成的草稿…**（`_on_discard_reference_draft`）。确认框逐条列出"第 N 遍 X 个桩点（保存时间）"，并明确写"已保存的参考线不受影响"。
+- 行为：只删 `reference_draft_p1.json` / `reference_draft_p2.json`；若正在标注，同时清空内存桩点、清 `interaction_reference` 临时图层并刷新状态条（否则会"提示已丢弃但画布上还画着几个点"）。
+- 与既有入口的分工（写进菜单语义，避免三者混淆）：**完成当前参考线**＝收线保存；**丢弃未完成的草稿**＝只丢没画完的点；**删除最后一条 / 清除本项目参考线**＝删已保存的 sidecar 数据。
+- 契约：`tests/test_reference_layer_visibility.py::test_discard_draft_keeps_saved_reference_lines`（草稿文件消失、已保存的 1 条参考线仍在、内存桩点清空）。全量 863 passed / 1 skipped。

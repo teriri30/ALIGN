@@ -503,6 +503,11 @@ class MainWindow(QMainWindow):
         self._add_action(ref_menu, "显示 / 隐藏参考线图层", None, self._on_toggle_reference_layer)
         self._add_action(ref_menu, "导出参考线 JSON…", None, self._on_export_reference_lines)
         ref_menu.addSeparator()
+        # DECISION-068：未完成草稿以前只能在标注模式里用 Ctrl+右键丢弃，入口太深；
+        # 这里给一条明确入口，并说清"只丢草稿、不动已保存的参考线"。
+        self._add_action(
+            ref_menu, "丢弃未完成的草稿…", None, self._on_discard_reference_draft
+        )
         self._add_action(
             ref_menu, "删除最后一条参考线", None, self._on_delete_last_reference_line
         )
@@ -4780,6 +4785,76 @@ class MainWindow(QMainWindow):
                 self._redraw_reference_interaction()
         self.log_panel.info(message)
         self._log_action(action, "", **fields)
+
+    def _on_discard_reference_draft(self):
+        """丢弃未完成的参考线草稿（第 1/2 遍），已保存的参考线不动。
+
+        DECISION-068：草稿是"每加一个桩点就落盘"的产物，重新进标注模式会自动
+        恢复；以前只能进模式后按 Ctrl+右键、或清除整个项目的参考线，用户分不清
+        "结束标注""丢弃当前草稿""清空已保存参考线"三件事。
+        """
+        import cache
+
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            self.log_panel.warn("当前没有打开的项目。")
+            return
+        drafts = []
+        for pass_index in (1, 2):
+            payload = cache.load_reference_draft(tif, pass_index)
+            points = [
+                point for point in (payload.get("points") or []) if len(point) >= 2
+            ]
+            if points:
+                drafts.append(
+                    (
+                        pass_index,
+                        len(points),
+                        str(payload.get("updated_at") or "时间未知"),
+                    )
+                )
+        if not drafts:
+            self.log_panel.info("当前没有未完成的参考线草稿。")
+            return
+        detail = "；".join(
+            "第 %d 遍 %d 个桩点（%s）" % item for item in drafts
+        )
+        answer = QMessageBox.question(
+            self,
+            "丢弃未完成的草稿",
+            "将丢弃未完成的桩点：%s。\n"
+            "已保存的参考线不受影响，之后仍可显示、导出或评价。\n"
+            "确定丢弃吗？" % detail,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            for pass_index, _count, _stamp in drafts:
+                cache.clear_reference_draft(tif, pass_index)
+        except OSError as exc:
+            self.log_panel.error("丢弃草稿失败：%s" % exc)
+            return
+        if self._reference_drawing:
+            # 正在标的那一遍也要清掉内存桩点与临时图层，否则会一边提示"已丢弃"
+            # 一边还画着几个点，用户会以为没生效。
+            self._reference_pts = []
+            self._reference_last_click = None
+            self.image_view.viewer.clear_overlay_layer("interaction_reference")
+            self._redraw_reference_interaction()
+            self.lbl_status.setText(
+                "参考线标注（第 %d 遍）：草稿已丢弃，可从空白重新开始"
+                % self._reference_pass
+            )
+        total = sum(item[1] for item in drafts)
+        self.log_panel.success("已丢弃未完成的参考线草稿（%s）" % detail)
+        self._log_action(
+            "reference.discard_draft",
+            "",
+            passes=[item[0] for item in drafts],
+            points=total,
+        )
 
     def _on_delete_last_reference_line(self):
         """删除最后一条已保存的参考线（画错的单条，不必清空全部）。"""

@@ -165,3 +165,30 @@ def test_delete_last_reference_line_keeps_the_rest(tmp_path, monkeypatch):
     assert cache.load_reference_lines(tif) == {}
     assert not os.path.isfile(cache.reference_lines_path(tif))
     window.close()
+
+
+def test_discard_draft_keeps_saved_reference_lines(tmp_path, monkeypatch):
+    """DECISION-068：丢弃未完成草稿只删草稿，已保存的参考线一条不动。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    import cache
+
+    window = _window(tmp_path, monkeypatch)
+    window._set_reference_mode(1)
+    _draw_line(window, LINE_A)                     # 先保存一条完整的线
+    for x, y in ((10.0, 300.0), (40.0, 302.0), (80.0, 304.0)):
+        window._on_viewer_mouse_pressed(x, y, 1)   # 再留 3 个点没画完
+    tif = window.state.tif_path
+    assert os.path.isfile(cache.reference_draft_path(tif, 1))
+    assert len(cache.load_reference_lines(tif)["lines"]) == 1
+
+    monkeypatch.setattr(
+        "pyside6_app.main_window.QMessageBox.question",
+        staticmethod(lambda *a, **k: QMessageBox.Yes),
+    )
+    window._on_discard_reference_draft()
+
+    assert not os.path.isfile(cache.reference_draft_path(tif, 1)), "草稿没删掉"
+    assert len(cache.load_reference_lines(tif)["lines"]) == 1, "已保存的参考线被误删"
+    assert window._reference_pts == [], "内存里的桩点没清"
+    window.close()

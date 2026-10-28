@@ -130,3 +130,43 @@ def test_only_one_tooltip_is_shown_per_hover():
             break
     assert not QToolTip.isVisible(), "鼠标移开后提示还挂着"
     dialog.close()
+
+
+def test_child_tooltip_survives_the_parent_leave():
+    """DECISION-067 修订：父 Enter → 子 Enter → 父 Leave 之后仍要弹提示。
+
+    这是真实的 Qt 事件顺序（从 QDoubleSpinBox 边缘移进数字区）。旧实现在任何
+    Leave 上都会停掉共享定时器，于是子控件的提示永远等不到触发。
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QToolTip
+
+    app = _app()
+    dialog = SettingsDialog({"model": {}, "path_planning": {}, "mask_processing": {}})
+    dialog.show()
+    app.processEvents()
+
+    spin = dialog.spin_conf
+    line = spin.lineEdit()
+    QToolTip.hideText()
+    for _ in range(30):
+        app.processEvents()
+        QTest.qWait(10)
+        if not QToolTip.isVisible():
+            break
+
+    QApplication.sendEvent(spin, QEvent(QEvent.Type.Enter))
+    QApplication.sendEvent(line, QEvent(QEvent.Type.Enter))
+    QApplication.sendEvent(spin, QEvent(QEvent.Type.Leave))
+
+    assert dialog._hover_tips._target is line, "父 Leave 不该把目标清掉"
+    visible = False
+    for _ in range(40):
+        app.processEvents()
+        QTest.qWait(10)
+        if QToolTip.isVisible():
+            visible = True
+            break
+    assert visible, "从输入框边缘移进数字区后提示没弹（计时器被父控件 Leave 停了）"
+    dialog.close()
