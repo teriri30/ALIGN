@@ -12,6 +12,48 @@ import device_runtime
 import os
 
 
+def _attach_hint(widget, text):
+    """挂多行悬浮说明。
+
+    QDoubleSpinBox / QSpinBox 的输入区是内部 QLineEdit：只对外层 setToolTip，
+    鼠标落在数字上时看不到提示（用户实测「没看到悬浮说明」就是这一条）。
+    所以把内部 lineEdit 也一起设上。
+    """
+    if widget is None or not text:
+        return widget
+    widget.setToolTip(text)
+    line_edit = getattr(widget, "lineEdit", None)
+    if callable(line_edit):
+        child = line_edit()
+        if child is not None:
+            child.setToolTip(text)
+    return widget
+
+
+def _hint_row(form, label_text, widget, tip):
+    """QFormLayout 的一行：标签 + ⓘ 标记 + 控件，三者共用同一条说明。
+
+    ⓘ 是给用户看的「这里可以悬停」提示；悬停显示、移开消失是 Qt 默认行为。
+    """
+    holder = QWidget()
+    lay = QHBoxLayout(holder)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(4)
+    label = QLabel(label_text)
+    label.setToolTip(tip)
+    mark = QLabel("ⓘ")
+    mark.setToolTip(tip)
+    mark.setStyleSheet(
+        f"color:{COLORS.get('text_dim', '#8B909A')};font-size:12px;"
+    )
+    lay.addWidget(label)
+    lay.addWidget(mark)
+    lay.addStretch(1)
+    _attach_hint(widget, tip)
+    form.addRow(holder, widget)
+    return widget
+
+
 class _DeviceStatusWorker(QThread):
     """后台探测显卡与 torch 状态：导入 torch 要几秒，不能卡界面。"""
 
@@ -200,7 +242,7 @@ class HarvesterParamsDialog(QDialog):
             6.0,
             0.1,
         )
-        fm.addRow(QLabel("割台有效割幅:"), self.spin_cutter)
+        _hint_row(fm, "割台有效割幅", self.spin_cutter, "割台有效割幅：割刀一次能完整覆盖的宽度（米），按实机量，不是机身宽度。\n默认 2.00 m。\n它决定等距区的作业带划分和覆盖率：填大了会漏割，填小了覆盖率虚低。")
         offset_value = self._params.get("cutter_forward_offset_m")
         self.spin_cutter_offset = self._spin(
             float(offset_value) if offset_value not in (None, "") else 0.0,
@@ -212,7 +254,7 @@ class HarvesterParamsDialog(QDialog):
         self.spin_cutter_offset.setToolTip(
             "履带接地区域几何中心到割刀切割线的水平前向距离，必须实测"
         )
-        fm.addRow(QLabel("割刀前置距离:"), self.spin_cutter_offset)
+        _hint_row(fm, "割刀前置距离", self.spin_cutter_offset, "割刀前置距离：履带接地中心到割刀切割线的水平前向距离（米），必须实测。\n系统不会按机身尺寸推算这个值，缺了不让确认。\n影响「割台能不能盖住作物行」的判定，填错会让覆盖、漏割结论失真。")
         self.spin_track = self._spin(
             self._params.get(
                 "track_width_m", DEFAULT_HARVESTER_PARAMS["track_width_m"]
@@ -221,7 +263,7 @@ class HarvesterParamsDialog(QDialog):
             1.0,
             0.05,
         )
-        fm.addRow(QLabel("履带宽度:"), self.spin_track)
+        _hint_row(fm, "履带宽度", self.spin_track, "履带宽度：单条履带接地的宽度（米），实机实测 0.35 m。\n直接决定碾压宽度与通行判定：填成 0.45 m 时履带外缘会压到宽行带（外缘超出通道约 3.7 cm）。")
         self.spin_gauge = self._spin(
             self._params.get(
                 "track_gauge_m", DEFAULT_HARVESTER_PARAMS["track_gauge_m"]
@@ -230,7 +272,7 @@ class HarvesterParamsDialog(QDialog):
             3.0,
             0.1,
         )
-        fm.addRow(QLabel("履带中心距:"), self.spin_gauge)
+        _hint_row(fm, "履带中心距", self.spin_gauge, "履带中心距：两条履带中心线之间的距离（米），实机实测 1.30 m。\n要和行距周期配合，两条履带才各自落在宽行带里；1.30 m = 2 × 0.65 m 与宽窄行周期对齐。")
         self.spin_track_length = self._spin(
             self._params.get(
                 "track_length_m", DEFAULT_HARVESTER_PARAMS["track_length_m"]
@@ -239,15 +281,15 @@ class HarvesterParamsDialog(QDialog):
             6.0,
             0.1,
         )
-        fm.addRow(QLabel("履带接地长度:"), self.spin_track_length)
+        _hint_row(fm, "履带接地长度", self.spin_track_length, "履带接地长度：履带与地面接触的长度（米），默认 1.70 m。\n影响转弯扫掠面积与田头碾压估计，填短了会低估压实范围。")
         self.spin_turn = self._spin(self._params.get("turn_radius_m", 2.0), 0.5, 6.0, 0.1)
-        fm.addRow(QLabel("最小转弯半径:"), self.spin_turn)
+        _hint_row(fm, "最小转弯半径", self.spin_turn, "最小转弯半径：实机原地转向的最小半径（米），默认 0.90 m。\n规划器据此判断地头够不够转、选哪种调头方式；填小了会给出物理上做不到的转弯。")
         self.spin_work_speed = self._speed_spin(self._params.get("work_speed_mps", 1.2))
-        fm.addRow(QLabel("作业速度:"), self.spin_work_speed)
+        _hint_row(fm, "作业速度", self.spin_work_speed, "作业速度：直线收割时的速度（米/秒），默认 1.20。\n只影响时间估算与演示动画，不改变几何路径。")
         self.spin_turn_speed = self._speed_spin(self._params.get("turn_speed_mps", 0.6))
-        fm.addRow(QLabel("转弯速度:"), self.spin_turn_speed)
+        _hint_row(fm, "转弯速度", self.spin_turn_speed, "转弯速度：地头转弯时的速度（米/秒），默认 0.60。\n只影响时间估算与演示动画，不改变转弯几何。")
         self.spin_entry_speed = self._speed_spin(self._params.get("entry_speed_mps", 0.8))
-        fm.addRow(QLabel("进出场速度:"), self.spin_entry_speed)
+        _hint_row(fm, "进出场速度", self.spin_entry_speed, "进出场速度：从起点进入作业线、从终点离场时的速度（米/秒），默认 0.80。\n只影响时间估算与演示动画。")
         lo.addLayout(fm)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
@@ -777,9 +819,9 @@ class SettingsDialog(QDialog):
             "调大 → 单块上下文更多但占显存，大图可能切不满；调小 → 小目标更敏感、拼接缝变多。\n"
             "建议 512–768；不确定就保持 640。"
         )
-        f.addRow("置信度阈值:", self.spin_conf)
-        f.addRow("IOU 阈值:", self.spin_iou)
-        f.addRow("切片大小:", self.spin_tile)
+        _hint_row(f, "置信度阈值", self.spin_conf, self.spin_conf.toolTip())
+        _hint_row(f, "IOU 阈值", self.spin_iou, self.spin_iou.toolTip())
+        _hint_row(f, "切片大小", self.spin_tile, self.spin_tile.toolTip())
         return w
 
     def _path_tab(self):
@@ -801,8 +843,8 @@ class SettingsDialog(QDialog):
             "必须大于机具转弯半径（本机 0.9 m）并留出安全余量；设太小会出现转弯出界、压苗。\n"
             "建议 2.0–6.0 m，田头窄的地块取小值、宽地块可加大。"
         )
-        f.addRow("路径点间距:", self.spin_interval)
-        f.addRow("田头缓冲:", self.spin_buffer)
+        _hint_row(f, "路径点间距", self.spin_interval, self.spin_interval.toolTip())
+        _hint_row(f, "田头缓冲", self.spin_buffer, self.spin_buffer.toolTip())
         return w
 
     def _mask_tab(self):
@@ -837,10 +879,10 @@ class SettingsDialog(QDialog):
             "调大 → 作业线更保守、少压边，但覆盖长度变短；调小 → 贴着田头作业。\n"
             "建议 0–0.3 m。"
         )
-        f.addRow("处理强度:", self.mask_strength_value)
-        f.addRow("行内断裂补全:", self.spin_gap)
-        f.addRow("端部断裂补全:", self.spin_end_gap)
-        f.addRow("端部收缩:", self.spin_trim)
+        _hint_row(f, "处理强度", self.mask_strength_value, self.mask_strength_value.toolTip())
+        _hint_row(f, "行内断裂补全", self.spin_gap, self.spin_gap.toolTip())
+        _hint_row(f, "端部断裂补全", self.spin_end_gap, self.spin_end_gap.toolTip())
+        _hint_row(f, "端部收缩", self.spin_trim, self.spin_trim.toolTip())
         return w
 
     def _save(self):

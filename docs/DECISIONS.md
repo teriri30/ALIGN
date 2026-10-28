@@ -1117,3 +1117,15 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - **④ 系统设置悬浮说明**：置信度阈值 / IOU 阈值 / 切片大小 / 路径点间距 / 田头缓冲 / 行内断裂补全 / 端部断裂补全 / 端部收缩 八个数值都加了多行 tooltip（是什么、默认值、调大调小分别会怎样、建议范围、改完要不要重跑哪一步）；运行设备三个按钮也补了说明。处理强度仍是不可调项，tooltip 里写明理由。
 - 代码锚点：`pyside6_app.panels`（`TASK_PANEL_DEFAULT_WIDTH`、`_build_ui` 的滚动策略、`_ClickableLabel`、`set_harvester_params`）、`pyside6_app.task_state`（`UI_STEP_ORDER`、`PREVIOUS_STEP`、`_stepwise_blocker`、`TASK_LABELS`）、`pyside6_app.main_window`（`_build_central` 初始摘要、`_sync_task_statuses`）、`pyside6_app.dialogs.SettingsDialog`。
 - 测试：`tests/test_task_chain.py::test_locked_rows_only_point_at_the_previous_or_current_step`（新增，钉住"不跨步"）、`tests/test_align_logic.py::test_harvester_params_summary_follows_the_edited_values`（走真实 `_apply_harvester_params`，只把写配置重定向到 tmp）、`test_clicking_the_params_summary_requests_the_dialog`；`test_mask_completion_does_not_stop_at_optional_advanced_settings` 的 blocker 断言改为「先完成上一步：起点」。全量 855 passed / 1 skipped。
+
+
+## DECISION-066 修订：悬浮说明要挂在光标下的子控件上（2026-10-28）
+
+用户 0.4.8 实测「并没有看到悬浮说明」。0.4.8 只做了 `setToolTip`，问题有两层：
+
+1. **`QDoubleSpinBox` / `QSpinBox` 的输入区是内部 `QLineEdit`**：鼠标落在数字上时命中的是子控件，它没有 tooltip，所以外层 `setToolTip` 在最常见的悬停位置根本不弹。必须同时 `spin.lineEdit().setToolTip(...)`。`QComboBox` 同理（可编辑时要设 `lineEdit()`）。
+2. **标签和 ⓘ 也得挂**：用户往往先悬停文字标签「置信度阈值:」而不是右边的小方框。`QFormLayout.addRow("文案", w)` 生成的标签拿不到句柄，所以改成自建 label + ⓘ 标记 + `_attach_hint(widget, tip)`，三者共用同一条说明。
+
+改法：`dialogs._attach_hint(widget, text)`（外层 + lineEdit）与 `dialogs._hint_row(form, label, widget, tip)`（标签 + ⓘ + 控件）。系统设置 8 个数值 + 不可调的「处理强度」、农机参数 9 个字段全部改成 `_hint_row`；ⓘ 是「这里可以悬停」的可见线索，悬停显示、移开消失仍是 Qt 默认行为，不做自定义浮层。
+
+契约：`tests/test_settings_tooltips.py`（2 条）——对每个字段断言 `toolTip()` 非空、**光标下的子控件 tooltip 与外层一致**、说明至少 3 行；系统设置 ⓘ 数量 = 9；割刀前置距离的说明必须含「必须实测」。全量 857 passed / 1 skipped。
