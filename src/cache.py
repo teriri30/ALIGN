@@ -211,6 +211,24 @@ def save_operator_paths(tif_path: str, payload: Dict[str, Any]) -> str:
     return path
 
 
+def delete_operator_paths(tif_path: str) -> bool:
+    """删除当前项目的作业线标定 sidecar（用户主动清除时调用）。
+
+    DECISION-064：每个落盘的标注 sidecar 必须有一个真删文件的入口。以前只有
+    逐条“清除当前线标定”，最后一条删掉后留下 ``{"lines": []}`` 的空文件，
+    用户既看不到也删不掉；批量清除必须把文件本身删掉。
+    """
+    path = operator_paths_path(tif_path)
+    with _project_lock(tif_path):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                return True
+        except OSError:
+            return False
+    return False
+
+
 def reference_draft_path(tif_path: str, pass_index: int = 1) -> str:
     """未完成参考线的草稿（每加一个桩点就落盘，退出/崩溃都不丢）。"""
     return os.path.join(_cache_dir(tif_path), "reference_draft_p%d.json" % int(pass_index))

@@ -1416,6 +1416,28 @@ class ImageViewerGroup(QWidget):
             return False
         return bool(self._display_layer_visibility.get(key, default))
 
+    def display_layer_user_overrides(self):
+        """Return the rows the user switched by hand (view-only, not persisted).
+
+        DECISION-064: automatic show/hide (entering or leaving a drawing mode)
+        must never be recorded here, otherwise the program overwrites the
+        user's own preference and there is no way to recover the default.
+        """
+        return set(self._display_layer_user_overrides)
+
+    def clear_display_layer_override(self, key):
+        """Forget one explicit user choice so the row falls back to its default."""
+        key = str(key or "").strip()
+        if not key:
+            return
+        self._display_layer_user_overrides.discard(key)
+        self._set_display_layer_state(
+            key,
+            bool(self._display_layer_defaults.get(key, False)),
+            user=False,
+            update_item=True,
+        )
+
     def display_layer_states(self):
         return {
             key: bool(self._display_layer_visibility.get(key, False))
@@ -1440,6 +1462,10 @@ class ImageViewerGroup(QWidget):
             self._display_tree_updating = False
         for key, value in changed:
             self.display_layer_changed.emit(key, value)
+
+    def reset_display_layer_defaults(self):
+        """Public entry: put every row back to its stage default (view-only)."""
+        self._reset_display_layer_defaults()
 
     def _reset_display_layer_defaults(self):
         changed = []

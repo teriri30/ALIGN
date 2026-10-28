@@ -78,6 +78,10 @@ OPERATOR_LINE_COLOR_BGR = (235, 200, 60)
 OPERATOR_EDIT_COLOR_BGR = (60, 255, 255)
 CALIBRATION_PICK_TOLERANCE_M = 1.0
 CALIBRATION_PREVIEW_POINT_LIMIT = 400
+# DECISION-064: 持久化的人工标注/研究证据图层。有数据时只把图层行点亮（可勾选），
+# 默认不画在画布上；它们不参与任何一步计算，常驻只是噪音，而且跨会话不会自己消失。
+# 新增同类图层必须登记到这里，测试会断言登记项一律默认收起（tests/test_display_layer_contracts.py）。
+PERSISTED_ANNOTATION_LAYERS = ("reference_lines",)
 
 
 class MainWindow(QMainWindow):
@@ -148,6 +152,9 @@ class MainWindow(QMainWindow):
         self._reference_last_click = None
         self._reference_payload = {}
         self._reference_payload_tif = ""
+        # DECISION-064: 进入标注模式前的用户显示偏好 (是否有显式勾选, 当时是否可见)。
+        # 程序自动显隐不许写进 image_view 的用户偏好集合，退出时把偏好还给用户。
+        self._reference_layer_pref_restore = None
         # DECISION-060: 作业线标定（人工纠偏）。_calibration_edits 按中心线 id
         # 存拖动记录（米制弧长 + 横向偏移），人线 = 算法线 + 这些偏移；每条
         # 拖动立即写 sidecar，不依赖"保存项目"。
@@ -470,6 +477,9 @@ class MainWindow(QMainWindow):
             lambda: self.image_view.viewer.set_rotation(self.image_view.viewer._rotation_deg + 90),
         )
         vm.addSeparator()
+        self._add_action(
+            vm, "恢复图层默认显示", None, self._on_reset_display_layer_defaults
+        )
         theme_menu = vm.addMenu("主题")
         self._add_action(theme_menu, "深色", None, lambda: self._set_theme_mode(ThemeMode.DARK))
         self._add_action(theme_menu, "浅色", None, lambda: self._set_theme_mode(ThemeMode.LIGHT))
@@ -502,6 +512,9 @@ class MainWindow(QMainWindow):
         cal_menu = tm.addMenu("作业线标定（人工纠偏）")
         self._add_action(cal_menu, "开始 / 结束标定", None, self._on_toggle_calibration)
         self._add_action(cal_menu, "清除当前线标定", None, self._on_clear_calibration)
+        self._add_action(
+            cal_menu, "清除本项目全部标定…", None, self._on_clear_operator_paths
+        )
         self._add_action(cal_menu, "导入参考线为标定线", None, self._on_import_reference_as_operator)
         self._add_action(cal_menu, "导出标定案例…", None, self._on_export_calibration_case)
 
@@ -3219,6 +3232,12 @@ class MainWindow(QMainWindow):
                 has_service and self._service_points_should_show(),
             ),
         }
+        # DECISION-064：标注类图层默认收起，规则由常量单点驱动，不靠每层手写
+        # False（手写的那一行下一个人就会抄成 has_xxx）。登记在
+        # PERSISTED_ANNOTATION_LAYERS 里的键，可用性照旧，默认可见性一律 False。
+        for annotation_key in PERSISTED_ANNOTATION_LAYERS:
+            annotation_available = availability[annotation_key][0]
+            availability[annotation_key] = (annotation_available, False)
         for key in DISPLAY_LAYER_KEYS:
             available, default_visible = availability[key]
             self.image_view.set_display_layer_available(
@@ -3237,6 +3256,19 @@ class MainWindow(QMainWindow):
             # A row can be enabled just before a stage's normal redraw.  Make
             # the first click useful while keeping the redraw idempotent.
             self._restore_visual_from_state()
+
+    def _on_reset_display_layer_defaults(self):
+        """把图层勾选恢复成默认：工作流产物显示，标注证据收起。
+
+        DECISION-064：以前 image_view 里就有这个能力，但没有入口，用户把勾选
+        改乱之后只能重启软件。
+        """
+        self.image_view.reset_display_layer_defaults()
+        states = self.image_view.display_layer_states()
+        visible = sorted(key for key, value in states.items() if value)
+        self.log_panel.info(
+            "已恢复图层默认显示：%s" % ("、".join(visible) if visible else "全部收起")
+        )
 
     def _restore_visual_from_state(self):
         self.top_toolbar.refresh_actions(self.state)
@@ -4137,7 +4169,15 @@ class MainWindow(QMainWindow):
         self._sync_display_layer_availability()
         # DECISION-063：进模式才把参考线图层打开（默认关闭，避免常驻画布）。
         # 必须放在 _sync_display_layer_availability 之后，否则会被默认值覆盖。
-        self._set_reference_layer_visible(True)
+        # DECISION-064：进模式前先记下用户自己的显示偏好（有没有显式勾选、当时
+        # 是否可见），退出时原样还回去；这里写 user=True 是为了让标注过程中
+        # 正常触发的图层同步不会把线又藏起来。
+        if getattr(self, "_reference_layer_pref_restore", None) is None:
+            self._reference_layer_pref_restore = (
+                "reference_lines" in self.image_view.display_layer_user_overrides(),
+                self.image_view.display_layer_visible("reference_lines", False),
+            )
+        self._set_reference_layer_visible(True, user=True)
         existing = len(self._reference_lines_payload().get("lines") or [])
         self.log_panel.info(
             "参考线标注（第 %d 遍）：左键沿宽行带中心逐点添加桩点（建议每 5 m 一点，"
@@ -4204,7 +4244,18 @@ class MainWindow(QMainWindow):
         self._sync_drawing_mode()
         # DECISION-063：退出标注就把参考线收起来，画布回到干净状态；
         # 需要看/复核时从“参考线标注 → 显示 / 隐藏参考线图层”或图层面板打开。
-        self._set_reference_layer_visible(False)
+        # DECISION-064：收起来之后要把用户自己的偏好还回去——本来显式打开过的
+        # 恢复打开，本来没有显式选择的回到默认（收起），程序不替用户做决定。
+        restore = getattr(self, "_reference_layer_pref_restore", None)
+        self._reference_layer_pref_restore = None
+        if restore is None:
+            self._set_reference_layer_visible(False)
+        else:
+            had_override, prior_visible = restore
+            if had_override:
+                self._set_reference_layer_visible(prior_visible, user=True)
+            else:
+                self.image_view.clear_display_layer_override("reference_lines")
         self._log_action(
             "reference.exit", "", pass_index=self._reference_pass, pending=pending
         )
@@ -4672,10 +4723,15 @@ class MainWindow(QMainWindow):
             return
         self.log_panel.success("参考线已导出：%s" % path)
 
-    def _set_reference_layer_visible(self, visible):
-        """打开/关闭参考线图层的显示（DECISION-063：默认关闭）。"""
+    def _set_reference_layer_visible(self, visible, *, user=False):
+        """打开/关闭参考线图层的显示（DECISION-063：默认关闭）。
+
+        DECISION-064：``user=True`` 只给用户自己的手势用（菜单开关、图层面板
+        勾选）。标注模式的进出是程序行为，写进用户偏好集合就会把用户的选择
+        冲掉，而且没有恢复入口。
+        """
         self.image_view.set_display_layer_visibility(
-            "reference_lines", bool(visible), user=True
+            "reference_lines", bool(visible), user=bool(user)
         )
 
     def _on_toggle_reference_layer(self):
@@ -4684,7 +4740,7 @@ class MainWindow(QMainWindow):
             self.log_panel.warn("当前项目还没有参考线，先标注再显示。")
             return
         current = self.image_view.display_layer_visible("reference_lines", False)
-        self._set_reference_layer_visible(not current)
+        self._set_reference_layer_visible(not current, user=True)
         self._draw_reference_lines_overlay()
         if current:
             self.log_panel.info("参考线图层已隐藏。")
@@ -5141,8 +5197,67 @@ class MainWindow(QMainWindow):
             entry for entry in (payload.get("lines") or [])
             if not (isinstance(entry, dict) and str(entry.get("id") or "") == str(record.get("id") or ""))
         ]
+        # 逐条删除沿用原语义：写回 lines 为空的 payload（已有测试钉住这一点，
+        # 空 payload 与删文件对规划等价）。真正删文件的是批量清除入口。
         self._operator_paths_save(payload)
         return True
+
+    def _on_clear_operator_paths(self):
+        """清除本项目全部作业线标定（需确认，删的是落盘数据）。
+
+        DECISION-064：对标定的删入口以前只有“清除当前线标定”，而且必须先
+        在画布上点选一条线；要清空整个项目只能一条条点，删到最后还会留下
+        空 sidecar。这里一次删文件，并把所有被改过的中心线恢复成算法线。
+        """
+        import cache
+
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            self.log_panel.warn("当前没有打开的项目。")
+            return
+        lines = list(self._operator_paths_payload().get("lines") or [])
+        if not lines:
+            self.log_panel.info("当前项目没有作业线标定")
+            return
+        answer = QMessageBox.question(
+            self,
+            "清除作业线标定",
+            "将删除当前项目已保存的 %d 条作业线标定，规划回到算法中心线。\n"
+            "标定是人工纠偏证据，删除后无法撤销，只能重新标定。\n"
+            "确定清除吗？" % len(lines),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            cache.delete_operator_paths(tif)
+        except OSError as exc:
+            self.log_panel.error("清除标定失败：%s" % exc)
+            return
+        restored = []
+        for record in lines:
+            record_id = str((record or {}).get("id") or "")
+            if not record_id:
+                continue
+            record_item_id = str((record or {}).get("centerline_id") or "")
+            if record_item_id:
+                self._restore_calibration_item(record_item_id)
+                restored.append(record_item_id)
+        self._calibration_payload = {}
+        self._calibration_payload_tif = ""
+        self._calibration_item_id = ""
+        self._calibration_history.clear()
+        self._draw_centerline_overlay(self.image_view.viewer)
+        self._draw_operator_paths_overlay()
+        self._invalidate_analysis_from("path", "已清除全部作业线标定")
+        self.log_panel.success(
+            "已清除本项目 %d 条作业线标定，%d 条线恢复算法中心线"
+            % (len(lines), len(restored))
+        )
+        self._log_action(
+            "calibration.clear_all", "", lines=len(lines), restored=len(restored)
+        )
 
     def _commit_calibration_edit(self, item_id, edit):
         item = self._calibration_item(item_id)

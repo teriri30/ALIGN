@@ -1064,3 +1064,24 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
   4. **界面与磁盘同源**：删除后必须清掉按 tif 记忆的 sidecar 缓存（`_reference_payload`）、清 `reference_lines` 图层、重新同步可用性，否则界面按旧内容重画——收敛点统一在 `_after_reference_edit()`。
 - 代码锚点：`pyside6_app.main_window._sync_display_layer_availability`、`_set_reference_mode`、`_exit_reference_mode`、`_set_reference_layer_visible`、`_on_toggle_reference_layer`、`_on_delete_last_reference_line`、`_on_clear_reference_lines`、`_after_reference_edit`；`cache.delete_reference_lines`。
 - 测试：`tests/test_reference_layer_visibility.py`（6 条：恢复后默认不可见但图层仍在 / 进模式显示退出收起 / 菜单开关不动数据 / 清除删文件并清图层 / 取消确认不动数据 / 逐条删除保留其余）、`tests/test_centerline_evaluation.py::test_cache_delete_reference_lines_removes_the_sidecar`。
+
+
+## DECISION-064：标注 sidecar 的显示与删除生命周期（2026-10-28）
+
+- 背景：DECISION-063 修完参考线之后做同类排查，问的是"还有没有别的落盘标注也这样"。结论是有，而且不止一处。
+- 排查结论（按代码核实，不是推测）：
+  1. **作业线标定 `operator_paths.json` 是同构缺陷**：`cache.py` 只有 `operator_paths_path/load/save`，没有 delete；菜单只有「清除当前线标定」，且前置条件是 `_calibration_item_id` 有值（必须在画布上点选一条线），清空整个项目只能逐条点；删到最后一条会在磁盘留下 `{"lines": []}` 的空壳。用户面对的现象与参考线当初一模一样：知道有东西、删不掉、也不知道藏在哪。
+  2. **程序显隐污染用户偏好**：`_set_reference_layer_visible` 恒传 `user=True`，进标注写 True、退标注写 False，把程序动作记成了"用户显式选择"。用户自己打开的图层在进出一次标注后被关掉，且 `_display_layer_user_overrides` 只在内存里，`_reset_display_layer_defaults` / `_set_all_display_layers` 虽已实现却**没有任何调用点**，用户改乱勾选后只能重启软件。
+  3. 未完成草稿 `reference_draft_p1/p2.json` 只能靠「清除本项目参考线」或标注模式内的 `Ctrl+右键` 丢弃，入口偏深；保留现状但写进"删除入口三件套"清单。
+  4. 禁行区 `forbidden_regions` **不是**同类缺陷：它是规划硬约束（参与计算，必须可见），有「清除全部禁行区」且走 `_save_system_undo` 可撤销。陈旧路径预览 `_stale_path_preview` 是纯内存态，打开项目不恢复，也不构成跨会话残留。
+  5. 排查期间我在用户缓存目录手工复制过 `reference_lines.backup-2026*` 两份 JSON，代码里没有任何生成 `.backup` 的逻辑；这类残留不会被清除入口删掉，也不该留在用户数据目录。
+- 判别规则（今后新增图层先问这一句）：**默认可见性只看"是否属于当前工作流阶段"，不看"有没有数据"。** 持久化的人工标注/研究证据默认收起（行仍可勾选），参与计算的硬约束例外且必须写明理由。
+- 规则：
+  1. 标注类图层登记到 `main_window.PERSISTED_ANNOTATION_LAYERS`，`_sync_display_layer_availability` 对登记项强制 `default_visible=False`；规则由常量单点驱动，不再每层手写。
+  2. 每个落盘标注 sidecar 的 `save_*` 必须有配对 `delete_*`，且批量清除入口真的删文件（`cache.delete_operator_paths`）。
+  3. `user=True` 只由用户手势写（菜单开关、图层面板勾选）；自动显隐一律 `user=False`，退出标注时把进入前的用户偏好原样还回去。
+  4. 提供「视图 → 恢复图层默认显示」入口（`image_view.reset_display_layer_defaults`）。
+- 刻意不改的两处：逐条删除作业线标定仍写回 `lines: []` 的空 payload（`tests/test_operator_calibration_ui.py::test_right_click_undoes_the_last_drag` 钉住了这一语义，对规划与空文件等价），批量清除才是删文件那条路；参考线清除仍不进撤销历史，确认框必须写明不可撤销。
+- 代码锚点：`pyside6_app.main_window.PERSISTED_ANNOTATION_LAYERS`、`_sync_display_layer_availability`、`_set_reference_layer_visible`、`_set_reference_mode`、`_exit_reference_mode`、`_on_toggle_reference_layer`、`_on_reset_display_layer_defaults`、`_on_clear_operator_paths`、`_delete_calibration_record`；`pyside6_app.image_view.display_layer_user_overrides/clear_display_layer_override/reset_display_layer_defaults`；`cache.delete_operator_paths`。
+- 测试：`tests/test_display_layer_contracts.py`（11 条：可用性表覆盖全部图层键的 AST 契约 / 登记表只含真实图层 / 有数据也默认收起 / operator_paths 有配对 delete 且真删文件 / 每个标注 sidecar 都有 delete / 批量清除删文件 / 取消确认不动数据 / 逐条删除不留旧记录 / 进出标注不写用户偏好 / 用户显式选择能活过模式往返 / 恢复默认收起标注层）。
+- 真实数据验收：用户项目 `ba570cbf2799`（17 条参考线 / 211 个桩点）打开后图层项 422 个、可见 0 个，图层行 available=True、default=False；进标注可见、退出收起且 `user_overrides` 为空；菜单打开后「恢复默认」回到收起；sidecar 17 条未改动。全量 `852 passed / 1 skipped`。
