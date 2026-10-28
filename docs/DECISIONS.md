@@ -1140,3 +1140,15 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - 为什么不自己写 hover 定时器：Qt 的 tooltip 还有"移到子控件重弹""按下收起""越界收起""多屏定位"等行为，自造一层会与原生提示抢显示。改 styleHint 是官方支持的最小侵入面。
 - 注意：`install_fast_tooltips` 必须在建窗口前调用；运行中 `QApplication.setStyle` 会让已建控件全部重新 polish（一次重绘闪烁），所以不要做成菜单里的开关。
 - 契约：`tests/test_tooltip_latency.py`（3 条）——唤醒延迟 ≤ 200 ms、醒着的窗口 ≥ 1000 ms、`install` 幂等、**启动入口必须真的调用 `install_fast_tooltips(`**（防止改动只存在于测试里）。全量 860 passed / 1 skipped。
+
+
+## DECISION-067 修订：同一个悬停位置只弹一个提示，并固定浅底（2026-10-28）
+
+用户 0.4.10 实测：「怎么有两个提示，保留一个就行了，白色的更显眼」。
+
+- 根因：`QDoubleSpinBox` 的输入区是内部 `QLineEdit`，为了让"鼠标落在数字上也能看说明"，0.4.9 把同一条说明同时挂在**外层控件和 lineEdit** 上。Qt 的原生 tooltip 会按控件事件各走一遍，于是同一位置先后弹出两个框（外观还受主题影响，一个深一个浅）。
+- 改法：`ui_tooltips.HoverTip` 接管——给控件及所有带 tooltip 的后代装事件过滤器，**吞掉 `QEvent.ToolTip`（原生提示全部禁用）**，只在 `Enter` 后 120 ms 用 `QToolTip.showText` 弹一个；`Leave`/`Hide`/按下/滚轮立即收起；提示框定位在控件左下角外侧，避免盖住光标导致 Leave 抖动。
+- 样式：`QToolTip` 固定浅底深字（`#F7F7F7` / `#1B1B1B` / 1 px `#C9C9C9`），不跟深色主题走——用户口径「白色的更显眼」。
+- 落点：`SettingsDialog._build_ui` 与 `HarvesterParamsDialog._build_ui` 结尾各 `self._hover_tips = install_hover_tips(self)`。`FastTooltipStyle` 保留作为未接管控件的兜底（150 ms）。
+- 实测（离屏探针）：控制器类型 `HoverTip`；控件与 lineEdit 的 `QEvent.ToolTip` 均返回 True（被吞）；`Enter` 后约 90–100 ms 出现提示；同一时刻可见的顶层提示窗口数 = **1**；`Leave` 后收起。
+- 契约：`tests/test_settings_tooltips.py::test_only_one_tooltip_is_shown_per_hover`（原生事件必须被吞、弹出 ≤400 ms、同一时刻只有 1 个提示框、移开必须收起）。全量 861 passed / 1 skipped。

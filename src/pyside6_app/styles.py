@@ -177,6 +177,9 @@ QListWidget {{ background: {_('bg_darkest')}; border: 1px solid {_('border')}; b
 QListWidget::item {{ padding: 8px 12px; border-radius: 4px; }}
 QListWidget::item:selected {{ background: {_('accent_bg')}; color: {_('text_accent')}; }}
 QDialog {{ background: {_('bg')}; }}
+/* DECISION-067：提示框固定用浅底深字——用户口径「白色的更显眼」，
+   深色主题下也保持这个对比，不跟主题走。 */
+QToolTip {{ background-color: #F7F7F7; color: #1B1B1B; border: 1px solid #C9C9C9; padding: 6px 8px; border-radius: 4px; }}
 QSplitter::handle {{ background: {_('border')}; }}
 QSplitter::handle:horizontal {{ width: 1px; }}
 QSplitter::handle:vertical {{ height: 1px; }}

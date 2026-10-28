@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QComboBox, QMessageBox
 )
 from pyside6_app.styles import COLORS
+from pyside6_app.ui_tooltips import install_hover_tips
 from config import save_json_atomic, DEFAULT_HARVESTER_PARAMS
 from runtime_paths import user_config_path
 import device_runtime
@@ -295,6 +296,9 @@ class HarvesterParamsDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lo.addWidget(bb)
+        # DECISION-067：原生 tooltip 会在控件与其内部 lineEdit 上各弹一次，
+        # 统一交给 HoverTip 只弹一个（白底、120 ms）。
+        self._hover_tips = install_hover_tips(self)
 
     def get_params(self):
         return {
@@ -556,6 +560,8 @@ class SettingsDialog(QDialog):
         bb.accepted.connect(self._save)
         bb.rejected.connect(self.reject)
         lo.addWidget(bb)
+        # DECISION-067：同上，设置项多、最容易出现"两个提示叠在一起"。
+        self._hover_tips = install_hover_tips(self)
 
     # ------------------------------------------------------------------ 运行设备
     def _device_tab(self):

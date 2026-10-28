@@ -80,3 +80,53 @@ def test_harvester_params_fields_explain_themselves():
     # 割刀前置距离必须强调"实测"，它是导出前的硬门槛
     assert "必须实测" in dialog.spin_cutter_offset.toolTip()
     dialog.close()
+
+
+def test_only_one_tooltip_is_shown_per_hover():
+    """DECISION-067：原生提示被吞，同一处只弹一个（用户看到过两个叠在一起）。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QToolTip
+
+    from pyside6_app.ui_tooltips import HoverTip
+
+    app = _app()
+    dialog = SettingsDialog({"model": {}, "path_planning": {}, "mask_processing": {}})
+    dialog.show()
+    app.processEvents()
+
+    controller = dialog._hover_tips
+    assert isinstance(controller, HoverTip), "对话框没装统一提示控制器"
+    spin = dialog.spin_conf
+    # 控件本体和它内部的 lineEdit 都会收到原生 ToolTip 事件，两个都必须被吞，
+    # 否则就是"两个提示叠在一起"。
+    assert controller.eventFilter(spin, QEvent(QEvent.Type.ToolTip)) is True
+    assert controller.eventFilter(spin.lineEdit(), QEvent(QEvent.Type.ToolTip)) is True
+
+    QToolTip.hideText()
+    QApplication.sendEvent(spin, QEvent(QEvent.Type.Enter))
+    visible_at = None
+    for waited in range(0, 900, 20):
+        app.processEvents()
+        QTest.qWait(20)
+        if QToolTip.isVisible():
+            visible_at = waited + 20
+            break
+    assert visible_at is not None, "悬停后没有弹出提示"
+    assert visible_at <= 400, "弹出用了 %s ms，用户会当成没反应" % visible_at
+    assert "置信度阈值" in QToolTip.text()
+    # 同一时刻屏幕上只能有一个提示框
+    top_labels = [
+        widget for widget in QApplication.topLevelWidgets()
+        if isinstance(widget, QLabel) and widget.isVisible() and widget.text()
+    ]
+    assert len(top_labels) == 1, "同时出现了 %d 个提示框" % len(top_labels)
+
+    QApplication.sendEvent(spin, QEvent(QEvent.Type.Leave))
+    for _ in range(40):
+        app.processEvents()
+        QTest.qWait(10)
+        if not QToolTip.isVisible():
+            break
+    assert not QToolTip.isVisible(), "鼠标移开后提示还挂着"
+    dialog.close()
