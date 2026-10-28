@@ -535,10 +535,19 @@ class SettingsDialog(QDialog):
 
         row = QHBoxLayout()
         self.btn_device_enable = QPushButton("启用 GPU 加速")
+        self.btn_device_enable.setToolTip(
+            "下载并安装 CUDA 版 PyTorch 运行库（约 2.7 GB，装在 ALIGN 数据目录，不动系统）。\n"
+            "装完需要关闭并重开 ALIGN 才会生效；不装也能用，走 CPU，只是识别更慢。"
+        )
         self.btn_device_enable.clicked.connect(self._start_gpu_install)
         self.btn_device_remove = QPushButton("移除 GPU 运行时")
+        self.btn_device_remove.setToolTip(
+            "删除已下载的 CUDA 运行库并释放磁盘空间，之后退回 CPU 模式。\n"
+            "不影响识别结果，只影响速度。"
+        )
         self.btn_device_remove.clicked.connect(self._remove_gpu)
         self.btn_device_refresh = QPushButton("重新检测")
+        self.btn_device_refresh.setToolTip("重新检测显卡与 torch 运行库状态（装完驱动或换机器后点一下）。")
         self.btn_device_refresh.clicked.connect(self._refresh_device)
         row.addWidget(self.btn_device_enable)
         row.addWidget(self.btn_device_remove)
@@ -746,10 +755,28 @@ class SettingsDialog(QDialog):
         w = QWidget(); f = QFormLayout(w)
         self.spin_conf = QDoubleSpinBox(); self.spin_conf.setRange(0.01, 0.99); self.spin_conf.setSingleStep(0.05)
         self.spin_conf.setValue(self._config.get("model", {}).get("conf_threshold", 0.25))
+        self.spin_conf.setToolTip(
+            "置信度阈值：模型认为「这是作物」的最低把握，低于它的像素直接丢掉。\n"
+            "默认 0.25（与本项目训练/验收同口径）。\n"
+            "调高 → 漏检，行带容易断；调低 → 杂草、阴影、田埂混进来。\n"
+            "建议范围 0.20–0.35；改动后必须重跑「作物识别」，旧掩膜不会自动重算。"
+        )
         self.spin_iou = QDoubleSpinBox(); self.spin_iou.setRange(0.01, 0.99); self.spin_iou.setSingleStep(0.05)
         self.spin_iou.setValue(self._config.get("model", {}).get("iou_threshold", 0.45))
+        self.spin_iou.setToolTip(
+            "IOU 阈值（NMS 去重）：两个候选框重叠超过这个比例就当成同一条作物行。\n"
+            "默认 0.45。\n"
+            "调高 → 同一行被拆成多条实例（碎）；调低 → 相邻行带被并成一大块。\n"
+            "建议范围 0.40–0.55；改动后需重跑「作物识别」。"
+        )
         self.spin_tile = QSpinBox(); self.spin_tile.setRange(256, 2048); self.spin_tile.setSingleStep(64)
         self.spin_tile.setSuffix(" px"); self.spin_tile.setValue(self._config.get("model", {}).get("tile_capture_size", 640))
+        self.spin_tile.setToolTip(
+            "切片大小：正射影像切片推理时每块的边长（像素）。\n"
+            "默认 640，与训练时的输入尺寸一致，改大改小都会偏离训练分布。\n"
+            "调大 → 单块上下文更多但占显存，大图可能切不满；调小 → 小目标更敏感、拼接缝变多。\n"
+            "建议 512–768；不确定就保持 640。"
+        )
         f.addRow("置信度阈值:", self.spin_conf)
         f.addRow("IOU 阈值:", self.spin_iou)
         f.addRow("切片大小:", self.spin_tile)
@@ -760,8 +787,20 @@ class SettingsDialog(QDialog):
         path_cfg = self._config.get("path_planning", {})
         self.spin_interval = QDoubleSpinBox(); self.spin_interval.setRange(0.1, 2.0); self.spin_interval.setSingleStep(0.1)
         self.spin_interval.setSuffix(" m"); self.spin_interval.setValue(path_cfg.get("path_point_interval_m", 0.6))
+        self.spin_interval.setToolTip(
+            "路径点间距：导出轨迹与控制点的采样间隔（米）。\n"
+            "默认 0.6 m。\n"
+            "调小 → 更贴合弯曲中心线，但点数变多；调大 → 文件更小，转弯处会被拉直。\n"
+            "建议 0.3–1.0 m；作业速度 1.2 m/s 时 0.6 m 约合 0.5 s 一个点。"
+        )
         self.spin_buffer = QDoubleSpinBox(); self.spin_buffer.setRange(0.0, 10.0); self.spin_buffer.setSingleStep(0.1)
         self.spin_buffer.setSuffix(" m"); self.spin_buffer.setValue(path_cfg.get("headland_buffer_m", 3.0))
+        self.spin_buffer.setToolTip(
+            "田头缓冲：作业线两端离田块边界内缩的距离（米），留给地头转弯。\n"
+            "默认 3.0 m。\n"
+            "必须大于机具转弯半径（本机 0.9 m）并留出安全余量；设太小会出现转弯出界、压苗。\n"
+            "建议 2.0–6.0 m，田头窄的地块取小值、宽地块可加大。"
+        )
         f.addRow("路径点间距:", self.spin_interval)
         f.addRow("田头缓冲:", self.spin_buffer)
         return w
@@ -770,15 +809,34 @@ class SettingsDialog(QDialog):
         w = QWidget(); f = QFormLayout(w)
         self.mask_strength_value = QLabel("标准（固定）")
         self.mask_strength_value.setToolTip(
-            "掩膜处理统一使用标准参数，保证不同任务的处理口径一致"
+            "掩膜处理统一使用标准参数，保证不同任务的处理口径一致。\n"
+            "这一项不可调：换成别的档位会让不同批次的掩膜与评价不可比。"
         )
         self.spin_gap = QDoubleSpinBox(); self.spin_gap.setRange(0.2, 20.0); self.spin_gap.setSingleStep(0.5)
         self.spin_gap.setSuffix(" m"); self.spin_gap.setValue(self._config.get("mask_processing", {}).get("band_internal_gap_close_m", 6.0))
+        self.spin_gap.setToolTip(
+            "行内断裂补全：同一条作物行内部断开（缺苗、倒伏、阴影）小于这个长度就补上（米）。\n"
+            "默认 6.0 m。\n"
+            "调大 → 碎行带能接起来，但跨到邻行的风险变大；调小 → 断行带原样保留，作业线会被截短。\n"
+            "建议 3–10 m；改完要重跑「掩膜优化」。"
+        )
         self.spin_end_gap = QDoubleSpinBox(); self.spin_end_gap.setRange(0.0, 2.0); self.spin_end_gap.setSingleStep(0.05)
         mask_cfg = self._config.get("mask_processing", {})
         self.spin_end_gap.setSuffix(" m"); self.spin_end_gap.setValue(mask_cfg.get("band_end_gap_close_m", mask_cfg.get("band_endpoint_gap_close_m", 0.35)))
+        self.spin_end_gap.setToolTip(
+            "端部断裂补全：行带在两端（田头、地角）缺一小截时，小于这个长度就补齐（米）。\n"
+            "默认 0.35 m。\n"
+            "调大 → 端部被拉长、便于对齐田头；调小 → 端部按实际作物结束。\n"
+            "超过 1 m 容易把田头空地也算成作物，建议 ≤ 0.6 m。"
+        )
         self.spin_trim = QDoubleSpinBox(); self.spin_trim.setRange(0.0, 2.0); self.spin_trim.setSingleStep(0.05)
         self.spin_trim.setSuffix(" m"); self.spin_trim.setValue(self._config.get("mask_processing", {}).get("band_end_trim_m", 0.1))
+        self.spin_trim.setToolTip(
+            "端部收缩：每条行带两端各向内缩的距离（米），避开田头杂草和边界噪声。\n"
+            "默认 0.10 m。\n"
+            "调大 → 作业线更保守、少压边，但覆盖长度变短；调小 → 贴着田头作业。\n"
+            "建议 0–0.3 m。"
+        )
         f.addRow("处理强度:", self.mask_strength_value)
         f.addRow("行内断裂补全:", self.spin_gap)
         f.addRow("端部断裂补全:", self.spin_end_gap)

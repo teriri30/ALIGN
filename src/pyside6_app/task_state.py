@@ -32,8 +32,8 @@ TASK_LABELS: Dict[str, str] = {
     "segment": "作物识别",
     "process": "掩膜优化",
     "params": "农机参数",
-    "centerline_generate": "生成中心线",
-    "centerline_select": "选择中心线",
+    "centerline_generate": "生成作业线",
+    "centerline_select": "选择作业线",
     "entry": "起点",
     "exit": "终点",
     "unload": "卸粮点",
@@ -76,6 +76,58 @@ class TaskStatus:
 #: Steps that may be skipped but still affect the planned route.
 #: 「高级设置」也是可选：默认参数来自配置，未确认同样能规划。
 OPTIONAL_TASKS = ("exit", "unload", "params")
+
+#: 界面上的步骤顺序（与 panels.STEP_GROUPS 一致）。`params` 已不占步骤位，
+#: 不参与"当前进行到哪一步"的判定。
+UI_STEP_ORDER = (
+    "import_img",
+    "draw_field",
+    "segment",
+    "process",
+    "centerline_generate",
+    "centerline_select",
+    "entry",
+    "exit",
+    "unload",
+    "plan",
+    "simulate",
+    "export",
+)
+
+#: 每个步骤的「上一步」。锁定提示只允许指一步，不跨步跳（DECISION-066）：
+#: 旧口径一律指"最上游真正缺的步骤"，用户点第 7 步会被告知"先完成作物识别"，
+#: 中间跨了四项，读起来像跳；现在按这个表逐级提示。
+PREVIOUS_STEP = {
+    "draw_field": "import_img",
+    "segment": "draw_field",
+    "process": "segment",
+    "centerline_generate": "process",
+    "centerline_select": "centerline_generate",
+    "entry": "centerline_select",
+    "exit": "centerline_select",
+    "unload": "centerline_select",
+    "plan": "entry",
+    "simulate": "plan",
+    "export": "plan",
+}
+
+
+def _stepwise_blocker(tid, current_tid):
+    """锁定原因的文案：只指上一步，或直接指当前进行的那一步。
+
+    用户口径（2026-10-28）：「每一步应该提示完成上一步而不是跳跃性的，要不就
+    直接提示到目前进行的一步」。所以：
+    - 上一步就是当前步骤 → 「先完成上一步：X」；
+    - 否则 → 「当前进行：Y」，让用户知道现在该做什么，而不是被推到四项之前。
+    """
+    previous = PREVIOUS_STEP.get(tid)
+    previous_label = TASK_LABELS.get(previous, previous or "")
+    if previous and previous == current_tid:
+        return "先完成上一步：%s" % previous_label
+    current_label = TASK_LABELS.get(current_tid, current_tid or "")
+    if current_label:
+        return "当前进行：%s" % current_label
+    return "先完成上一步：%s" % previous_label
 
 
 def _has_points(value: Any) -> bool:
@@ -324,6 +376,32 @@ def derive_task_statuses(state: Any, has_image: bool = False) -> Dict[str, TaskS
     if path_done:
         statuses["simulate"] = TaskStatus("done" if sim_done else "available")
         statuses["export"] = TaskStatus("done" if export_done else "available")
+    else:
+        # 没有路径时这两步一直是 pending；给出占位 blocker，交给下面统一改成
+        # 逐级提示（否则点它们只会闪一句"请先完成前置步骤"）。
+        statuses["simulate"] = TaskStatus("pending", blocker="待前面步骤完成")
+        statuses["export"] = TaskStatus("pending", blocker="待前面步骤完成")
+    # 锁定文案在最后统一收口（DECISION-066）：逐级提示，不跨步跳。
+    # 上一步就是当前步骤 → 「先完成上一步：X」；否则 → 「当前进行：Y」。
+    current_tid = next(
+        (
+            tid
+            for tid in UI_STEP_ORDER
+            if statuses.get(tid) is not None and statuses[tid].status != "done"
+        ),
+        None,
+    )
+    for tid in UI_STEP_ORDER:
+        status = statuses.get(tid)
+        if status is None or status.status != "pending" or not status.blocker:
+            continue
+        statuses[tid] = TaskStatus(
+            status.status,
+            status.text,
+            status.action,
+            status.optional,
+            _stepwise_blocker(tid, current_tid),
+        )
     return statuses
 
 

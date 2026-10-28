@@ -125,6 +125,33 @@ def test_optional_steps_are_flagged_and_never_block_planning():
     assert statuses["plan"].status == "available"
 
 
+def test_locked_rows_only_point_at_the_previous_or_current_step():
+    """DECISION-066：锁定提示只指一步，不跨步跳。
+
+    用户口径：点第 7 步却被告知「先完成作物识别」，中间隔着四项，读起来像跳。
+    现在上一步就是当前步骤时提示「先完成上一步：X」，否则提示「当前进行：Y」。
+    """
+    from state import AppState
+
+    state = AppState()
+    state.tif_path = "field.tif"          # 只导入影像
+    statuses = derive_task_statuses(state, has_image=True)
+
+    # 当前进行的是「田块圈选」
+    assert statuses["segment"].blocker == "先完成上一步：田块圈选"
+    for tid in ("process", "centerline_generate", "entry", "plan", "export"):
+        assert statuses[tid].blocker == "当前进行：田块圈选", tid
+
+    # 圈好田块后，当前推进到「作物识别」
+    state.field_boundary = [(0, 0), (10, 0), (10, 10)]
+    statuses = derive_task_statuses(state, has_image=True)
+    assert statuses["process"].blocker == "先完成上一步：作物识别"
+    assert statuses["plan"].blocker == "当前进行：作物识别"
+    # 「作物识别」这一步自己已经是可操作状态，不该再背任何锁定提示
+    assert statuses["segment"].status == "available"
+    assert not statuses["segment"].blocker
+
+
 def test_advanced_settings_defaults_never_block_planning():
     """高级设置可动可不动：不确认也照常规划（参数来源在导出阶段才校验）。"""
     state = _state()

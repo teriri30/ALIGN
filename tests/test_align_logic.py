@@ -1404,9 +1404,10 @@ def test_mask_completion_does_not_stop_at_optional_advanced_settings():
     assert statuses["entry"].status == "available"
     assert statuses["exit"].status == "done"
     assert statuses["exit"].optional is True
-    # 高级设置不是门槛：规划只等起点确认。
+    # 高级设置（农机参数）不是门槛：规划只等起点确认。
     assert statuses["plan"].status == "pending"
-    assert statuses["plan"].blocker == "先设置并确认起点"
+    # DECISION-066：锁定提示只指上一步（起点），不再跨步提示"最上游缺口"。
+    assert statuses["plan"].blocker == "先完成上一步：起点"
 
 
 def test_path_planning_unlocks_after_start_is_confirmed():
@@ -3369,3 +3370,49 @@ def test_plan_row_shows_why_it_is_still_pending():
     assert panel._task_widgets["plan"]._status.text() == "先确认高级设置"
     panel.close()
 
+
+
+def test_harvester_params_summary_follows_the_edited_values(monkeypatch, tmp_path):
+    """DECISION-066：规划卡里的农机参数摘要必须显示「当前生效」的数值。
+
+    用户口径：图 3 应该显示当前农机参数，在菜单改完之后显示的就该是改后的值。
+    这里走真实入口 `_apply_harvester_params`（只把写配置重定向到临时文件）。
+    """
+    import pyside6_app.main_window as mw
+
+    window = _window()
+    monkeypatch.setattr(window.cfg, "config_path", lambda: str(tmp_path / "config.json"))
+    monkeypatch.setattr(mw, "save_json_atomic", lambda *a, **k: True)
+
+    window._apply_harvester_params(
+        {
+            "cutter_width_m": 2.00,
+            "cutter_forward_offset_m": 1.35,
+            "track_width_m": 0.35,
+            "track_gauge_m": 1.30,
+        },
+        "user_entered",
+    )
+    summary = window.task_panel.params_summary_label.text()
+    assert "割幅 2.00 m" in summary
+    assert "履带 0.35 m" in summary
+    assert "轨距 1.30 m" in summary
+    assert "已确认" in summary
+    window.close()
+
+
+def test_clicking_the_params_summary_requests_the_dialog():
+    """摘要行可点：点一下等于走菜单「设置 → 农机参数…」。"""
+    from PySide6.QtTest import QTest
+    from pyside6_app.panels import TaskPanel
+
+    app = QApplication.instance() or QApplication([])
+    panel = TaskPanel()
+    panel.show()
+    app.processEvents()
+    calls = []
+    panel.params_requested.connect(lambda: calls.append(1))
+    QTest.mouseClick(panel.params_summary_label, Qt.LeftButton)
+    app.processEvents()
+    assert calls == [1]
+    panel.close()

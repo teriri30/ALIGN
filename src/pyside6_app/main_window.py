@@ -30,6 +30,7 @@ from pyside6_app.image_view import DISPLAY_LAYER_KEYS, ImageViewerGroup
 from pyside6_app.harvester_visual import HarvesterItem
 from pyside6_app.panels import (
     TASK_PANEL_COMPACT_MIN_WIDTH,
+    TASK_PANEL_DEFAULT_WIDTH,
     TaskPanel,
     ParamPanel,
     LogPanel,
@@ -608,6 +609,12 @@ class MainWindow(QMainWindow):
         # 左侧栏：任务清单 + 路径结果（垂直分割）
         left_split = QSplitter(Qt.Vertical); left_split.setHandleWidth(2)
         self.task_panel = TaskPanel()
+        # DECISION-066：建面板时就把当前生效的机具几何写进摘要，避免启动瞬间
+        # 显示「读取中」（用户把这个当成"没读到参数"）。
+        self.task_panel.set_harvester_params(
+            self.state.harvester_params,
+            getattr(self.state, "harvester_params_confirmed", False),
+        )
         left_split.addWidget(self.task_panel)
         self.route_info = RouteInfoPanel()
         left_split.addWidget(self.route_info)
@@ -625,8 +632,12 @@ class MainWindow(QMainWindow):
         # 左侧任务清单在启动时保持一个不挤占的宽度（约 1/6 屏），避免被
         # 右侧影像区挤压到最小宽度；同时设最小宽度防止拖得太窄文字被裁切。
         left_split.setMinimumWidth(TASK_PANEL_COMPACT_MIN_WIDTH)
-        _left_w = max(TASK_PANEL_COMPACT_MIN_WIDTH, self.width() // 6)
-        sp.setSizes([_left_w, self.width() - _left_w])
+        # DECISION-066：启动时就给够宽度（约 1/4 屏，不低于默认值），不要等
+        # 用户拖动分割条才发现卡片被挤压。
+        _left_w = max(
+            TASK_PANEL_DEFAULT_WIDTH, int(self.width() * 0.24)
+        )
+        sp.setSizes([_left_w, max(400, self.width() - _left_w)])
         self._left_split = left_split
         self._outer_splitter = sp
 

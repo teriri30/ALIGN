@@ -1105,3 +1105,15 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - 代码锚点：`pyside6_app.panels.STEP_GROUPS`、`_make_task_row`、`_build_planning_input_rows`、`_build_route_edit_rows`、`set_harvester_params`、`_build_ui` 里 plan 行前后的插入点；`pyside6_app.main_window._sync_task_statuses` 调 `set_harvester_params`。
 - 测试（已随结构更新，不是放松断言）：`tests/test_align_logic.py::test_workflow_separates_centerlines_from_path_planning`（新增 9 组清单与「无 params 行」断言）、`test_planning_card_fully_expands_in_scroll_area_without_overlap`、`test_edit_mode_does_not_inject_a_duplicate_tool_grid_into_planning_card`、`test_centerline_selection_is_rendered_in_its_own_task_card`（钉住调头方式/禁行区/编辑路线的父卡片就是路径规划卡）、`test_cache_restore_reenables_confirmed_parameters_after_processed_mask`（改为断言摘要文字与"已确认"）。
 - 验收：结构探针输出 9 张卡；规划卡内控件顺序为 起点 → 智能推荐起点 → 选填（终点/卸粮）→ 分隔线 → 禁行区 → 调头方式 → 农机参数摘要 → 路径规划 → 编辑路线 → 新增点/作业·转弯/直线·转弯；全量 852 passed / 1 skipped。
+
+
+## DECISION-066：左栏宽度稳定、锁定提示逐级、参数摘要显示当前值、设置项加悬浮说明（2026-10-28）
+
+用户反馈四件事（截图 2026-10-28 19:42）：卡片老被挤、拖边时宽度一直在变；「先完成作物识别」跨步提示看不懂；规划卡里的农机参数不是当前值；系统设置每个数字不知道是什么、该填多少。
+
+- **① 卡片宽度跳变**：纵向滚动条随内容出现/消失，可用宽度在一次展开动作里变两次（`QScrollArea` 默认 `ScrollBarAsNeeded`）。改法：`setVerticalScrollBarPolicy(AlwaysOn)` + `setHorizontalScrollBarPolicy(AlwaysOff)`；左栏默认宽度从「1/6 屏、下限 330」改为 `TASK_PANEL_DEFAULT_WIDTH = 384`（约 1/4 屏），最小宽度 360。实测：384 宽面板展开任意卡片，第一张卡宽度恒为 354 px、横向滚动 max=0、六种展开状态完全一致；1600 宽窗口启动左栏 384 / 右栏 1214、清单 9 张卡。
+- **② 锁定提示逐级（推翻 DECISION-043 的「指最上游缺口」）**：用户原话「每一步应该提示完成上一步而不是跳跃性的，要不就直接提示到目前进行的一步」。新规则（`task_state._stepwise_blocker`）：上一步就是当前步骤 → 「先完成上一步：X」；否则 → 「当前进行：Y」。`PREVIOUS_STEP` + `UI_STEP_ORDER` 是唯一来源，`derive_task_statuses` 末尾统一改写所有 pending 行的 blocker（不再各分支各写一句）。顺带补了 `simulate`/`export` 的 pending 占位 blocker（以前点它们只闪「请先完成前置步骤」），并把 `TASK_LABELS` 的「生成中心线/选择中心线」改成与界面一致的「生成作业线/选择作业线」。
+- **③ 农机参数摘要**：改成显示**当前生效**的机具几何（`set_harvester_params` 由 `_sync_task_statuses` 与建面板时各写一次，菜单改完立即刷新）；标签可点，等于走「设置 → 农机参数…」；工具提示注明这是实际参与足迹/通行判定的数值。检查结论：显示 1.60/0.45/1.00 不是 bug，而是打包版用户配置 `%LOCALAPPDATA%\ALIGN\config\config.json` 里就是这三个值（仓库 `config.json` 是 2.00/0.35/1.30）。**没有替用户改这份配置**：正式实验要求参数来源为 `user_measured`，正确做法是在参数对话框里按实测录入一遍，既改数值又把来源记成实测。
+- **④ 系统设置悬浮说明**：置信度阈值 / IOU 阈值 / 切片大小 / 路径点间距 / 田头缓冲 / 行内断裂补全 / 端部断裂补全 / 端部收缩 八个数值都加了多行 tooltip（是什么、默认值、调大调小分别会怎样、建议范围、改完要不要重跑哪一步）；运行设备三个按钮也补了说明。处理强度仍是不可调项，tooltip 里写明理由。
+- 代码锚点：`pyside6_app.panels`（`TASK_PANEL_DEFAULT_WIDTH`、`_build_ui` 的滚动策略、`_ClickableLabel`、`set_harvester_params`）、`pyside6_app.task_state`（`UI_STEP_ORDER`、`PREVIOUS_STEP`、`_stepwise_blocker`、`TASK_LABELS`）、`pyside6_app.main_window`（`_build_central` 初始摘要、`_sync_task_statuses`）、`pyside6_app.dialogs.SettingsDialog`。
+- 测试：`tests/test_task_chain.py::test_locked_rows_only_point_at_the_previous_or_current_step`（新增，钉住"不跨步"）、`tests/test_align_logic.py::test_harvester_params_summary_follows_the_edited_values`（走真实 `_apply_harvester_params`，只把写配置重定向到 tmp）、`test_clicking_the_params_summary_requests_the_dialog`；`test_mask_completion_does_not_stop_at_optional_advanced_settings` 的 blocker 断言改为「先完成上一步：起点」。全量 855 passed / 1 skipped。

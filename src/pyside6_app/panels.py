@@ -22,9 +22,12 @@ from pyside6_app.ui_motion import (
 # 不要在这里或控件样式表里再写 font-family：QSS 的字体族会压过 setFont，
 # 之前就是因为它，步骤标题回退成了 SimHei。
 
-# 真实窗口 show() 后逐级缩窄测得：高级设置或路径规划卡片展开且出现纵向滚动条时，
-# 328 px 仍会产生 1 px 横向滚动，330 px 起全部控件不再横向挤压。
-TASK_PANEL_COMPACT_MIN_WIDTH = 330
+# 真实窗口 show() 后逐级缩窄测得：滚动条常驻（DECISION-066）后 330 px 仍可用，
+# 但右缘按钮贴边；默认给到 384 px 让「禁行区 / 确认无 / 绘制」这类整行控件有
+# 余量，最小宽度 360 px 是拖窄时的下限（再窄就只剩贴边）。
+TASK_PANEL_COMPACT_MIN_WIDTH = 360
+#: 启动时的左栏宽度：约 1/4 屏，但不少于最小宽度。用户口径是「预设就把空间放开点」。
+TASK_PANEL_DEFAULT_WIDTH = 384
 
 class ExplicitPopupComboBox(QComboBox):
     """Ignore wheel selection unless the popup list is explicitly open.
@@ -788,6 +791,23 @@ class StepCard(QWidget):
         self.refresh_state()
 
 
+class _ClickableLabel(QLabel):
+    """只读摘要标签，点一下打开对应设置（不改变外观，只换手型光标）。"""
+
+    clicked = Signal()
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class _OptionalHeader(QWidget):
     """二级折叠分组的表头（整行可点，暗色文字）。"""
 
@@ -952,6 +972,11 @@ class TaskPanel(QWidget):
         self._title.setStyleSheet(f"font-size:17px;font-weight:600;color:{COLORS['text_bright']};")
         lo.addWidget(self._title)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
+        # DECISION-066：滚动条常驻，展开/收起卡片时卡片可用宽度不再跳变
+        # （以前纵向滚动条随内容出现/消失，整列卡片的宽度会在一次点击里变两次，
+        #  看着就是"卡片一直在抖"）。横向滚动条一律不要：内容必须挤得下。
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
         self._scroll = scroll
         body = QWidget(); bl = QVBoxLayout(body); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(10)
@@ -1139,13 +1164,14 @@ class TaskPanel(QWidget):
         turn_layout.addWidget(turn_label)
         turn_layout.addWidget(self.turn_combo, 1)
         rows.append(turn_row)
-        self.params_summary_label = QLabel("农机参数：读取中")
+        self.params_summary_label = _ClickableLabel("农机参数：读取中")
         self.params_summary_label.setToolTip(
-            "实际参与规划的机具几何；修改入口在 设置 → 农机参数…（Ctrl+P）"
+            "实际参与规划的机具几何；点击或在 设置 → 农机参数…（Ctrl+P）修改"
         )
         self.params_summary_label.setStyleSheet(
             f"color:{COLORS['text_dim']};font-size:12px;padding-left:8px;"
         )
+        self.params_summary_label.clicked.connect(self.params_requested.emit)
         rows.append(self.params_summary_label)
         return rows
 
@@ -1981,7 +2007,7 @@ class CenterlineSelectionPanel(QWidget):
         self._layout.setSpacing(1)
         self._scroll.setWidget(self._container)
         lo.addWidget(self._scroll)
-        self._empty_label = QLabel("尚未生成中心线，请先点击上一步“生成中心线”。")
+        self._empty_label = QLabel("尚未生成作业线，请先点击上一步“生成作业线”。")
         self._empty_label.setWordWrap(True)
         self._empty_label.setStyleSheet(
             f"font-size:12px;color:{COLORS['text_dim']};"
