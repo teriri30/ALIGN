@@ -164,6 +164,23 @@ def save_reference_lines(tif_path: str, payload: Dict[str, Any]) -> str:
     return path
 
 
+def delete_reference_lines(tif_path: str) -> bool:
+    """删除当前项目的参考线 sidecar（用户主动清除时调用）。
+
+    DECISION-063：参考线是研究工具证据，以前只能手工删文件；界面上的
+    “清除参考线”必须同时删掉落盘记录，否则重开项目又画回来。
+    """
+    path = reference_lines_path(tif_path)
+    with _project_lock(tif_path):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                return True
+        except OSError:
+            return False
+    return False
+
+
 def operator_paths_path(tif_path: str) -> str:
     """人工标定作业线（operator centerline）sidecar 路径。
 

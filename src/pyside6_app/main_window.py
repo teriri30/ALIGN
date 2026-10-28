@@ -489,7 +489,15 @@ class MainWindow(QMainWindow):
         self._add_action(ref_menu, "第 1 遍", None, lambda: self._set_reference_mode(1))
         self._add_action(ref_menu, "第 2 遍（重复性）", None, lambda: self._set_reference_mode(2))
         self._add_action(ref_menu, "完成当前参考线（保存）", None, self._on_finish_reference_line)
+        self._add_action(ref_menu, "显示 / 隐藏参考线图层", None, self._on_toggle_reference_layer)
         self._add_action(ref_menu, "导出参考线 JSON…", None, self._on_export_reference_lines)
+        ref_menu.addSeparator()
+        self._add_action(
+            ref_menu, "删除最后一条参考线", None, self._on_delete_last_reference_line
+        )
+        self._add_action(
+            ref_menu, "清除本项目参考线…", None, self._on_clear_reference_lines
+        )
         tm.addSeparator()
         cal_menu = tm.addMenu("作业线标定（人工纠偏）")
         self._add_action(cal_menu, "开始 / 结束标定", None, self._on_toggle_calibration)
@@ -3200,7 +3208,10 @@ class MainWindow(QMainWindow):
             "headland_mask": (has_headland, has_headland),
             "uncertain_residual": (has_uncertain, has_uncertain),
             "centerlines": (has_centerlines, has_centerlines),
-            "reference_lines": (has_reference, has_reference),
+            # DECISION-063：参考线是研究工具的标注证据，不该常驻画布。
+            # 有数据就把行亮起来（可勾选），但默认不画；用户勾选图层或进入
+            # 参考线标注模式时才显示。
+            "reference_lines": (has_reference, False),
             "route": (has_route, has_route),
             "forbidden_regions": (has_forbidden, has_forbidden),
             "service_points": (
@@ -4124,6 +4135,9 @@ class MainWindow(QMainWindow):
         self._draw_reference_lines_overlay()
         self._redraw_reference_interaction()
         self._sync_display_layer_availability()
+        # DECISION-063：进模式才把参考线图层打开（默认关闭，避免常驻画布）。
+        # 必须放在 _sync_display_layer_availability 之后，否则会被默认值覆盖。
+        self._set_reference_layer_visible(True)
         existing = len(self._reference_lines_payload().get("lines") or [])
         self.log_panel.info(
             "参考线标注（第 %d 遍）：左键沿宽行带中心逐点添加桩点（建议每 5 m 一点，"
@@ -4188,6 +4202,9 @@ class MainWindow(QMainWindow):
         self._reference_last_click = None
         self.image_view.viewer.clear_overlay_layer("interaction_reference")
         self._sync_drawing_mode()
+        # DECISION-063：退出标注就把参考线收起来，画布回到干净状态；
+        # 需要看/复核时从“参考线标注 → 显示 / 隐藏参考线图层”或图层面板打开。
+        self._set_reference_layer_visible(False)
         self._log_action(
             "reference.exit", "", pass_index=self._reference_pass, pending=pending
         )
@@ -4654,6 +4671,122 @@ class MainWindow(QMainWindow):
             self.log_panel.error("导出失败：%s" % exc)
             return
         self.log_panel.success("参考线已导出：%s" % path)
+
+    def _set_reference_layer_visible(self, visible):
+        """打开/关闭参考线图层的显示（DECISION-063：默认关闭）。"""
+        self.image_view.set_display_layer_visibility(
+            "reference_lines", bool(visible), user=True
+        )
+
+    def _on_toggle_reference_layer(self):
+        """菜单入口：手动显示/隐藏已保存的参考线，不动数据。"""
+        if not self._reference_lines_present():
+            self.log_panel.warn("当前项目还没有参考线，先标注再显示。")
+            return
+        current = self.image_view.display_layer_visible("reference_lines", False)
+        self._set_reference_layer_visible(not current)
+        self._draw_reference_lines_overlay()
+        if current:
+            self.log_panel.info("参考线图层已隐藏。")
+        else:
+            count = len(self._reference_lines_payload().get("lines") or [])
+            self.log_panel.info("参考线图层已显示（%d 条）。" % count)
+
+    def _after_reference_edit(self, message, action, **fields):
+        """删除/清除后的统一收口：图层、可用性、内存缓存、日志一起对齐。"""
+        # 清掉按 tif 记忆的 sidecar 缓存，否则界面还会按旧内容重画。
+        self._reference_payload = {}
+        self._reference_payload_tif = ""
+        self.image_view.viewer.clear_overlay_layer("reference_lines")
+        self._sync_display_layer_availability()
+        if self._reference_lines_present():
+            self._draw_reference_lines_overlay()
+        else:
+            self._reference_last_click = None
+            if self._reference_drawing:
+                self._redraw_reference_interaction()
+        self.log_panel.info(message)
+        self._log_action(action, "", **fields)
+
+    def _on_delete_last_reference_line(self):
+        """删除最后一条已保存的参考线（画错的单条，不必清空全部）。"""
+        import cache
+        import reference_lines
+
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        payload = self._reference_lines_payload()
+        lines = list(payload.get("lines") or [])
+        if not tif or not lines:
+            self.log_panel.warn("当前项目还没有已保存的参考线。")
+            return
+        removed = lines[-1]
+        remaining = lines[:-1]
+        new_payload = dict(payload)
+        new_payload["lines"] = remaining
+        new_payload["schema"] = new_payload.get("schema") or reference_lines.SCHEMA
+        try:
+            if remaining:
+                cache.save_reference_lines(tif, new_payload)
+            else:
+                cache.delete_reference_lines(tif)
+        except OSError as exc:
+            self.log_panel.error("删除参考线失败：%s" % exc)
+            return
+        self._after_reference_edit(
+            "已删除最后 1 条参考线（第 %s 遍，%d 个桩点），剩余 %d 条"
+            % (
+                removed.get("pass", 1),
+                len(removed.get("points") or []),
+                len(remaining),
+            ),
+            "reference.delete",
+            pass_index=int(removed.get("pass", 1) or 1),
+            remaining=len(remaining),
+        )
+
+    def _on_clear_reference_lines(self):
+        """清除当前项目全部参考线与未完成草稿（需确认，删的是落盘数据）。"""
+        import cache
+
+        tif = str(getattr(self.state, "tif_path", "") or "")
+        if not tif:
+            self.log_panel.warn("当前没有打开的项目。")
+            return
+        lines = list(self._reference_lines_payload().get("lines") or [])
+        draft_pending = len(self._reference_pts)
+        if not lines and not draft_pending:
+            self.log_panel.warn("当前项目没有参考线可清除。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "清除参考线",
+            "将删除当前项目已保存的 %d 条参考线%s。\n"
+            "参考线是中心线评价的人工基准，删除后无法撤销，只能重新标注。\n"
+            "确定清除吗？" % (len(lines), "和正在画的 %d 个桩点" % draft_pending if draft_pending else ""),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            cache.delete_reference_lines(tif)
+            for pass_index in (1, 2):
+                cache.clear_reference_draft(tif, pass_index)
+        except OSError as exc:
+            self.log_panel.error("清除参考线失败：%s" % exc)
+            return
+        self._reference_pts = []
+        self._reference_last_click = None
+        self.image_view.viewer.clear_overlay_layer("interaction_reference")
+        self._after_reference_edit(
+            "已清除本项目参考线（%d 条%s）" % (
+                len(lines),
+                "，草稿 %d 个桩点" % draft_pending if draft_pending else "",
+            ),
+            "reference.clear",
+            lines=len(lines),
+            draft_points=draft_pending,
+        )
 
     # ── 作业线标定（人工纠偏，DECISION-060） ──────────────────────────
     #

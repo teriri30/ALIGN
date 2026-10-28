@@ -270,3 +270,21 @@ def test_cache_reference_lines_sidecar_roundtrip(tmp_path, monkeypatch):
     assert loaded["schema"] == payload["schema"]
     assert len(loaded["lines"]) == 1
     assert cache.project_cache_dir(tif) == os.path.dirname(path)
+
+
+def test_cache_delete_reference_lines_removes_the_sidecar(tmp_path, monkeypatch):
+    """DECISION-063：清除参考线必须真的删掉 sidecar，否则重开项目又画回来。"""
+    import cache
+
+    monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
+    tif = str(tmp_path / "field.tif")
+    payload = empty_payload(tif)
+    upsert_line(payload, new_line_record([(0.0, 0.0), (10.0, 10.0)], pass_index=1))
+    path = cache.save_reference_lines(tif, payload)
+    assert os.path.isfile(path)
+
+    assert cache.delete_reference_lines(tif) is True
+    assert not os.path.isfile(path)
+    assert cache.load_reference_lines(tif) == {}
+    # 已删除再删一次不算失败，但不能声称删了东西
+    assert cache.delete_reference_lines(tif) is False
