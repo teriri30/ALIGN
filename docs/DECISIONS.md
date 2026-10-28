@@ -1129,3 +1129,14 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 改法：`dialogs._attach_hint(widget, text)`（外层 + lineEdit）与 `dialogs._hint_row(form, label, widget, tip)`（标签 + ⓘ + 控件）。系统设置 8 个数值 + 不可调的「处理强度」、农机参数 9 个字段全部改成 `_hint_row`；ⓘ 是「这里可以悬停」的可见线索，悬停显示、移开消失仍是 Qt 默认行为，不做自定义浮层。
 
 契约：`tests/test_settings_tooltips.py`（2 条）——对每个字段断言 `toolTip()` 非空、**光标下的子控件 tooltip 与外层一致**、说明至少 3 行；系统设置 ⓘ 数量 = 9；割刀前置距离的说明必须含「必须实测」。全量 857 passed / 1 skipped。
+
+
+## DECISION-067：悬浮说明的响应速度（2026-10-28）
+
+用户 0.4.9 实测：「移上去一下子没反应，要加载一会才有，体验不好」。根因不是渲染慢，而是 Qt 的 tooltip 唤醒延迟：`QStyle.SH_ToolTip_WakeUpDelay` 默认 **700 ms**（本机实测 693–706 ms 才弹）。
+
+- 改法：`src/pyside6_app/ui_tooltips.py` 里 `FastTooltipStyle(QProxyStyle)` 只覆写两个 styleHint：`SH_ToolTip_WakeUpDelay = 150`、`SH_ToolTip_FallAsleepDelay = 3000`（离开后仍算"醒着"，相邻设置项之间移动立刻再弹，不用重新等）。其余行为全部交回 Fusion。`app_entry.run_app` 在 `MainWindow()` 之前调用 `install_fast_tooltips(app, "Fusion")`，失败才回落 `QStyleFactory.create("Fusion")`。
+- 实测（离屏，同一探针）：默认样式 **706 ms / 693 ms**；代理样式 **152 / 155 / 161 ms**。三标签页 + 农机参数对话框里所有带说明的控件都吃这个时延。
+- 为什么不自己写 hover 定时器：Qt 的 tooltip 还有"移到子控件重弹""按下收起""越界收起""多屏定位"等行为，自造一层会与原生提示抢显示。改 styleHint 是官方支持的最小侵入面。
+- 注意：`install_fast_tooltips` 必须在建窗口前调用；运行中 `QApplication.setStyle` 会让已建控件全部重新 polish（一次重绘闪烁），所以不要做成菜单里的开关。
+- 契约：`tests/test_tooltip_latency.py`（3 条）——唤醒延迟 ≤ 200 ms、醒着的窗口 ≥ 1000 ms、`install` 幂等、**启动入口必须真的调用 `install_fast_tooltips(`**（防止改动只存在于测试里）。全量 860 passed / 1 skipped。

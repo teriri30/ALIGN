@@ -179,7 +179,14 @@ def run_app(argv: Sequence[str] | None = None) -> int:
     build_info = load_build_info()
     app.setApplicationVersion(str(build_info.get("version") or APP_VERSION))
     app.setOrganizationName("ZHL")
-    app.setStyle(QStyleFactory.create("Fusion"))
+    try:
+        from pyside6_app.ui_tooltips import install_fast_tooltips
+
+        # DECISION-067：默认 700 ms 才弹 tooltip，用户实测"要加载一会"；
+        # 换成把唤醒延迟压到 200 ms 的代理样式，仍以 Fusion 为底。
+        install_fast_tooltips(app, "Fusion")
+    except Exception:
+        app.setStyle(QStyleFactory.create("Fusion"))
     # 对话框（项目选择器等）是独立顶层窗口，只给 MainWindow 设样式表它们拿不到，
     # 会出现"浅色 + 系统默认字体"的割裂感，所以在应用级也铺一份。
     try:
