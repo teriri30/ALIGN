@@ -1085,3 +1085,23 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - 代码锚点：`pyside6_app.main_window.PERSISTED_ANNOTATION_LAYERS`、`_sync_display_layer_availability`、`_set_reference_layer_visible`、`_set_reference_mode`、`_exit_reference_mode`、`_on_toggle_reference_layer`、`_on_reset_display_layer_defaults`、`_on_clear_operator_paths`、`_delete_calibration_record`；`pyside6_app.image_view.display_layer_user_overrides/clear_display_layer_override/reset_display_layer_defaults`；`cache.delete_operator_paths`。
 - 测试：`tests/test_display_layer_contracts.py`（11 条：可用性表覆盖全部图层键的 AST 契约 / 登记表只含真实图层 / 有数据也默认收起 / operator_paths 有配对 delete 且真删文件 / 每个标注 sidecar 都有 delete / 批量清除删文件 / 取消确认不动数据 / 逐条删除不留旧记录 / 进出标注不写用户偏好 / 用户显式选择能活过模式往返 / 恢复默认收起标注层）。
 - 真实数据验收：用户项目 `ba570cbf2799`（17 条参考线 / 211 个桩点）打开后图层项 422 个、可见 0 个，图层行 available=True、default=False；进标注可见、退出收起且 `user_overrides` 为空；菜单打开后「恢复默认」回到收起；sidecar 17 条未改动。全量 `852 passed / 1 skipped`。
+
+
+## DECISION-065：撤掉「高级设置」步骤卡，调头方式/禁行区并入路径规划，农机参数回到菜单（2026-10-28）
+
+- 现象（用户 2026-10-28）：「高级设置」虽然不再卡进度，但一直在卡片清单里亮着，打断直觉；追问「这些内容有必要存在吗」。
+- 机制（代码核实，不是主观判断）：这张卡不是流程步骤，却占了一个步骤位。
+  1. `task_state.derive_task_statuses` 里 `process_done` 一成立就把 `params` 置成 `done`（文案「默认参数（可修改）」），所以掩膜优化一做完，这张卡表头就永久挂绿色状态点 + 绿勾，**用户从没点开过它**；
+  2. 呼吸动画只在行处于 `active/available` 时启动，`params` 行没有这两个状态，所以看到的是"常驻绿灯"而不是真在闪；
+  3. 卡片排在「路径规划」与「模拟演示」之间，把「规划→模拟→导出」的直读顺序打断；
+  4. 卡里混装四类不同性质的东西：农机参数（数据来源）、禁行区（规划硬约束）、调头方式（算法口径）、人工路线编辑（规划之后的修改工具）。
+- 规则：
+  1. **清单只放流程步骤**。`STEP_GROUPS` 定稿 9 组：影像导入 → 田块圈选 → 作物识别 → 掩膜优化 → 生成作业线 → 选择作业线 → 路径规划 → 模拟演示 → TXT 路径导出（一一对应作业流程，多一组都算错）。
+  2. **调头方式 + 禁行区 = 规划输入**，进「路径规划」卡，排在生成行之前（`_build_planning_input_rows`）。
+  3. **农机参数不占步骤位**：改参数走 设置 → 农机参数…（Ctrl+P）；规划卡里只留一行只读摘要 `set_harvester_params()` →「农机参数：割幅 2.00 m · 履带 0.35 m · 轨距 1.30 m（默认值|已确认）」，写清实际参与足迹/通行判定的几何。
+  4. **人工路线编辑 = 规划结果的操作**，留在规划卡、跟在生成行之后（`_build_route_edit_rows`）。
+  5. 选填的终点/卸粮点分组挪到「起点」之后（原实现追加在卡片末尾，会落到人工编辑工具后面）。
+- 刻意不改：`task_state` 仍为 `params` 产出状态（`OPTIONAL_TASKS` 不变），因为「参数未确认也能规划、导出阶段按 provenance 把关」这条契约没变；只是界面上不再渲染这一行。命中 `set_task_status("params")` 时行不存在会自动跳过。
+- 代码锚点：`pyside6_app.panels.STEP_GROUPS`、`_make_task_row`、`_build_planning_input_rows`、`_build_route_edit_rows`、`set_harvester_params`、`_build_ui` 里 plan 行前后的插入点；`pyside6_app.main_window._sync_task_statuses` 调 `set_harvester_params`。
+- 测试（已随结构更新，不是放松断言）：`tests/test_align_logic.py::test_workflow_separates_centerlines_from_path_planning`（新增 9 组清单与「无 params 行」断言）、`test_planning_card_fully_expands_in_scroll_area_without_overlap`、`test_edit_mode_does_not_inject_a_duplicate_tool_grid_into_planning_card`、`test_centerline_selection_is_rendered_in_its_own_task_card`（钉住调头方式/禁行区/编辑路线的父卡片就是路径规划卡）、`test_cache_restore_reenables_confirmed_parameters_after_processed_mask`（改为断言摘要文字与"已确认"）。
+- 验收：结构探针输出 9 张卡；规划卡内控件顺序为 起点 → 智能推荐起点 → 选填（终点/卸粮）→ 分隔线 → 禁行区 → 调头方式 → 农机参数摘要 → 路径规划 → 编辑路线 → 新增点/作业·转弯/直线·转弯；全量 852 passed / 1 skipped。

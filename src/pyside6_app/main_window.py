@@ -3500,6 +3500,12 @@ class MainWindow(QMainWindow):
     def _sync_task_statuses(self):
         """Render task panel from the actual domain state (single source of truth)."""
         statuses = derive_task_statuses(self.state, has_image=self._tif_rgb is not None)
+        # DECISION-065：农机参数不再是步骤卡，规划卡里只显示实际参与规划的
+        # 机具几何摘要（改参数走 设置 → 农机参数…）。
+        self.task_panel.set_harvester_params(
+            self.state.harvester_params,
+            getattr(self.state, "harvester_params_confirmed", False),
+        )
         self.task_panel.apply_task_statuses(statuses)
         # ``derive_task_statuses`` intentionally knows only domain stages;
         # model deserialisation is a transient runtime task.  Re-apply this

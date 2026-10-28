@@ -47,7 +47,6 @@ TASK_DEFS = [
     {"id": "draw_field", "label": "田块圈选", "hint": "在影像上圈选田块作业范围。", "color": "#5EAF6E", "action": "圈选"},
     {"id": "segment", "label": "作物识别", "hint": "使用训练好的模型识别作物种植带（像素级分割）。", "color": "#649C7E", "action": "运行"},
     {"id": "process", "label": "掩膜优化", "hint": "对识别掩膜去噪、聚合，提取清晰的种植带几何。", "color": "#648C82", "action": "处理"},
-    {"id": "params", "label": "农机参数", "hint": "设置收割机幅宽、轮距、转弯半径等参数。", "color": "#AC7E56", "action": "设置"},
     {"id": "centerline_generate", "label": "生成作业线", "hint": "从识别出的种植带生成收割路线（作业线）。", "color": "#5EAF8A", "action": "生成"},
     {"id": "centerline_select", "label": "选择作业线", "hint": "勾选要采用的作业线；每条4行种植带对应一条作业线。", "color": "#4F9D8E", "action": "选择"},
     {"id": "entry", "label": "起点（必选）", "hint": "可自由布设或拖动；规划必须从离起点最近的作业线端点开始。", "color": "#589C94", "action": "布设"},
@@ -78,10 +77,7 @@ STEP_GROUPS = [
     {"label": "掩膜优化", "tasks": ["process"]},
     {"label": "生成作业线", "tasks": ["centerline_generate"]},
     {"label": "选择作业线", "tasks": ["centerline_select"]},
-    # 高级设置是可选步骤（默认参数即来自配置），不再作为规划前置条件，
-    # 因此放回流程末尾附近，避免让人以为"必须先设置"。
     {"label": "路径规划", "tasks": ["entry", "exit", "unload", "plan"]},
-    {"label": "高级设置", "tasks": ["params"]},
     {"label": "模拟演示", "tasks": ["simulate"]},
     {"label": "TXT路径导出", "tasks": ["export"]},
 ]
@@ -964,15 +960,18 @@ class TaskPanel(QWidget):
             rows = []
             optional_rows = []
             for tid in group["tasks"]:
-                td = _task_def(tid); row = TaskRow(td); self._task_widgets[tid] = row
-                row.clicked.connect(self._on_task_clicked)
-                row.action_clicked.connect(self._on_task_action)
-                row.delete_clicked.connect(self.step_deleted.emit)
+                if tid == "plan":
+                    # DECISION-065：调头方式与禁行区是规划输入，跟着规划卡走；
+                    # 农机参数只留一行只读摘要，改参数走设置菜单。
+                    rows.extend(self._build_planning_input_rows())
+                row = self._make_task_row(tid)
                 # 选填行折进二级分组（默认收起、暗色表头），必选流程保持一屏可见。
                 if tid in ("exit", "unload"):
                     optional_rows.append(row)
                     continue
                 rows.append(row)
+                if tid == "plan":
+                    rows.extend(self._build_route_edit_rows())
                 if tid == "process":
                     self._mask_strength_label = QLabel("处理强度")
                     self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;padding-left:8px;")
@@ -1030,143 +1029,218 @@ class TaskPanel(QWidget):
                         self.recommend_service_points_requested.emit
                     )
                     rows.append(self.recommend_service_points_btn)
-                if tid == "params":
-                    # 高级设置单独放在“高级设置”折叠卡中，默认不挤占
-                    # 基础的中心线选择、起终点和路径规划流程。
-                    sep = QFrame()
-                    sep.setFrameShape(QFrame.HLine)
-                    sep.setFixedHeight(1)
-                    sep.setStyleSheet(f"color:{COLORS.get('border', '#383848')};background:{COLORS.get('border', '#383848')};")
-                    rows.append(sep)
-                    forbidden_row = QWidget()
-                    forbidden_layout = QHBoxLayout(forbidden_row)
-                    forbidden_layout.setContentsMargins(8, 0, 8, 0)
-                    forbidden_layout.setSpacing(6)
-                    self.forbidden_status_label = QLabel("禁行区：未确认")
-                    self.forbidden_status_label.setStyleSheet(
-                        f"color:{COLORS['orange']};font-size:13px;"
-                    )
-                    self.confirm_no_forbidden_btn = QPushButton("确认无")
-                    self.draw_forbidden_btn = QPushButton("绘制")
-                    for button in (self.confirm_no_forbidden_btn, self.draw_forbidden_btn):
-                        button.setMinimumSize(52, 26)
-                        button.setStyleSheet(
-                            f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                            f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;}}"
-                            f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
-                        )
-                    self.confirm_no_forbidden_btn.setToolTip("确认田块内没有需要避让的沟渠、水坑或障碍")
-                    self.draw_forbidden_btn.setToolTip("在影像上绘制不可通行区域")
-                    self.confirm_no_forbidden_btn.clicked.connect(self.confirm_no_forbidden_requested.emit)
-                    self.draw_forbidden_btn.clicked.connect(self.draw_forbidden_requested.emit)
-                    forbidden_layout.addWidget(self.forbidden_status_label, 1)
-                    forbidden_layout.addWidget(self.confirm_no_forbidden_btn)
-                    forbidden_layout.addWidget(self.draw_forbidden_btn)
-                    rows.append(forbidden_row)
-                    turn_row = QWidget()
-                    turn_layout = QHBoxLayout(turn_row)
-                    turn_layout.setContentsMargins(8, 0, 8, 0)
-                    turn_layout.setSpacing(6)
-                    turn_label = QLabel("调头方式")
-                    turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;")
-                    self.turn_combo = ExplicitPopupComboBox()
-                    self.turn_combo.setToolTip(
-                        "点击展开后选择调头/转弯方式；未展开时滚轮只滚动面板，不会改策略"
-                    )
-                    self.turn_combo.setMinimumHeight(28)
-                    self.turn_combo.setStyleSheet(
-                        f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                        f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;}}"
-                    )
-                    # DECISION-016: contour is an auditable pass-order strategy.
-                    # 套圈收割为默认策略（置于首位）。
-                    for label, key in [
-                        ("套圈收割", "contour"), ("自动推荐", "auto"),
-                        ("弓形调头", "bow"), ("半圆调头", "semicircle"),
-                        ("梨形调头", "pear"), ("鱼尾折返", "fishtail"), ("紧凑 Alpha", "alpha"),
-                    ]:
-                        self.turn_combo.addItem(label, key)
-                    # Only an explicit popup selection may change this
-                    # scientific input. Programmatic synchronisation and a
-                    # closed-combo wheel event must stay silent.
-                    self.turn_combo.activated.connect(self._on_turn_combo_changed)
-                    turn_layout.addWidget(turn_label)
-                    turn_layout.addWidget(self.turn_combo, 1)
-                    rows.append(turn_row)
-                    self.route_edit_btn = QPushButton("编辑路线")
-                    self.route_edit_btn.setToolTip(
-                        "进入人工路线编辑；画布负责点线拖动和加点，下面的路径结果负责结构操作、直线/转弯切换与验证"
-                    )
-                    self.route_edit_btn.setMinimumHeight(30)
-                    self.route_edit_btn.setStyleSheet(
-                        f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                        f"border:1px solid {COLORS['border']};border-radius:5px;padding:4px 8px;}}"
-                        f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
-                        f"QPushButton:disabled{{color:{COLORS.get('text_dim', '#8B909A')};}}"
-                    )
-                    self.route_edit_btn.clicked.connect(self.route_edit_requested.emit)
-                    rows.append(self.route_edit_btn)
-                    self.route_edit_action_row = QWidget()
-                    route_edit_action_layout = QHBoxLayout(
-                        self.route_edit_action_row
-                    )
-                    route_edit_action_layout.setContentsMargins(8, 0, 8, 0)
-                    route_edit_action_layout.setSpacing(6)
-                    self.route_add_point_btn = QPushButton("新增点")
-                    self.route_add_point_btn.setCheckable(True)
-                    self.route_add_point_btn.setToolTip(
-                        "在线段上单击可插入控制点；空白处单击会从当前路线末端追加控制点"
-                    )
-                    self.route_toggle_status_btn = QPushButton("作业/转弯")
-                    self.route_toggle_status_btn.setToolTip(
-                        "把当前选中的整条线段在作业状态与转弯状态之间切换"
-                    )
-                    self.route_toggle_geometry_btn = QPushButton("直线/转弯")
-                    self.route_toggle_geometry_btn.setToolTip(
-                        "把当前选中的点—点连接切换为直线或曲线转弯；不改变作业语义"
-                    )
-                    for button in (
-                        self.route_add_point_btn,
-                        self.route_toggle_status_btn,
-                        self.route_toggle_geometry_btn,
-                    ):
-                        button.setMinimumHeight(28)
-                        button.setStyleSheet(
-                            f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
-                            f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;}}"
-                            f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
-                            f"QPushButton:checked{{background:{COLORS['accent']};color:white;}}"
-                        )
-                    self.route_add_point_btn.clicked.connect(
-                        lambda: self.route_edit_tool_requested.emit("add_point")
-                    )
-                    self.route_toggle_status_btn.clicked.connect(
-                        lambda: self.route_edit_tool_requested.emit("toggle_status")
-                    )
-                    self.route_toggle_geometry_btn.clicked.connect(
-                        lambda: self.route_edit_tool_requested.emit("toggle_geometry")
-                    )
-                    route_edit_action_layout.addWidget(
-                        self.route_add_point_btn, 1
-                    )
-                    route_edit_action_layout.addWidget(
-                        self.route_toggle_status_btn, 1
-                    )
-                    route_edit_action_layout.addWidget(
-                        self.route_toggle_geometry_btn, 1
-                    )
-                    self.route_edit_action_row.setVisible(False)
-                    rows.append(self.route_edit_action_row)
             if optional_rows:
                 self.optional_group = OptionalRowGroup(
                     "选填：终点与卸粮点", optional_rows
                 )
-                rows.append(self.optional_group)
+                # DECISION-065：选填项紧跟起点，读起来才是「起点→终点→卸粮→
+                # 约束与策略→生成」；放到卡片最底部会排到人工编辑工具之后。
+                anchor = next(
+                    (
+                        index
+                        for index, widget in enumerate(rows)
+                        if isinstance(widget, TaskRow) and widget.tid == "entry"
+                    ),
+                    None,
+                )
+                if group["label"] == "路径规划" and anchor is not None:
+                    insert_at = anchor + 1
+                    # 「智能推荐起点」是起点这一行的动作，选填组必须排在它后面，
+                    # 否则读起来像先填终点再推荐起点。
+                    if (
+                        insert_at < len(rows)
+                        and rows[insert_at]
+                        is getattr(self, "recommend_service_points_btn", None)
+                    ):
+                        insert_at += 1
+                    rows.insert(insert_at, self.optional_group)
+                else:
+                    rows.append(self.optional_group)
             card = StepCard(f"{idx}. {group['label']}", rows)
             card.toggled.connect(lambda _checked=False, i=idx - 1: self._on_card_toggled(i))
             self._step_cards.append(card); bl.addWidget(card)
         bl.addStretch(); scroll.setWidget(body); lo.addWidget(scroll, 1)
         self._refresh_cards()
+
+    def _make_task_row(self, tid):
+        """Create one task row and wire the three signals the panel owns."""
+        row = TaskRow(_task_def(tid))
+        self._task_widgets[tid] = row
+        row.clicked.connect(self._on_task_clicked)
+        row.action_clicked.connect(self._on_task_action)
+        row.delete_clicked.connect(self.step_deleted.emit)
+        return row
+
+    def _build_planning_input_rows(self):
+        """路径规划的输入区：禁行区、调头方式、农机参数只读摘要（DECISION-065）。
+
+        这三样都是「生成路径时采用的口径」。以前它们塞在独立的「高级设置」步骤卡里，
+        清单里多出一格、还夹在路径规划与模拟演示之间，把「规划→模拟→导出」的
+        阅读顺序打断了；农机参数更是默认值即可用，却长期亮着一个绿色完成态。
+        """
+        rows = []
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f"color:{COLORS.get('border', '#383848')};background:{COLORS.get('border', '#383848')};")
+        rows.append(sep)
+        forbidden_row = QWidget()
+        forbidden_layout = QHBoxLayout(forbidden_row)
+        forbidden_layout.setContentsMargins(8, 0, 8, 0)
+        forbidden_layout.setSpacing(6)
+        self.forbidden_status_label = QLabel("禁行区：未确认")
+        self.forbidden_status_label.setStyleSheet(
+            f"color:{COLORS['orange']};font-size:13px;"
+        )
+        self.confirm_no_forbidden_btn = QPushButton("确认无")
+        self.draw_forbidden_btn = QPushButton("绘制")
+        for button in (self.confirm_no_forbidden_btn, self.draw_forbidden_btn):
+            button.setMinimumSize(52, 26)
+            button.setStyleSheet(
+                f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
+                f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;}}"
+                f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
+            )
+        self.confirm_no_forbidden_btn.setToolTip("确认田块内没有需要避让的沟渠、水坑或障碍")
+        self.draw_forbidden_btn.setToolTip("在影像上绘制不可通行区域")
+        self.confirm_no_forbidden_btn.clicked.connect(self.confirm_no_forbidden_requested.emit)
+        self.draw_forbidden_btn.clicked.connect(self.draw_forbidden_requested.emit)
+        forbidden_layout.addWidget(self.forbidden_status_label, 1)
+        forbidden_layout.addWidget(self.confirm_no_forbidden_btn)
+        forbidden_layout.addWidget(self.draw_forbidden_btn)
+        rows.append(forbidden_row)
+        turn_row = QWidget()
+        turn_layout = QHBoxLayout(turn_row)
+        turn_layout.setContentsMargins(8, 0, 8, 0)
+        turn_layout.setSpacing(6)
+        turn_label = QLabel("调头方式")
+        turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;")
+        self.turn_combo = ExplicitPopupComboBox()
+        self.turn_combo.setToolTip(
+            "点击展开后选择调头/转弯方式；未展开时滚轮只滚动面板，不会改策略"
+        )
+        self.turn_combo.setMinimumHeight(28)
+        self.turn_combo.setStyleSheet(
+            f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
+            f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;}}"
+        )
+        # DECISION-016: contour is an auditable pass-order strategy.
+        # 套圈收割为默认策略（置于首位）。
+        for label, key in [
+            ("套圈收割", "contour"), ("自动推荐", "auto"),
+            ("弓形调头", "bow"), ("半圆调头", "semicircle"),
+            ("梨形调头", "pear"), ("鱼尾折返", "fishtail"), ("紧凑 Alpha", "alpha"),
+        ]:
+            self.turn_combo.addItem(label, key)
+        # Only an explicit popup selection may change this
+        # scientific input. Programmatic synchronisation and a
+        # closed-combo wheel event must stay silent.
+        self.turn_combo.activated.connect(self._on_turn_combo_changed)
+        turn_layout.addWidget(turn_label)
+        turn_layout.addWidget(self.turn_combo, 1)
+        rows.append(turn_row)
+        self.params_summary_label = QLabel("农机参数：读取中")
+        self.params_summary_label.setToolTip(
+            "实际参与规划的机具几何；修改入口在 设置 → 农机参数…（Ctrl+P）"
+        )
+        self.params_summary_label.setStyleSheet(
+            f"color:{COLORS['text_dim']};font-size:12px;padding-left:8px;"
+        )
+        rows.append(self.params_summary_label)
+        return rows
+
+    def _build_route_edit_rows(self):
+        """规划结果的人工修改入口（编辑路线 + 三个工具），跟在生成行之后。"""
+        rows = []
+        self.route_edit_btn = QPushButton("编辑路线")
+        self.route_edit_btn.setToolTip(
+            "进入人工路线编辑；画布负责点线拖动和加点，下面的路径结果负责结构操作、直线/转弯切换与验证"
+        )
+        self.route_edit_btn.setMinimumHeight(30)
+        self.route_edit_btn.setStyleSheet(
+            f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
+            f"border:1px solid {COLORS['border']};border-radius:5px;padding:4px 8px;}}"
+            f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
+            f"QPushButton:disabled{{color:{COLORS.get('text_dim', '#8B909A')};}}"
+        )
+        self.route_edit_btn.clicked.connect(self.route_edit_requested.emit)
+        rows.append(self.route_edit_btn)
+        self.route_edit_action_row = QWidget()
+        route_edit_action_layout = QHBoxLayout(
+            self.route_edit_action_row
+        )
+        route_edit_action_layout.setContentsMargins(8, 0, 8, 0)
+        route_edit_action_layout.setSpacing(6)
+        self.route_add_point_btn = QPushButton("新增点")
+        self.route_add_point_btn.setCheckable(True)
+        self.route_add_point_btn.setToolTip(
+            "在线段上单击可插入控制点；空白处单击会从当前路线末端追加控制点"
+        )
+        self.route_toggle_status_btn = QPushButton("作业/转弯")
+        self.route_toggle_status_btn.setToolTip(
+            "把当前选中的整条线段在作业状态与转弯状态之间切换"
+        )
+        self.route_toggle_geometry_btn = QPushButton("直线/转弯")
+        self.route_toggle_geometry_btn.setToolTip(
+            "把当前选中的点—点连接切换为直线或曲线转弯；不改变作业语义"
+        )
+        for button in (
+            self.route_add_point_btn,
+            self.route_toggle_status_btn,
+            self.route_toggle_geometry_btn,
+        ):
+            button.setMinimumHeight(28)
+            button.setStyleSheet(
+                f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
+                f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;}}"
+                f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
+                f"QPushButton:checked{{background:{COLORS['accent']};color:white;}}"
+            )
+        self.route_add_point_btn.clicked.connect(
+            lambda: self.route_edit_tool_requested.emit("add_point")
+        )
+        self.route_toggle_status_btn.clicked.connect(
+            lambda: self.route_edit_tool_requested.emit("toggle_status")
+        )
+        self.route_toggle_geometry_btn.clicked.connect(
+            lambda: self.route_edit_tool_requested.emit("toggle_geometry")
+        )
+        route_edit_action_layout.addWidget(
+            self.route_add_point_btn, 1
+        )
+        route_edit_action_layout.addWidget(
+            self.route_toggle_status_btn, 1
+        )
+        route_edit_action_layout.addWidget(
+            self.route_toggle_geometry_btn, 1
+        )
+        self.route_edit_action_row.setVisible(False)
+        rows.append(self.route_edit_action_row)
+        return rows
+
+    def set_harvester_params(self, params, confirmed=False):
+        """把实际参与规划的机具几何显示成一行只读摘要。
+
+        DECISION-065：农机参数不再占一个步骤卡位——默认值可用，确认与否只影响
+        导出时的参数来源校验，不该让清单里多一格"已完成的设置"。
+        """
+        params = params or {}
+
+        def _fmt(key, digits=2):
+            try:
+                return ("%%.%df" % digits) % float(params.get(key, 0.0))
+            except (TypeError, ValueError):
+                return "?"
+
+        text = "农机参数：割幅 %s m · 履带 %s m · 轨距 %s m（%s）" % (
+            _fmt("cutter_width_m"),
+            _fmt("track_width_m"),
+            _fmt("track_gauge_m"),
+            "已确认" if confirmed else "默认值",
+        )
+        label = getattr(self, "params_summary_label", None)
+        if label is not None and label.text() != text:
+            label.setText(text)
 
     def _on_task_clicked(self, tid):
         mapping = {

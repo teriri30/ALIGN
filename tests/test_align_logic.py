@@ -325,10 +325,11 @@ def test_pipeline_step_results_update_state():
     assert window.state.mask_result is processed
 
 
-def test_workflow_separates_centerlines_from_path_planning_and_advanced_settings():
+def test_workflow_separates_centerlines_from_path_planning():
+    """DECISION-065：清单与作业流程一一对应，不再有「高级设置」这一类步骤。"""
     from pyside6_app.panels import STEP_GROUPS
 
-    advanced_group = next(group for group in STEP_GROUPS if group["label"] == "高级设置")
+    labels = [group["label"] for group in STEP_GROUPS]
     centerline_generation_group = next(
         group for group in STEP_GROUPS if group["label"] == "生成作业线"
     )
@@ -337,12 +338,15 @@ def test_workflow_separates_centerlines_from_path_planning_and_advanced_settings
     )
     planning_group = next(group for group in STEP_GROUPS if group["label"] == "路径规划")
 
-    assert advanced_group["tasks"] == ["params"]
+    assert "高级设置" not in labels, "高级设置卡已撤掉，调头方式/禁行区并入路径规划"
+    assert labels == [
+        "影像导入", "田块圈选", "作物识别", "掩膜优化", "生成作业线",
+        "选择作业线", "路径规划", "模拟演示", "TXT路径导出",
+    ]
     assert centerline_generation_group["tasks"] == ["centerline_generate"]
     assert centerline_selection_group["tasks"] == ["centerline_select"]
     assert planning_group["tasks"] == ["entry", "exit", "unload", "plan"]
-    # 高级设置是可选步骤（默认参数即可规划），排在规划之后，不再当前置门槛。
-    assert STEP_GROUPS.index(advanced_group) > STEP_GROUPS.index(planning_group)
+    assert "params" not in [tid for group in STEP_GROUPS for tid in group["tasks"]]
 
 
 def test_task_rows_stack_actions_below_summary_without_overlap():
@@ -397,7 +401,7 @@ def test_planning_card_fully_expands_in_scroll_area_without_overlap():
     panel = window.task_panel
     panel.set_route_editing_active(True)
     app.processEvents()
-    card = next(c for c in panel._step_cards if c._title.text().endswith("高级设置"))
+    card = next(c for c in panel._step_cards if c._title.text().endswith("路径规划"))
     card.set_expanded(True)
     for other in panel._step_cards:
         if other is not card:
@@ -413,13 +417,13 @@ def test_planning_card_fully_expands_in_scroll_area_without_overlap():
             break
     app.processEvents()
 
-    rows = [panel._task_widgets["params"]]
+    rows = [panel._task_widgets[tid] for tid in ("entry", "plan")]
     tops = [row.mapTo(panel, QPoint(0, 0)).y() for row in rows]
     for i in range(1, len(rows)):
         assert tops[i] >= tops[i - 1] + rows[i - 1].height() - 1, f"任务行 {rows[i].tid} 与上一行重叠"
 
-    # 卡片底部必须低于所有任务行（下方设置区可见），且设置区最后一个
-    # 控件（编辑路线）不越出卡片边界
+    # 卡片底部必须低于所有任务行（输入区与编辑区都在卡内可见），且编辑区
+    # 最后一个控件（编辑路线）不越出卡片边界
     card_bottom = card.mapTo(panel, QPoint(0, card.height())).y()
     assert card_bottom > max(tops[i] + rows[i].height() for i in range(len(rows)))
     edit_bottom = panel.route_edit_btn.mapTo(panel, QPoint(0, panel.route_edit_btn.height())).y()
@@ -439,7 +443,7 @@ def test_edit_mode_does_not_inject_a_duplicate_tool_grid_into_planning_card():
     app = QApplication.instance()
     app.processEvents()
     panel = window.task_panel
-    card = next(c for c in panel._step_cards if c._title.text().endswith("高级设置"))
+    card = next(c for c in panel._step_cards if c._title.text().endswith("路径规划"))
     card.set_expanded(True)
     for other in panel._step_cards:
         if other is not card:
@@ -480,18 +484,18 @@ def test_centerline_selection_is_rendered_in_its_own_task_card():
         card for card in panel._step_cards if card._title.text().endswith("选择作业线")
     )
     advanced_card = next(
-        card for card in panel._step_cards if card._title.text().endswith("高级设置")
-    )
-    planning_card = next(
         card for card in panel._step_cards if card._title.text().endswith("路径规划")
     )
+    planning_card = advanced_card
     assert not centerline_card._expanded
     assert not advanced_card._expanded
     assert panel._task_widgets["exit"]._label.text() == "终点（选填）"
     assert panel._task_widgets["unload"]._label.text() == "卸粮点（选填）"
-    assert panel._task_widgets["params"].parentWidget() is advanced_card._content
-    assert panel.route_edit_btn.parentWidget() is advanced_card._content
-    assert panel.route_edit_btn.parentWidget() is not planning_card._content
+    # DECISION-065：调头方式/禁行区/编辑路线都并进路径规划卡，高级设置卡已撤
+    assert panel.route_edit_btn.parentWidget() is planning_card._content
+    assert panel.turn_combo.parentWidget().parentWidget() is planning_card._content
+    assert panel.forbidden_status_label.parentWidget().parentWidget() is planning_card._content
+    assert "params" not in panel._task_widgets
 
     catalog = {
         "items": [
@@ -1729,13 +1733,16 @@ def test_cache_restore_reenables_confirmed_parameters_after_processed_mask(monke
         "path_cache_valid": False,
     })
 
-    row = window.task_panel._task_widgets["params"]
     assert window.state.harvester_params_confirmed is True
     # A restored project keeps its mask-derived steps: invalidation is driven by
     # the action that changes an upstream artifact, not inferred from an empty
     # polygon (see tests/test_task_chain.py::test_deleting_field_polygon...).
-    assert row._done is True
-    assert row._action_btn.isEnabled()
+    # DECISION-065：农机参数不再占步骤行，改为规划卡里的一行只读摘要；
+    # 恢复缓存后摘要必须反映实际参与规划的几何与确认状态。
+    assert "params" not in window.task_panel._task_widgets
+    summary = window.task_panel.params_summary_label.text()
+    assert "割幅 1.75 m" in summary and "履带 0.60 m" in summary
+    assert "已确认" in summary
 
 
 def test_cache_restore_keeps_visible_turn_strategy_equal_to_restored_state(monkeypatch):
