@@ -1,5 +1,6 @@
 """项目缓存：保存影像对应的完整工作状态，支持跨会话继续处理。"""
 import os, json, hashlib, datetime
+import shutil
 import math
 import threading
 import time
@@ -1287,6 +1288,98 @@ def clear_cached_masks_in_dir(cache_dir: str, suffixes=None):
                 os.remove(p)
             except OSError:
                 pass
+
+
+# “从零开始”要删的落盘产物：分析结果 + 项目状态 + 操作历史。
+# meta.json（显示降采样、tif 路径）与 image_bgr.*（解码缓存）不删——它们只由影像本身
+# 决定，删了只会让下一次打开变慢，不是“处理历史”。centerline_eval/、band_eval/ 是
+# 已导出的研究产物，同样不动。
+_ANALYSIS_CACHE_FILES = (
+    "project_state.json",
+    "bands.json",
+    "mask.npz",
+    "mask_best.npz",
+    "mask_processed.npz",
+    "mask_smoothed.npz",
+)
+_ANNOTATION_CACHE_FILES = (
+    "reference_lines.json",
+    "reference_draft_p1.json",
+    "reference_draft_p2.json",
+    "operator_paths.json",
+)
+
+
+def cancel_pending_project_saves(tif_path: str) -> int:
+    """丢弃尚未开始写盘的排队保存，返回丢弃条数。
+
+    “从零开始”先重置内存状态再删文件；如果队列里还压着一份旧状态的保存任务，
+    它会在删除之后落盘，把刚清掉的处理结果又写回来。已开始写入的那一份无法中断，
+    调用方应随后用 ``wait_for_project_state_saves`` 等它结束再删文件。
+    """
+    if not tif_path:
+        return 0
+    key = os.path.abspath(tif_path)
+    with _STATE_SAVE_QUEUE_LOCK:
+        dropped = 1 if _PENDING_STATE_SAVES.pop(key, None) is not None else 0
+    return dropped
+
+
+def clear_project_cache(tif_path: str, *, include_annotations: bool = False) -> Dict[str, Any]:
+    """删除当前项目的分析产物与操作历史，返回删除清单（“从零开始”）。
+
+    ``include_annotations`` 为真时连人工标注 sidecar（参考线、未完成草稿、作业线标定）
+    一起删除。默认保留：它们是研究证据，与“重跑一遍处理”无关，误删只能重新标注。
+
+    调用方负责先让内存状态归零并等排队保存结束（见 ``cancel_pending_project_saves``）；
+    本函数只做磁盘删除，且整段持项目锁，避免与后台保存线程交错。
+    """
+    report: Dict[str, Any] = {
+        "cache_dir": "",
+        "removed": [],
+        "removed_bytes": 0,
+        "annotations_cleared": False,
+        "failed": [],
+    }
+    if not tif_path:
+        return report
+    root = _cache_dir(tif_path)
+    report["cache_dir"] = root
+    if not os.path.isdir(root):
+        return report
+    names = list(_ANALYSIS_CACHE_FILES)
+    if include_annotations:
+        names.extend(_ANNOTATION_CACHE_FILES)
+    with _project_lock(tif_path):
+        for name in names:
+            path = os.path.join(root, name)
+            try:
+                if os.path.isfile(path):
+                    size = os.path.getsize(path)
+                    os.remove(path)
+                    report["removed"].append(name)
+                    report["removed_bytes"] += size
+            except OSError:
+                report["failed"].append(name)
+        history_dir = os.path.join(root, "history")
+        if os.path.isdir(history_dir):
+            for dirpath, _dirnames, filenames in os.walk(history_dir):
+                for name in filenames:
+                    try:
+                        report["removed_bytes"] += os.path.getsize(
+                            os.path.join(dirpath, name)
+                        )
+                    except OSError:
+                        pass
+            try:
+                shutil.rmtree(history_dir)
+                report["removed"].append("history/")
+            except OSError:
+                report["failed"].append("history/")
+    report["annotations_cleared"] = any(
+        name in report["removed"] for name in _ANNOTATION_CACHE_FILES
+    )
+    return report
 
 
 def save_bands_json(tif_path: str, bands_data: list):

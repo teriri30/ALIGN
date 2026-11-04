@@ -1170,3 +1170,15 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - 行为：只删 `reference_draft_p1.json` / `reference_draft_p2.json`；若正在标注，同时清空内存桩点、清 `interaction_reference` 临时图层并刷新状态条（否则会"提示已丢弃但画布上还画着几个点"）。
 - 与既有入口的分工（写进菜单语义，避免三者混淆）：**完成当前参考线**＝收线保存；**丢弃未完成的草稿**＝只丢没画完的点；**删除最后一条 / 清除本项目参考线**＝删已保存的 sidecar 数据。
 - 契约：`tests/test_reference_layer_visibility.py::test_discard_draft_keeps_saved_reference_lines`（草稿文件消失、已保存的 1 条参考线仍在、内存桩点清空）。全量 863 passed / 1 skipped。
+
+## DECISION-069：「从零开始（清除本项目）」——清内存不够，必须同时删磁盘缓存（2026-11-04）
+
+用户演示前要把同一块田从头跑一遍，发现「选中文件后就有历史处理」：任务行上的「回退」只清内存，而缓存按 `md5(tif 路径)[:12]` 落盘，重新选择同一张影像时 `CacheRestoreWorker` 会把田块、掩膜、作业线、路径和撤销历史整条恢复回来，界面上没有任何入口能丢掉它们（只能手动去 `%LOCALAPPDATA%\ALIGN\cache\<hash>\` 删文件）。核实结论：**确实缺一个一键入口**。
+
+- 新入口：文件 → **从零开始（清除本项目）…**（`Ctrl+Shift+N`，`_on_reset_project`）。确认框写明清除/保留清单，主按钮「清除并重新开始」，默认按钮是「取消」。
+- 磁盘侧：`cache.clear_project_cache(tif, include_annotations=False)` 删 `project_state.json`、`bands.json`、`mask*.npz` 与整个 `history/`；保留 `meta.json`、`image_bgr.*`（影像解码/显示参数，与处理无关）、`centerline_eval/`、`band_eval/`（已导出的研究产物）。
+- 人工标注（`reference_lines.json`、`reference_draft_p1/p2.json`、`operator_paths.json`）**默认保留**，确认框里勾选才删——它们是研究证据，误删只能重新标注。
+- 内存侧：`reset_project_state()` 把生成号 +1（在飞的旧结果会被 `generation_matches` 挡掉），再写回 `_IMAGE_IDENTITY_FIELDS` 里的影像自身字段，所以**影像留在画布上、不必重新选文件**；画布与任务清单统一重绘到“刚导入影像”。
+- 时序（关键）：`cancel_pending_project_saves()` 丢掉排队中的旧状态保存 → `wait_for_project_state_saves(5 s)` 等正在写的那一份结束 → 重置内存 → 删文件 → 重绘。顺序颠倒会让后台保存把刚清掉的处理结果又写回来，或让被删的标注还留在画布上。
+- 处理进行中（识别/掩膜/规划/平滑，或 `_worker_thread` 在跑）时直接拒绝并提示，不弹确认框。
+- 契约：`tests/test_project_reset.py`（7 例：清理范围、标注可选删除、无缓存目录安全、排队保存丢弃、菜单唯一入口、重置后内存归零且影像仍在、处理中拒绝执行）。全量 870 passed / 1 skipped。

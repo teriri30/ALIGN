@@ -12,7 +12,7 @@ from PySide6.QtGui import QAction, QKeySequence, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QFileDialog, QMessageBox, QStatusBar, QTabWidget, QLabel, QProgressBar,
-    QDialog, QInputDialog, QApplication, QPushButton,
+    QDialog, QInputDialog, QApplication, QPushButton, QCheckBox,
 )
 from config import (
     Config,
@@ -438,6 +438,11 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "打开影像…", QKeySequence.Open, self._on_open_tif)
         self._add_action(fm, "打开内置测试影像", "Ctrl+Shift+O", self._on_open_builtin_test)
         self._add_action(fm, "保存项目", QKeySequence.Save, self._on_save_project)
+        # 演示前把同一块田重新跑一遍：只靠任务行「回退」清不掉磁盘缓存，
+        # 重新选同一张影像时缓存恢复又整条回来了（见 _on_reset_project）。
+        self._add_action(
+            fm, "从零开始（清除本项目）…", "Ctrl+Shift+N", self._on_reset_project
+        )
         self._add_action(fm, "加载模型…", "Ctrl+M", self._on_load_model)
         fm.addSeparator()
 
@@ -559,6 +564,208 @@ class MainWindow(QMainWindow):
         from runtime_paths import user_data_root
 
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(user_data_root())))
+
+    # ------------------------------------------------------ 从零开始（清除本项目）
+    #: 影像自身的状态。``state.reset()`` 会把 tif_path / img_* 一起清空，
+    #: 而“从零开始”只清派生结果、影像仍要在画布上，所以这些字段必须写回。
+    _IMAGE_IDENTITY_FIELDS = (
+        "tif_path",
+        "source_img_h",
+        "source_img_w",
+        "img_h",
+        "img_w",
+        "display_h",
+        "display_w",
+        "downsample_factor",
+        "display_scale_x",
+        "display_scale_y",
+        "source_sha256",
+        "source_metadata",
+        "raster_preprocessing",
+    )
+
+    def _project_processing_busy(self) -> bool:
+        """后台流水线是否正在占用当前项目（此时不允许清除）。"""
+        thread = getattr(self, "_worker_thread", None)
+        if thread is not None and thread.isRunning():
+            return True
+        return any(
+            bool(getattr(self.state, flag, False))
+            for flag in (
+                "inference_running",
+                "mask_processing_running",
+                "plan_running",
+                "smooth_running",
+            )
+        )
+
+    def _ask_reset_project(self, reference_count: int, calibration_count: int):
+        """“从零开始”确认框，返回 (是否执行, 是否连人工标注一起删)。
+
+        抽成独立方法是为了让测试能直接替换它——模态框在离屏环境里点不动，
+        而清除范围本身（删哪些、留哪些）才是要钉住的契约。
+        """
+        annotation_bits = []
+        if reference_count:
+            annotation_bits.append("参考线 %d 条" % reference_count)
+        if calibration_count:
+            annotation_bits.append("作业线标定 %d 条" % calibration_count)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("从零开始")
+        box.setText("清除本项目的处理结果，从影像重新开始？")
+        detail = [
+            "将清除：田块边界、禁行区、识别与掩膜结果、作业线、起终点与卸粮点、"
+            "路径与演示状态、导出完成标记，以及操作历史（撤销/重做）。",
+            "将保留：当前影像（不用重新选文件）、显示参数、机具参数与调头方式；"
+            "参数来源需在导出前重新确认。",
+        ]
+        if annotation_bits:
+            detail.append(
+                "人工标注默认保留（%s）；勾选下面的选项才一并删除。"
+                % "、".join(annotation_bits)
+            )
+        detail.append("删除后无法撤销。")
+        box.setInformativeText("\n".join(detail))
+        annotations_box = QCheckBox("同时清除人工标注（参考线与作业线标定）")
+        if annotation_bits:
+            annotations_box.setToolTip("人工标注是研究证据，误删只能重新标注")
+        else:
+            annotations_box.setEnabled(False)
+            annotations_box.setText("当前项目没有人工标注")
+        box.setCheckBox(annotations_box)
+        accept = box.addButton("清除并重新开始", QMessageBox.AcceptRole)
+        cancel = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        return box.clickedButton() is accept, bool(annotations_box.isChecked())
+
+    def _on_reset_project(self):
+        """从零开始：清除本项目落盘的处理结果，保留影像与机具设置。
+
+        任务行的「回退」只清内存；缓存按 tif 路径哈希落盘，重新选择同一张影像时
+        ``CacheRestoreWorker`` 会把田块、掩膜、作业线、路径和操作历史整条恢复回来。
+        演示前要真正从零开始，必须同时删掉磁盘缓存。
+        """
+        import cache
+
+        tif_path = str(self._tif_path or getattr(self.state, "tif_path", "") or "")
+        if not tif_path:
+            self.log_panel.warn("还没有打开影像，没有可清除的项目。")
+            return
+        if self._project_processing_busy():
+            self.log_panel.warn("正在处理中，等这一轮识别、掩膜或规划结束后再清除。")
+            return
+
+        reference_count = len(list(self._reference_lines_payload().get("lines") or []))
+        calibration_count = len(list(self._operator_paths_payload().get("lines") or []))
+        approved, include_annotations = self._ask_reset_project(
+            reference_count, calibration_count
+        )
+        if not approved:
+            return
+
+        # 先丢掉排队中的旧状态保存，再等正在写的那一份结束：否则删完文件，
+        # 后台保存会把旧的处理结果又写回来。
+        timer = getattr(self, "_history_checkpoint_timer", None)
+        if timer is not None:
+            timer.stop()
+        cache.cancel_pending_project_saves(tif_path)
+        if not cache.wait_for_project_state_saves(tif_path, timeout=5.0):
+            self.log_panel.warn("上一次保存还没落盘完成，请稍后再试一次。")
+            return
+
+        self._reset_project_memory_to_image()
+        report = cache.clear_project_cache(
+            tif_path, include_annotations=include_annotations
+        )
+        # 重绘放在删除之后：人工标注被删掉时，画布上不能还留着那几条线。
+        self._refresh_after_project_reset()
+        if report.get("failed"):
+            self.log_panel.error("以下缓存删除失败：%s" % "、".join(report["failed"]))
+        removed_mb = float(report.get("removed_bytes", 0) or 0) / (1024.0 * 1024.0)
+        kept_note = (
+            "，人工标注一并删除"
+            if report.get("annotations_cleared")
+            else "，人工标注保留"
+        )
+        message = "已从零开始：清除本项目处理结果（%d 项，%.1f MB）%s" % (
+            len(report.get("removed") or []),
+            removed_mb,
+            kept_note,
+        )
+        self.log_panel.success(message)
+        self._journal.info(
+            message,
+            module="project",
+            details={
+                "tif_path": tif_path,
+                "removed": list(report.get("removed") or []),
+                "removed_bytes": int(report.get("removed_bytes", 0) or 0),
+                "annotations_cleared": bool(report.get("annotations_cleared")),
+                "failed": list(report.get("failed") or []),
+            },
+        )
+        self.lbl_status.setText("已清除本项目处理结果，可从影像重新开始")
+
+    def _reset_project_memory_to_image(self):
+        """把内存状态清回“刚导入影像”，画布与任务清单同步归零。"""
+        # 退出标注模式要放在 state.reset() 之前：收线会自动保存已画桩点，
+        # 依赖当前的掩膜/比例尺；退出后再清状态，桩点不会丢。
+        if getattr(self, "_reference_drawing", False):
+            self._exit_reference_mode()
+        if getattr(self, "_calibration_drawing", False):
+            self._set_calibration_mode(False)
+
+        identity = {}
+        for name in self._IMAGE_IDENTITY_FIELDS:
+            value = getattr(self.state, name, None)
+            identity[name] = deepcopy(value) if isinstance(value, dict) else value
+        # 生成号 +1：任何还在飞的异步结果都会被 generation_matches 挡掉。
+        reset_project_state(self.state)
+        self.state.safe_update(**identity)
+
+        # 人工标注的读盘缓存也要失效：否则“连标注一起删”之后，
+        # 画布还会按内存里的旧 payload 把线画回来。
+        self._reference_payload = {}
+        self._reference_payload_tif = ""
+        self._calibration_payload = {}
+        self._calibration_payload_tif = ""
+
+        if self._anim_timer:
+            self._anim_timer.stop()
+        self._anim_timer = None
+        self._anim_engine = None
+        # 演示残留必须从场景里摘掉：停止定时器只是不再推进，机器图形还在画布上。
+        self._dispose_harvester_item()
+        self._pipeline_result = None
+        self._stale_path_preview = None
+        self._clear_machine_route_preview()
+        self._service_points_visible = False
+        self._field_pts.clear()
+        self._field_drawing = False
+        self._forbidden_drawing = False
+        self._reference_pts = []
+        self._reference_last_click = None
+        self._calibration_history.clear()
+        self._calibration_item_id = ""
+        self._export_risk_notices = []
+        self.image_view.set_animation_controls_visible(False)
+        self.lbl_speed.clear()
+        self.route_info.clear_info()
+
+    def _refresh_after_project_reset(self):
+        """按重置后的状态统一重绘画布与清单（删除缓存之后再调用）。"""
+        self.task_panel.clear_centerline_selection()
+        self._sync_drawing_mode()
+        self._clear_display_overlay_layers()
+        self._restore_visual_from_state()
+        self._refresh_service_points_panel()
+        self._sync_display_layer_availability()
+        self._sync_task_statuses()
+        self.top_toolbar.refresh_actions(self.state)
+        self._repair_canvas_if_state_disagrees(where="reset_project")
 
     def _on_open_manual(self):
         from PySide6.QtCore import QUrl
