@@ -9,7 +9,7 @@
   - contour:     Contour/spiral ordering — 外圈向内访问现有作业中心线
 """
 import math, csv, json, os, tempfile, hashlib
-from typing import List, Tuple, Optional, Dict
+from typing import Any, List, Tuple, Optional, Dict
 import numpy as np
 import cv2
 from shapely.geometry import LineString, Point, Polygon
