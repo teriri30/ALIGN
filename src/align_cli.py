@@ -1,12 +1,20 @@
-"""ALIGN 命令层 CLI —— 阶段 1（主流程 12 条 + run-batch）。
+"""ALIGN 命令层 CLI —— 阶段 1（主流程 12 条 + run-batch）+ 阶段 2（B/C/D 组 14 条 + 并发防护）。
+
+命令行等价界面手动操作：加载影像→圈田块→识别→掩膜→中心线→选线→起点→（参数/禁行区/
+参考线/标定线）→规划→模拟→导出（TXT/快照/资料包）；查询（状态/诊断/缓存/恢复）；
+医生（环境自检）；维护（回滚/重置）。
 
 设计文档：docs/命令层设计方案.md（§4.4 契约核对底表含每条命令的界面层锚点）。
 
 铁律：
 1. 只编排、不发明——全部算法调用界面同款领域函数，本文件不写几何/识别逻辑；
-2. 本文件不得 import 界面层包（Qt 外壳目录），grep 该目录名须零命中；
+2. 不 import 界面主窗口/工作线程（main_window、workers 等 Qt 外壳）；仅两个例外：
+   pyside6_app.task_state（Qt-free 任务状态表，query-status/rollback 复用）与
+   pyside6_app.snapshot_export（快照渲染纯函数；导入会拉入 PySide6，仅启动开销）；
 3. 命令边界同步强写缓存（cache.save_project_state + wait_for_project_state_saves），
-   与界面共用同一缓存根（%LOCALAPPDATA%\\ALIGN\\cache\\md5(tif)[:12]），断点即缓存。
+   与界面共用同一缓存根（%LOCALAPPDATA%\\ALIGN\\cache\\md5(tif)[:12]），断点即缓存；
+4. 并发防护：写命令持有缓存目录字节锁（cli.lock，进程退出自动释放）；
+   保存前比对 project_state.json 磁盘指纹，外部（界面）改动则拒绝覆盖。
 
 退出码：0 成功；2 前置门禁未满足（JSON 附 blocker，文案对齐界面）；3 执行失败；4 参数错误。
 所有 stdout 输出为 UTF-8 JSON（单行），供 Agent/脚本直接消费。
@@ -14,9 +22,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import math
 import os
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -49,12 +61,16 @@ BATCH_STAGES = [
 
 
 class GateError(RuntimeError):
-    """前置门禁未满足：等价于界面上按钮被禁用时的 blocker 文案。"""
+    """前置门禁未满足 → 退出码 2。blocker 文案对齐界面；extra.missing 给出补齐项。"""
 
     def __init__(self, blocker: str, **extra):
         super().__init__(blocker)
         self.blocker = blocker
         self.extra = extra
+
+
+class ParamError(ValueError):
+    """参数错误 → 退出码 4。"""
 
 
 def _emit(payload: dict) -> None:
@@ -170,6 +186,7 @@ class Ctx:
         self._read_header()
         if restore:
             self._restore()
+        self._state_sig = self._state_file_sig()
 
     def _read_header(self) -> None:
         import rasterio
@@ -225,13 +242,40 @@ class Ctx:
             full_height=self.full_h,
         )
 
+    def _state_file_sig(self):
+        """project_state.json 的磁盘指纹（存在性 + mtime_ns + size），用于并发防护。"""
+        import cache as cache_mod
+
+        path = os.path.join(cache_mod.project_cache_dir(self.tif), "project_state.json")
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (int(st.st_mtime_ns), int(st.st_size))
+
     def save(self, stage: str) -> None:
         import cache as cache_mod
 
+        # 并发防护（阶段 2）：界面/其他进程在本命令运行期间改写了缓存时拒绝覆盖。
+        if self._state_file_sig() != self._state_sig:
+            raise GateError(
+                "缓存在本命令运行期间被外部修改（可能界面正在操作本项目）；"
+                "为避免覆盖他人工作已中止。请重新执行本命令——CLI 会先恢复最新现场再执行。",
+                missing=["重新执行命令"],
+            )
         if not cache_mod.save_project_state(self.tif, self.state, stage=stage):
             raise RuntimeError(f"缓存写入失败（stage={stage}），已 fail-closed")
         if not cache_mod.wait_for_project_state_saves(self.tif, timeout=30.0):
             raise RuntimeError(f"缓存写入超时（stage={stage}），已 fail-closed")
+        self._state_sig = self._state_file_sig()
+
+    def resync(self) -> None:
+        """落盘指纹重同步：领域代码自保存（如 inference.py 识别中途 checkpoint 直写
+        project_state.json）之后调用，否则后续 save() 会把自家写入误判为外部并发修改。"""
+        import cache as cache_mod
+
+        cache_mod.wait_for_project_state_saves(self.tif, timeout=30.0)
+        self._state_sig = self._state_file_sig()
 
 
 def _apply_saved(state, saved: dict, meta: dict) -> None:
@@ -250,8 +294,9 @@ def _apply_saved(state, saved: dict, meta: dict) -> None:
         "harvester_params", "harvester_param_sources", "harvester_params_confirmed",
         "turn_strategy", "turn_strategy_user_selected",
         "entry_point", "entry_point_locked", "exit_point", "exit_point_locked",
-        "unload_points", "workflow_step", "simulation_done", "export_done",
-        "auto_path_planned", "auto_path_valid", "auto_path_description",
+        "unload_points", "unload_point", "unload_point_locked",
+        "workflow_step", "simulation_done", "export_done",
+        "auto_path_planned", "auto_path_valid", "auto_path_desc",
         "path_provenance", "path_runtime", "path_validation", "path_artifact",
         "auto_path_geo", "path_points", "path_status", "path_geometry_modes",
         "last_coverage_rate", "last_track_coverage_rate", "last_turning_rate",
@@ -348,7 +393,7 @@ def _invalidate_from(state, stage: str) -> None:
             state.safe_update(mask_processed=False, mask_result=None)
         state.safe_update(
             auto_path_planned=False, auto_path_valid=False, auto_path=None,
-            auto_path_segments=None, auto_path_geo=None, auto_path_description=None,
+            auto_path_segments=None, auto_path_geo=None, auto_path_desc="",
             simulation_done=False, export_done=False,
         )
 
@@ -567,6 +612,7 @@ def do_segment(ctx: Ctx, timeout_s: int = 1800, **_kw) -> dict:
     mask = ctx.state.mask_raw
     if mask is None or not ctx.state.inference_done:
         raise RuntimeError("作物识别失败：未产出掩膜（详见进程日志）")
+    ctx.resync()  # InferenceRunner 中途自保存 project_state（INF:1568/1750），同步落盘指纹
     import numpy as np
 
     ratio = float(np.count_nonzero(mask)) / float(mask.size) if mask.size else 0.0
@@ -1122,6 +1168,114 @@ def do_export_txt(ctx: Ctx, out: str, force: bool = False, **_kw) -> dict:
     界面的「导出确认」弹窗在命令层映射为 --force 预授权：不带 --force 时
     全部风险项以门禁（exit 2）列出，一条不漏。
     """
+    risks, geo_points = _export_risk_gate(ctx, force)
+
+    out_dir = Path(out).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    from path_planner import export_machine_compatibility_path
+
+    export_result = export_machine_compatibility_path(geo_points, str(out_dir))
+    if not export_result:
+        raise RuntimeError("机手兼容路径导出失败（export_machine_compatibility_path 返回空）")
+    export_diag = export_result[1] if isinstance(export_result, tuple) and len(export_result) > 1 else {}
+    output_files = list(export_diag.get("output_files") or export_diag.get("files") or [])
+    if not output_files:
+        output_files = sorted(str(p) for p in out_dir.glob("*.txt"))
+    _gate(bool(output_files), "导出后未找到输出文件，已 fail-closed")
+
+    # 导出后回读验证（规格门槛：$PATH/$INFM/条数）
+    import hashlib
+
+    files_info = []
+    for f in output_files:
+        path = Path(f)
+        _gate(path.is_file(), f"导出文件缺失：{f}")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        _gate(any("$PATH" in ln for ln in lines[:5]), f"导出文件缺少 $PATH 头：{path.name}")
+        point_lines = [ln for ln in lines if ln.strip().upper().startswith("$PATH")]
+        _gate(bool(point_lines), f"导出文件缺少路径点：{path.name}")
+        files_info.append(
+            {
+                "file": str(path),
+                "points": len(point_lines),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()[:16],
+            }
+        )
+    _gate(len(point_lines) <= 5000, "路径点超过 5000，机手端无法导入，请抽稀后重试")
+
+    ctx.state.safe_update(export_done=True)
+    from workflow import WorkflowUpdater
+
+    WorkflowUpdater.advance(ctx.state, "EXPORTED")
+    ctx.save("export")
+    return {"out_dir": str(out_dir), "files": files_info}
+
+
+# ---------------------------------------------------------------------------
+# run-batch：一键全链（等价 smoke_full_pipeline，但每阶段落盘缓存）
+# ---------------------------------------------------------------------------
+
+def _load_display_rgb(ctx: Ctx):
+    """读显示网格 RGB（workers.py:531-537 界面预览同款调用口径）。
+
+    out_shape=(h, w) 二元组、resampling=average、config=Config().section("raster_preprocessing")。
+    """
+    import rasterio
+    from rasterio.enums import Resampling
+
+    from config import Config
+    from raster_preprocessing import read_rgb_raster
+
+    with rasterio.open(ctx.tif) as dataset:
+        rgb, _metadata = read_rgb_raster(
+            dataset,
+            out_shape=(ctx.disp_h, ctx.disp_w),
+            resampling=Resampling.average,
+            config=Config().section("raster_preprocessing"),
+        )
+    return rgb
+
+
+def _path_result_from_state(ctx: Ctx) -> dict:
+    """从缓存的 AutoPathSegment 列表重建界面 _normalise_path_result 同款归一化结果。
+
+    段对象真身：state.AutoPathSegment(points=[PathPoint(pixel_x, pixel_y, ...)], status, ...)；
+    status==1 为作业段（tracks，与 AnimationEngine._gen_report 同口径），其余为转弯/衔接。
+    """
+    segments = list(
+        getattr(ctx.state, "auto_path_segments", None)
+        or getattr(ctx.state, "auto_path", None)
+        or []
+    )
+    tracks, turns, full_path = [], [], []
+    for seg in segments:
+        pts = [
+            [float(p.pixel_x), float(p.pixel_y)]
+            for p in (getattr(seg, "points", None) or [])
+            if hasattr(p, "pixel_x") and hasattr(p, "pixel_y")
+        ]
+        if len(pts) < 2:
+            continue
+        (tracks if int(getattr(seg, "status", 1)) == 1 else turns).append({"points": pts})
+        full_path.extend(pts)
+    return {
+        "full_path": full_path,
+        "tracks": tracks,
+        "turns": turns,
+        "validation": getattr(ctx.state, "path_validation", {}) or {},
+        "provenance": getattr(ctx.state, "path_provenance", {}) or {},
+        "description": getattr(ctx.state, "auto_path_desc", "") or "",
+        "runtime": getattr(ctx.state, "path_runtime", "") or "",
+    }
+
+
+def _export_risk_gate(ctx: Ctx, force: bool) -> tuple[list, list]:
+    """镜像界面 _geo_export_payload 的风险确认链（MW:7410-7465；含转向评估/参数漂移检查）。
+
+    返回 (风险清单, geo_points)；风险非空且未 --force 时以门禁拦截（exit 2）。
+    界面的「导出确认」弹窗在命令层映射为 --force 预授权。
+    """
     _gate(ctx.geo is not None and ctx.geo.is_ready(), "当前影像没有可用地理坐标，不能导出经纬度文件", missing=["地理坐标"])
     # 源文件完整性（MW:7422-7425）：加载后 tif 被改动则必须重来
     from cache import source_identity
@@ -1179,52 +1333,1003 @@ def do_export_txt(ctx: Ctx, out: str, force: bool = False, **_kw) -> dict:
         "；".join(risks) + "。确认风险后加 --force 导出（等价界面「导出确认」弹窗的确认按钮）。",
         missing=["--force 风险确认"],
     )
+    return risks, geo_points
 
-    out_dir = Path(out).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    from path_planner import export_machine_compatibility_path
 
-    export_result = export_machine_compatibility_path(geo_points, str(out_dir))
-    if not export_result:
-        raise RuntimeError("机手兼容路径导出失败（export_machine_compatibility_path 返回空）")
-    export_diag = export_result[1] if isinstance(export_result, tuple) and len(export_result) > 1 else {}
-    output_files = list(export_diag.get("output_files") or export_diag.get("files") or [])
-    if not output_files:
-        output_files = sorted(str(p) for p in out_dir.glob("*.txt"))
-    _gate(bool(output_files), "导出后未找到输出文件，已 fail-closed")
+def _write_export_manifest(ctx: Ctx, output_path: str, output_format: str,
+                           path_result: dict, geo_points: list,
+                           protocol_metadata: dict | None = None) -> str:
+    """镜像界面 _write_export_manifest（MW:7722-）：导出与审计证据不可分（DECISION-001）。"""
+    import cache as cache_mod
+    from importlib import metadata
 
-    # 导出后回读验证（规格门槛：$PATH/$INFM/条数）
-    import hashlib
+    from build_info import SCIENTIFIC_CODE_PATHS, load_build_info
+    from provenance import APP_VERSION, code_identity, file_sha256, git_is_dirty, git_revision
+    from runtime_paths import project_root as runtime_project_root
 
-    files_info = []
-    for f in output_files:
-        path = Path(f)
-        _gate(path.is_file(), f"导出文件缺失：{f}")
-        text = path.read_text(encoding="utf-8", errors="replace")
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        _gate(any("$PATH" in ln for ln in lines[:5]), f"导出文件缺少 $PATH 头：{path.name}")
-        point_lines = [ln for ln in lines if ln.strip().upper().startswith("$PATH")]
-        _gate(bool(point_lines), f"导出文件缺少路径点：{path.name}")
-        files_info.append(
-            {
-                "file": str(path),
-                "points": len(point_lines),
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()[:16],
-            }
+    from path_planner import PATH_PLANNING_VERSION
+
+    versions = {}
+    for package in ("numpy", "opencv-python", "PySide6", "pyproj",
+                    "rasterio", "shapely", "ultralytics"):
+        try:
+            versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            versions[package] = "not-installed"
+    root = runtime_project_root()
+    manifest = {
+        "schema": "align-export-manifest-v1",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "channel": "cli",
+        "format": output_format,
+        "output_path": str(output_path),
+        "output_sha256": file_sha256(output_path),
+        "point_count": len(geo_points),
+        "tif_path": ctx.tif,
+        "source_identity": cache_mod.source_identity(ctx.tif),
+        "app_version": APP_VERSION,
+        "path_planning_version": PATH_PLANNING_VERSION,
+        "build_info": load_build_info(),
+        "git": {"revision": git_revision(root), "dirty": git_is_dirty(root)},
+        "scientific_code": code_identity(root, SCIENTIFIC_CODE_PATHS),
+        "config": _jsonable(ctx.cfg.snapshot()),
+        "packages": versions,
+        "validation": getattr(ctx.state, "path_validation", {}) or {},
+        "harvester": {
+            "params": _effective_harvester_params(ctx.cfg, getattr(ctx.state, "harvester_params", {}) or {}),
+            "sources": getattr(ctx.state, "harvester_param_sources", {}) or {},
+        },
+        "protocol_metadata": dict(protocol_metadata or {}),
+    }
+    manifest_path = str(output_path) + ".manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(_jsonable(manifest), fh, ensure_ascii=False, indent=2)
+    return manifest_path
+
+
+# ── B 组：参数与标注 ─────────────────────────────────────────────
+
+def do_set_params(ctx: Ctx, params: str, **_kw) -> dict:
+    """set-params：等价界面「设置→农机参数」（_apply_harvester_params MW:11438-11532）。
+
+    R7 口径：参数不经确认门禁，来源记为 user_measured；与界面一致把生效值写进
+    config.json；参数变化使已规划路径失效（足迹验证失效）。
+    """
+    from config import save_json_atomic
+
+    try:
+        values = json.loads(params)
+    except json.JSONDecodeError as exc:
+        raise ParamError(f"--params 不是合法 JSON：{exc}") from exc
+    _gate(isinstance(values, dict) and values,
+          "--params 必须是非空 JSON 对象",
+          missing=['--params \'{"cutter_width_m": 2.0, "track_width_m": 0.45}\''])
+    known = set(_effective_harvester_params(ctx.cfg, {}).keys())
+    unknown = sorted(str(k) for k in values if k not in known)
+    _gate(not unknown, f"未知农机参数键：{', '.join(unknown)}；允许：{', '.join(sorted(known))}",
+          missing=([f"--params 中去掉 {unknown[0]}"] if unknown else []))
+    cleaned = {}
+    for key, val in values.items():
+        try:
+            cleaned[key] = float(val)
+        except (TypeError, ValueError) as exc:
+            raise ParamError(f"参数 {key} 的值不是数字：{val!r}") from exc
+    merged = dict(getattr(ctx.state, "harvester_params", {}) or {})
+    merged.update(cleaned)
+    effective = _effective_harvester_params(ctx.cfg, merged)
+    previous = _effective_harvester_params(
+        ctx.cfg, getattr(ctx.state, "harvester_params", {}) or {})
+    changed = any(abs(float(previous.get(k, 0.0)) - float(effective.get(k, 0.0))) > 1e-9
+                  for k in set(previous) | set(effective))
+    ctx.state.harvester_params = effective
+    sources = dict(getattr(ctx.state, "harvester_param_sources", {}) or {})
+    for key in cleaned:
+        sources[key] = "user_measured"
+    ctx.state.harvester_param_sources = sources
+    ctx.state.harvester_params_confirmed = True
+    snapshot = ctx.cfg.update_section("harvester", effective)
+    save_json_atomic(ctx.cfg.config_path(), snapshot)
+    invalidated = False
+    if changed and bool(getattr(ctx.state, "auto_path_planned", False)):
+        # MW:11517-11530：农机物理参数已变化，旧路径足迹验证已经失效
+        _invalidate_from(ctx.state, "path")
+        invalidated = True
+    ctx.save("params")
+    return {
+        "changed": changed,
+        "path_invalidated": invalidated,
+        "params": effective,
+        "overridden": sorted(cleaned.keys()),
+    }
+
+
+def _parse_polygon_arg(raw: str) -> list:
+    """--polygon 载荷：[[x,y],...] 或 GeoJSON Feature/Geometry/Polygon。"""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ParamError(f"--polygon 不是合法 JSON：{exc}") from exc
+    if isinstance(data, dict):
+        if data.get("type") == "Feature":
+            data = data.get("geometry") or {}
+        if isinstance(data, dict) and data.get("type") == "Polygon":
+            data = (data.get("coordinates") or [[]])[0]
+        else:
+            raise ParamError("--polygon 的 GeoJSON 必须是 Polygon 或含 Polygon geometry 的 Feature")
+    if not (isinstance(data, list) and all(isinstance(p, (list, tuple)) and len(p) >= 2 for p in data)):
+        raise ParamError("--polygon 必须是 [[x, y], ...] 顶点数组（显示坐标）")
+    return [[float(p[0]), float(p[1])] for p in data]
+
+
+def do_set_forbidden(ctx: Ctx, polygon: str | None = None, clear: bool = False, **_kw) -> dict:
+    """set-forbidden：等价界面禁行区确认/清除（MW:4278-4320）。
+
+    顶点为显示坐标；必须 ≥3 点且完全落在已确认田块内；--clear 清空。
+    """
+    import cv2
+    import numpy as np
+
+    regions = [list(map(list, r)) for r in (getattr(ctx.state, "forbidden_regions", None) or [])]
+    had_path = bool(getattr(ctx.state, "auto_path_planned", False))
+    if clear:
+        _gate(bool(regions), "当前没有禁行区。", missing=["禁行区"])
+        ctx.state.safe_update(forbidden_regions=[], forbidden_regions_confirmed=False)
+        if had_path:
+            _invalidate_from(ctx.state, "path")
+        ctx.save("forbidden")
+        return {"cleared": len(regions), "regions": 0, "path_invalidated": had_path}
+    _gate(polygon, "缺少 --polygon（或改用 --clear 清空禁行区）。", missing=["--polygon"])
+    pts = _parse_polygon_arg(polygon)
+    _gate(len(pts) >= 3, "禁行区至少需要 3 个顶点。", missing=["补全禁行区顶点"])
+    field = list(getattr(ctx.state, "field_boundary", None) or [])
+    _gate(len(field) >= 3, "请先圈选田块。", missing=["田块边界"])
+    field_arr = np.asarray(field, dtype=np.float32)
+    outside = [p for p in pts if cv2.pointPolygonTest(field_arr, (float(p[0]), float(p[1])), False) < 0]
+    _gate(not outside, "禁行区必须完全位于已确认的田块边界内。", missing=["调整禁行区顶点"])
+    regions.append([[float(x), float(y)] for x, y in pts])
+    ctx.state.safe_update(forbidden_regions=regions, forbidden_regions_confirmed=True)
+    if had_path:
+        _invalidate_from(ctx.state, "path")
+    ctx.save("forbidden")
+    return {"cleared": 0, "regions": len(regions), "added_points": len(pts),
+            "path_invalidated": had_path}
+
+
+def _load_json_file(path: str, what: str) -> dict:
+    _gate(os.path.isfile(path), f"{what}文件不存在：{path}", missing=[what])
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ParamError(f"{what}文件读取失败：{exc}") from exc
+
+
+def do_import_reference(ctx: Ctx, json_path: str, **_kw) -> dict:
+    """import-reference：导入参考线 sidecar（CA:139-160 save_reference_lines）。
+
+    参考线是评价对照锚点，不参与计算链，导入不触发失效。
+    """
+    import cache as cache_mod
+
+    payload = _load_json_file(json_path, "参考线 JSON")
+    _gate(isinstance(payload, dict) and isinstance(payload.get("lines"), list),
+          "参考线 JSON 必须是含 lines 数组的对象。", missing=['{"lines": [...]}'])
+    out = cache_mod.save_reference_lines(ctx.tif, payload)
+    return {"lines": len(payload["lines"]), "sidecar": out}
+
+
+def do_import_operator(ctx: Ctx, json_path: str, **_kw) -> dict:
+    """import-operator：导入人工标定线 sidecar（OP:33 SCHEMA；CA:195-215）。
+
+    标定线作为规划覆盖输入（runtime.operator_centerlines），导入后使已规划路径失效。
+    """
+    import operator_paths
+
+    payload = _load_json_file(json_path, "人工标定线 JSON")
+    _gate(isinstance(payload, dict), "人工标定线 JSON 必须是对象。", missing=["标定线 JSON"])
+    if payload.get("schema") != operator_paths.SCHEMA:
+        if isinstance(payload.get("lines"), list):
+            wrapped = operator_paths.empty_payload(ctx.tif, {})
+            wrapped["lines"] = payload["lines"]
+            payload = wrapped
+        else:
+            raise ParamError(
+                f"人工标定线 JSON 的 schema 必须是 {operator_paths.SCHEMA}，"
+                "或提供含 lines 数组的对象。")
+    import cache as cache_mod
+
+    out = cache_mod.save_operator_paths(ctx.tif, payload)
+    had_path = bool(getattr(ctx.state, "auto_path_planned", False))
+    if had_path:
+        _invalidate_from(ctx.state, "path")
+    ctx.save("operator")
+    return {"lines": len(payload.get("lines") or []), "sidecar": out,
+            "path_invalidated": had_path}
+
+
+# ── C 组：导出与模拟 ─────────────────────────────────────────────
+
+def _build_cli_snapshot_scene(ctx: Ctx):
+    """按界面 _build_snapshot_scene（MW:8791-9093）默认口径构建快照图层（全图层可见、无标签）。
+
+    图层顺序与颜色与界面一致；界面的图层开关在 CLI 侧固定为默认可见集。
+    注意：pyside6_app.snapshot_export 会拉入 PySide6（仅启动开销，渲染本身纯函数）。
+    """
+    import numpy as np
+
+    from pyside6_app.snapshot_export import SnapshotScene
+
+    state = ctx.state
+    scene = SnapshotScene()
+    try:
+        raw = _attach_raw_mask(ctx)
+        scene.mask(raw, getattr(state, "mask_raw_offset_x", 0),
+                   getattr(state, "mask_raw_offset_y", 0), (100, 210, 255))
+    except Exception:
+        pass
+    if getattr(state, "mask_processed", False):
+        _attach_processed_mask(ctx)
+        mr = state.mask_result or {}
+        headland = mr.get("headland_mask")
+        if isinstance(headland, np.ndarray):
+            scene.mask(headland, getattr(state, "mask_offset_x", 0),
+                       getattr(state, "mask_offset_y", 0), (210, 230, 120))
+        uncertain = mr.get("uncertain_mask")
+        if isinstance(uncertain, np.ndarray):
+            scene.mask(uncertain, getattr(state, "mask_offset_x", 0),
+                       getattr(state, "mask_offset_y", 0), (170, 170, 190))
+        processed = mr.get("processed_mask")
+        if isinstance(processed, np.ndarray):
+            scene.mask(processed, getattr(state, "mask_offset_x", 0),
+                       getattr(state, "mask_offset_y", 0), (120, 255, 140))
+    # 一条线原则：路线已存在时不再叠加中心线
+    has_route = bool(getattr(state, "auto_path_planned", False))
+    if not has_route:
+        catalog = getattr(state, "centerline_catalog", None) or {}
+        items = list(catalog.get("items") or [])
+        selected = set(getattr(state, "selected_centerline_ids", None) or [])
+        for item in items:
+            poly = item.get("polyline") or []
+            if item.get("id") in selected and len(poly) >= 2:
+                pts = [(float(p[0]), float(p[1])) for p in poly]
+                scene.polyline(pts, (40, 220, 80), width=5)
+                scene.circle(pts[0][0], pts[0][1], 4, (120, 255, 150))
+                scene.circle(pts[-1][0], pts[-1][1], 4, (120, 255, 150))
+    # 参考线默认在界面为隐藏图层，CLI 默认同样不叠加
+    field = [(float(p[0]), float(p[1])) for p in (getattr(state, "field_boundary", None) or [])]
+    if len(field) >= 3:
+        scene.polyline(field + [field[0]], (255, 140, 50), width=4)
+        for x, y in field:
+            scene.circle(x, y, 5, (255, 255, 0))  # MW:4065 _field_vertex_radius=5
+    for idx, region in enumerate(getattr(state, "forbidden_regions", None) or [], start=1):
+        pts = [(float(p[0]), float(p[1])) for p in region]
+        if len(pts) >= 3:
+            scene.polygon(pts, (35, 35, 220), outline=(20, 20, 255), width=4)
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            scene.label(cx, cy, f"禁行{idx}", color=(20, 20, 255))
+    # 服务点（入口/出口颜色跟随路径边状态，与 _route_edit_control_point_color 同口径）
+    path_status = list(getattr(state, "path_status", []) or [])
+    work_color, turn_color = (0, 255, 70), (70, 120, 255)
+    entry = getattr(state, "entry_point", None)
+    if entry:
+        color = work_color if (path_status and int(path_status[0]) == 1) else turn_color
+        scene.circle(float(entry[0]), float(entry[1]), 6, color)
+    exit_pt = getattr(state, "exit_point", None)
+    if exit_pt:
+        color = work_color if (path_status and int(path_status[-1]) == 1) else turn_color
+        scene.circle(float(exit_pt[0]), float(exit_pt[1]), 6, color)
+    for point in getattr(state, "unload_points", None) or []:
+        scene.circle(float(point[0]), float(point[1]), 8, (255, 210, 40))
+    # 规划路径：作业绿 / 转弯蓝 / 界外红（MW:9019-9093 同口径）
+    if has_route:
+        field_boundary = list(getattr(state, "field_boundary", None) or [])
+        path_result = _path_result_from_state(ctx)
+        for track in path_result["tracks"]:
+            if track["points"]:
+                scene.polyline([tuple(p) for p in track["points"]], work_color, width=4)
+        for turn in path_result["turns"]:
+            pts = turn["points"]
+            if not pts:
+                continue
+            if field_boundary:
+                inside, outside = _split_polyline_by_field(pts, field_boundary)
+                for sub in inside:
+                    scene.polyline([tuple(p) for p in sub], turn_color, width=3)
+                for sub in outside:
+                    scene.polyline([tuple(p) for p in sub], (40, 40, 255), width=3)
+            else:
+                scene.polyline([tuple(p) for p in pts], turn_color, width=3)
+        full_path = path_result["full_path"]
+        if exit_pt is None and len(full_path) >= 2:
+            scene.circle(float(full_path[-1][0]), float(full_path[-1][1]), 9, (255, 80, 80))
+    return scene
+
+
+def _split_polyline_by_field(points, boundary):
+    """镜像界面 _split_polyline_by_field_boundary：按田块边界把折线拆成界内/界外。"""
+    import cv2
+    import numpy as np
+
+    if len(points) < 2 or len(boundary) < 3:
+        return ([[list(p) for p in points]] if len(points) >= 2 else []), []
+    field_arr = np.asarray(boundary, dtype=np.float32)
+
+    def _inside(x, y):
+        return cv2.pointPolygonTest(field_arr, (float(x), float(y)), False) >= 0
+
+    inside_parts, outside_parts = [], []
+    current = [list(map(float, points[0]))]
+    current_inside = _inside(*points[0])
+    for pt in points[1:]:
+        pt = [float(pt[0]), float(pt[1])]
+        pt_inside = _inside(*pt)
+        if pt_inside != current_inside:
+            (inside_parts if current_inside else outside_parts).append(current + [pt])
+            current = [pt]
+            current_inside = pt_inside
+        else:
+            current.append(pt)
+    (inside_parts if current_inside else outside_parts).append(current)
+    return inside_parts, outside_parts
+
+
+def do_export_snapshot(ctx: Ctx, out: str, **_kw) -> dict:
+    """export-snapshot：等价界面「导出全分辨率快照」（MW:8731-8777 + snapshot_export.render）。"""
+    from provenance import file_sha256
+    from pyside6_app.snapshot_export import render_snapshot_png
+
+    scene = _build_cli_snapshot_scene(ctx)
+    out_path = str(Path(out).expanduser().resolve())
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    info = render_snapshot_png(
+        ctx.tif, scene, out_path,
+        display_shape=(ctx.disp_h, ctx.disp_w), view_scale=1.0,
+    )
+    return {"png": info.get("path", out_path), "shape": info.get("source_shape"),
+            "vectors": info.get("vector_count"), "masks": info.get("mask_count"),
+            "sha256": file_sha256(info.get("path", out_path))}
+
+
+def _diagnostic_metadata(ctx: Ctx, run_label: str = "路径规划", stage: str = "export") -> dict:
+    """镜像界面 _diagnostic_metadata（MW:11177-11287）：源/模型/坐标溯源证据。"""
+    import cache as cache_mod
+    from provenance import file_sha256
+    from runtime_paths import builtin_model_dir
+
+    state = ctx.state
+    source_path = str(ctx.tif or getattr(state, "tif_path", "") or "")
+    source_width, source_height = int(ctx.full_w or 0), int(ctx.full_h or 0)
+    display_width, display_height = int(ctx.disp_w or 0), int(ctx.disp_h or 0)
+    scale_x = float(getattr(state, "display_scale_x", 0.0) or 0.0)
+    scale_y = float(getattr(state, "display_scale_y", 0.0) or 0.0)
+    if scale_x <= 0 and source_width and display_width:
+        scale_x = float(source_width) / float(display_width)
+    if scale_y <= 0 and source_height and display_height:
+        scale_y = float(source_height) / float(display_height)
+    scale_x = scale_x if scale_x > 0 else 1.0
+    scale_y = scale_y if scale_y > 0 else 1.0
+
+    boundary_display = [
+        [float(p[0]), float(p[1])]
+        for p in (getattr(state, "field_boundary", []) or [])
+        if len(p) >= 2
+    ]
+    boundary_source = [[p[0] * scale_x, p[1] * scale_y] for p in boundary_display]
+    boundary_lonlat = []
+    geo = ctx.geo
+    if geo is not None and geo.is_ready():
+        for point in boundary_source:
+            try:
+                lon, lat = geo.pixel_to_lonlat(point[0], point[1])
+                boundary_lonlat.append([float(lon), float(lat)])
+            except Exception:
+                boundary_lonlat = []
+                break
+
+    model_path = str(getattr(state, "current_model_path", "") or "")
+    model_sha256 = str(getattr(state, "model_sha256", "") or "")
+    if not model_sha256 and model_path and os.path.isfile(model_path):
+        model_sha256 = file_sha256(model_path)
+    registry = {}
+    try:
+        registry_path = os.path.join(str(builtin_model_dir()), "model_registry.json")
+        with open(registry_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        entries = payload.get("models", payload) if isinstance(payload, dict) else {}
+        if isinstance(entries, dict):
+            registry = dict(entries.get(os.path.basename(model_path), {}) or {})
+    except (OSError, ValueError, AttributeError):
+        registry = {}
+    inference_record = dict(getattr(state, "inference_provenance", {}) or {})
+    inference_inputs = dict(inference_record.get("inputs") or {})
+    try:
+        source_identity_value = cache_mod.source_identity(source_path) if source_path else {}
+    except Exception:
+        source_identity_value = {}
+    crop_window = inference_inputs.get("source_crop_window") or []
+    metadata = {
+        "run_label": str(run_label or ""),
+        "stage": str(stage),
+        "source_image": {
+            "path": os.path.abspath(source_path) if source_path else "",
+            "sha256": str(getattr(state, "source_sha256", "") or ""),
+            "identity": source_identity_value,
+            "source_raster_shape": [source_height, source_width],
+            "display_shape": [display_height, display_width],
+            "display_to_source_scale": {"x": scale_x, "y": scale_y},
+            "metadata": _jsonable(getattr(state, "source_metadata", {}) or {}),
+        },
+        "model": {
+            "name": str(getattr(state, "current_model_name", "") or ""),
+            "path": os.path.abspath(model_path) if model_path else "",
+            "sha256": model_sha256,
+            "registry": _jsonable(registry),
+        },
+        "image_position": {
+            "source_crop_window_xywh": _jsonable(crop_window),
+            "mask_offset_xy_display": [
+                int(getattr(state, "mask_offset_x", 0) or 0),
+                int(getattr(state, "mask_offset_y", 0) or 0),
+            ],
+            "field_boundary_display": boundary_display,
+            "field_boundary_source": boundary_source,
+            "field_boundary_lonlat": boundary_lonlat,
+        },
+        "inference": {
+            "algorithm_version": str(inference_record.get("algorithm_version", "") or ""),
+            "config": _jsonable(
+                inference_inputs.get("inference_config")
+                or (ctx.cfg.section("model") if getattr(ctx, "cfg", None) is not None else {})
+            ),
+            "fingerprint": str(inference_record.get("fingerprint", "") or ""),
+            "artifact_sha256": str(inference_record.get("artifact_sha256", "") or ""),
+        },
+        "preprocessing": _jsonable(getattr(state, "raster_preprocessing", {}) or {}),
+        "runtime": _jsonable(getattr(state, "inference_runtime", {}) or {}),
+        "stage_provenance": {
+            "inference": _jsonable(inference_record),
+            "mask": _jsonable(getattr(state, "mask_provenance", {}) or {}),
+        },
+    }
+    if geo is not None and geo.is_ready() and source_width > 0 and source_height > 0:
+        try:
+            metadata["source_image"]["geographic_extent"] = _jsonable(
+                geo.validate_raster_extent(source_width, source_height)
+            )
+        except Exception:
+            pass
+    return metadata
+
+
+def do_export_package(ctx: Ctx, out: str, force: bool = False, **_kw) -> dict:
+    """export-package：等价界面「导出完整试验资料包」（MW:10915-11130 三段式）。"""
+    risks, geo_points = _export_risk_gate(ctx, force)
+    from path_planner import export_path_format
+    from provenance import file_sha256
+    import trial_package
+
+    rgb = _load_display_rgb(ctx)
+    raw = _attach_raw_mask(ctx)
+    _attach_processed_mask(ctx)
+    base = Path(out).expanduser().resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    final_dir = base / f"align_trial_package_{stamp}"
+    suffix = 1
+    while final_dir.exists():
+        suffix += 1
+        final_dir = base / f"align_trial_package_{stamp}_{suffix}"
+    staging = Path(tempfile.mkdtemp(prefix=".align_package_build_", dir=str(base)))
+    manifest = None
+    try:
+        trial_package.export_visual_artifacts(
+            str(staging),
+            source_image=rgb,
+            raw_mask=raw,
+            mask_result=getattr(ctx.state, "mask_result", None) or {},
+            path_result=_path_result_from_state(ctx),
+            offset=(getattr(ctx.state, "mask_offset_x", 0), getattr(ctx.state, "mask_offset_y", 0)),
+            field_boundary=list(getattr(ctx.state, "field_boundary", None) or []),
+            forbidden_regions=list(getattr(ctx.state, "forbidden_regions", None) or []),
+            service_points={
+                "entry": getattr(ctx.state, "entry_point", None),
+                "exit": getattr(ctx.state, "exit_point", None),
+                "unload": list(getattr(ctx.state, "unload_points", None) or []),
+            },
+            geo=ctx.geo,
+            mask_config=ctx.cfg.section("mask_processing"),
+            inference_metadata=_diagnostic_metadata(ctx),
         )
-    _gate(len(point_lines) <= 5000, "路径点超过 5000，机手端无法导入，请抽稀后重试")
-
-    ctx.state.safe_update(export_done=True)
+        os.replace(staging, final_dir)
+        # 第三段：任务路径 + 审计清单 + 包索引
+        route_path = str(final_dir / "mission_field_trial.txt")
+        export_path_format(geo_points, route_path)
+        manifest = _write_export_manifest(
+            ctx, route_path, "$PATH", _path_result_from_state(ctx), geo_points)
+        trial_package.write_package_index(str(final_dir))
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
     from workflow import WorkflowUpdater
 
     WorkflowUpdater.advance(ctx.state, "EXPORTED")
+    ctx.state.safe_update(export_done=True)
     ctx.save("export")
-    return {"out_dir": str(out_dir), "files": files_info}
+    return {
+        "package_dir": str(final_dir),
+        "route": route_path,
+        "route_sha256": file_sha256(route_path),
+        "manifest": manifest,
+        "points": len(geo_points),
+        "warnings": risks,
+    }
 
 
-# ---------------------------------------------------------------------------
-# run-batch：一键全链（等价 smoke_full_pipeline，但每阶段落盘缓存）
-# ---------------------------------------------------------------------------
+def do_simulate(ctx: Ctx, frames: str | None = None, frame_stride: int = 30,
+                max_frames: int = 200000, **_kw) -> dict:
+    """simulate：等价界面「模拟演示」（MW:10440-10530；AnimationEngine WK_flow:87-619）。
+
+    离线确定性复跑：注入固定步长时钟（dt=1/30s，对齐界面 33ms 定时器），
+    逐帧取 get_interpolated_position() 位姿；--frames 输出离屏帧图与 frames.jsonl。
+    """
+    _gate(bool(getattr(ctx.state, "auto_path_planned", False)),
+          "请先生成路径后再开始模拟演示。", missing=["路径规划"])
+    segments = list(getattr(ctx.state, "auto_path_segments", None) or [])
+    _gate(bool(segments),
+          "路径点不足：当前路径点不足，无法进行模拟演示，请重新执行路径规划。",
+          missing=["路径点"])
+    import workflow
+    from workflow import AnimationEngine
+
+    engine = AnimationEngine(ctx.state, ctx.geo)
+    engine.setup(segments)
+    _gate(bool(getattr(ctx.state, "anim_total_frames", 0)),
+          "路径点不足：当前路径点不足，无法进行模拟演示，请重新执行路径规划。",
+          missing=["路径点"])
+
+    class _FixedClock:
+        """确定性帧时钟：每次 time() 前进固定 dt，使离屏轨迹与界面逐帧一致。"""
+
+        def __init__(self, dt):
+            self._t = 10_000.0
+            self._dt = dt
+
+        def time(self):
+            self._t += self._dt
+            return self._t
+
+    real_time = workflow.time
+    workflow.time = _FixedClock(1.0 / 30.0)
+    renderer = None
+    frames_rows = []
+    finished = False
+    try:
+        if frames:
+            renderer = _SimFrameRenderer(ctx, frames, frame_stride)
+        for frame_i in range(max_frames):
+            alive = engine.advance()
+            pose = engine.get_interpolated_position()
+            idx = int(getattr(ctx.state, "anim_frame", 0))
+            speed = engine._current_speed_mps(idx)
+            types = list(getattr(ctx.state, "anim_all_types", None) or ["work"])
+            frames_rows.append({
+                "frame": idx,
+                "x": round(float(pose[0][0]), 4),
+                "y": round(float(pose[0][1]), 4),
+                "heading_deg": round(float(pose[1]), 4),
+                "speed_mps": round(float(speed), 4),
+                "segment_type": types[min(idx, len(types) - 1)] if types else "work",
+                "progress": round(engine.progress_ratio(), 6),
+            })
+            if renderer is not None:
+                renderer.draw(ctx.state, pose, frame_i)
+            # 与界面 _anim_frame_tick（MW:10518-10536）同口径：引擎内部完成分支
+            # 实际上不可达（anim_frame 最大 = total-1），由外层 tick 判完成。
+            if (not alive) or idx >= int(getattr(ctx.state, "anim_total_frames", 0)) - 1:
+                finished = True
+                break
+        if not finished:
+            raise RuntimeError(f"模拟超过 {max_frames} 帧仍未结束，fail-closed")
+    finally:
+        workflow.time = real_time
+    # 界面完成分支：显式 _gen_report + WorkflowUpdater.advance("ANIMATION_DONE")
+    engine._gen_report()
+    workflow.WorkflowUpdater.advance(ctx.state, "ANIMATION_DONE")
+    ctx.state.safe_update(anim_active=False, anim_paused=False)
+    report = str(getattr(ctx.state, "anim_report", "") or "")
+    ctx.state.safe_update(simulation_done=True, anim_active=False)
+    ctx.save("simulate")
+    out = {
+        "frames": len(frames_rows),
+        "path_frames": int(getattr(ctx.state, "anim_total_frames", 0)),
+        "total_m": round(float((engine._cum_dists[-1] if getattr(engine, "_cum_dists", None) else 0.0)), 3),
+        "report": report,
+    }
+    if renderer is not None:
+        out["frames_dir"] = renderer.finish(frames_rows, report)
+    return out
+
+
+class _SimFrameRenderer:
+    """模拟演示的离屏帧渲染（CLI 便利化产物：显示网格底图 + 规划路径 + 农机位姿）。"""
+
+    def __init__(self, ctx: Ctx, out_dir: str, stride: int):
+        import cv2
+        import numpy as np
+
+        self._cv2 = cv2
+        self.dir = str(Path(out_dir).expanduser().resolve())
+        os.makedirs(self.dir, exist_ok=True)
+        self.stride = max(1, int(stride))
+        self.count = 0
+        rgb = _load_display_rgb(ctx)
+        self.base = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR) if rgb.ndim == 3 else rgb
+        path_result = _path_result_from_state(ctx)
+        for track in path_result["tracks"]:
+            pts = np.asarray(track["points"], dtype=np.int32)
+            if len(pts) >= 2:
+                cv2.polylines(self.base, [pts], False, (0, 255, 70), 1, cv2.LINE_AA)
+        for turn in path_result["turns"]:
+            pts = np.asarray(turn["points"], dtype=np.int32)
+            if len(pts) >= 2:
+                cv2.polylines(self.base, [pts], False, (70, 120, 255), 1, cv2.LINE_AA)
+
+    def draw(self, state, pose, frame_idx: int) -> None:
+        if frame_idx % self.stride != 0:
+            return
+        cv2 = self._cv2
+        canvas = self.base.copy()
+        x, y = float(pose[0][0]), float(pose[0][1])
+        heading = float(pose[1])
+        tip = (int(round(x + 18 * math.cos(math.radians(heading)))),
+               int(round(y + 18 * math.sin(math.radians(heading)))))
+        cv2.arrowedLine(canvas, (int(round(x)), int(round(y))), tip, (0, 165, 255), 2, cv2.LINE_AA)
+        cv2.circle(canvas, (int(round(x)), int(round(y))), 6, (0, 165, 255), -1, cv2.LINE_AA)
+        self.count += 1
+        cv2.imwrite(os.path.join(self.dir, f"frame_{self.count:06d}.png"), canvas)
+
+    def finish(self, rows: list, report: str) -> str:
+        with open(os.path.join(self.dir, "frames.jsonl"), "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with open(os.path.join(self.dir, "simulation_report.txt"), "w", encoding="utf-8") as fh:
+            fh.write(report + "\n")
+        return self.dir
+
+
+# ── D 组：只读与运维 ─────────────────────────────────────────────
+
+def do_query_status(ctx: Ctx, **_kw) -> dict:
+    """query-status：复用界面任务状态体系（pyside6_app/task_state.py，Qt-free 直接导入）。
+
+    derive_task_statuses 以 state.mask_raw / state.mask_result 判定识别与掩膜是否完成，
+    与界面启动恢复同口径：这里先把缓存掩膜挂回 state 再推导。
+    """
+    from pyside6_app.task_state import TASK_LABELS, TASK_ORDER, derive_task_statuses
+
+    if getattr(ctx.state, "inference_done", False) and getattr(ctx.state, "mask_raw", None) is None:
+        _attach_raw_mask(ctx)
+    if getattr(ctx.state, "mask_processed", False):
+        _attach_processed_mask(ctx)
+    statuses = derive_task_statuses(ctx.state, bool(getattr(ctx.state, "tif_path", "")))
+    tasks = []
+    for tid in TASK_ORDER:
+        st = statuses[tid]
+        tasks.append({
+            "id": tid,
+            "label": TASK_LABELS[tid],
+            "status": st.status,
+            "text": st.text,
+            "action": st.action,
+            "optional": bool(st.optional),
+            "blocker": st.blocker,
+        })
+    pending = [t for t in tasks if not t["optional"] and t["status"] not in ("done", "disabled")]
+    if pending:
+        head = pending[0]
+        next_action = head["action"] or f"{head['label']}（{head['id']}）"
+    else:
+        next_action = "全流程就绪"
+    return {
+        "workflow_step": getattr(ctx.state, "workflow_step", "IDLE"),
+        "tasks": tasks,
+        "pending_required": [t["id"] for t in pending],
+        "next_action": next_action,
+        "cache_dir": _cache_dir_of(ctx.tif),
+    }
+
+
+def _cache_dir_of(tif: str) -> str:
+    import cache as cache_mod
+
+    return cache_mod.project_cache_dir(tif)
+
+
+def do_query_diagnostics(ctx: Ctx, export_zip: str | None = None, **_kw) -> dict:
+    """query-diagnostics：汇总识别/掩膜/路径诊断（均可追溯到底层产物）。"""
+    import numpy as np
+
+    mask_result = getattr(ctx.state, "mask_result", None) or {}
+    mask_metrics = {}
+    for key, val in mask_result.items():
+        if isinstance(val, np.ndarray):
+            from provenance import artifact_sha256
+
+            mask_metrics[key] = {"shape": [int(v) for v in val.shape],
+                                 "nonzero": int(np.count_nonzero(val)),
+                                 "sha256": artifact_sha256(val)}
+        elif key in ("config", "scale_gate"):
+            continue
+        else:
+            mask_metrics[key] = val
+    diag = {
+        "source": {
+            "tif": ctx.tif,
+            "sha256": getattr(ctx.state, "source_sha256", "") or "",
+            "crs": ctx.crs,
+            "full_size": [ctx.full_w, ctx.full_h],
+            "display_size": [ctx.disp_w, ctx.disp_h],
+        },
+        "inference": {
+            "done": bool(getattr(ctx.state, "inference_done", False)),
+            "model": getattr(ctx.state, "current_model_path", "") or "",
+            "model_sha256": getattr(ctx.state, "model_sha256", "") or "",
+            "provenance": getattr(ctx.state, "inference_provenance", {}) or {},
+            "runtime": getattr(ctx.state, "inference_runtime", "") or "",
+        },
+        "mask": {
+            "processed": bool(getattr(ctx.state, "mask_processed", False)),
+            "provenance": getattr(ctx.state, "mask_provenance", {}) or {},
+            "offsets": [getattr(ctx.state, "mask_offset_x", 0),
+                        getattr(ctx.state, "mask_offset_y", 0)],
+            "metrics": mask_metrics,
+        },
+        "path": {
+            "planned": bool(getattr(ctx.state, "auto_path_planned", False)),
+            "valid": bool(getattr(ctx.state, "auto_path_valid", False)),
+            "description": getattr(ctx.state, "auto_path_desc", "") or "",
+            "validation": getattr(ctx.state, "path_validation", {}) or {},
+            "provenance": getattr(ctx.state, "path_provenance", {}) or {},
+            "runtime": getattr(ctx.state, "path_runtime", "") or "",
+        },
+        "harvester": {
+            "params": _effective_harvester_params(
+                ctx.cfg, getattr(ctx.state, "harvester_params", {}) or {}),
+            "sources": getattr(ctx.state, "harvester_param_sources", {}) or {},
+            "confirmed": bool(getattr(ctx.state, "harvester_params_confirmed", False)),
+        },
+        "workflow_step": getattr(ctx.state, "workflow_step", "IDLE"),
+    }
+    if export_zip:
+        import zipfile
+
+        cache_dir = _cache_dir_of(ctx.tif)
+        out = str(Path(export_zip).expanduser().resolve())
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        names = [
+            "project_state.json", "meta.json", "operator_paths.json",
+            "reference_lines.json", "inference_report.json", "diagnostics.json",
+        ]
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name in names:
+                path = os.path.join(cache_dir, name)
+                if os.path.isfile(path):
+                    zf.write(path, name)
+            zf.writestr("cli_diagnostics.json",
+                        json.dumps(_jsonable(diag), ensure_ascii=False, indent=2))
+        diag["export_zip"] = out
+    return diag
+
+
+def do_query_cache(**_kw) -> dict:
+    """query-cache：盘点缓存根下全部项目缓存（全局视图，不需要 --tif）。"""
+    from cache import CACHE_ROOT
+
+    rows = []
+    for state_path in sorted(Path(CACHE_ROOT).glob("*/project_state.json")):
+        entry = {"cache_dir": str(state_path.parent)}
+        try:
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+            entry["tif_path"] = state.get("tif_path", "")
+            entry["workflow_step"] = state.get("workflow_step", "")
+            entry["path_planned"] = bool(state.get("auto_path_planned"))
+        except (OSError, json.JSONDecodeError):
+            entry["tif_path"] = ""
+            entry["workflow_step"] = "<损坏>"
+        try:
+            st = state_path.stat()
+            entry["state_updated"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+            size = sum(f.stat().st_size for f in state_path.parent.rglob("*") if f.is_file())
+            entry["size_mb"] = round(size / (1024 * 1024), 2)
+        except OSError:
+            pass
+        rows.append(entry)
+    rows.sort(key=lambda r: r.get("state_updated", ""), reverse=True)
+    return {"cache_root": str(CACHE_ROOT), "projects": rows, "count": len(rows)}
+
+
+def do_restore(ctx: Ctx, **_kw) -> dict:
+    """restore：从缓存重建现场并报告（等价界面启动恢复；只读不落盘）。"""
+    state = ctx.state
+    catalog = getattr(state, "centerline_catalog", None) or {}
+    return {
+        "workflow_step": getattr(state, "workflow_step", "IDLE"),
+        "tif": getattr(state, "tif_path", "") or ctx.tif,
+        "display_size": [ctx.disp_w, ctx.disp_h],
+        "field_points": len(getattr(state, "field_boundary", None) or []),
+        "forbidden_regions": len(getattr(state, "forbidden_regions", None) or []),
+        "inference_done": bool(getattr(state, "inference_done", False)),
+        "mask_processed": bool(getattr(state, "mask_processed", False)),
+        "centerlines": len(catalog.get("items") or []),
+        "selected_worklines": len(getattr(state, "selected_centerline_ids", None) or []),
+        "entry_point": getattr(state, "entry_point", None),
+        "exit_point": getattr(state, "exit_point", None),
+        "unload_points": len(getattr(state, "unload_points", None) or []),
+        "path_planned": bool(getattr(state, "auto_path_planned", False)),
+        "path_valid": bool(getattr(state, "auto_path_valid", False)),
+        "path_points": len(getattr(state, "auto_path", None) or []),
+        "simulation_done": bool(getattr(state, "simulation_done", False)),
+        "export_done": bool(getattr(state, "export_done", False)),
+        "cache_dir": _cache_dir_of(ctx.tif),
+    }
+
+
+def do_doctor(**_kw) -> dict:
+    """doctor：CLI 环境自检（解释器 / 依赖 / 设备 / 配置 / 缓存可写）。"""
+    checks = {}
+    checks["python"] = {"version": sys.version.split()[0], "ok": sys.version_info >= (3, 10)}
+    for mod in ("numpy", "cv2", "rasterio", "pyproj", "ultralytics"):
+        try:
+            m = importlib.import_module(mod)
+            checks[mod] = {"version": getattr(m, "__version__", "?"), "ok": True}
+        except Exception as exc:
+            checks[mod] = {"ok": False, "error": str(exc)}
+    try:
+        import torch
+
+        cuda = bool(torch.cuda.is_available())
+        checks["torch"] = {
+            "version": torch.__version__, "ok": True, "cuda": cuda,
+            "device": (torch.cuda.get_device_name(0) if cuda else "cpu"),
+        }
+    except Exception as exc:
+        checks["torch"] = {"ok": False, "error": str(exc)}
+    try:
+        from config import Config
+
+        cfg = Config()
+        model_section = cfg.section("model") if hasattr(cfg, "section") else {}
+        checks["config"] = {"ok": True, "model": dict(model_section)}
+    except Exception as exc:
+        checks["config"] = {"ok": False, "error": str(exc)}
+    try:
+        from cache import CACHE_ROOT
+
+        cache_root = Path(CACHE_ROOT)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        probe = cache_root / ".doctor_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        checks["cache_root"] = {"path": str(cache_root), "writable": True, "ok": True}
+    except Exception as exc:
+        checks["cache_root"] = {"ok": False, "error": str(exc)}
+    try:
+        from provenance import APP_VERSION, git_revision
+        from runtime_paths import project_root
+
+        checks["version"] = {"app": APP_VERSION, "git": git_revision(project_root()), "ok": True}
+    except Exception as exc:
+        checks["version"] = {"ok": False, "error": str(exc)}
+    ok = all(v.get("ok") for v in checks.values())
+    return {"ok": ok, "checks": checks}
+
+
+# ── rollback / reset ─────────────────────────────────────────────
+
+def _rollback_cascade(state, tid: str) -> list:
+    """镜像界面 _rollback_from_task（MW:3568-3720）的状态级联（画布/计时器不适用，略）。"""
+    from pyside6_app.task_state import TASK_ORDER
+
+    idx = TASK_ORDER.index(tid)
+    affected = set(TASK_ORDER[idx:])
+
+    if "import_img" in affected:
+        state.safe_update(
+            tif_path="", img_h=0, img_w=0, display_h=0, display_w=0,
+            downsample_factor=1, display_scale_x=1.0, display_scale_y=1.0,
+            field_boundary=[], forbidden_regions=[], forbidden_regions_confirmed=False,
+            mask_raw=None, inference_original_mask=None, mask_result=None,
+            inference_done=False, mask_processed=False,
+        )
+    elif "draw_field" in affected:
+        state.safe_update(
+            field_boundary=[], forbidden_regions=[], forbidden_regions_confirmed=False,
+            inference_done=False, mask_raw=None, inference_original_mask=None,
+            mask_processed=False, mask_result=None,
+        )
+    elif "segment" in affected:
+        state.safe_update(
+            inference_done=False, mask_raw=None, inference_original_mask=None,
+            mask_processed=False, mask_result=None,
+        )
+    elif "process" in affected:
+        state.safe_update(mask_processed=False, mask_result=None)
+    if any(step in affected for step in ("import_img", "draw_field", "segment", "process")):
+        state.safe_update(
+            centerline_catalog={}, selected_centerline_ids=[], centerline_selection_report={},
+            work_band_catalog={}, selected_work_band_ids=[], work_band_selection_report={},
+        )
+    if "centerline_generate" in affected:
+        state.safe_update(
+            centerline_catalog={}, selected_centerline_ids=[], centerline_selection_report={},
+            work_band_catalog={}, selected_work_band_ids=[], work_band_selection_report={},
+        )
+    elif "centerline_select" in affected:
+        catalog = getattr(state, "centerline_catalog", None) or {}
+        rollback_report = {
+            "algorithm_version": "operator-centerline-selection-v1",
+            "selection_origin": "rollback",
+            "selected_ids": [],
+            "selected_count": 0,
+            "candidate_count": len(catalog.get("items") or []),
+            "selection_mode": "empty",
+        }
+        state.safe_update(
+            selected_centerline_ids=[], selected_work_band_ids=[],
+            centerline_selection_report=dict(rollback_report),
+            work_band_selection_report=dict(rollback_report),
+        )
+    if "params" in affected:
+        state.safe_update(harvester_params={}, harvester_param_sources={})
+    if "entry" in affected:
+        state.safe_update(entry_point=None, entry_point_locked=False)
+    if "exit" in affected:
+        state.safe_update(exit_point=None, exit_point_locked=False)
+    if "unload" in affected:
+        state.safe_update(unload_points=[], unload_point=None, unload_point_locked=False)
+    if "plan" in affected:
+        state.safe_update(
+            auto_path_planned=False, auto_path=[], auto_path_segments=[],
+            auto_path_geo=[], auto_path_valid=False, auto_path_desc="",
+            path_points=[], path_status=[], path_geometry_modes=[],
+        )
+    if "simulate" in affected:
+        state.safe_update(anim_active=False, anim_paused=False, simulation_done=False)
+    if "export" in affected:
+        state.export_done = False
+    return sorted(affected, key=TASK_ORDER.index)
+
+
+def do_rollback(ctx: Ctx, step: str, **_kw) -> dict:
+    """rollback：等价界面各步骤的「回退到此处」（_rollback_from_task MW:3568-3720）。"""
+    from pyside6_app.task_state import TASK_ORDER
+
+    _gate(step in TASK_ORDER,
+          f"未知任务步骤：{step}；允许：{', '.join(TASK_ORDER)}",
+          missing=[f"--step {TASK_ORDER[0]}"])
+    affected = _rollback_cascade(ctx.state, step)
+    ctx.save("rollback")
+    return {"rolled_back_to": step, "cleared_stages": affected}
+
+
+def do_reset(ctx: Ctx, yes: bool = False, **_kw) -> dict:
+    """reset：清空本项目缓存（等价界面「从零开始」）。破坏性操作，必须 --yes。"""
+    _gate(bool(yes),
+          "reset 将清空本项目全部缓存（识别/掩膜/路径/标定 sidecar 一并删除），"
+          "破坏性操作必须显式 --yes 确认。",
+          missing=["--yes"])
+    cache_dir = _cache_dir_of(ctx.tif)
+    existed = os.path.isdir(cache_dir)
+    if existed:
+        # 本进程自己的 cli.lock 就躺在缓存目录里且句柄开着——先释放再删（Windows 句柄占用）。
+        lock = getattr(ctx, "_lock", None)
+        if lock is not None:
+            lock.release()
+        shutil.rmtree(cache_dir)
+    return {"deleted": existed, "cache_dir": cache_dir}
+
 
 def run_batch(ctx: Ctx, args) -> dict:
 
@@ -1309,6 +2414,64 @@ def _add_tif(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tif", required=True, help="GeoTIFF 影像路径（项目缓存按它定位）")
 
 
+class ProjectLock:
+    """CLI 进程间缓存目录互斥：msvcrt 字节锁，进程退出自动释放（铁律 4）。
+
+    界面不参与本锁——对界面的并发防护靠 Ctx.save 的磁盘指纹检查。
+    """
+
+    def __init__(self, tif: str):
+        import cache as cache_mod
+
+        # 与 Ctx.__init__ 同款归一化（resolve）：cache 键 = md5(路径字符串)，
+        # 不统一归一化会导致锁与缓存落在不同目录（混合斜杠输入时实测复现）。
+        norm_tif = str(Path(tif).expanduser().resolve())
+        cache_dir = cache_mod.project_cache_dir(norm_tif)
+        os.makedirs(cache_dir, exist_ok=True)
+        self.path = os.path.join(cache_dir, "cli.lock")
+        self._fh = None
+
+    def acquire(self) -> None:
+        import msvcrt
+
+        self._fh = open(self.path, "a+b")
+        try:
+            self._fh.seek(0)
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            self._fh.close()
+            self._fh = None
+            raise GateError(
+                f"另一个 CLI 进程正在操作本项目缓存（{self.path} 被锁定）；"
+                "等它结束或换用另一幅影像。",
+                missing=["等待其他命令结束"],
+            ) from exc
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        import msvcrt
+
+        try:
+            self._fh.seek(0)
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        self._fh.close()
+        self._fh = None
+
+
+# 会改缓存的命令需要持锁；只读命令（query-*/restore/doctor）不持锁。
+_WRITE_COMMANDS = frozenset({
+    "load-image", "set-field", "load-model", "segment", "process-mask",
+    "gen-worklines", "select-worklines", "set-entry", "set-exit", "set-unload",
+    "set-params", "set-forbidden", "import-reference", "import-operator",
+    "plan", "simulate", "export-txt", "export-snapshot", "export-package",
+    "rollback", "reset", "run-batch",
+})
+_NO_TIF_COMMANDS = frozenset({"query-cache", "doctor"})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="align_cli",
@@ -1375,6 +2538,61 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=1800)
     p.add_argument("--stop-after", choices=BATCH_STAGES, help="跑到指定阶段即停（断点续跑实验用）")
     p.add_argument("--force", action="store_true", help="导出阶段预授权风险（等价逐条命令 export-txt --force）")
+
+    # ── 阶段 2：B/C/D 组命令 ──
+    p = sub.add_parser("set-params", help="设置农机参数（JSON 对象，写 config.json 并使旧路径失效）")
+    _add_tif(p)
+    p.add_argument("--params", required=True, help="JSON 对象，如 '{\"cutter_width_m\": 2.0}'")
+
+    p = sub.add_parser("set-forbidden", help="添加/清空禁行区（顶点为显示坐标）")
+    _add_tif(p)
+    p.add_argument("--polygon", help="'[[x,y],...]' 或 GeoJSON Polygon/Feature")
+    p.add_argument("--clear", action="store_true", help="清空全部禁行区")
+
+    p = sub.add_parser("import-reference", help="导入参考线 sidecar（JSON 文件）")
+    _add_tif(p)
+    p.add_argument("--json", dest="json_path", required=True, help="参考线 JSON 文件路径")
+
+    p = sub.add_parser("import-operator", help="导入人工标定线 sidecar（JSON 文件，导入后需重新规划）")
+    _add_tif(p)
+    p.add_argument("--json", dest="json_path", required=True, help="标定线 JSON 文件路径")
+
+    p = sub.add_parser("simulate", help="模拟演示（离线确定性复跑；可选离屏帧图）")
+    _add_tif(p)
+    p.add_argument("--frames", help="离屏帧图输出目录（缺省只输出轨迹统计与报告）")
+    p.add_argument("--frame-stride", type=int, default=30, help="帧图抽样间隔（默认每 30 帧一张）")
+    p.add_argument("--max-frames", type=int, default=200000, help="模拟帧数上限（fail-closed）")
+
+    p = sub.add_parser("export-snapshot", help="导出全分辨率快照 PNG（图层口径同界面）")
+    _add_tif(p)
+    p.add_argument("--out", required=True, help="输出 PNG 路径")
+
+    p = sub.add_parser("export-package", help="导出完整试验资料包（含审计清单与包索引）")
+    _add_tif(p)
+    p.add_argument("--out", required=True, help="输出目录")
+    p.add_argument("--force", action="store_true", help="预授权风险导出（等价界面「导出确认」弹窗）")
+
+    p = sub.add_parser("query-status", help="任务面板状态（下一步该干什么 + 阻塞原因）")
+    _add_tif(p)
+
+    p = sub.add_parser("query-diagnostics", help="诊断汇总（识别/掩膜/路径，可导出 ZIP）")
+    _add_tif(p)
+    p.add_argument("--export", dest="export_zip", help="同时导出诊断 ZIP 到该路径")
+
+    p = sub.add_parser("query-cache", help="盘点缓存根下全部项目缓存（全局视图，免 --tif）")
+
+    p = sub.add_parser("restore", help="从缓存重建现场并报告（只读）")
+    _add_tif(p)
+
+    p = sub.add_parser("doctor", help="环境自检（解释器/依赖/设备/配置/缓存，免 --tif）")
+
+    p = sub.add_parser("rollback", help="回退到指定任务步骤（清空该步骤及下游状态）")
+    _add_tif(p)
+    p.add_argument("--step", required=True, help="任务步骤 id（query-status 的 id 列）")
+
+    p = sub.add_parser("reset", help="清空本项目缓存（破坏性，必须 --yes）")
+    _add_tif(p)
+    p.add_argument("--yes", action="store_true", help="确认执行破坏性清空")
     return parser
 
 
@@ -1392,6 +2610,21 @@ def _dispatch(cmd: str, ctx: Ctx, args) -> dict:
         "set-unload": lambda: do_set_unload(ctx, points=args.points, clear=args.clear),
         "plan": lambda: do_plan(ctx),
         "export-txt": lambda: do_export_txt(ctx, out=args.out, force=bool(getattr(args, "force", False))),
+        "set-params": lambda: do_set_params(ctx, params=args.params),
+        "set-forbidden": lambda: do_set_forbidden(ctx, polygon=args.polygon, clear=args.clear),
+        "import-reference": lambda: do_import_reference(ctx, json_path=args.json_path),
+        "import-operator": lambda: do_import_operator(ctx, json_path=args.json_path),
+        "simulate": lambda: do_simulate(ctx, frames=args.frames,
+                                        frame_stride=args.frame_stride, max_frames=args.max_frames),
+        "export-snapshot": lambda: do_export_snapshot(ctx, out=args.out),
+        "export-package": lambda: do_export_package(ctx, out=args.out, force=bool(getattr(args, "force", False))),
+        "query-status": lambda: do_query_status(ctx),
+        "query-diagnostics": lambda: do_query_diagnostics(ctx, export_zip=args.export_zip),
+        "query-cache": lambda: do_query_cache(),
+        "restore": lambda: do_restore(ctx),
+        "doctor": lambda: do_doctor(),
+        "rollback": lambda: do_rollback(ctx, step=args.step),
+        "reset": lambda: do_reset(ctx, yes=bool(args.yes)),
         "run-batch": lambda: run_batch(ctx, args),
     }
     return table[cmd]()
@@ -1404,11 +2637,19 @@ def main(argv: list | None = None) -> int:
         parser.print_help()
         return EXIT_OK
     t0 = time.time()
+    lock = None
     try:
         # run-batch 的 set-field 缺省整幅
         if args.cmd == "run-batch" and not args.field_polygon:
             args.full_frame = True
-        ctx = Ctx(args.tif, restore=True)
+        if args.cmd in _NO_TIF_COMMANDS:
+            ctx = None
+        else:
+            if args.cmd in _WRITE_COMMANDS:
+                lock = ProjectLock(args.tif)
+                lock.acquire()
+            ctx = Ctx(args.tif, restore=True)
+            ctx._lock = lock  # do_reset 需要在删目录前释放本进程锁
         result = _dispatch(args.cmd, ctx, args)
         if args.cmd != "run-batch":
             _emit({"cmd": args.cmd, "status": "ok", "seconds": round(time.time() - t0, 1), "result": result})
@@ -1419,6 +2660,10 @@ def main(argv: list | None = None) -> int:
             "missing": exc.extra.get("missing", []), "seconds": round(time.time() - t0, 1),
         })
         return EXIT_GATE
+    except ParamError as exc:
+        _emit({"cmd": args.cmd, "status": "args_error", "error": str(exc),
+               "seconds": round(time.time() - t0, 1)})
+        return EXIT_ARGS
     except SystemExit:
         raise
     except Exception as exc:  # 执行失败 → 退出码 3 + traceback
@@ -1426,6 +2671,9 @@ def main(argv: list | None = None) -> int:
         _emit({"cmd": args.cmd, "status": "error", "error": f"{type(exc).__name__}: {exc}",
                "seconds": round(time.time() - t0, 1)})
         return EXIT_FAIL
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":
