@@ -61,7 +61,7 @@ def test_task_panel_has_route_edit_button_and_signal():
     assert called == [True]
 
 
-def test_prepare_route_editing_compacts_auto_path_into_control_points():
+def test_prepare_route_editing_keeps_work_polyline_in_control_points():
     window = _window()
     dense = [(float(i), 100.0) for i in range(200)]
     window.state.auto_path = [
@@ -71,15 +71,10 @@ def test_prepare_route_editing_compacts_auto_path_into_control_points():
 
     window._prepare_route_editing()
 
-    assert len(window.state.path_points) < len(dense)
-    assert window.state.path_points[0] == dense[0]
-    assert window.state.path_points[-1] == (220.0, 100.0)
-    assert window.state.path_points == [
-        (0.0, 100.0),
-        (199.0, 100.0),
-        (220.0, 100.0),
-    ]
-    assert window.state.path_status == [1, 0]
+    # 一条线原则：作业段折线点全部保留（编辑器看到的就是导出的）；
+    # 非作业段仍压缩为端点弦。
+    assert window.state.path_points == dense + [(220.0, 100.0)]
+    assert window.state.path_status == [1] * 199 + [0]
 
 
 def test_store_path_result_and_route_editor_share_the_same_control_polyline():
@@ -103,11 +98,12 @@ def test_store_path_result_and_route_editor_share_the_same_control_polyline():
 
     assert window.state.path_points == stored_points
     assert window.state.path_status == stored_status
-    assert stored_points == [(0.0, 50.0), (99.0, 50.0), (120.0, 50.0)]
-    assert stored_status == [1, 0]
+    # 作业段折线全保留；turn_reverse 非完整重耕，压缩为端点弦。
+    assert stored_points == dense_work + [(120.0, 50.0)]
+    assert stored_status == [1] * 99 + [0]
 
 
-def test_route_control_polyline_uses_only_work_line_endpoints():
+def test_route_control_polyline_keeps_work_line_polylines():
     window = _window()
     curved_work = [
         (0.0, 0.0),
@@ -122,13 +118,18 @@ def test_route_control_polyline_uses_only_work_line_endpoints():
         _segment("work", 1, [(116.0, 0.0), (140.0, -3.0), (160.0, 0.0)]),
     ])
 
+    # 一条线原则：作业折线点一个不丢；转弯压缩为端点弦。
     assert points == [
         (0.0, 0.0),
+        (25.0, 3.0),
+        (50.0, -2.0),
+        (75.0, 4.0),
         (100.0, 0.0),
         (116.0, 0.0),
+        (140.0, -3.0),
         (160.0, 0.0),
     ]
-    assert statuses == [1, 0, 1]
+    assert statuses == [1, 1, 1, 1, 0, 1, 1]
 
 
 def test_route_control_polyline_preserves_full_harvested_retrace_vertex():

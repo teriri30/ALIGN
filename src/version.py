@@ -1,3 +1,3 @@
 """Single source for the application fallback version."""
 
-APP_VERSION = "0.4.14"
+APP_VERSION = "0.4.15"

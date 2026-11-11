@@ -48,7 +48,8 @@ def test_machine_compatibility_collapses_a_curved_turn_to_one_chord():
     assert diagnostics["removed_near_duplicate_count"] == 0
 
 
-def test_machine_compatibility_compresses_each_dense_work_line_to_two_points():
+def test_machine_compatibility_keeps_every_dense_work_line_point():
+    """一条线原则：作业段折线的每个点都进入导出文件，终端沿同一折线行驶。"""
     from path_planner import prepare_machine_compatibility_points
 
     route = [
@@ -66,9 +67,10 @@ def test_machine_compatibility_compresses_each_dense_work_line_to_two_points():
     assert [
         (round(point["pixel_x"]), round(point["pixel_y"]))
         for point in points
-    ] == [(0, 0), (10, 0), (20, 10), (30, 10)]
-    assert [point["status"] for point in points] == [1, 0, 1, 0]
-    assert diagnostics["work_line_point_compression"] is True
+    ] == [(0, 0), (5, 2), (10, 0), (20, 10), (25, 7), (30, 10)]
+    assert [point["status"] for point in points] == [1, 1, 0, 1, 1, 0]
+    assert diagnostics["work_line_point_compression"] is False
+    assert diagnostics["work_line_geometry"] == "centerline_polyline"
 
 
 def test_machine_compatibility_turn_chord_ignores_multiple_non_work_segments():
@@ -109,10 +111,10 @@ def test_machine_compatibility_removes_sub_two_centimetre_points(tmp_path):
 
     points, diagnostics = export_machine_compatibility_path(route, str(output))
 
-    # A logical work line is now projected directly to its two endpoints, so
-    # the dense middle pose never reaches the protocol serializer.
-    assert diagnostics["removed_near_duplicate_count"] == 0
-    assert diagnostics["work_line_geometry"] == "straight_endpoint_chord"
+    # 折线点逐点保留（一条线原则）；亚 2 厘米的中间姿态仍被去重阈值拦下，
+    # 所以序列化输出仍是两个点。
+    assert diagnostics["removed_near_duplicate_count"] == 1
+    assert diagnostics["work_line_geometry"] == "centerline_polyline"
     assert len(points) == 2
     assert all(points[index]["status"] in (0, 1) for index in range(len(points)))
     for first, second in zip(points, points[1:]):

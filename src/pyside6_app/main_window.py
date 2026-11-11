@@ -8887,12 +8887,16 @@ class MainWindow(QMainWindow):
                     drawn_lines.append((item, points, bool(operator_points)))
                 # 画布按 z 值分层（线 25 < 端点圆 30 < 标签 31），快照按
                 # 同一先后顺序绘制，避免后画的线压住先画的标签。
-                for _item, points, is_operator in drawn_lines:
-                    scene.polyline(
-                        points,
-                        OPERATOR_LINE_COLOR_BGR if is_operator else (40, 220, 80),
-                        width=5,
-                    )
+                # 一条线原则：路径生效且路线层可见时折线与作业段同几何，
+                # 不再单独画（与 _draw_centerline_overlay 同规则）。
+                polylines_covered = self._centerline_polylines_covered_by_route()
+                if not polylines_covered:
+                    for _item, points, is_operator in drawn_lines:
+                        scene.polyline(
+                            points,
+                            OPERATOR_LINE_COLOR_BGR if is_operator else (40, 220, 80),
+                            width=5,
+                        )
                 for _item, points, _is_operator in drawn_lines:
                     marker_start, marker_end = self._centerline_endpoint_markers(
                         points, work_endpoints
@@ -10030,6 +10034,22 @@ class MainWindow(QMainWindow):
         """
         return bool(self._path_result_from_state())
 
+    def _centerline_polylines_covered_by_route(self):
+        """路径生效且路线层可见时，中心线折线与作业段是同一份几何，不再单画。
+
+        一条线原则（2026-11-11 用户定）：作业段就是行带中心线折线本身，
+        路线层的 work 段与中心线图层逐点重合。两层都画只会留下一条更宽
+        的虚影边，让用户以为还存在另一条线。路线层被用户手动关掉时中心
+        线折线恢复绘制（几何相同，仍能看到线）；路径失效后同样恢复。
+        端点圆与编号取舍不受此影响。
+        """
+        if not self._path_result_from_state():
+            return False
+        try:
+            return bool(self.image_view.display_layer_visible("route"))
+        except Exception:
+            return True
+
     def _draw_centerline_overlay(self, viewer):
         if hasattr(viewer, "clear_overlay_layer"):
             viewer.clear_overlay_layer("centerlines")
@@ -10052,6 +10072,7 @@ class MainWindow(QMainWindow):
         # 的编号登记下来；None 表示本帧没有做过取舍，快照退回画全部。
         # _centerline_labels_hidden 每次都要重建路径投影，本帧只算一次。
         labels_hidden = self._centerline_labels_hidden()
+        polylines_covered = self._centerline_polylines_covered_by_route()
         visible_labels = set()
         self._centerline_visible_label_ids = set() if labels_hidden else None
         # 端点圆要吸附到作业段端点，一次取好，别在循环里反复重建路径投影。
@@ -10085,14 +10106,16 @@ class MainWindow(QMainWindow):
                 )
                 for end_x, end_y in (marker_start, marker_end):
                     viewer.draw_circle(end_x, end_y, radius=4, color=(120, 255, 150))
-                # 路径生成后编号自动隐藏（见 _centerline_labels_hidden）：线
-                # 和端点照画（几何本身仍是路径证据），只去掉「作业线 N」文字。
+                # 路径生成后编号自动隐藏（见 _centerline_labels_hidden）；
+                # 路线层可见时折线也不再单画（与作业段同一份几何，
+                # 见 _centerline_polylines_covered_by_route），只留端点圆。
                 if labels_hidden:
-                    viewer.draw_polyline(
-                        points,
-                        color=OPERATOR_LINE_COLOR_BGR if operator_points else (40, 220, 80),
-                        width=5,
-                    )
+                    if not polylines_covered:
+                        viewer.draw_polyline(
+                            points,
+                            color=OPERATOR_LINE_COLOR_BGR if operator_points else (40, 220, 80),
+                            width=5,
+                        )
                     continue
                 # 编号写全称"中心线 N"（用户要求：只写数字信息量不够）；文字带
                 # 描边、线全程连续，被字压住的只有十来个字宽，不影响判断整条线。
@@ -10259,7 +10282,7 @@ class MainWindow(QMainWindow):
         )
         self._show_path(path_result, route_projection=True)
         # Keep the route-result list bound to the geometry currently shown.
-        # Otherwise a two-point TXT preview can sit beside stale work/turn rows
+        # Otherwise a compacted TXT preview can sit beside stale work/turn rows
         # from the pre-edit continuous planner, which is not WYSIWYG.
         self.route_info.update_route(path_result, {})
         viewer = self.image_view.viewer
@@ -11950,23 +11973,18 @@ class MainWindow(QMainWindow):
     def _build_route_control_polyline(self, segments):
         """Build the single compact polyline shared by editing and compat export.
 
-        Every work line is represented by its two endpoints.  Every contiguous
-        non-work run is represented by one straight chord, because the target
-        terminal accepts only the outgoing status values 1 (work) and 0
-        (turn/other).  The canonical ``auto_path`` remains untouched and
-        retains the dense research geometry used for scientific validation.
+        一条线原则：作业段即行带中心线折线，控制折线保留作业段的全部
+        折线点——编辑器里看到/拖动的就是导出给终端的同一份点集。连续
+        非作业段仍压缩为一条端点弦，因为终端只接受外发状态值 1（作业）
+        和 0（转弯/其他）。canonical ``auto_path`` 保持不变，继续作为
+        科学验证与足迹指标的数据源。
         """
         points = []
         statuses = []
         route_segments = list(segments or [])
         def simplify_work(source_points):
             values = np.asarray(source_points, dtype=np.float32)
-            if len(values) <= 2:
-                return [tuple(map(float, point)) for point in values]
-            return [
-                tuple(map(float, values[0])),
-                tuple(map(float, values[-1])),
-            ]
+            return [tuple(map(float, point)) for point in values]
 
         def append_control_point(point, status):
             point = (float(point[0]), float(point[1]))

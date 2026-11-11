@@ -229,8 +229,10 @@ def test_build_snapshot_scene_collects_visible_layers(tmp_path):
         masks = scene.masks
         assert any(isinstance(op, MaskOp) for op in masks)
         polylines = [op for op in scene.vectors if isinstance(op, PolylineOp)]
-        # 作业线（绿）与田块边界（蓝）、轨迹（绿粗）都在。
-        assert any(op.color_bgr == (40, 220, 80) for op in polylines)
+        # 一条线原则：路径已生成且路线层可见时，作业线折线与轨迹同一份几何，
+        # 不再单独画（否则同位置叠出一条虚影边，看起来像"两条线"）。
+        assert not any(op.color_bgr == (40, 220, 80) for op in polylines)
+        # 田块边界（蓝）与轨迹（绿粗）都在。
         assert any(op.color_bgr == FIELD_BOUNDARY_COLOR_BGR for op in polylines)
         assert any(op.color_bgr == (0, 255, 70) and op.width == 4 for op in polylines)
         labels = [op for op in scene.vectors if isinstance(op, LabelOp)]
@@ -258,6 +260,9 @@ def test_build_snapshot_scene_shows_centerline_labels_before_path(tmp_path):
         scene = window._build_snapshot_scene()
         labels = [op for op in scene.vectors if isinstance(op, LabelOp)]
         assert any(op.text == "作业线 1" for op in labels)
+        # 折线也随路径失效恢复（路径生效时由路线层承载，见一条线原则）。
+        polylines = [op for op in scene.vectors if isinstance(op, PolylineOp)]
+        assert any(op.color_bgr == (40, 220, 80) for op in polylines)
     finally:
         window.close()
 
@@ -322,6 +327,10 @@ def test_build_snapshot_scene_uses_operator_line_when_calibrated(tmp_path):
             ]
         }
         # 标定线存在时，画线数据走人线（同画布 _draw_centerline_overlay 规则）。
+        # 清除路径让中心线折线恢复绘制：路径生效时折线由路线层承载（一条线原则），
+        # 本测试验证的是折线的数据来源与坐标偏移规则。
+        window.state.auto_path_planned = False
+        window.state.auto_path_segments = []
         monkey_target = window._operator_paths_payload
         window._operator_paths_payload = lambda: window._operator_payload_override
         try:

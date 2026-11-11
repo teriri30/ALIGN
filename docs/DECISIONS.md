@@ -325,7 +325,7 @@
   4. 奇数作业线允许中心单行收尾；不得因未配对中心线拒绝整条套圈路线。
   5. 等距种植区细分线使用相对质心的局部主向坐标扫描，禁止把绝对投影再次叠加质心而只生成半段主航线。
   6. 等距区未给出显式间距时，细分线间距取 `track_gauge_m`，使相邻两趟的右履带/左履带中心线重合；掩膜缝隙补偿只能选择整块统一相位，不得逐条移动作业线；诊断必须记录 `actual_spacing_m`、`phase_offset_m` 和 `spacing_is_uniform=true`。显式 `uniform_zone_line_spacing_m` 必须在诊断中标记为研究对照。
-  7. 兼容农机控制折线中每条主作业线只保留两个端点，套圈非作业段只保留一条直线弦；canonical 稠密路径仍单独用于科研足迹验证。
+  7. ~~兼容农机控制折线中每条主作业线只保留两个端点~~（已被 2026-11-11「一条线原则」覆盖，见文末）：作业段保留行带中心线折线全部点，套圈非作业段仍只保留一条直线弦；canonical 稠密路径继续单独用于科研足迹验证。
 - **v4（2026-08-06 修订）**：同一侧田头的全部转弯先按田界逐段审计安全余量，再采用该侧最严格的共同余量；混合种植田块还必须跨全部已分类区域共同审计。接近 `2R`、且半径短缺不超过显式米制几何容差时，用向外平移的小半圆保持最小半径切线位置；超过容差仍失败关闭或使用原有安全回退，不得产生单独梨形环。
 - 原因：仅连接相邻法向作业线会把最后两条相邻作业线硬接在一起并产生过大的转弯角；两半交错顺序、共享田头墙和弓形横向切线共同表达用户确认的套圈拓扑，同时仍以作物中心线、田界和农机曲率作为安全证据。
 - 不变量：
@@ -1202,3 +1202,14 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - **田块顶点缩小**：`_field_vertex_radius` 7 → 5（圈选时顶点圆偏大）；快照 `_build_snapshot_scene` 直接引用该值，画布与出图同口径。
 - **作业线编号在路径生成后自动隐藏**：`_centerline_labels_hidden()`＝存在生效路径（`_path_result_from_state()`；待重规划虚线预览不算）。画布 `_draw_centerline_overlay` 与快照场景同规则：线、端点圆保留，只去「作业线 N」文字；路径清除/下游失效后自动恢复。挂点不需要新钩子——`_show_path` 已调 `_draw_static_display_layers` 全量重画，`_invalidate_downstream` 走 `_repair_canvas_if_state_disagrees` 对账。
 - 契约：`tests/test_snapshot_export.py` 新增 `test_build_snapshot_scene_shows_centerline_labels_before_path`、`test_centerline_labels_hidden_follows_path_state`，collects 用例改断言「有路径时编号不出现」+ 顶点半径=5。
+
+## DECISION-072：一条线原则——作业段就是中心线折线，转弯只做串联（2026-11-11）
+
+用户明确要求：「就是应该只存在一条线，而不是存在两条线，既然都已经计算拟合出最中心的一条的作业线了，那肯定那条线就是正确的，后续只要通过转弯将作业线串联起来啊」。此前规划链在三个环节各自把作业线压成首末端点弦（`straight_endpoint_chord`），画布上「中心线一条 + 路径弦一条」同位叠出虚影边，看起来就是「两条线」，与用户对「拟合出的最中心那条线才是正确作业线」的认知直接冲突。
+
+- **作业段几何**：`_connect_work_lines` 不再把套圈作业段压成两端点弦，`work_line_geometry` 改为 `centerline_polyline`，诊断 `work_line_point_compression=false`；作业段就是选中中心线的折线本身（一个点不丢）。
+- **端点外延**：共享田头墙锚点（`contour-connectors-v3`）沿折线末端局部方向推进——`_line_outward_direction` 取端点向内约 1.5 m 弧长（弧长插值，不跳 overshoot 折点）的平均方向；与主轴夹角 ≥60° 或需反向截短时回退主轴投影。锚点合并进作业线时，折线段追加外延尖端（原折点不动），两点直线保持替换端点（几何等价）。
+- **转弯职责**：转弯只负责把相邻作业线串联起来（套圈排序 + 共享田头墙 + 弓形/回退几何不变）；非作业段在控制折线与兼容导出中仍压缩为端点弦。
+- **显示去重**：路径生效且路线层可见时（`_centerline_polylines_covered_by_route`），中心线折线与作业段是同一份几何，画布 `_draw_centerline_overlay` 与快照 `_build_snapshot_scene` 都不再单独画中心线折线（端点圆、编号取舍不变）；路线层被关掉或路径失效后自动恢复。编辑器与兼容 TXT 的控制折线 `simplify_work` 保留全部作业折点——看到的就是导出的。
+- **版本**：`footprint-path-v35`（旧路径缓存重规划）；掩膜处理版本仍为 21。DECISION-012 v3 第 7 条的「每条主作业线只保留两个端点」由本条覆盖。
+- **契约**：`tests/test_contour_strategy.py`（折线保留、局部方向外延、钩子回退、尖端追加）、`tests/test_machine_compat_export.py`（折线全点导出、亚 2cm 去重保留）、`tests/test_route_edit_pyside.py`（控制折线保留折点）、`tests/test_snapshot_export.py`（有路径不画中心线折线、失效恢复）。全量 896 passed。

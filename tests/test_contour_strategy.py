@@ -212,7 +212,7 @@ def test_contour_connector_anchors_share_each_pair_end_wall():
     )
 
     assert diagnostics["fallback_reason"] is None
-    assert diagnostics["algorithm_version"] == "contour-connectors-v2"
+    assert diagnostics["algorithm_version"] == "contour-connectors-v3"
     assert diagnostics["shared_headland_lines"] is True
     assert diagnostics["turn_distances_m"] == pytest.approx([3.0, 2.0, 1.0])
     assert diagnostics["turn_distances_nonincreasing"] is True
@@ -505,8 +505,8 @@ def test_contour_route_reuses_headland_lines_and_keeps_center_single():
     assert "connector" not in segment_types
 
 
-def test_contour_route_uses_two_endpoint_work_chords_after_pairing():
-    """套圈候选先配对，再将每条主作业带固定为起终点直线。"""
+def test_contour_route_keeps_centerline_polyline_work_segments():
+    """一条线原则：套圈作业段保留行带中心线折线，不再压成端点弦。"""
     from path_planner import _connect_work_lines
 
     class _Geo:
@@ -552,10 +552,131 @@ def test_contour_route_uses_two_endpoint_work_chords_after_pairing():
         segment for segment, kind in zip(path, segment_types)
         if kind == "work"
     ]
-    assert all(len(segment) == 2 for segment in work)
     assert diagnostics["contour_ordering"]["work_line_geometry"] == (
-        "straight_endpoint_chord"
+        "centerline_polyline"
     )
+    assert len(work) == 5
+    # 每条作业段必须是某条输入折线（可能因蛇形反向），一个点都不丢。
+    canonical = {
+        tuple((float(x), float(y)) for x, y in line)
+        for line in curved_lines
+    }
+    for segment in work:
+        assert len(segment) == 3
+        as_tuple = tuple((float(x), float(y)) for x, y in segment)
+        assert as_tuple in canonical or tuple(reversed(as_tuple)) in canonical
+
+
+def test_contour_connector_extends_curved_endpoint_along_local_direction():
+    """弯曲折线端点沿末端局部方向外延到共享田头墙（不再按全田主轴硬投影）。"""
+    from path_planner import _build_contour_connector_anchors
+
+    curved = [(10.0, 10.0), (50.0, 10.0), (88.0, 13.0)]
+    straight = [(90.0, 40.0), (10.0, 40.0)]
+    polygon = np.asarray(
+        [[0.0, 0.0], [100.0, 0.0], [100.0, 50.0], [0.0, 50.0]],
+        dtype=np.float64,
+    )
+
+    anchors, diagnostics = _build_contour_connector_anchors(
+        [curved, straight],
+        main_angle=0.0,
+        field_polygon=polygon,
+        mpp=0.1,
+        config={"contour_max_endpoint_extension_m": 4.0},
+    )
+
+    assert diagnostics["fallback_reason"] is None
+    end_anchor = anchors[0]["end"]
+    # 目标必须精确落在共享墙（x=90）上……
+    assert end_anchor[0] == pytest.approx(90.0)
+    # ……但横向位置跟随末端局部方向 (38,3)：推进 2/cosθ ≈ 2.006 px 后
+    # y ≈ 13.158，而旧的主轴硬投影会停在 y=13.0。
+    assert end_anchor[1] == pytest.approx(13.158, abs=1e-3)
+
+
+def test_contour_connector_falls_back_to_axial_when_end_hooks_sideways():
+    """末端方向偏离主轴超过 60°（异常钩子）时回退主轴投影。"""
+    from path_planner import _build_contour_connector_anchors
+
+    hooked = [(10.0, 10.0), (50.0, 10.0), (52.0, 25.0)]
+    straight = [(90.0, 40.0), (10.0, 40.0)]
+    polygon = np.asarray(
+        [[0.0, 0.0], [100.0, 0.0], [100.0, 50.0], [0.0, 50.0]],
+        dtype=np.float64,
+    )
+
+    anchors, diagnostics = _build_contour_connector_anchors(
+        [hooked, straight],
+        main_angle=0.0,
+        field_polygon=polygon,
+        mpp=0.1,
+        config={"contour_max_endpoint_extension_m": 4.0},
+    )
+
+    assert diagnostics["fallback_reason"] is None
+    # 末端方向 (2,15) 与主轴 (1,0) 夹角约 82°，回退主轴投影：y 保持 25.0。
+    assert anchors[0]["end"] == pytest.approx((90.0, 25.0))
+
+
+def test_contour_route_appends_local_direction_tip_to_polyline():
+    """折线作业段保留全部中心线点，外延锚点作为尖端追加（不改动原折点）。"""
+    from path_planner import _connect_work_lines
+
+    class _Geo:
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def meters_per_pixel(_x, _y):
+            return 0.1
+
+    class _State:
+        mask_raw = np.zeros((120, 120), dtype=np.uint8)
+        mask_offset_x = 0
+        mask_offset_y = 0
+        field_boundary = [
+            (0.0, 0.0), (100.0, 0.0), (100.0, 90.0), (0.0, 90.0)
+        ]
+        entry_point = None
+        exit_point = None
+        unload_points = []
+
+    lines = [
+        [(20.0, 10.0), (50.0, 12.0), (75.0, 10.0)],
+        [(80.0, 40.0), (20.0, 40.0)],
+        [(20.0, 70.0), (50.0, 72.0), (75.0, 70.0)],
+    ]
+    path, segment_types, diagnostics = _connect_work_lines(
+        lines,
+        geo=_Geo(),
+        state=_State(),
+        min_turn_radius_m=1.0,
+        turn_strategy="contour",
+        config={
+            "turn_outward_clearance_m": 0.1,
+            "turn_safety_margin_m": 0.1,
+            "endpoint_extension_max_m": 0.0,
+            "contour_max_endpoint_extension_m": 4.0,
+        },
+        global_main_angle=0.0,
+        return_diagnostics=True,
+    )
+
+    work = [
+        segment for segment, kind in zip(path, segment_types)
+        if kind == "work"
+    ]
+    assert diagnostics["contour_route_mode"] is True
+    first = work[0]
+    # 原折线点原样保留，外延尖端追加在尾部。
+    assert first[:3] == [(20.0, 10.0), (50.0, 12.0), (75.0, 10.0)]
+    assert len(first) == 4
+    # 共享高侧墙在 x=80（最长线的端点投影）。
+    assert first[3][0] == pytest.approx(80.0)
+    # 末端局部方向 (25,-2)：外延 5 px 时 y 略降，水平投影则保持 y=10。
+    assert first[3][1] == pytest.approx(9.6, abs=1e-3)
 
 
 def test_contour_near_radius_limit_uses_shared_tangent_without_pear_loop():

@@ -42,7 +42,7 @@ from headland_turn_validation import (
 )
 
 
-PATH_PLANNING_VERSION = "footprint-path-v34"
+PATH_PLANNING_VERSION = "footprint-path-v35"
 
 
 def _adjacent_snake_order_work_lines(
@@ -506,6 +506,61 @@ def _select_contour_entry_rotation(
     return [list(item[0]) for item in selected_records]
 
 
+def _line_outward_direction(
+    line: List[Tuple[float, float]],
+    endpoint: str,
+    mpp: float,
+    *,
+    span_m: float = 1.5,
+) -> Optional[Tuple[float, float]]:
+    """Local outward unit direction at a polyline endpoint (pixel units).
+
+    一条线原则：作业段就是行带中心线折线本身，端点外延必须沿折线末端
+    局部走向推进，而不是沿全田主轴硬投影——后者会把末端轻微弯曲的
+    作业线拉出一个拐角。取端点向内约 span_m 弧长内的平均方向抑制单点
+    噪声；折线退化时返回 None，调用方回退到全局主轴方向。
+    """
+    points = list(line or [])
+    if len(points) < 2:
+        return None
+    try:
+        span_px = max(float(span_m), 0.0) / max(float(mpp), 1e-9)
+    except (TypeError, ValueError):
+        span_px = 0.0
+    if endpoint == "start":
+        base = np.asarray(points[0], dtype=np.float64)
+        inward = points[1:]
+    else:
+        base = np.asarray(points[-1], dtype=np.float64)
+        inward = list(reversed(points[:-1]))
+    if not np.all(np.isfinite(base)):
+        return None
+    anchor = None
+    walked = 0.0
+    previous = base
+    for raw_point in inward:
+        point = np.asarray(raw_point, dtype=np.float64)
+        if not np.all(np.isfinite(point)):
+            return None
+        leg = float(np.linalg.norm(point - previous))
+        # 在 span 弧长处线性插值，而不是跳到 overshoot 的折点：否则长直线
+        # 段会把近端的真实局部走向平均掉。
+        if leg > 1e-12 and walked + leg >= span_px:
+            ratio = (span_px - walked) / leg
+            anchor = previous + (point - previous) * ratio
+            break
+        walked += leg
+        anchor = point
+        previous = point
+    if anchor is None:
+        return None
+    vector = base - anchor
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-9:
+        return None
+    return (float(vector[0] / norm), float(vector[1] / norm))
+
+
 def _build_contour_connector_anchors(
     oriented_lines: List[List[Tuple[float, float]]],
     main_angle: float,
@@ -531,7 +586,7 @@ def _build_contour_connector_anchors(
     cfg = dict(config or {})
     diagnostics = {
         "enabled": True,
-        "algorithm_version": "contour-connectors-v2",
+        "algorithm_version": "contour-connectors-v3",
         "connector_count": 0,
         "shared_headland_lines": False,
         "center_single_finish": bool(len(oriented_lines) % 2),
@@ -663,7 +718,25 @@ def _build_contour_connector_anchors(
             projection = record[f"{endpoint_name}_projection"]
             side = record[f"{endpoint_name}_side"]
             target_projection = wall_projection[side]
+            # 一条线原则：作业段即行带中心线折线，端点外延沿折线末端局部
+            # 方向推进到共享田头墙，不再沿全田主轴硬投影——后者会把末端
+            # 轻微弯曲的折线拉出一个拐角。末端方向与主轴夹角超过 60°
+            # （退化/异常）或需要反向截短时，回退主轴投影以保持原语义。
             target = endpoint + direction * (target_projection - projection)
+            local_direction = _line_outward_direction(
+                oriented_lines[line_index], endpoint_name, mpp
+            )
+            if local_direction is not None:
+                alignment = float(
+                    local_direction[0] * direction[0]
+                    + local_direction[1] * direction[1]
+                )
+                if abs(alignment) >= 0.5:
+                    travel = (target_projection - projection) / alignment
+                    if travel >= 0.0:
+                        target = endpoint + np.asarray(
+                            local_direction, dtype=np.float64
+                        ) * travel
             extension_m = float(np.linalg.norm(target - endpoint) * mpp)
             if extension_m > max_extension_m + 1e-6:
                 diagnostics["fallback_reason"] = "headland_wall_extension_too_long"
@@ -3257,20 +3330,15 @@ def _connect_work_lines(
         # must not be replaced by the pear/bulb fallback used by ordinary bow
         # requests.
         turn_request_strategy = "contour"
-        # The contour candidate is also the machine-facing straight-line
-        # topology: retain only the crop-supported endpoints of each already
-        # generated parallel pass.  This makes the route's work segments agree
-        # with the two-point control/export contract; the other candidate
-        # strategies continue to retain their dense canonical geometry.
+        # 一条线原则：套圈作业段保留行带中心线折线本身，不再压成首末端点
+        # 弦——拟合出的最中心那条线才是正确作业线，转弯只接在折线端点上
+        # （端点外延沿折线末端局部方向，见 _build_contour_connector_anchors）。
         ordered_lines = [
-            [
-                (float(line[0][0]), float(line[0][1])),
-                (float(line[-1][0]), float(line[-1][1])),
-            ]
+            [(float(point[0]), float(point[1])) for point in line]
             for line in ordered_lines
             if len(line) >= 2
         ]
-        contour_ordering["work_line_geometry"] = "straight_endpoint_chord"
+        contour_ordering["work_line_geometry"] = "centerline_polyline"
         contour_ordering["work_line_point_counts"] = [
             len(line) for line in ordered_lines
         ]
@@ -3677,11 +3745,12 @@ def _connect_work_lines(
             f"contour geometry unavailable: {contour_fallback_reason or 'unknown'}"
         )
 
-    # 锚点延长合并进作业线本身：锚点沿主方向延长（同法向、叉积小）时，
-    # 直接把作业线端点延伸到锚点位置。否则转弯段会包含数十米的
+    # 锚点延长合并进作业线本身：锚点沿主方向或折线末端局部方向延长（叉积
+    # 小）时，直接把作业线端点延伸到锚点位置。否则转弯段会包含数十米的
     # turn_approach 空驶（用户视角的"长转弯"），且直线看起来没有走完；
     # 合并后作业线完整延伸到田头，转弯保持短小。侧面调整（法向偏移大）
-    # 仍保留 approach 段。
+    # 仍保留 approach 段。折线保留全部中心线点，锚点作为外延尖端追加；
+    # 两点直线替换端点（与追加几何等价，保持两点形态）。
     if oriented and turn_anchors:
         direction_x = math.cos(float(alignment_angle))
         direction_y = math.sin(float(alignment_angle))
@@ -3700,10 +3769,24 @@ def _connect_work_lines(
                 distance = math.hypot(dx, dy)
                 if distance < 1e-6 or distance > max_merge_distance_px:
                     continue
-                # 锚点必须沿主方向延长（叉积小）；偏离超过 0.3m 视为侧面调整
-                if abs(dx * direction_y - dy * direction_x) > merge_side_tolerance_px:
+                local_direction = _line_outward_direction(
+                    line, endpoint_name, mpp
+                )
+                references = [(direction_x, direction_y)]
+                if local_direction is not None:
+                    references.append(local_direction)
+                if all(
+                    abs(dx * ref_y - dy * ref_x) > merge_side_tolerance_px
+                    for ref_x, ref_y in references
+                ):
                     continue
-                line[point_index] = anchor
+                if len(line) > 2:
+                    if point_index == 0:
+                        line.insert(0, anchor)
+                    else:
+                        line.append(anchor)
+                else:
+                    line[point_index] = anchor
         endpoint_alignment["long_anchor_extensions_merged_into_work_lines"] = True
 
     # DECISION-016/017: audit the entry against the geometry that will actually
@@ -5195,16 +5278,12 @@ def _machine_compatibility_edges(groups: List[Dict]) -> List[Tuple[Dict, Dict, i
             raise ValueError(
                 f"第 {work_index + 1} 条 work 作业线少于两个点，不能生成兼容路径"
             )
-        # The target controller consumes one straight work edge per logical
-        # work line.  Intermediate research poses are deliberately discarded
-        # here; otherwise the visible two-point route and the exported file
-        # would diverge again for curved/dense canonical segments.
-        edges.append((
-            work_points[0],
-            work_points[-1],
-            1,
-            "work",
-        ))
+        # 一条线原则：作业段即行带中心线折线，导出的工作边必须与画布/
+        # 快照中的可见几何为同一份点集——逐相邻点生成 status=1 作业边，
+        # 终端按短直线段依次跟随，等效沿中心线行驶。只丢弃非作业段的
+        # 内部姿态（转弯压缩为端点弦），作业折线本身一点不丢。
+        for first, second in zip(work_points, work_points[1:]):
+            edges.append((first, second, 1, "work"))
 
         if position + 1 < len(work_indices):
             next_work_index = work_indices[position + 1]
@@ -5306,7 +5385,9 @@ def prepare_machine_compatibility_points(
     The research route keeps its physical turn curves.  This projection
     collapses each contiguous non-work run between two work lines to one
     straight chord and assigns the status to the outgoing edge, matching the
-    supplied terminal sample (1=work, 0=turn).
+    supplied terminal sample (1=work, 0=turn).  Work runs keep every
+    centerline polyline point (一条线原则): the terminal follows the same
+    point set the canvas displays.
     """
     geo_points = validate_geo_points(geo_points)
     cfg = Config()
@@ -5420,8 +5501,8 @@ def prepare_machine_compatibility_points(
             str(edge[3]) == "turn_reverse" for edge in edges
         )),
         "removed_near_duplicate_count": int(removed_count),
-        "work_line_geometry": "straight_endpoint_chord",
-        "work_line_point_compression": True,
+        "work_line_geometry": "centerline_polyline",
+        "work_line_point_compression": False,
         "deduplicate_distance_m": float(threshold),
         "route_id": 0,
         "status_codes": {
