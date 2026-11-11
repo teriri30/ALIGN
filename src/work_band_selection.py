@@ -15,6 +15,79 @@ import cv2
 CATALOG_VERSION = "operator-work-band-catalog-v1"
 CENTERLINE_CATALOG_VERSION = "operator-centerline-catalog-v1"
 
+# 端点短刺判定：末段短于线长的 2% 且与线身夹角大于 12°，基本只可能是端部采样残差。
+# 端部那一段是逐站横向偏移的最后一站，行带在田头收窄时这一站容易落在带边，
+# 保留下来画布上的线端就会出现钩状折角（实测 0.10–0.50 m、19°–90°）。
+END_SPUR_MAX_SEGMENT_RATIO = 0.02
+END_SPUR_MAX_TURN_DEG = 12.0
+END_SPUR_MAX_TOTAL_RATIO = 0.04
+END_SPUR_MAX_ITERATIONS = 3
+
+
+def _polyline_length(points: np.ndarray) -> float:
+    if points.shape[0] < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+
+
+def _vertex_turn_deg(prev: np.ndarray, seg: np.ndarray) -> float:
+    prev_len = float(np.linalg.norm(prev))
+    seg_len = float(np.linalg.norm(seg))
+    if prev_len <= 1e-12 or seg_len <= 1e-12:
+        return 0.0
+    cos = float(np.dot(prev, seg) / (prev_len * seg_len))
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+
+
+def trim_centerline_end_spurs(
+    line: Iterable[Sequence[float]],
+    *,
+    max_segment_ratio: float = END_SPUR_MAX_SEGMENT_RATIO,
+    max_turn_deg: float = END_SPUR_MAX_TURN_DEG,
+    max_total_ratio: float = END_SPUR_MAX_TOTAL_RATIO,
+    max_iterations: int = END_SPUR_MAX_ITERATIONS,
+) -> List[Tuple[float, float]]:
+    """去掉中心线两端的短刺，返回保序的新点列（不改变中间几何）。
+
+    判据只看相对量（末段占线长的比例 + 与线身夹角），因此不需要米制标定：
+    端点处一小段离线、且方向突变，是横向逐站估计在田头收窄处的残差，不是真实行向。
+    """
+    clean = _clean_line(line)
+    if len(clean) < 3:
+        return clean
+    points = np.asarray(clean, dtype=np.float64)
+    total = _polyline_length(points)
+    if total <= 0.0:
+        return clean
+    length_limit = max_segment_ratio * total
+    budget = max_total_ratio * total
+    trimmed = 0.0
+    for _ in range(max(0, int(max_iterations))):
+        changed = False
+        for at_end in (True, False):
+            if points.shape[0] <= 2:
+                break
+            if at_end:
+                seg = points[-1] - points[-2]
+                prev = points[-2] - points[-3]
+            else:
+                seg = points[0] - points[1]
+                prev = points[1] - points[2]
+            seg_len = float(np.linalg.norm(seg))
+            spur = seg_len <= 1e-12 or (
+                seg_len <= length_limit
+                and _vertex_turn_deg(prev, seg) > max_turn_deg
+            )
+            if not spur or trimmed + seg_len > budget:
+                continue
+            points = points[:-1] if at_end else points[1:]
+            trimmed += seg_len
+            changed = True
+        if not changed:
+            break
+    return [(float(x), float(y)) for x, y in points]
+
+
 
 def _clean_line(line: Iterable[Sequence[float]]) -> List[Tuple[float, float]]:
     points = np.asarray(list(line or []), dtype=np.float64)
@@ -60,6 +133,7 @@ def build_work_band_catalog(
             line = _clean_line(raw_line)
             if not line:
                 continue
+            line = trim_centerline_end_spurs(line)
             records.append({
                 "region_id": region.get("region_id"),
                 "region_line_index": int(line_index),
@@ -274,7 +348,7 @@ def migrate_cached_centerline_catalog(catalog: Optional[Dict]) -> Tuple[Dict, Di
         updated["legacy_id"] = str(updated.get("legacy_id") or old_id)
         updated["id"] = new_id
         updated["label"] = f"中心线 {sequence}"
-        updated["centerline"] = list(
+        updated["centerline"] = trim_centerline_end_spurs(
             updated.get("centerline") or updated.get("work_line") or []
         )
         items.append(updated)

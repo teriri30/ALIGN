@@ -1009,3 +1009,72 @@ def test_checkbox_toggle_preserves_confirmation_state():
     window.close()
 
 
+
+
+def test_centerline_terminal_hook_is_trimmed():
+    from work_band_selection import trim_centerline_end_spurs
+
+    # 56 m 的线（约 4000 显示像素），末端多出一段 12 px、与线身成 90° 的短刺
+    line = [(0.0, 0.0), (2000.0, 0.0), (4000.0, 0.0), (4000.0, -12.0)]
+
+    assert trim_centerline_end_spurs(line) == [
+        (0.0, 0.0), (2000.0, 0.0), (4000.0, 0.0)
+    ]
+
+
+def test_centerline_start_hook_is_trimmed():
+    from work_band_selection import trim_centerline_end_spurs
+
+    line = [(-9.0, 3.0), (0.0, 0.0), (2000.0, 0.0), (4000.0, 0.0)]
+
+    assert trim_centerline_end_spurs(line) == [
+        (0.0, 0.0), (2000.0, 0.0), (4000.0, 0.0)
+    ]
+
+
+def test_centerline_gentle_taper_is_kept():
+    from work_band_selection import trim_centerline_end_spurs
+
+    # 末段 140 px = 线长的 3.4%，且只偏 2.9°：属于正常的端部收敛，不动
+    line = [(0.0, 0.0), (2000.0, 0.0), (4000.0, 0.0), (4140.0, 7.0)]
+
+    assert trim_centerline_end_spurs(line) == line
+
+
+def test_centerline_short_line_is_not_eaten():
+    from work_band_selection import trim_centerline_end_spurs
+
+    # 很短的线：末段 6 px 已占线长 6%，超过 2% 上限，不该为了去刺把线吃光
+    line = [(0.0, 0.0), (100.0, 0.0), (100.0, 6.0)]
+
+    assert trim_centerline_end_spurs(line) == line
+
+
+def test_build_catalog_trims_hooked_centerline_geometry():
+    from work_band_selection import build_work_band_catalog
+
+    region = _region("right", [0.0])
+    region["work_lines"] = [[(10.0, 0.0), (2000.0, 0.0), (4000.0, 0.0), (4000.0, 12.0)]]
+
+    catalog = build_work_band_catalog([region], main_angle=0.0)
+
+    item = catalog["items"][0]
+    assert item["work_line"] == [(10.0, 0.0), (2000.0, 0.0), (4000.0, 0.0)]
+
+
+def test_cached_catalog_with_hook_is_trimmed_on_migration():
+    from work_band_selection import migrate_cached_centerline_catalog
+
+    catalog, _ = migrate_cached_centerline_catalog({
+        "algorithm_version": "operator-work-band-catalog-v1",
+        "items": [{
+            "id": "work-band-001",
+            "sequence": 1,
+            "work_line": [(0.0, 0.0), (2000.0, 0.0), (4000.0, 0.0), (4000.0, 12.0)],
+            "centerline": [(0.0, 0.0), (2000.0, 0.0), (4000.0, 0.0), (4000.0, 12.0)],
+        }],
+    })
+
+    assert catalog["items"][0]["centerline"] == [
+        (0.0, 0.0), (2000.0, 0.0), (4000.0, 0.0)
+    ]

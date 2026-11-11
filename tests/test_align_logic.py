@@ -24,18 +24,19 @@ def _window():
 
 
 def test_snapshot_save_uses_next_number_in_selected_folder(monkeypatch, tmp_path):
+    # DECISION-070 后快照走原图分辨率后台导出（_export_full_resolution_snapshot），
+    # 不再控件截图；本契约只钉住「选文件夹、不覆盖文件、自动递增编号、记住目录」，
+    # 图层与像素级渲染由 tests/test_snapshot_export.py 验证。
     window = _window()
     (tmp_path / "snapshot.png").write_bytes(b"old-default")
     (tmp_path / "快照1.png").write_bytes(b"one")
     (tmp_path / "快照2.jpg").write_bytes(b"two")
     saved = []
 
-    class FakeGrab:
-        def save(self, path):
-            target = Path(path)
-            target.write_bytes(b"snapshot")
-            saved.append(target)
-            return True
+    def fake_export(path):
+        target = Path(path)
+        target.write_bytes(b"snapshot")
+        saved.append(target)
 
     def reject_filename_dialog(*_args, **_kwargs):
         raise AssertionError("snapshot saving must select a folder, not overwrite a file")
@@ -48,7 +49,7 @@ def test_snapshot_save_uses_next_number_in_selected_folder(monkeypatch, tmp_path
         "pyside6_app.main_window.QFileDialog.getExistingDirectory",
         lambda *_args, **_kwargs: str(tmp_path),
     )
-    monkeypatch.setattr(window.image_view.viewer, "grab", lambda: FakeGrab())
+    monkeypatch.setattr(window, "_export_full_resolution_snapshot", fake_export)
 
     window._on_save_snapshot()
     window._on_save_snapshot()

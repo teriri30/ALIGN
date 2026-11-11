@@ -56,6 +56,7 @@ from workflow import WorkflowUpdater, AnimationEngine
 from project_log import ProjectJournal
 from task_lifecycle import admit_task_result, make_task_token
 from pyside6_app.project_session import cached_path_restore_plan, reset_project_state
+from pyside6_app.snapshot_export import SnapshotExportWorker, SnapshotScene
 from runtime_paths import builtin_model_dir
 import interaction_log
 import operator_paths
@@ -4062,7 +4063,9 @@ class MainWindow(QMainWindow):
         return 4
 
     def _field_vertex_radius(self):
-        return 7
+        # 2026-11-10 用户要求缩小：7 → 5（圈选时顶点圆显得偏大）。快照
+        # 导出直接引用本值，保持画布与出图同口径。
+        return 5
 
     def _redraw_field_overlay(self, mouse_pos=None):
         viewer = self.image_view.viewer
@@ -8719,10 +8722,426 @@ class MainWindow(QMainWindow):
         directory = os.path.abspath(directory)
         self._snapshot_directory = directory
         path = self._next_snapshot_path(directory)
-        if self.image_view.viewer.grab().save(path):
-            self.log_panel.success(f"已保存: {path}")
-        else:
-            self.log_panel.error(f"保存失败: {path}")
+        self._export_full_resolution_snapshot(path)
+
+    def _export_full_resolution_snapshot(self, path):
+        """在原始栅格上重绘当前可见图层并写出快照（DECISION-070）。
+
+        旧路径是 ``viewer.grab()`` 控件截图，分辨率被屏幕和缩放钉死；这里
+        改为后台读取全分辨率原图并叠加与画布同源的图层。失败时如实报错，
+        不回退到控件截图（截图会掩盖问题且产出的图仍是低分辨率）。
+        """
+        tif_path = str(self._tif_path or getattr(self.state, "tif_path", "") or "")
+        if (
+            not isinstance(self._tif_rgb, np.ndarray)
+            or not tif_path
+            or not os.path.isfile(tif_path)
+        ):
+            self.log_panel.error("请先加载影像，再导出快照。")
+            return
+        if self._has_background_worker():
+            self.log_panel.warn(
+                "任务正在运行：请等待当前任务完成后再导出快照。"
+            )
+            return
+        scene = self._build_snapshot_scene()
+        display_shape = (int(self._tif_rgb.shape[0]), int(self._tif_rgb.shape[1]))
+        # WYSIWYG：把导出时刻的视图比例尺带进渲染，线宽/半径/字号按它换算，
+        # 否则快照等于“100% 缩放下的画布”，在适应窗口下看只有画布的 1/4 粗。
+        view_scale = 1.0
+        try:
+            view_scale = float(self.image_view.viewer.get_view_scale() or 1.0)
+        except Exception:
+            view_scale = 1.0
+        worker = SnapshotExportWorker(
+            tif_path, scene, path, display_shape, view_scale=view_scale
+        )
+        worker.finished.connect(self._on_snapshot_export_done)
+        if not self._start_background_worker(
+            worker,
+            "正在导出原图分辨率快照（读取原图 → 叠加当前图层 → 写出文件）...",
+        ):
+            return
+        self.set_status_text(f"正在导出快照: {os.path.basename(path)}", "busy")
+
+    @Slot(dict)
+    def _on_snapshot_export_done(self, result):
+        result = dict(result or {})
+        path = str(result.get("path") or "")
+        shape = result.get("source_shape") or []
+        scale = result.get("display_scale") or []
+        detail = ""
+        if len(shape) == 2:
+            detail += f"，原图 {int(shape[1])}×{int(shape[0])}"
+        if len(scale) == 2:
+            detail += f"，显示→原图 {float(scale[0]):.2f}×{float(scale[1]):.2f}"
+        anchor = result.get("view_scale")
+        if anchor:
+            # 可溯源：快照的线宽/字号锚定在导出那一刻的视图比例尺上，
+            # 复现时按同一屏幕尺寸查看才与画布一致（见 snapshot_export）。
+            detail += f"，按视图 {float(anchor):.2f}× 还原"
+        self.progress_bar.hide()
+        if hasattr(self, "btn_cancel_task"):
+            self.btn_cancel_task.hide()
+        self.top_toolbar.set_progress(0)
+        self.top_toolbar.set_worker_cancel_visible(False)
+        self.set_status_text("快照导出完成", "ready")
+        self.log_panel.success(f"已保存快照: {path}{detail}")
+
+    def _build_snapshot_scene(self):
+        """把画布上当前可见的操作图层收集成快照绘制指令。
+
+        数据源、色号、叠加顺序与画布绘制同源（_draw_static_display_layers
+        → _show_path / _show_machine_route_preview）；坐标统一为显示网格
+        像素，由 snapshot_export 按 display_scale 还原到原图。图层的取舍跟
+        随显示图层面板的可见性；对比模式（_show_mask_before）下画布只有
+        原始影像，快照同样不叠加任何图层。线宽/半径/字号按导出时刻的视图
+        比例尺换算（见 snapshot_export.render_snapshot_png 的 view_scale），
+        标签沿用画布本帧的碰撞过滤结果。
+        """
+        scene = SnapshotScene()
+        if not isinstance(self._tif_rgb, np.ndarray):
+            return scene
+        if getattr(self, "_show_mask_before", False):
+            return scene
+        layer_visible = self.image_view.display_layer_visible
+
+        # ── 掩膜（raw → headland → uncertain → processed，画布同序同色） ──
+        raw = getattr(self.state, "mask_raw", None)
+        if isinstance(raw, np.ndarray) and layer_visible("raw_mask"):
+            raw, raw_x, raw_y = self._normalise_mask_for_overlay(raw)
+            raw = self._display_mask_clipped_to_field(raw, raw_x, raw_y)
+            if isinstance(raw, np.ndarray) and raw.size:
+                scene.mask(raw, raw_x, raw_y, (100, 210, 255))
+        mask_result = getattr(self.state, "mask_result", None)
+        mask_result = mask_result if isinstance(mask_result, dict) else {}
+        processed = mask_result.get("processed_mask")
+        if isinstance(processed, np.ndarray) and (
+            layer_visible("processed_mask")
+            or layer_visible("headland_mask")
+            or layer_visible("uncertain_residual")
+        ):
+            processed, mask_x, mask_y = self._normalise_mask_for_overlay(processed)
+            processed = self._display_mask_clipped_to_field(processed, mask_x, mask_y)
+            headland = mask_result.get("headland_mask")
+            if layer_visible("headland_mask") and isinstance(headland, np.ndarray):
+                headland, headland_x, headland_y = self._normalise_mask_for_overlay(
+                    headland
+                )
+                if headland.shape[:2] == processed.shape[:2]:
+                    headland = self._display_mask_clipped_to_field(
+                        headland, headland_x, headland_y
+                    )
+                    scene.mask(headland, headland_x, headland_y, (210, 230, 120))
+            uncertain = mask_result.get("uncertain_residual_mask")
+            if layer_visible("uncertain_residual") and isinstance(uncertain, np.ndarray):
+                uncertain, uncertain_x, uncertain_y = self._normalise_mask_for_overlay(
+                    uncertain
+                )
+                if uncertain.shape[:2] == processed.shape[:2]:
+                    uncertain = self._display_mask_clipped_to_field(
+                        uncertain, uncertain_x, uncertain_y
+                    )
+                    scene.mask(uncertain, uncertain_x, uncertain_y, (170, 170, 190))
+            if layer_visible("processed_mask") and processed.size:
+                scene.mask(processed, mask_x, mask_y, (120, 255, 140))
+
+        # ── 作业线（选中项；已标定的人工线替换算法线，画布同规则） ──
+        if layer_visible("centerlines"):
+            catalog = (
+                getattr(self.state, "centerline_catalog", None)
+                or getattr(self.state, "work_band_catalog", {})
+                or {}
+            )
+            items = [
+                item
+                for item in (catalog.get("items") or [])
+                if isinstance(item, dict)
+            ]
+            selected = {
+                str(value)
+                for value in (
+                    getattr(self.state, "selected_centerline_ids", None)
+                    or getattr(self.state, "selected_work_band_ids", [])
+                    or []
+                )
+            }
+            if items and selected:
+                anchors = self._aligned_label_anchors(items, selected)
+                operator_payload = self._operator_paths_payload()
+                work_endpoints = self._work_segment_endpoints()
+                drawn_lines = []
+                for item in items:
+                    if str(item.get("id")) not in selected:
+                        continue
+                    points = self._centerline_display_points(item)
+                    operator_points = None
+                    record = self._operator_record_for_item(item, operator_payload)
+                    if record is not None:
+                        local = operator_paths.as_points(record.get("points") or [])
+                        if local.size >= 2:
+                            operator_points = self._calibration_local_to_display(local)
+                            points = operator_points
+                    if len(points) < 2:
+                        continue
+                    drawn_lines.append((item, points, bool(operator_points)))
+                # 画布按 z 值分层（线 25 < 端点圆 30 < 标签 31），快照按
+                # 同一先后顺序绘制，避免后画的线压住先画的标签。
+                for _item, points, is_operator in drawn_lines:
+                    scene.polyline(
+                        points,
+                        OPERATOR_LINE_COLOR_BGR if is_operator else (40, 220, 80),
+                        width=5,
+                    )
+                for _item, points, _is_operator in drawn_lines:
+                    marker_start, marker_end = self._centerline_endpoint_markers(
+                        points, work_endpoints
+                    )
+                    for end_x, end_y in (marker_start, marker_end):
+                        scene.circle(end_x, end_y, 4, (120, 255, 150))
+                # 编号与画布同规则：路径生成后自动隐藏（见 _centerline_labels_hidden），
+                # 且只画画布当前没被碰撞过滤掉的编号（缩放相关，见
+                # _draw_centerline_overlay 的 _centerline_visible_label_ids）。
+                if not self._centerline_labels_hidden():
+                    visible_labels = getattr(
+                        self, "_centerline_visible_label_ids", None
+                    )
+                    for item, points, _is_operator in drawn_lines:
+                        if isinstance(visible_labels, set) and str(
+                            item.get("id")
+                        ) not in visible_labels:
+                            continue
+                        label = str(item.get("label") or item.get("id") or "中心线")
+                        angle = math.degrees(
+                            math.atan2(
+                                points[-1][1] - points[0][1],
+                                points[-1][0] - points[0][0],
+                            )
+                        )
+                        while angle > 90.0:
+                            angle -= 180.0
+                        while angle < -90.0:
+                            angle += 180.0
+                        anchor = anchors.get(str(item.get("id"))) or self._point_along_polyline(
+                            points, 0.5
+                        )
+                        scene.label(
+                            anchor[0], anchor[1], label, size=9, rotation=angle
+                        )
+
+        # ── 参考线（研究标注证据；画布默认不显示，跟随图层勾选） ──
+        if layer_visible("reference_lines"):
+            import reference_lines
+
+            for line in list(self._reference_lines_payload().get("lines") or []):
+                points = [
+                    (float(point[0]), float(point[1]))
+                    for point in (line.get("points") or [])
+                    if len(point) >= 2
+                ]
+                if len(points) < 2:
+                    continue
+                try:
+                    fit = reference_lines.reference_fit(line)
+                    p1 = (float(fit["p1"][0]), float(fit["p1"][1]))
+                    p2 = (float(fit["p2"][0]), float(fit["p2"][1]))
+                except ValueError:
+                    p1 = None
+                if p1 is not None:
+                    scene.polyline([p1, p2], REFERENCE_FIT_COLOR_BGR, width=1, dash=True)
+                scene.polyline(points, REFERENCE_LINE_COLOR_BGR, width=2)
+                for px, py in points:
+                    scene.circle(px, py, 5, REFERENCE_STATION_COLOR_BGR)
+
+        # ── 田块边界（闭合蓝线 + 顶点圆）与禁行区 ──
+        boundary = list(getattr(self.state, "field_boundary", []) or [])
+        if layer_visible("field_boundary") and len(boundary) >= 3:
+            closed = boundary + [boundary[0]]
+            scene.polyline(closed, FIELD_BOUNDARY_COLOR_BGR, width=4)
+            for px, py in boundary:
+                # 与画布 _field_vertex_radius 同值（2026-11-10 用户要求缩小）。
+                scene.circle(px, py, self._field_vertex_radius(), (255, 255, 0))
+        if layer_visible("forbidden_regions"):
+            for index, region in enumerate(
+                getattr(self.state, "forbidden_regions", []) or []
+            ):
+                if len(region) < 3:
+                    continue
+                scene.polygon(region, (35, 35, 220), outline=(20, 20, 255), width=2)
+                center = np.mean(np.asarray(region, dtype=np.float64), axis=0)
+                scene.label(
+                    float(center[0]),
+                    float(center[1]),
+                    f"禁行 {index + 1}",
+                    color=(245, 245, 245),
+                    size=10,
+                    center=False,
+                    halo=False,
+                    bold=False,
+                )
+
+        # ── 服务点（起点/终点/卸粮点，画布同半径同色） ──
+        if self._service_points_should_show() or layer_visible("service_points"):
+            service_entries = []
+            ep = self._display_service_point_value(("entry", 0))
+            xp = self._display_service_point_value(("exit", 0))
+            if ep:
+                service_entries.append((ep, "起点"))
+            if xp:
+                service_entries.append((xp, "终点"))
+            for index, point in enumerate(
+                list(getattr(self.state, "unload_points", []) or []), start=1
+            ):
+                service_entries.append((point, f"卸粮点{index}"))
+            for point, label in service_entries:
+                x, y = float(point[0]), float(point[1])
+                kind = (
+                    "entry"
+                    if label == "起点"
+                    else ("exit" if label == "终点" else "unload")
+                )
+                if kind in {"entry", "exit"}:
+                    color, _node_index = self._service_point_control_style(
+                        (kind, 0), point
+                    )
+                    radius = 6
+                else:
+                    color = (255, 210, 40)
+                    radius = 8
+                scene.circle(x, y, radius, color)
+                scene.label(
+                    x + 8,
+                    y - 10,
+                    label,
+                    color=color,
+                    size=10,
+                    center=False,
+                    halo=False,
+                    bold=False,
+                )
+
+        # ── 路径（连续轨迹 / 农机文件预览；陈旧预览虚线，画布同规则） ──
+        if layer_visible("route"):
+            machine_mode = (
+                self.image_view.route_display_mode() == "machine_file"
+                and isinstance(getattr(self, "_machine_route_preview", None), dict)
+            )
+            if isinstance(getattr(self, "_stale_path_preview", None), dict):
+                path_result = self._normalise_path_result(self._stale_path_preview)
+                stale_preview = True
+            elif machine_mode:
+                path_result = self._normalise_path_result(
+                    self._machine_route_preview.get("path_result") or {}
+                )
+                stale_preview = False
+            else:
+                pipeline = getattr(self, "_pipeline_result", None)
+                pipeline = pipeline if isinstance(pipeline, dict) else {}
+                path_result = self._normalise_path_result(pipeline.get("path") or {})
+                stale_preview = False
+            if path_result:
+                track_color = (150, 160, 170) if stale_preview else (0, 255, 70)
+                turn_color = (190, 150, 90) if stale_preview else (70, 120, 255)
+                outside_field_color = (40, 40, 255)
+                display_boundary = boundary if len(boundary) >= 3 else None
+                for t in path_result.get("tracks", []):
+                    pts = self._coerce_points(t.get("points", []))
+                    if len(pts) > 1:
+                        scene.polyline(pts, track_color, width=4, dash=stale_preview)
+                for t in path_result.get("turns", []):
+                    pts = self._coerce_points(t.get("points", []))
+                    if len(pts) > 1:
+                        for piece, inside_field in self._split_polyline_by_field_boundary(
+                            pts, display_boundary
+                        ):
+                            scene.polyline(
+                                piece,
+                                turn_color if inside_field else outside_field_color,
+                                width=3,
+                                dash=stale_preview,
+                            )
+                if (
+                    not stale_preview
+                    and getattr(self.state, "exit_point", None) is None
+                    and not self._service_points_should_show()
+                ):
+                    finish = self._route_finish_point_from_result(path_result)
+                    if finish is not None:
+                        scene.circle(
+                            float(finish[0]), float(finish[1]), 9, (255, 80, 80)
+                        )
+                        scene.label(
+                            float(finish[0]) + 12,
+                            float(finish[1]) - 16,
+                            "终点",
+                            color=(255, 80, 80),
+                            size=12,
+                            center=False,
+                            halo=False,
+                            bold=False,
+                        )
+                if stale_preview:
+                    label_point = None
+                    for item in path_result.get("tracks", []) + path_result.get(
+                        "turns", []
+                    ):
+                        points = self._coerce_points(item.get("points", []))
+                        if points:
+                            label_point = points[0]
+                            break
+                    if label_point is None:
+                        full_path = path_result.get("full_path", []) or []
+                        if full_path:
+                            points = self._coerce_points(full_path[0])
+                            if points:
+                                label_point = points[0]
+                    if label_point is not None:
+                        scene.label(
+                            float(label_point[0]) + 12.0,
+                            float(label_point[1]) + 12.0,
+                            "待重新规划预览（不可导出）",
+                            color=(255, 190, 70),
+                            size=11,
+                            center=False,
+                            halo=False,
+                            bold=False,
+                        )
+                if machine_mode:
+                    for chunk in self._machine_route_preview.get("file_chunks") or []:
+                        records = list(chunk.get("records") or [])
+                        for record in records:
+                            color = (
+                                (0, 255, 70)
+                                if int(record.get("status", 0)) == 1
+                                else (70, 120, 255)
+                            )
+                            scene.circle(
+                                float(record["pixel_x"]),
+                                float(record["pixel_y"]),
+                                3,
+                                color,
+                            )
+                        if records:
+                            first = records[0]
+                            scene.circle(
+                                float(first["pixel_x"]),
+                                float(first["pixel_y"]),
+                                5,
+                                (255, 255, 0),
+                            )
+                            scene.label(
+                                float(first["pixel_x"]) + 8.0,
+                                float(first["pixel_y"]) + 8.0,
+                                os.path.basename(
+                                    str(chunk.get("path") or "农机文件")
+                                ),
+                                color=(255, 255, 0),
+                                size=10,
+                                center=False,
+                                halo=False,
+                                bold=False,
+                            )
+        return scene
 
     def _on_toggle_mask_compare(self):
         """DECISION-004: compare the immutable source image with current state."""
@@ -9316,6 +9735,73 @@ class MainWindow(QMainWindow):
         points[:, 1] += offset_y
         return [(float(x), float(y)) for x, y in points]
 
+    def _work_segment_endpoints(self):
+        """当前路径各作业段的起终点（显示网格像素）。
+
+        端点圆要标在"作业线和转弯的衔接处"，而衔接点就是作业段端点：规划按
+        ``work_line_endpoint_extension_m``（默认 0.5 m）把作业段两端外延，
+        转弯弧线的首尾点与作业段端点完全重合（实测 gap = 0.00 px）。中心线
+        目录本身不含这段外延，所以不能直接拿中心线端点当标记位置。
+        """
+        try:
+            result = self._path_result_from_state()
+        except Exception:
+            return []
+        if not isinstance(result, dict):
+            return []
+        endpoints = []
+        for points, kind in zip(
+            result.get("full_path") or [], result.get("segment_types") or []
+        ):
+            if str(kind) != "work" or len(points) < 2:
+                continue
+            first, last = points[0], points[-1]
+            endpoints.append(
+                (
+                    (float(first[0]), float(first[1])),
+                    (float(last[0]), float(last[1])),
+                )
+            )
+        return endpoints
+
+    def _centerline_endpoint_markers(self, points, work_endpoints):
+        """端点标记位置：有对应作业段就吸附到作业段两端，否则用中心线端点。
+
+        吸附条件 = 两端距离之和在容差内，且作业段长度与中心线一致（±15%）：
+        只按"最近"匹配会把没进路径的线吸到相邻作业段上（相邻线间距 16 m）。
+        """
+        if len(points) < 2:
+            return None, None
+        first = (float(points[0][0]), float(points[0][1]))
+        last = (float(points[-1][0]), float(points[-1][1]))
+        if not work_endpoints:
+            return first, last
+        span = math.hypot(last[0] - first[0], last[1] - first[1])
+        if span <= 1e-6:
+            return first, last
+        # 容差随线长走：外延 0.5 m + 横向 ±0.25 m 在 4 km 长的线（约 57 m）
+        # 上只有几十像素，取 5% 线长足够宽松，又不至于串到别的作业段。
+        tolerance = min(120.0, max(8.0, 0.05 * span))
+        best = None
+        for start, end in work_endpoints:
+            track_span = math.hypot(end[0] - start[0], end[1] - start[1])
+            if abs(track_span - span) > 0.15 * span:
+                continue
+            straight = math.hypot(
+                first[0] - start[0], first[1] - start[1]
+            ) + math.hypot(last[0] - end[0], last[1] - end[1])
+            flipped = math.hypot(
+                first[0] - end[0], first[1] - end[1]
+            ) + math.hypot(last[0] - start[0], last[1] - start[1])
+            pair, score = (
+                ((start, end), straight) if straight <= flipped else ((end, start), flipped)
+            )
+            if score > 2.0 * tolerance:
+                continue
+            if best is None or score < best[0]:
+                best = (score, pair)
+        return best[1] if best is not None else (first, last)
+
     @staticmethod
     def _point_along_polyline(points, fraction):
         """Return the point at *fraction* of the polyline's arc length.
@@ -9534,6 +10020,16 @@ class MainWindow(QMainWindow):
                     return record
         return None
 
+    def _centerline_labels_hidden(self):
+        """路径生成后作业线文字编号自动隐藏（用户要求，2026-11-10）。
+
+        编号服务于「勾选哪些线参与规划」的阶段；路径一旦生成，画布主角
+        是轨迹与转弯，一排「作业线 N」只会添乱。路径被清除或下游失效
+        （回到调整阶段）后自动恢复。判定只认生效路径：待重新规划的虚线
+        预览不算——那正是需要看编号重新勾选的时候。
+        """
+        return bool(self._path_result_from_state())
+
     def _draw_centerline_overlay(self, viewer):
         if hasattr(viewer, "clear_overlay_layer"):
             viewer.clear_overlay_layer("centerlines")
@@ -9552,6 +10048,14 @@ class MainWindow(QMainWindow):
             viewer.begin_overlay_layer("centerlines")
         label_rects = []
         anchors = self._aligned_label_anchors(items, selected)
+        # 快照要复现画布的标签取舍（碰撞过滤依赖当前缩放），这里把真正画出来
+        # 的编号登记下来；None 表示本帧没有做过取舍，快照退回画全部。
+        # _centerline_labels_hidden 每次都要重建路径投影，本帧只算一次。
+        labels_hidden = self._centerline_labels_hidden()
+        visible_labels = set()
+        self._centerline_visible_label_ids = set() if labels_hidden else None
+        # 端点圆要吸附到作业段端点，一次取好，别在循环里反复重建路径投影。
+        work_endpoints = self._work_segment_endpoints()
         label_size = self._centerline_label_size(viewer, anchors)
         operator_payload = self._operator_paths_payload()
         try:
@@ -9571,11 +10075,25 @@ class MainWindow(QMainWindow):
                 is_selected = str(item.get("id")) in selected
                 if not is_selected:
                     continue
-                # 线在编号处要断开一小段，所以先建编号、量长度，再画线（见下）。
                 # 线段要有两个端点：只画线时"从哪到哪"看不出来，两条相邻线
                 # 的端头也容易连成一片。端点用固定屏幕半径的圆点，缩放不变形。
-                for end_x, end_y in (points[0], points[-1]):
+                # 位置对齐作业段端点：路径规划按 work_line_endpoint_extension_m
+                # 把作业段两端各外延 0.5 m，转弯弧线正好接在外延端；端点圆仍画
+                # 中心线端点就会停在离衔接处半个刀宽的地方（用户 2026-11-10 报）。
+                marker_start, marker_end = self._centerline_endpoint_markers(
+                    points, work_endpoints
+                )
+                for end_x, end_y in (marker_start, marker_end):
                     viewer.draw_circle(end_x, end_y, radius=4, color=(120, 255, 150))
+                # 路径生成后编号自动隐藏（见 _centerline_labels_hidden）：线
+                # 和端点照画（几何本身仍是路径证据），只去掉「作业线 N」文字。
+                if labels_hidden:
+                    viewer.draw_polyline(
+                        points,
+                        color=OPERATOR_LINE_COLOR_BGR if operator_points else (40, 220, 80),
+                        width=5,
+                    )
+                    continue
                 # 编号写全称"中心线 N"（用户要求：只写数字信息量不够）；文字带
                 # 描边、线全程连续，被字压住的只有十来个字宽，不影响判断整条线。
                 label = str(item.get("label") or item.get("id") or "中心线")
@@ -9634,7 +10152,11 @@ class MainWindow(QMainWindow):
                 )
                 if polygon is not None:
                     label_rects.append(polygon)
+                    visible_labels.add(str(item.get("id"))) 
         finally:
+            self._centerline_visible_label_ids = (
+                set() if labels_hidden else set(visible_labels)
+            )
             if hasattr(viewer, "end_overlay_layer"):
                 viewer.end_overlay_layer()
 
@@ -10586,17 +11108,13 @@ class MainWindow(QMainWindow):
 
     def _on_export_img(self):
         path, _ = QFileDialog.getSaveFileName(self, "保存图像", "result.png", "PNG (*.png);;JPEG (*.jpg)")
-        if not path or self._tif_rgb is None:
+        if not path:
             return
-        overlay = self._tif_rgb.copy()
-        pr = self._pipeline_result or {}
-        path_result = self._normalise_path_result(pr.get("path", {}))
-        for track in path_result.get("tracks", []):
-            pts = np.array(track.get("points", []))
-            if len(pts) > 1:
-                cv2.polylines(overlay, [pts.astype(np.int32)], False, (0, 200, 50), 3)
-        cv2.imwrite(path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-        self.log_panel.success(f"已保存图像: {path}")
+        if not path.lower().endswith((".png", ".jpg", ".jpeg")):
+            path += ".png"
+        # DECISION-070：与图像区快照按钮同一条原图分辨率渲染路径，不再用
+        # 降采样显示图 + 只画轨迹的旧导出。
+        self._export_full_resolution_snapshot(path)
 
     def _next_diagnostic_default_path(self, prefix: str) -> str:
         """Return a non-overwriting default name for a stage diagnostic ZIP."""

@@ -1182,3 +1182,23 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - 时序（关键）：`cancel_pending_project_saves()` 丢掉排队中的旧状态保存 → `wait_for_project_state_saves(5 s)` 等正在写的那一份结束 → 重置内存 → 删文件 → 重绘。顺序颠倒会让后台保存把刚清掉的处理结果又写回来，或让被删的标注还留在画布上。
 - 处理进行中（识别/掩膜/规划/平滑，或 `_worker_thread` 在跑）时直接拒绝并提示，不弹确认框。
 - 契约：`tests/test_project_reset.py`（7 例：清理范围、标注可选删除、无缓存目录安全、排队保存丢弃、菜单唯一入口、重置后内存归零且影像仍在、处理中拒绝执行）。全量 870 passed / 1 skipped。
+
+## DECISION-070：快照从控件截图改为原图分辨率重绘（2026-11-10）
+
+用户指出：快照走 `viewer.grab()` 控件截图，分辨率被屏幕尺寸和当时缩放钉死，产出的效果图不够清晰；要求改成「在原图的基础上叠加系统的操作」。核实结论：**属实**，且菜单「文件→导出→快照 PNG…」的 `_on_export_img` 也只在降采样显示图（最长边 ≤6000）上画轨迹线，同样到不了原始栅格分辨率。
+
+- 新模块 `src/pyside6_app/snapshot_export.py`：`SnapshotScene`（掩膜/折线/多边形/圆点/标签五类 op，坐标一律显示网格像素、色号一律 BGR，与 viewer API 同口径）+ `render_snapshot_png`（rasterio 按原分辨率重读 GeoTIFF → 掩膜按 viewer 同一混合公式（α=115/255）上采样融合 → QPainter 绘矢量/中文标签（带描边）→ QImageWriter 写 PNG/JPG）+ `SnapshotExportWorker`（后台线程 + 进度 + 协作取消）。
+- 出图口径：**WYSIWYG**。`_build_snapshot_scene` 从画布同源数据取图层（掩膜 raw/headland/uncertain/processed、作业线及已标定人线、参考线、田块边界、禁行区、服务点、路径含陈旧虚线预览与农机文件预览），取舍跟随显示图层面板的可见性；对比模式（显示原始影像）下快照就是纯原图。
+- 两个入口合一：图像区相机按钮（`_on_save_snapshot`，选文件夹 + 快照N.png 自动编号）与菜单「快照 PNG…」（`_on_export_img`，另存对话框）都走 `_export_full_resolution_snapshot`。失败如实报错，**不回退到控件截图**（截图会掩盖问题且产物仍是低分辨率）。
+- 有意的非 WYSIWYG 项（写在模块说明里）：画布 cosmetic 笔宽随缩放漂移，快照用几何比例宽（display 宽 × display_scale）；画布标签碰撞过滤依赖当前缩放，快照在全分辨率下按锚点画全部选中标签。
+- 渲染依赖 Qt 应用实例（字体）；无实例时补建 **QApplication**（不能是裸 QGuiApplication——后续 `QApplication.instance() or QApplication(...)` 会跳过创建、构造 QWidget 直接崩）。掩膜按 1024 行条带融合限制临时内存（源图可达 15k×21k）。
+- 契约：`tests/test_snapshot_export.py`（11 例：源分辨率/像素级混合公式/基底保持/JPG/非法显示尺寸报错/worker 同步跑与取消/场景收集与图层可见性/对比模式为空/标定人线替换/无影像拒绝/入口端到端）。`tests/test_align_logic.py` 的快照编号契约改挂 `_export_full_resolution_snapshot` 桩。
+
+## DECISION-071：快照导出的三个界面配套修正（2026-11-10）
+
+用户实测快照后反馈三点（当时运行的是 11-04 的旧 exe，看到的仍是控件截图——文件 1210×582、边缘带画布灰背景、仅 320 KB，均为旧路径铁证；新渲染需重建 exe 后生效）。随本次一并落地的源码修正：
+
+- **快照范围**：`render_snapshot_png` 画布＝`QImage(源宽, 源高)`，从 GeoTIFF 原点铺满——不含任何 QGraphicsScene 灰背景，与窗口视角/缩放完全无关（用户明确要求「不取决于我在软件窗口的视角，就是整个 tif 图像的范围」）。
+- **田块顶点缩小**：`_field_vertex_radius` 7 → 5（圈选时顶点圆偏大）；快照 `_build_snapshot_scene` 直接引用该值，画布与出图同口径。
+- **作业线编号在路径生成后自动隐藏**：`_centerline_labels_hidden()`＝存在生效路径（`_path_result_from_state()`；待重规划虚线预览不算）。画布 `_draw_centerline_overlay` 与快照场景同规则：线、端点圆保留，只去「作业线 N」文字；路径清除/下游失效后自动恢复。挂点不需要新钩子——`_show_path` 已调 `_draw_static_display_layers` 全量重画，`_invalidate_downstream` 走 `_repair_canvas_if_state_disagrees` 对账。
+- 契约：`tests/test_snapshot_export.py` 新增 `test_build_snapshot_scene_shows_centerline_labels_before_path`、`test_centerline_labels_hidden_follows_path_state`，collects 用例改断言「有路径时编号不出现」+ 顶点半径=5。
