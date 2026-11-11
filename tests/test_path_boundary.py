@@ -407,9 +407,13 @@ def test_centerline_budget_preserves_heading_when_distance_is_small():
 
 
 def test_preserving_bends_does_not_move_existing_endpoint_repair_anchor():
-    """DECISION-017: output density must not relocate a repair anchor."""
+    """DECISION-017: output density must not relocate a repair anchor.
+
+    v36 起锚点取折线自身端点的横向坐标（简化器永不移动端点），因此输出
+    密度不可能搬动锚点；延长沿作业线自身轴向推进，不产生侧向台阶。
+    """
     from types import SimpleNamespace
-    from path_planner import prepare_band_centerlines, _smooth_band_centerline
+    from path_planner import prepare_band_centerlines
 
     class Geo:
         @staticmethod
@@ -432,21 +436,16 @@ def test_preserving_bends_does_not_move_existing_endpoint_repair_anchor():
         mask_offset_x=0, mask_offset_y=0,
     )
     config = {"centerline_simplify_max_points": 2}
-    # The former two-point output is the endpoint-repair reference, while
-    # the new detailed output must retain the observed internal bends.
-    reference = _smooth_band_centerline(
-        curve, 0.0, 1.0,
-        {**config, "centerline_simplify_max_deviation_m": 100.0,
-         "centerline_simplify_max_heading_change_deg": 180.0},
-    )
-    expected_y = float(np.median(np.asarray(reference)[:, 1]))
     lines, report = prepare_band_centerlines(
         bands, 0.0, geo=Geo(), state=state, config=config,
     )
     curve_line = lines[report["ordered_band_ids"].index(4)]
 
     assert len(curve_line) > 8
-    assert curve_line[-1] == pytest.approx((100.0, expected_y))
+    # 锚点 = 折线自身端点的横向坐标：延长尖端与端点共线（沿主方向直射，
+    # 无侧向台阶）。平滑会微量移动端点，故断言与线自身端点一致。
+    own_endpoint = curve_line[-2]
+    assert curve_line[-1] == pytest.approx((100.0, own_endpoint[1]))
 
 
 def test_soft_budget_spends_extra_points_before_dense_fallback():

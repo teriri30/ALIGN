@@ -620,7 +620,7 @@ def test_contour_connector_falls_back_to_axial_when_end_hooks_sideways():
 
 
 def test_contour_route_appends_local_direction_tip_to_polyline():
-    """折线作业段保留全部中心线点，外延锚点作为尖端追加（不改动原折点）。"""
+    """折线作业段保留全部中心线点；超出原端点的外延锚点以橙色空驶段发射。"""
     from path_planner import _connect_work_lines
 
     class _Geo:
@@ -670,13 +670,19 @@ def test_contour_route_appends_local_direction_tip_to_polyline():
     ]
     assert diagnostics["contour_route_mode"] is True
     first = work[0]
-    # 原折线点原样保留，外延尖端追加在尾部。
-    assert first[:3] == [(20.0, 10.0), (50.0, 12.0), (75.0, 10.0)]
-    assert len(first) == 4
+    # 绿色作业段 = 原中心线折线本身，不再附加外延尖端。
+    assert first == [(20.0, 10.0), (50.0, 12.0), (75.0, 10.0)]
+    # 外延锚点以 turn_approach 段紧跟作业段发射（同一条直线，橙色空驶）。
+    first_index = next(
+        i for i, kind in enumerate(segment_types) if kind == "work"
+    )
+    assert segment_types[first_index + 1] == "turn_approach"
+    extension = path[first_index + 1]
+    assert extension[0] == pytest.approx((75.0, 10.0))
     # 共享高侧墙在 x=80（最长线的端点投影）。
-    assert first[3][0] == pytest.approx(80.0)
+    assert extension[-1][0] == pytest.approx(80.0)
     # 末端局部方向 (25,-2)：外延 5 px 时 y 略降，水平投影则保持 y=10。
-    assert first[3][1] == pytest.approx(9.6, abs=1e-3)
+    assert extension[-1][1] == pytest.approx(9.6, abs=1e-3)
 
 
 def test_contour_near_radius_limit_uses_shared_tangent_without_pear_loop():

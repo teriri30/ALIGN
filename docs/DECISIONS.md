@@ -1213,3 +1213,13 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - **显示去重**：路径生效且路线层可见时（`_centerline_polylines_covered_by_route`），中心线折线与作业段是同一份几何，画布 `_draw_centerline_overlay` 与快照 `_build_snapshot_scene` 都不再单独画中心线折线（端点圆、编号取舍不变）；路线层被关掉或路径失效后自动恢复。编辑器与兼容 TXT 的控制折线 `simplify_work` 保留全部作业折点——看到的就是导出的。
 - **版本**：`footprint-path-v35`（旧路径缓存重规划）；掩膜处理版本仍为 21。DECISION-012 v3 第 7 条的「每条主作业线只保留两个端点」由本条覆盖。
 - **契约**：`tests/test_contour_strategy.py`（折线保留、局部方向外延、钩子回退、尖端追加）、`tests/test_machine_compat_export.py`（折线全点导出、亚 2cm 去重保留）、`tests/test_route_edit_pyside.py`（控制折线保留折点）、`tests/test_snapshot_export.py`（有路径不画中心线折线、失效恢复）。全量 896 passed。
+
+## DECISION-073：尖端拆分——绿色作业段还原为原中心线，超出端点部分统一橙色空驶（2026-11-11）
+
+用户实测 v35 路径后反馈：「生成的作业线是直的，但是加上串联以后就弯了——弯的地方是串联出来的转弯路线，端点就应该在原本的作业线两端，这个就不用动了；超出端点的部分不管是直的还是转弯统一用橙色段标识；且转弯路线为什么这么奇怪要拐一下，你直接延长作业线到足够转弯的地方不就了吗，这个折线不应该存在」。真实项目缓存离线复现（镜像桌面 PathPlanningWorker 管线）定位到两个叠加机制：
+
+- **端点修复横向锚点错源**：`prepare_band_centerlines` 的短缺端点修复把延长目标的横向坐标取在端点参考序列（`compact_reference` 两点弦）的中位横向上，而非折线自身端点的横向坐标——延长段带侧向分量，在作业线端部形成实测最高 90.16° 的可见折角（「拐一下」）。修复：锚点改为折线自身端点的横向坐标，沿作业线自身轴向直射延长（平滑会微量移动端点，故锚点随线自身端点）；修复报告新增 `low_tip`/`high_tip` 记录尖端坐标。
+- **合并尖端的显示归属**：锚点合并块（0.3 m 侧向容差内 `insert/append` 进作业线）把这些尖端全部渲染成绿色。v36 在 `_connect_work_lines` 发射阶段按 `merged_tip_flags` + `cfg["_endpoint_repair_tip_points"]` 把超出原中心线端点的部分（修复延长 + 锚点外延 + 田头接近段）统一拆回 `turn_approach` 段——橙色空驶通道已存在，渲染零改动。轨迹点列不变，只改段归属；转弯走廊验证仍用合并后的完整线形。`turn_decisions` 的 `crop_exit`/`crop_entry` 改为原中心线端点（真实作物边界语义）。
+- **版本**：`footprint-path-v36`（旧路径缓存重规划）；掩膜处理版本仍为 21。
+- **验证**：真实缓存端到端——30 条橙色延长链与绿线衔接角最大 2.91°（基线尖端折角最高 90.16°）；work 段内 >4° 折角仅剩中心线自身保留的真实行带弯曲 3 处（基线同位置同值）；总长 1093.5 m（基线 1093.8 m）、交叉点 0、碾压 39.6%（基线 39.8%）。
+- **契约**：`tests/test_contour_strategy.py::test_contour_route_appends_local_direction_tip_to_polyline`（绿色段=原折线、外延以 turn_approach 紧跟发射）、`tests/test_path_boundary.py::test_preserving_bends_does_not_move_existing_endpoint_repair_anchor`（锚点=线自身端点横向坐标，延长与端点共线；DECISION-017 语义强化——简化器永不移动端点，故密度不可能搬动锚点）。全量 896 passed。

@@ -42,7 +42,7 @@ from headland_turn_validation import (
 )
 
 
-PATH_PLANNING_VERSION = "footprint-path-v35"
+PATH_PLANNING_VERSION = "footprint-path-v36"
 
 
 def _adjacent_snake_order_work_lines(
@@ -1023,10 +1023,9 @@ def _simplify_centerline_polyline(
     )
     budget_exceeded = len(compact) > len(soft_compact)
     if diagnostics is not None:
-        # compact_reference is the soft-budget line that endpoint repair used
-        # before this policy existed. Keeping it as the repair anchor means
-        # extra detail never relocates an endpoint; it is not an executable
-        # work line.
+        # compact_reference（软预算线）曾是端点修复的锚点；v36 起修复直接
+        # 以折线自身端点的横向坐标外延（避免端部侧向折角），它只作为诊断
+        # 载荷保留，不是可执行作业线。
         diagnostics["compact_reference"] = soft_compact
         diagnostics["soft_point_budget"] = soft_max_points
         diagnostics["hard_point_budget"] = hard_max_points
@@ -1298,14 +1297,12 @@ def prepare_band_centerlines(
                     high = float(np.max(projections))
                     low_extension_m = max(0.0, (low - target_low) * mpp)
                     high_extension_m = max(0.0, (target_high - high) * mpp)
-                    endpoint_points = np.asarray(
-                        item.get("endpoint_reference", line), dtype=np.float64,
-                    )
-                    endpoint_projections = endpoint_points @ direction
-                    endpoint_laterals = endpoint_points @ normal
-                    low_endpoint_index = int(np.argmin(endpoint_projections))
-                    high_endpoint_index = int(np.argmax(endpoint_projections))
-                    endpoint_sample_count = min(5, len(endpoint_points))
+                    # 一条线原则：端点修复沿作业线自身端点的轴向推进，目标
+                    # 横向位置取折线自身端点的横向坐标。若改用端点参考序列
+                    # 的中位横向，延长段会带侧向分量，在作业线端部形成可见
+                    # 折角（“拐一下”）；修复只应把线补到队列共同深度。
+                    low_extreme_index = int(np.argmin(projections))
+                    high_extreme_index = int(np.argmax(projections))
                     self_evidence_supported = (
                         item["declared_span_m"] is not None
                         and item["declared_span_m"]
@@ -1329,12 +1326,11 @@ def prepare_band_centerlines(
                     low_target = None
                     high_target = None
                     if low_extension_m > 1e-6:
-                        sample_indices = np.argsort(endpoint_projections)[:endpoint_sample_count]
-                        lateral = float(np.median(endpoint_laterals[sample_indices]))
+                        lateral = float(laterals[low_extreme_index])
                         low_target = target_low * direction + lateral * normal
-                        low_anchor = endpoint_points[low_endpoint_index]
+                        low_anchor = points[low_extreme_index]
                         if not segment_within_field_boundary(
-                            [tuple(low_target), tuple(low_anchor)],
+                            [tuple(low_anchor), tuple(low_target)],
                             field_polygon,
                         ):
                             endpoint_repair_report["rejected"][
@@ -1346,10 +1342,9 @@ def prepare_band_centerlines(
                         else:
                             repaired_line = [tuple(map(float, low_target))] + repaired_line
                     if high_extension_m > 1e-6:
-                        sample_indices = np.argsort(endpoint_projections)[-endpoint_sample_count:]
-                        lateral = float(np.median(endpoint_laterals[sample_indices]))
+                        lateral = float(laterals[high_extreme_index])
                         high_target = target_high * direction + lateral * normal
-                        high_anchor = endpoint_points[high_endpoint_index]
+                        high_anchor = points[high_extreme_index]
                         if not segment_within_field_boundary(
                             [tuple(high_anchor), tuple(high_target)],
                             field_polygon,
@@ -1387,6 +1382,19 @@ def prepare_band_centerlines(
                         "result_span_m": float(item["span_m"]),
                         "completion_kind": "declared_extent_repair",
                         "inferred": False,
+                        # 发射阶段用这些尖端点把超出原中心线端点的延长部分
+                        # 拆成 turn_approach（橙色空驶），绿色作业段保持为
+                        # 原行带中心线本身。
+                        "low_tip": (
+                            None
+                            if low_target is None
+                            else [float(low_target[0]), float(low_target[1])]
+                        ),
+                        "high_tip": (
+                            None
+                            if high_target is None
+                            else [float(high_target[0]), float(high_target[1])]
+                        ),
                     })
 
     median_span = float(np.median([item["span_m"] for item in candidates]))
@@ -3751,6 +3759,9 @@ def _connect_work_lines(
     # 合并后作业线完整延伸到田头，转弯保持短小。侧面调整（法向偏移大）
     # 仍保留 approach 段。折线保留全部中心线点，锚点作为外延尖端追加；
     # 两点直线替换端点（与追加几何等价，保持两点形态）。
+    # 注意：合并只服务于几何连续性/验证；发射阶段会把合并尖端与端点修复
+    # 尖端重新拆分为 turn_approach（橙色），绿色作业段还原为原中心线。
+    merged_tip_flags: Dict[int, Dict[str, int]] = {}
     if oriented and turn_anchors:
         direction_x = math.cos(float(alignment_angle))
         direction_y = math.sin(float(alignment_angle))
@@ -3785,9 +3796,48 @@ def _connect_work_lines(
                         line.insert(0, anchor)
                     else:
                         line.append(anchor)
+                    merged_tip_flags.setdefault(
+                        line_index, {"start": 0, "end": 0}
+                    )[endpoint_name] = 1
                 else:
                     line[point_index] = anchor
         endpoint_alignment["long_anchor_extensions_merged_into_work_lines"] = True
+
+    # 发射阶段的“一条线”拆分：绿色作业段 = 原行带中心线折线本身；超出原
+    # 端点的部分（端点修复延长尖端 + 合并的锚点尖端，以及田头接近直线）
+    # 统一作为 turn_approach 橙色段发射。几何点列完全不变，只改变段的
+    # 语义/渲染归属；转弯走廊验证仍使用合并后的完整线形。
+    repair_tip_points = set()
+    for raw_tip in cfg.get("_endpoint_repair_tip_points") or []:
+        try:
+            repair_tip_points.add((float(raw_tip[0]), float(raw_tip[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+
+    def _split_tip_extensions(line_index, line):
+        """Split (prefix_tips, core, suffix_tips) for one merged work line."""
+        points = [(float(p[0]), float(p[1])) for p in line]
+        flags = merged_tip_flags.get(line_index) or {}
+        n_prefix = 1 if flags.get("start") else 0
+        n_suffix = 1 if flags.get("end") else 0
+        if len(points) - n_prefix - n_suffix >= 2:
+            if n_prefix < len(points) - n_suffix and (
+                points[n_prefix] in repair_tip_points
+            ):
+                n_prefix += 1
+            if n_suffix < len(points) - n_prefix and (
+                points[len(points) - 1 - n_suffix] in repair_tip_points
+            ):
+                n_suffix += 1
+        if len(points) - n_prefix - n_suffix < 2:
+            return [], points, []
+        end_index = len(points) - n_suffix
+        return points[:n_prefix], points[n_prefix:end_index], points[end_index:]
+
+    line_tip_splits = [
+        _split_tip_extensions(line_index, line)
+        for line_index, line in enumerate(oriented)
+    ]
 
     # DECISION-016/017: audit the entry against the geometry that will actually
     # be emitted.  Ordering happens before short-end repair and shared-headland
@@ -4019,18 +4069,36 @@ def _connect_work_lines(
         full_path.append([entry_point, oriented[0][0]])
         segment_types.append("entry")
     for index, line in enumerate(oriented):
-        full_path.append(line)
+        prefix_tips, core_line, suffix_tips = line_tip_splits[index]
+        if index == 0 and prefix_tips:
+            # 首条线的入线延长：从最外锚点尖端到原中心线起点，橙色空驶。
+            full_path.append(list(prefix_tips) + [core_line[0]])
+            segment_types.append("turn_approach")
+        full_path.append(core_line)
         segment_types.append("work")
+        start = (
+            turn_anchors[index]["end"]
+            if index < len(turn_anchors)
+            else line[-1]
+        )
+        # 田头延长/接近段：原中心线端点 → 修复尖端 → 锚点尖端 → 田头墙
+        # 锚点。这些点近似共线，统一以 turn_approach（橙色空驶）发射；
+        # 绿色作业段因此恰好终止在原行带中心线端点。
+        approach_chain = [core_line[-1]] + list(suffix_tips)
+        if math.hypot(
+            approach_chain[-1][0] - start[0],
+            approach_chain[-1][1] - start[1],
+        ) > 1e-7:
+            approach_chain.append(start)
+        if len(approach_chain) >= 2:
+            full_path.append(approach_chain)
+            segment_types.append("turn_approach")
         if index >= len(oriented) - 1:
             continue
-        next_line = oriented[index + 1]
-        start = turn_anchors[index]["end"]
+        next_prefix_tips, next_core_line, _ = line_tip_splits[index + 1]
         end = turn_anchors[index + 1]["start"]
-        if math.hypot(start[0] - line[-1][0], start[1] - line[-1][1]) > 1e-7:
-            full_path.append([line[-1], start])
-            segment_types.append("turn_approach")
-        direction_x = start[0] - line[-2][0]
-        direction_y = start[1] - line[-2][1]
+        direction_x = start[0] - core_line[-2][0]
+        direction_y = start[1] - core_line[-2][1]
         direction_norm = math.hypot(direction_x, direction_y)
         if direction_norm <= 1e-9:
             work_direction = (math.cos(0.0), math.sin(0.0))
@@ -4121,10 +4189,10 @@ def _connect_work_lines(
             "reason": decision.get("reason", ""),
             "fallback_reason": decision.get("fallback_reason", ""),
             "geometry_signature": decision.get("geometry_signature", ""),
-            "crop_exit": [float(line[-1][0]), float(line[-1][1])],
+            "crop_exit": [float(core_line[-1][0]), float(core_line[-1][1])],
             "turn_start": [float(start[0]), float(start[1])],
             "turn_end": [float(end[0]), float(end[1])],
-            "crop_entry": [float(next_line[0][0]), float(next_line[0][1])],
+            "crop_entry": [float(next_core_line[0][0]), float(next_core_line[0][1])],
         })
         if requested_strategy == "contour":
             turn_decisions[-1]["ordering_strategy"] = "contour"
@@ -4261,11 +4329,18 @@ def _connect_work_lines(
                     turn_decisions[-1].update(connector)
             full_path.append(turn)
             segment_types.append("turn")
-        if math.hypot(
-            end[0] - next_line[0][0],
-            end[1] - next_line[0][1],
-        ) > 1e-7:
-            full_path.append([end, next_line[0]])
+        # 入线延长/接近段：田头墙锚点 → 锚点尖端 → 修复尖端 → 原中心线
+        # 起点，与转弯段衔接为一条连续轨迹，统一橙色空驶。
+        approach_in = [end] + list(next_prefix_tips) + [next_core_line[0]]
+        deduped_approach = [approach_in[0]]
+        for point in approach_in[1:]:
+            if math.hypot(
+                point[0] - deduped_approach[-1][0],
+                point[1] - deduped_approach[-1][1],
+            ) > 1e-7:
+                deduped_approach.append(point)
+        if len(deduped_approach) >= 2:
+            full_path.append(deduped_approach)
             segment_types.append("turn_approach")
 
     if include_exit_service and exit_point and oriented:
@@ -9834,6 +9909,18 @@ def plan_path(wide_bands: List[Dict],
     planning_bands = prepared["planning_bands"]
     layout = prepared["layout"]
     cfg = prepared["executed_config"]
+    # 端点修复尖端点传给发射阶段：绿色作业段还原为原行带中心线，超出原
+    # 端点的延长部分统一作为 turn_approach（橙色空驶）发射。
+    repair_tip_points = []
+    for repair_record in (
+        (layout.get("endpoint_repair") or {}).get("lines") or []
+    ):
+        for tip_key in ("low_tip", "high_tip"):
+            tip = repair_record.get(tip_key)
+            if isinstance(tip, (list, tuple)) and len(tip) >= 2:
+                repair_tip_points.append((float(tip[0]), float(tip[1])))
+    if repair_tip_points:
+        cfg["_endpoint_repair_tip_points"] = repair_tip_points
     # 等距区细分线不参与田头端点校正（已在掩膜边界正确截断）
     abort_if_cancelled()
     if not work_lines:
