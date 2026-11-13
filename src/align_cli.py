@@ -1549,10 +1549,11 @@ def do_import_operator(ctx: Ctx, json_path: str, **_kw) -> dict:
 
 # ── C 组：导出与模拟 ─────────────────────────────────────────────
 
-def _build_cli_snapshot_scene(ctx: Ctx):
+def _build_cli_snapshot_scene(ctx: Ctx, include_masks: bool = True):
     """按界面 _build_snapshot_scene（MW:8791-9093）默认口径构建快照图层（全图层可见、无标签）。
 
-    图层顺序与颜色与界面一致；界面的图层开关在 CLI 侧固定为默认可见集。
+    图层顺序与颜色与界面一致；界面的图层开关在 CLI 侧固定为默认可见集，
+    掩膜系图层可用 include_masks=False 整体去掉（等价界面里手动关掉掩膜图层）。
     注意：pyside6_app.snapshot_export 会拉入 PySide6（仅启动开销，渲染本身纯函数）。
     """
     import numpy as np
@@ -1561,13 +1562,14 @@ def _build_cli_snapshot_scene(ctx: Ctx):
 
     state = ctx.state
     scene = SnapshotScene()
-    try:
-        raw = _attach_raw_mask(ctx)
-        scene.mask(raw, getattr(state, "mask_raw_offset_x", 0),
-                   getattr(state, "mask_raw_offset_y", 0), (100, 210, 255))
-    except Exception:
-        pass
-    if getattr(state, "mask_processed", False):
+    if include_masks:
+        try:
+            raw = _attach_raw_mask(ctx)
+            scene.mask(raw, getattr(state, "mask_raw_offset_x", 0),
+                       getattr(state, "mask_raw_offset_y", 0), (100, 210, 255))
+        except Exception:
+            pass
+    if include_masks and getattr(state, "mask_processed", False):
         _attach_processed_mask(ctx)
         mr = state.mask_result or {}
         headland = mr.get("headland_mask")
@@ -1674,19 +1676,26 @@ def _split_polyline_by_field(points, boundary):
     return inside_parts, outside_parts
 
 
-def do_export_snapshot(ctx: Ctx, out: str, **_kw) -> dict:
-    """export-snapshot：等价界面「导出全分辨率快照」（MW:8731-8777 + snapshot_export.render）。"""
+def do_export_snapshot(ctx: Ctx, out: str, quality: int | None = None,
+                       include_masks: bool = True, **_kw) -> dict:
+    """export-snapshot：等价界面「导出全分辨率快照」（MW:8731-8777 + snapshot_export.render）。
+
+    体积实测（21021×15078 航片）：PNG 压不动（压缩级别 3/9 同为 908 MB），
+    JPG q95 = 45.6 MB、PSNR 51.25 dB（视觉无损）——要压体积用 .jpg 后缀。
+    """
     from provenance import file_sha256
     from pyside6_app.snapshot_export import render_snapshot_png
 
-    scene = _build_cli_snapshot_scene(ctx)
+    scene = _build_cli_snapshot_scene(ctx, include_masks=include_masks)
     out_path = str(Path(out).expanduser().resolve())
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     info = render_snapshot_png(
         ctx.tif, scene, out_path,
         display_shape=(ctx.disp_h, ctx.disp_w), view_scale=1.0,
+        jpeg_quality=(min(100, max(1, int(quality))) if quality is not None else None),
     )
-    return {"png": info.get("path", out_path), "shape": info.get("source_shape"),
+    return {"image": info.get("path", out_path), "format": info.get("format"),
+            "shape": info.get("source_shape"),
             "vectors": info.get("vector_count"), "masks": info.get("mask_count"),
             "sha256": file_sha256(info.get("path", out_path))}
 
@@ -2563,9 +2572,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--frame-stride", type=int, default=30, help="帧图抽样间隔（默认每 30 帧一张）")
     p.add_argument("--max-frames", type=int, default=200000, help="模拟帧数上限（fail-closed）")
 
-    p = sub.add_parser("export-snapshot", help="导出全分辨率快照 PNG（图层口径同界面）")
+    p = sub.add_parser("export-snapshot", help="导出全分辨率快照（.png 无损 908MB；.jpg q95≈46MB 视觉无损，图层口径同界面）")
     _add_tif(p)
-    p.add_argument("--out", required=True, help="输出 PNG 路径")
+    p.add_argument("--out", required=True, help="输出路径，扩展名决定格式：.png 无损 / .jpg 高压缩")
+    p.add_argument("--quality", type=int, default=None, help="JPG 质量 1-100（默认 95，实测 PSNR≈51dB）")
+    p.add_argument("--no-masks", action="store_true", help="不叠加掩膜图层（等价界面关掉掩膜图层）")
 
     p = sub.add_parser("export-package", help="导出完整试验资料包（含审计清单与包索引）")
     _add_tif(p)
@@ -2616,7 +2627,8 @@ def _dispatch(cmd: str, ctx: Ctx, args) -> dict:
         "import-operator": lambda: do_import_operator(ctx, json_path=args.json_path),
         "simulate": lambda: do_simulate(ctx, frames=args.frames,
                                         frame_stride=args.frame_stride, max_frames=args.max_frames),
-        "export-snapshot": lambda: do_export_snapshot(ctx, out=args.out),
+        "export-snapshot": lambda: do_export_snapshot(ctx, out=args.out, quality=args.quality,
+                                                      include_masks=not args.no_masks),
         "export-package": lambda: do_export_package(ctx, out=args.out, force=bool(getattr(args, "force", False))),
         "query-status": lambda: do_query_status(ctx),
         "query-diagnostics": lambda: do_query_diagnostics(ctx, export_zip=args.export_zip),
@@ -2630,12 +2642,28 @@ def _dispatch(cmd: str, ctx: Ctx, args) -> dict:
     return table[cmd]()
 
 
+def _msys_to_native(p: str) -> str:
+    """git-bash 的 /e/foo 形式在 Windows Python 里会被 resolve 成 E:\\e\\foo
+    （盘符被当成一级目录，导出物静默写错位置，实测踩过），显式翻译回 E:/foo。"""
+    import re
+
+    m = re.match(r"^/([a-zA-Z])(/|$)", p)
+    if m:
+        return m.group(1).upper() + ":" + p[2:]
+    return p
+
+
 def main(argv: list | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.cmd:
         parser.print_help()
         return EXIT_OK
+    # 路径类参数统一过 MSYS 翻译（在 git-bash 里跑本 CLI 是常态）
+    for _attr in ("tif", "out", "frames", "json_path", "export_zip"):
+        _val = getattr(args, _attr, None)
+        if isinstance(_val, str) and _val:
+            setattr(args, _attr, _msys_to_native(_val))
     t0 = time.time()
     lock = None
     try:

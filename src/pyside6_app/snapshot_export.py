@@ -364,6 +364,7 @@ def render_snapshot_png(
     progress: Optional[Callable[[int, str], None]] = None,
     image_format: Optional[str] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    jpeg_quality: Optional[int] = None,
 ) -> dict:
     """在原始栅格上渲染快照场景并写出图像文件。
 
@@ -374,6 +375,7 @@ def render_snapshot_png(
 
     返回审计元数据（源/显示尺寸、缩放、op 数量），供日志与测试核对。
     ``image_format``: "PNG"（默认）或 "JPG"；后缀大小写不敏感。
+    ``jpeg_quality``: 仅 JPG 生效；None 时用模块默认 JPEG_QUALITY。
     """
 
     def _report(pct: int, message: str) -> None:
@@ -490,7 +492,7 @@ def render_snapshot_png(
         from PySide6.QtGui import QImageWriter
 
         writer = QImageWriter(output_path, b"JPG")
-        writer.setQuality(JPEG_QUALITY)
+        writer.setQuality(JPEG_QUALITY if jpeg_quality is None else int(jpeg_quality))
         if not writer.write(image):
             raise OSError(f"JPEG 写入失败: {output_path} ({writer.errorString()})")
     _report(100, "")
