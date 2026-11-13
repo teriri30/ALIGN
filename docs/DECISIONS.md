@@ -1223,3 +1223,15 @@ eUI\data\models\*.pt`，文件不存在 → `ProvenanceError`；
 - **版本**：`footprint-path-v36`（旧路径缓存重规划）；掩膜处理版本仍为 21。
 - **验证**：真实缓存端到端——30 条橙色延长链与绿线衔接角最大 2.91°（基线尖端折角最高 90.16°）；work 段内 >4° 折角仅剩中心线自身保留的真实行带弯曲 3 处（基线同位置同值）；总长 1093.5 m（基线 1093.8 m）、交叉点 0、碾压 39.6%（基线 39.8%）。
 - **契约**：`tests/test_contour_strategy.py::test_contour_route_appends_local_direction_tip_to_polyline`（绿色段=原折线、外延以 turn_approach 紧跟发射）、`tests/test_path_boundary.py::test_preserving_bends_does_not_move_existing_endpoint_repair_anchor`（锚点=线自身端点横向坐标，延长与端点共线；DECISION-017 语义强化——简化器永不移动端点，故密度不可能搬动锚点）。全量 896 passed。
+
+
+## DECISION-074：带内居中再校正（recenter）默认关闭（2026-11-13）
+
+- 背景：DECISION-058/059 引入的 recenter 以「行带轮廓弦中点」为锚把中心线横移到带内中间，当时内部度量（中位偏心 20→10 mm）显示改善，但 DECISION-060 建立人工真值闭环后形势反转。
+- 证据（两田全票反对，共 30/30）：
+  1. 5.27 田人工标定线评估：recenter 开 → 17/17 条线全部劣化，横向误差均值 3.67 → 7.80 cm。
+  2. 4.12 田4 全流程审计（2026-11-13）：13 条作业线被横移 0.9–16.4 cm，横移量与逐线核心碾压率强相关（Pearson r=0.875，p=0.0001；去掉极值带后 r=0.627、p=0.029 仍显著）；同图 A/B 复跑（仅差本开关），13/13 条线核心碾压率全部改善，均值 7.05% → 4.26%，最差的带 2 由 18.6% 降至 6.4%。
+- 失效机理：轮廓弦中点假设「带内空白即通道」，对单侧贴边/冠层悬伸/局部粘连的轮廓会给出系统性偏移的锚点；多项式拟合把这种偏移平滑成全线的「自信错误」。
+- 处置：`_recenter_band_centerlines` 的 `centerline_recenter` 默认值 True → False；开关保留（`config.json`/`config.example.json` 的 `mask_processing.centerline_recenter` 显式置 true 可恢复），后续若重做锚点质量门可再评估启用。
+- 代码锚点：`row_geometry._recenter_band_centerlines`；既有测试 `tests/test_centerline_recenter.py` 均显式传参，不受默认值变化影响。
+- 审计产物：`桌面/ALIGN审计_20261113/`（对比图、A/B 逐带评估、探针脚本与摘要）。

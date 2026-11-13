@@ -12,7 +12,7 @@ try:  # shapely >= 2.0
 except ImportError:  # pragma: no cover - shapely 1.8 fallback
     from shapely.validation import make_valid as shapely_make_valid
 
-MASK_REGULARIZATION_VERSION = 21
+MASK_REGULARIZATION_VERSION = 22  # v22: centerline_recenter 默认关闭（DECISION-074）
 
 FIELD_BOUNDARY_GEOMETRY_VERSION = "field-boundary-geometry-v1"
 # A self-intersecting field outline is repaired only when the discarded parts
@@ -2749,7 +2749,11 @@ def _recenter_band_centerlines(bands, mpp: float, config: Optional[Dict] = None)
     但把中位偏心从 ~19 mm 压到 ~9 mm、P90 从 ~78 mm 压到 ~49 mm（实测）。
     """
     cfg = config or {}
-    if not bool(cfg.get("centerline_recenter", True)):
+    # 2026-11-13 起默认关闭（DECISION-074）：两块真实田全量对照显示该步骤
+    # 系统性把线推离人工认可的带中心（4.12 田4 核心碾压率 13/13 全线变差，
+    # 均值 7.05%→4.26%（关闭后）；5.27 田人工线评估 17/17 劣化，3.67→7.80 cm）。
+    # 开关保留：config.json 的 mask_processing.centerline_recenter 显式置 true 可恢复。
+    if not bool(cfg.get("centerline_recenter", False)):
         return
     if not bands or mpp <= 0:
         return
